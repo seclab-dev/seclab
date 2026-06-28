@@ -1,0 +1,16 @@
+[Unit]
+Description=SecLab Distributed Telemetry Agent
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=__SECLAB_HOME__
+Environment=SECLAB_HOME=__SECLAB_HOME__
+ExecStart=/usr/local/bin/seclab-agent start
+Restart=always
+RestartSec=10
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

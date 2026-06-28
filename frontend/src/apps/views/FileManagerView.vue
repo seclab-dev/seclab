@@ -1,0 +1,896 @@
+<script setup lang="ts">
+import { computed, ref, watch, onMounted, onUnmounted } from 'vue'
+import { fsApi } from '@/api/modules/fs'
+import type { FsEntry } from '@/api/interface/fs'
+import { useNotificationStore } from '@/stores/notification'
+import { useNodeStore } from '@/stores/node'
+import { useWindowManagerStore } from '@/stores/window-manager'
+import { useI18n } from 'vue-i18n'
+import SecLabTable, { type SecLabTableColumn } from '@/components/ui/SecLabTable.vue'
+import {
+  SecLabButton,
+  SecLabTag,
+  SecLabBreadcrumb,
+  SecLabBreadcrumbItem,
+  SecLabInput,
+  SecLabSelect,
+  SecLabPagination,
+  SecLabSwitch,
+  SecLabEmpty,
+  SecLabLoading,
+  SecLabDialog,
+  SecLabCheckbox,
+} from '@/components/ui'
+import SecLabIcon from '@/components/icons/SecLabIcon.vue'
+import AppContextMenu from '@/components/AppContextMenu.vue'
+import { formatBytes } from '@/utils/units'
+import { formatDateTime } from '@/utils/time'
+import { useFileOperations } from '@/composables/useFileOperations'
+
+const { t } = useI18n()
+const notificationStore = useNotificationStore()
+const nodeStore = useNodeStore()
+const windowStore = useWindowManagerStore()
+const fsClient = computed(() => fsApi.forNode(nodeStore.currentNodeId))
+const { mkdir, removePath, renamePath, copyPath, downloadFile, uploadFile, writeFile } =
+  useFileOperations()
+
+const props = defineProps<{
+  isMaximized?: boolean
+  windowId?: string
+  payload?: Record<string, unknown>
+}>()
+
+const currentPath = ref('')
+const pathInput = ref('')
+const showHidden = ref(false)
+const entries = ref<FsEntry[]>([])
+const selectedEntry = ref<FsEntry | null>(null)
+const selectedPaths = ref<Set<string>>(new Set())
+const listLoading = ref(false)
+const fileOperationCount = ref(0)
+const listError = ref('')
+const fileTableRef = ref<HTMLElement | null>(null)
+
+/** 每页条数选项 */
+const pageSizeOptions = computed(() => [
+  { label: t('common.pagination.perPage', { n: 50 }), value: 50 },
+  { label: t('common.pagination.perPage', { n: 100 }), value: 100 },
+  { label: t('common.pagination.perPage', { n: 200 }), value: 200 },
+  { label: t('common.pagination.perPage', { n: 500 }), value: 500 },
+])
+const pageSize = ref(50)
+const currentPage = ref(1)
+
+const columns = computed<SecLabTableColumn[]>(() => [
+  { label: '', width: 40, slot: 'selection', headerSlot: 'selectionHeader', align: 'center' },
+  { label: t('app.fileManager.name'), width: 220, minWidth: 180, slot: 'name' },
+  { label: t('app.fileManager.type'), width: 50, slot: 'type', align: 'center' },
+  {
+    label: t('app.fileManager.lastModified'),
+    width: 110,
+    minWidth: 100,
+    slot: 'mtime',
+    align: 'center',
+  },
+  { label: t('app.fileManager.size'), width: 80, slot: 'size', align: 'center' },
+])
+const sortState = ref<{
+  prop: 'name' | 'modified' | 'size'
+  order: 'ascending' | 'descending'
+}>({
+  prop: 'name',
+  order: 'ascending',
+})
+
+const currentDisplayPath = computed(() => currentPath.value || '/')
+const parentPath = computed(() => {
+  const path = currentDisplayPath.value
+  if (path === '/') return '/'
+  const segments = path.split('/').filter(Boolean)
+  segments.pop()
+  return segments.length ? `/${segments.join('/')}` : '/'
+})
+const breadcrumbItems = computed(() => {
+  const path = currentDisplayPath.value
+  if (path === '/') {
+    return [{ label: '/', path: '/' }]
+  }
+  const segments = path.split('/').filter(Boolean)
+  return [
+    { label: '/', path: '/' },
+    ...segments.map((segment, index) => ({
+      label: segment,
+      path: `/${segments.slice(0, index + 1).join('/')}`,
+    })),
+  ]
+})
+
+const sortedEntries = computed(() => {
+  const { prop, order } = sortState.value
+  const direction = order === 'ascending' ? 1 : -1
+  return [...entries.value].sort((a, b) => {
+    if (a.entryType !== b.entryType) {
+      return a.entryType === 'dir' ? -1 : 1
+    }
+    if (prop === 'modified') {
+      const left = a.modified || 0
+      const right = b.modified || 0
+      if (left === right) return a.name.localeCompare(b.name)
+      return (left - right) * direction
+    }
+    if (prop === 'size') {
+      const left = a.entryType === 'dir' ? -1 : a.size || 0
+      const right = b.entryType === 'dir' ? -1 : b.size || 0
+      if (left === right) return a.name.localeCompare(b.name)
+      return (left - right) * direction
+    }
+    return a.name.localeCompare(b.name) * direction
+  })
+})
+
+const totalPages = computed(() => {
+  const total = sortedEntries.value.length
+  return Math.max(1, Math.ceil(total / pageSize.value))
+})
+
+const pagedEntries = computed(() => {
+  const start = (currentPage.value - 1) * pageSize.value
+  return sortedEntries.value.slice(start, start + pageSize.value)
+})
+
+const currentPageStats = computed(() => {
+  let dirs = 0
+  let files = 0
+  pagedEntries.value.forEach((entry) => {
+    if (entry.entryType === 'dir') {
+      dirs += 1
+    } else {
+      files += 1
+    }
+  })
+  return { dirs, files }
+})
+
+const fileManagerBusy = computed(() => listLoading.value || fileOperationCount.value > 0)
+
+const runFileOperation = async <T,>(operation: () => Promise<T>) => {
+  fileOperationCount.value += 1
+  try {
+    return await operation()
+  } finally {
+    fileOperationCount.value = Math.max(0, fileOperationCount.value - 1)
+  }
+}
+
+watch(
+  fileManagerBusy,
+  (busy) => {
+    if (!props.windowId) return
+    windowStore.updateWindowRuntimeState(props.windowId, {
+      busy,
+      allowsNodeSwitch: false,
+      blockLevel: busy ? 'busy' : 'open',
+      blockReason: busy ? t('app.fileManager.guardBusy') : t('app.fileManager.guardOpen'),
+    })
+  },
+  { immediate: true },
+)
+
+const setPath = async (path: string) => {
+  const normalized = path.trim() || '/'
+  currentPath.value = normalized
+  pathInput.value = normalized
+  selectedEntry.value = null
+  currentPage.value = 1
+  await loadEntries(normalized)
+}
+
+const loadEntries = async (path: string) => {
+  listLoading.value = true
+  listError.value = ''
+  selectedPaths.value.clear()
+  try {
+    const res = await fsClient.value.listEntries(path, false, showHidden.value)
+    if (!res.success) {
+      listError.value = res.message || t('app.fileManager.fetchError')
+      entries.value = []
+      notificationStore.error(`${t('app.fileManager.loadError')}: ${listError.value}`)
+      return
+    }
+    entries.value = res.data || []
+    currentPage.value = 1
+  } finally {
+    listLoading.value = false
+  }
+}
+
+const selectEntry = (entry: FsEntry, e?: MouseEvent) => {
+  selectedEntry.value = entry
+  if (e && (e.ctrlKey || e.metaKey)) {
+    if (selectedPaths.value.has(entry.path)) {
+      selectedPaths.value.delete(entry.path)
+    } else {
+      selectedPaths.value.add(entry.path)
+    }
+  } else if (e && e.shiftKey) {
+    selectedPaths.value.add(entry.path)
+  }
+}
+
+const openEntry = async (entry: FsEntry) => {
+  if (entry.entryType === 'dir') {
+    await setPath(entry.path)
+    return
+  }
+  windowStore.openWindowWithPayload(
+    'file-editor',
+    { path: entry.path },
+    { title: t('app.fileEditor.appName') },
+  )
+}
+
+const openSelected = async () => {
+  if (!selectedEntry.value) return
+  await openEntry(selectedEntry.value)
+}
+
+const goParent = async () => {
+  await setPath(parentPath.value)
+}
+
+const copyCurrentPath = async () => {
+  const path = selectedEntry.value?.path || currentDisplayPath.value
+  if (!navigator.clipboard) {
+    notificationStore.error(t('app.fileManager.copyPathUnsupported'))
+    return
+  }
+  try {
+    await navigator.clipboard.writeText(path)
+    notificationStore.success(t('app.fileManager.copyPathSuccess'))
+  } catch (error) {
+    notificationStore.error(
+      `${t('app.fileManager.copyPathFailed')}: ${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
+}
+
+const refresh = async () => {
+  if (!currentPath.value) return
+  await loadEntries(currentPath.value)
+}
+
+const applyPathInput = async () => {
+  await setPath(pathInput.value)
+}
+
+const initHome = async () => {
+  await runFileOperation(async () => {
+    const res = await fsClient.value.home()
+    if (res.success && res.data?.path) {
+      await setPath(res.data.path)
+    } else {
+      await setPath('/home')
+    }
+  })
+}
+
+watch(showHidden, () => {
+  void refresh()
+})
+watch(pageSize, () => {
+  currentPage.value = 1
+})
+
+void initHome()
+
+// Selection features
+const isSelected = (path: string) => selectedPaths.value.has(path)
+const toggleSelection = (path: string, checked: boolean) => {
+  if (checked) selectedPaths.value.add(path)
+  else selectedPaths.value.delete(path)
+}
+const toggleAll = (checked: boolean) => {
+  if (checked) {
+    pagedEntries.value.forEach((e) => selectedPaths.value.add(e.path))
+  } else {
+    pagedEntries.value.forEach((e) => selectedPaths.value.delete(e.path))
+  }
+}
+const isAllSelected = computed(() => {
+  if (pagedEntries.value.length === 0) return false
+  return pagedEntries.value.every((e) => selectedPaths.value.has(e.path))
+})
+
+const handleBatchDelete = async () => {
+  if (selectedPaths.value.size === 0) return
+  await runFileOperation(async () => {
+    for (const p of Array.from(selectedPaths.value)) {
+      await removePath(p, true)
+    }
+    selectedPaths.value.clear()
+    await refresh()
+  })
+}
+
+// Dialog features
+const dialogState = ref({
+  visible: false,
+  type: 'dir' as 'dir' | 'file' | 'rename' | 'batchMove' | 'batchCopy',
+  inputName: '',
+  targetEntry: null as FsEntry | null,
+})
+const dialogTitle = computed(() => {
+  if (dialogState.value.type === 'dir') return t('app.fileManager.newDir')
+  if (dialogState.value.type === 'file') return t('app.fileManager.newFile')
+  if (dialogState.value.type === 'batchMove') return t('app.fileManager.batchMove')
+  if (dialogState.value.type === 'batchCopy') return t('app.fileManager.batchCopy')
+  return t('app.fileManager.rename')
+})
+
+const openDialog = (
+  type: 'dir' | 'file' | 'rename' | 'batchMove' | 'batchCopy',
+  entry: FsEntry | null = null,
+) => {
+  dialogState.value.type = type
+  dialogState.value.targetEntry = entry
+  dialogState.value.inputName = entry ? entry.name : ''
+  dialogState.value.visible = true
+}
+
+const confirmDialog = async () => {
+  const { type, inputName, targetEntry } = dialogState.value
+  if (!inputName.trim()) return
+
+  await runFileOperation(async () => {
+    let success = false
+    if (type === 'dir') {
+      const path = `${currentDisplayPath.value}/${inputName}`.replace(/\/\//g, '/')
+      success = await mkdir(path)
+    } else if (type === 'file') {
+      const path = `${currentDisplayPath.value}/${inputName}`.replace(/\/\//g, '/')
+      success = await writeFile(path, '')
+    } else if (type === 'batchMove' || type === 'batchCopy') {
+      const targetDir = inputName.endsWith('/') ? inputName.slice(0, -1) : inputName
+      for (const p of Array.from(selectedPaths.value)) {
+        const name = p.split('/').pop()
+        const newPath = `${targetDir}/${name}`.replace(/\/\//g, '/')
+        if (type === 'batchMove') {
+          success = await renamePath(p, newPath)
+        } else {
+          success = await copyPath(p, newPath)
+        }
+      }
+      if (success) {
+        selectedPaths.value.clear()
+      }
+    } else if (type === 'rename' && targetEntry) {
+      const parent = targetEntry.path.substring(0, targetEntry.path.lastIndexOf('/'))
+      const newPath = `${parent}/${inputName}`.replace(/\/\//g, '/')
+      success = await renamePath(targetEntry.path, newPath)
+    }
+
+    if (success) {
+      dialogState.value.visible = false
+      await refresh()
+    }
+  })
+}
+
+// Upload/Download features
+const fileInput = ref<HTMLInputElement | null>(null)
+const triggerUpload = () => fileInput.value?.click()
+const onFileChange = async (e: Event) => {
+  const target = e.target as HTMLInputElement
+  if (!target.files?.length) return
+  const file = target.files[0]
+  const path = `${currentDisplayPath.value}/${file.name}`.replace(/\/\//g, '/')
+  const success = await runFileOperation(() => uploadFile(path, file))
+  if (success) await refresh()
+  target.value = ''
+}
+const handleDownload = async (entry: FsEntry) => {
+  if (entry.entryType === 'dir') return
+  await runFileOperation(() => downloadFile(entry.path, entry.name))
+}
+const handleDelete = async (entry: FsEntry) => {
+  await runFileOperation(async () => {
+    const success = await removePath(entry.path, true)
+    if (success) {
+      selectedPaths.value.delete(entry.path)
+      await refresh()
+    }
+  })
+}
+
+const copyEntryPath = async (entry: FsEntry) => {
+  if (!navigator.clipboard) return notificationStore.error(t('app.fileManager.copyPathUnsupported'))
+  await navigator.clipboard.writeText(entry.path)
+  notificationStore.success(t('app.fileManager.copyPathSuccess'))
+}
+
+// Context menu
+const contextMenu = ref({ visible: false, x: 0, y: 0, entry: null as FsEntry | null })
+const showContextMenu = (entry: FsEntry, event: MouseEvent) => {
+  event.preventDefault()
+  selectEntry(entry)
+  contextMenu.value = { visible: true, x: event.clientX, y: event.clientY, entry }
+}
+const hideContextMenu = () => {
+  contextMenu.value.visible = false
+}
+onMounted(() => document.addEventListener('click', hideContextMenu))
+onUnmounted(() => document.removeEventListener('click', hideContextMenu))
+</script>
+
+<template>
+  <section class="file-manager" data-seclab-app="file-manager">
+    <div class="toolbar" data-slot="header" data-ui="file-manager-toolbar">
+      <div class="path-bar">
+        <div class="sl-input-group">
+          <SecLabInput
+            v-model="pathInput"
+            class="path-input"
+            :placeholder="t('app.fileManager.path')"
+            @keyup.enter="applyPathInput"
+          />
+          <SecLabButton type="secondary" class="path-btn" @click="applyPathInput">
+            {{ t('app.fileManager.open') }}
+          </SecLabButton>
+        </div>
+      </div>
+      <div class="options-bar">
+        <SecLabSwitch v-model="showHidden" :active-text="t('app.fileManager.showHidden')" />
+      </div>
+      <div class="nav-actions">
+        <SecLabButton type="secondary" @click="openDialog('file')">{{
+          t('app.fileManager.newFile')
+        }}</SecLabButton>
+        <SecLabButton type="secondary" @click="openDialog('dir')">{{
+          t('app.fileManager.newDir')
+        }}</SecLabButton>
+        <SecLabButton type="secondary" @click="triggerUpload">{{
+          t('app.fileManager.upload')
+        }}</SecLabButton>
+        <input type="file" ref="fileInput" @change="onFileChange" style="display: none" />
+        <SecLabButton type="primary" @click="refresh">{{
+          t('app.fileManager.refresh')
+        }}</SecLabButton>
+      </div>
+    </div>
+
+    <section class="list-container">
+      <div class="breadcrumb-wrap" data-ui="breadcrumb-bar">
+        <SecLabBreadcrumb separator="/">
+          <SecLabBreadcrumbItem v-for="item in breadcrumbItems" :key="item.path">
+            <button type="button" class="link-btn" @click="setPath(item.path)">
+              {{ item.label }}
+            </button>
+          </SecLabBreadcrumbItem>
+        </SecLabBreadcrumb>
+        <div class="list-actions">
+          <SecLabButton size="small" :disabled="currentDisplayPath === '/'" @click="goParent">
+            {{ t('app.fileManager.upDir') }}
+          </SecLabButton>
+          <SecLabButton size="small" :disabled="!selectedEntry" @click="openSelected">
+            {{ t('app.fileManager.openSelected') }}
+          </SecLabButton>
+          <SecLabButton size="small" @click="copyCurrentPath">
+            {{ t('app.fileManager.copyPath') }}
+          </SecLabButton>
+          <SecLabButton
+            size="small"
+            type="danger"
+            :disabled="selectedPaths.size === 0"
+            @click="handleBatchDelete"
+          >
+            {{ t('app.fileManager.batchDelete') }}
+          </SecLabButton>
+        </div>
+      </div>
+
+      <div v-if="listError" class="list-state error">{{ listError }}</div>
+
+      <div class="table-wrapper">
+        <SecLabTable
+          ref="fileTableRef"
+          class="file-table"
+          data-ui="file-table"
+          :data="pagedEntries"
+          :columns="columns"
+          border
+          @row-contextmenu="showContextMenu"
+        >
+          <template #selectionHeader>
+            <SecLabCheckbox :modelValue="isAllSelected" @update:modelValue="toggleAll" />
+          </template>
+          <template #selection="{ row }: { row: any }">
+            <SecLabCheckbox
+              :modelValue="isSelected(row.path)"
+              @update:modelValue="(val) => toggleSelection(row.path, val)"
+            />
+          </template>
+
+          <template #name="{ row }: { row: any }">
+            <div
+              class="entry-name"
+              :class="{ 'is-selected': selectedEntry?.path === row.path }"
+              @click="selectEntry(row, $event)"
+              @dblclick="openEntry(row)"
+            >
+              <SecLabIcon
+                class="entry-icon"
+                :name="row.entryType === 'dir' ? 'folder' : 'file'"
+                :size="18"
+              />
+              <span class="entry-name-text">{{ row.name }}</span>
+            </div>
+          </template>
+
+          <template #type="{ row }: { row: any }">
+            <SecLabTag :type="row.entryType === 'dir' ? 'success' : 'info'">
+              {{ row.entryType === 'dir' ? t('app.fileManager.dir') : t('app.fileManager.file') }}
+            </SecLabTag>
+          </template>
+
+          <template #mtime="{ row }: { row: any }">
+            <span class="sl-text-secondary">{{ formatDateTime(row.modified) }}</span>
+          </template>
+
+          <template #size="{ row }: { row: any }">
+            <span class="sl-text-secondary">
+              {{ row.entryType === 'dir' ? '-' : formatBytes(row.size) }}
+            </span>
+          </template>
+
+          <template #empty>
+            <SecLabEmpty :description="t('app.fileManager.empty')" />
+          </template>
+        </SecLabTable>
+      </div>
+
+      <div class="pagination-bar">
+        <div class="page-info">
+          {{
+            t('app.fileManager.pageStats', {
+              currentPage: currentPage,
+              totalPages: totalPages,
+              total: sortedEntries.length,
+            })
+          }}
+        </div>
+        <div class="page-size-selector">
+          <SecLabSelect
+            v-model="pageSize"
+            size="small"
+            class="page-size-select"
+            data-ui="file-page-size-select"
+            :options="pageSizeOptions"
+          />
+        </div>
+
+        <SecLabPagination
+          :current-page="currentPage"
+          :total-pages="totalPages"
+          @page-change="(p) => (currentPage = p)"
+        />
+
+        <div class="page-stats">
+          {{
+            t('app.fileManager.currentDirStats', {
+              dirs: currentPageStats.dirs,
+              files: currentPageStats.files,
+            })
+          }}
+        </div>
+      </div>
+    </section>
+
+    <!-- Context Menu -->
+    <AppContextMenu
+      :visible="contextMenu.visible"
+      :x="contextMenu.x"
+      :y="contextMenu.y"
+      @close="hideContextMenu"
+    >
+      <button
+        type="button"
+        class="context-menu-btn"
+        data-ui="file-open-btn"
+        @click="
+          () => {
+            contextMenu.entry && openEntry(contextMenu.entry)
+            hideContextMenu()
+          }
+        "
+      >
+        {{ t('app.fileManager.open') }}
+      </button>
+      <button
+        type="button"
+        class="context-menu-btn"
+        data-ui="file-rename-btn"
+        @click="
+          () => {
+            contextMenu.entry && openDialog('rename', contextMenu.entry)
+            hideContextMenu()
+          }
+        "
+      >
+        {{ t('app.fileManager.rename') }}
+      </button>
+      <button
+        v-if="contextMenu.entry?.entryType !== 'dir'"
+        type="button"
+        class="context-menu-btn"
+        data-ui="file-download-btn"
+        @click="
+          () => {
+            contextMenu.entry && handleDownload(contextMenu.entry)
+            hideContextMenu()
+          }
+        "
+      >
+        {{ t('app.fileManager.download') }}
+      </button>
+      <button
+        type="button"
+        class="context-menu-btn"
+        data-ui="file-copy-path-btn"
+        @click="
+          () => {
+            contextMenu.entry && copyEntryPath(contextMenu.entry)
+            hideContextMenu()
+          }
+        "
+      >
+        {{ t('app.fileManager.copyPath') }}
+      </button>
+      <button
+        type="button"
+        class="context-menu-btn file-context-danger"
+        data-ui="file-delete-btn"
+        @click="
+          () => {
+            contextMenu.entry && handleDelete(contextMenu.entry)
+            hideContextMenu()
+          }
+        "
+      >
+        {{ t('app.fileManager.delete') }}
+      </button>
+    </AppContextMenu>
+
+    <!-- Dialog -->
+    <SecLabDialog
+      :visible="dialogState.visible"
+      :title="dialogTitle"
+      @close="dialogState.visible = false"
+    >
+      <div style="padding-top: 10px">
+        <SecLabInput
+          v-model="dialogState.inputName"
+          :placeholder="
+            dialogState.type.startsWith('batch')
+              ? t('app.fileManager.targetPath')
+              : t('app.fileManager.inputName')
+          "
+          @keyup.enter="confirmDialog"
+        />
+      </div>
+      <template #footer>
+        <SecLabButton @click="dialogState.visible = false">{{
+          t('app.fileManager.cancel')
+        }}</SecLabButton>
+        <SecLabButton type="primary" @click="confirmDialog">{{
+          t('app.fileManager.confirm')
+        }}</SecLabButton>
+      </template>
+    </SecLabDialog>
+
+    <SecLabLoading :loading="listLoading" :text="t('app.fileManager.loading')" cover />
+  </section>
+</template>
+
+<style scoped>
+.file-manager {
+  font-family: var(--sdl-font-family);
+  color: var(--sdl-text-primary);
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sdl-space-4);
+  padding: var(--sdl-space-4);
+  background: var(--sdl-bg-canvas);
+  border-radius: var(--sdl-radius-lg);
+  overflow: hidden;
+  box-sizing: border-box;
+  min-height: 0;
+  position: relative;
+}
+
+.toolbar {
+  padding: var(--sdl-space-2) var(--sdl-space-3);
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: var(--sdl-space-3);
+  align-items: center;
+  border: 1px solid var(--sdl-border-default);
+  border-radius: var(--sdl-radius-lg);
+  background: var(--sdl-bg-panel);
+}
+
+.path-bar {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  min-width: 300px;
+}
+
+.sl-input-group {
+  display: flex;
+  width: 100%;
+}
+
+.path-input {
+  flex: 1;
+}
+
+.path-input :deep(.sl-input-inner-wrapper) {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+  border-right: none;
+}
+
+.path-btn {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+}
+
+.nav-actions {
+  display: flex;
+  gap: var(--sdl-space-2);
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.options-bar {
+  display: flex;
+  align-items: center;
+}
+
+.list-container {
+  background: var(--sdl-bg-panel);
+  border: 1px solid var(--sdl-border-default);
+  border-radius: var(--sdl-radius-lg);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+
+.breadcrumb-wrap {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sdl-space-3);
+  padding: var(--sdl-space-3) var(--sdl-space-4);
+  border-bottom: 1px solid var(--sdl-border-default);
+  background: var(--sdl-bg-muted);
+}
+
+.list-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sdl-space-2);
+  flex-wrap: wrap;
+}
+
+.link-btn {
+  border: none;
+  background: transparent;
+  color: var(--sdl-primary);
+  padding: 0;
+  font-size: var(--sdl-font-body-sm);
+  cursor: pointer;
+}
+
+.link-btn:hover {
+  text-decoration: underline;
+}
+
+.list-state {
+  padding: var(--sdl-space-3) var(--sdl-space-4) 0;
+  font-size: var(--sdl-font-caption);
+  color: var(--sdl-text-muted);
+}
+
+.list-state.error {
+  color: var(--sdl-danger);
+}
+
+.table-wrapper {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.file-table {
+  height: 100%;
+}
+
+.entry-name {
+  display: flex;
+  align-items: center;
+  gap: var(--sdl-space-2);
+  padding: var(--sdl-space-1) 0;
+  cursor: pointer;
+  border-radius: var(--sdl-radius-sm);
+  transition: all 0.2s;
+}
+
+.entry-name.is-selected {
+  background-color: var(--sdl-bg-active);
+  box-shadow: 0 0 0 4px var(--sdl-bg-active);
+}
+
+.entry-name-text {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.entry-icon {
+  color: var(--sdl-text-secondary);
+}
+
+.pagination-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--sdl-space-3);
+  padding: var(--sdl-space-3) var(--sdl-space-4);
+  border-top: 1px solid var(--sdl-border-default);
+  font-size: var(--sdl-font-caption);
+  color: var(--sdl-text-muted);
+  flex-wrap: wrap;
+}
+
+.page-size-select {
+  width: 110px;
+}
+
+.page-stats {
+  white-space: nowrap;
+}
+
+.file-context-danger {
+  color: var(--sdl-danger);
+}
+
+.file-context-danger:hover {
+  background: var(--sdl-danger-muted);
+}
+
+@media (max-width: 1100px) {
+  .toolbar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .options-bar {
+    align-items: flex-start;
+  }
+  .pagination-bar {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--sdl-space-4);
+  }
+  .breadcrumb-wrap {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}
+</style>

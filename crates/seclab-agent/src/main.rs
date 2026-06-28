@@ -1,0 +1,1123 @@
+//! 服务入口：加载配置、初始化依赖并启动 HTTP 服务。
+
+use crate::models::identity::{
+    clear_runtime_session, ensure_identity_certs, load_or_init_identity, update_runtime_session,
+};
+use crate::state::DbPool;
+use crate::types::AgentMode;
+use axum_server::tls_rustls::RustlsConfig;
+use clap::{Parser, Subcommand};
+use routes::create_router;
+use rustls::crypto::ring::default_provider;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::WebPkiClientVerifier;
+use seclab_api::response::ApiResponse;
+use seclab_contracts::types::agent_socket_path;
+use seclab_security::certs::AGENT_CA_CERT_PEM;
+use seclab_security::client::build_tls_client;
+use semver::Version;
+use shadow_rs::{formatcp, shadow};
+use std::io;
+use std::net::SocketAddr;
+use std::{fs, os::unix::fs::PermissionsExt};
+use tokio::{net::UnixListener, signal, sync::watch};
+use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
+use tracing_subscriber::{fmt::time::ChronoLocal, layer::SubscriberExt, util::SubscriberInitExt};
+
+pub mod api;
+pub mod config;
+pub mod crypto;
+pub mod db;
+pub mod errors;
+pub mod models;
+pub mod routes;
+pub mod services;
+pub mod state;
+#[cfg(test)]
+mod test_support;
+pub mod types;
+
+const DEFAULT_PRODUCTION_HOME: &str = "/opt/seclab";
+const RUNTIME_RETRY_INITIAL_DELAY_SECONDS: u64 = 3;
+const RUNTIME_RETRY_MAX_DELAY_SECONDS: u64 = 20;
+const RUNTIME_RETRY_JITTER_SECONDS: u64 = 3;
+
+shadow!(build);
+
+const VERSION_INFO: &str = formatcp!(
+    r#"{}
+commit_hash: {}
+build_time: {}
+build_env: {},{}"#,
+    build::PKG_VERSION,
+    build::SHORT_COMMIT,
+    build::BUILD_TIME,
+    build::RUST_VERSION,
+    build::RUST_CHANNEL
+);
+
+#[derive(Parser, Debug)]
+#[command(name = "SecLab Agent", version = VERSION_INFO)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// 启动 Agent 服务
+    Start,
+}
+
+#[tokio::main]
+async fn main() {
+    let _args = Cli::parse();
+
+    load_env();
+    let _log_guard = init_logging();
+    config::init();
+    if let Err(err) = default_provider().install_default() {
+        tracing::error!("Failed to install rustls crypto provider: {:?}", err);
+        std::process::exit(1);
+    }
+
+    let (app, pools_for_shutdown) = match create_router().await {
+        Ok(app) => app,
+        Err(err) => {
+            let root_cause = err.root_cause();
+            if let Some(io_error) = root_cause.downcast_ref::<io::Error>() {
+                tracing::error!("Root cause is std::io::Error; kind: {:?}", io_error.kind());
+                std::process::exit(1);
+            }
+            tracing::error!("Unexpected startup error: {:?}", err);
+            std::process::exit(1);
+        }
+    };
+
+    let mut identity = match load_or_init_identity(&pools_for_shutdown, config::get()).await {
+        Ok(identity) => identity,
+        Err(err) => {
+            tracing::error!("Failed to load agent identity: {}", err);
+            std::process::exit(1);
+        }
+    };
+
+    let use_uds = identity.mode == AgentMode::Local;
+
+    if identity.mode == AgentMode::Remote && identity.agent_ip.is_none() {
+        tracing::warn!("agent_identity.agent_ip is empty; TLS SAN may not match remote address.");
+    }
+
+    if use_uds {
+        let socket_path = agent_socket_path();
+        if tokio::fs::metadata(&socket_path).await.is_ok() {
+            // 尝试连接已存在的套接字
+            match tokio::net::UnixStream::connect(&socket_path).await {
+                Ok(_) => {
+                    // 连接成功，表明另一个实例正在运行
+                    tracing::error!(
+                        "Failed to start Agent: Another instance is already running and listening on UDS socket at {}.",
+                        socket_path.display()
+                    );
+                    std::process::exit(1);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    // 连接被拒，说明旧实例已退出，只残留了垃圾文件，可以安全清理
+                    tracing::info!(
+                        socket_path = %socket_path.display(),
+                        "Detected stale UDS socket file (connection refused). Removing it..."
+                    );
+                    if let Err(err) = tokio::fs::remove_file(&socket_path).await {
+                        tracing::error!(
+                            "Failed to remove stale socket file at {}: {}",
+                            socket_path.display(),
+                            err
+                        );
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    // 其他系统或权限错误，为避免破坏活跃服务，打印错误并退出
+                    tracing::error!(
+                        "Failed to check UDS socket status at {}: {}. If you are sure no other instance is running, please remove this file manually.",
+                        socket_path.display(),
+                        e
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        // 创建目录（如果不存在）
+        if let Some(dir) = socket_path.parent() {
+            fs::create_dir_all(dir).unwrap();
+        }
+    }
+
+    if use_uds {
+        let socket_path = agent_socket_path();
+        let listener = match UnixListener::bind(&socket_path) {
+            Ok(l) => l,
+            Err(err) => {
+                if err.kind() == std::io::ErrorKind::AddrInUse {
+                    tracing::error!(
+                        "Failed to bind Unix socket at {}: Address already in use. Please check if another instance of seclab-agent is running.",
+                        socket_path.display()
+                    );
+                } else {
+                    tracing::error!(
+                        "Failed to bind Unix socket at {}: {}",
+                        socket_path.display(),
+                        err
+                    );
+                }
+                std::process::exit(1);
+            }
+        };
+
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o777))
+            .expect("Failed to set socket file permissions");
+
+        tracing::info!(
+            "Starting Agent server at {:?}",
+            listener.local_addr().unwrap()
+        );
+        axum::serve(listener, app.into_make_service())
+            .with_graceful_shutdown(async move {
+                shutdown_signal().await;
+                tracing::info!(
+                    "seclab-agent local listener received shutdown signal. Terminating..."
+                );
+                tracing::info!("Attempting to close agent database connection pool...");
+                pools_for_shutdown.close().await;
+                tracing::info!("Agent database connection pool closed successfully.");
+                if tokio::fs::metadata(&socket_path).await.is_ok() {
+                    tokio::fs::remove_file(&socket_path).await.unwrap();
+                }
+            })
+            .await
+            .unwrap();
+        return;
+    }
+
+    let listen_addr: SocketAddr = identity
+        .listen_addr
+        .clone()
+        .unwrap_or_else(|| self::config::DEFAULT_AGENT_LISTEN_ADDR.to_string())
+        .parse()
+        .expect("Invalid listen_addr in agent_identity");
+    let tls_config = match build_tls_config(&mut identity, &pools_for_shutdown).await {
+        Ok(config) => config,
+        Err(err) => {
+            tracing::error!("Failed to build TLS config: {}", err);
+            std::process::exit(1);
+        }
+    };
+
+    let (runtime_stop_tx, runtime_stop_rx) = watch::channel(false);
+    tokio::spawn(run_runtime_supervisor(
+        pools_for_shutdown.clone(),
+        runtime_stop_rx,
+    ));
+
+    tracing::info!("Starting Agent TLS server at {:?}", listen_addr);
+    let handle = axum_server::Handle::new();
+    let shutdown_handle = handle.clone();
+    let runtime_stop_tx_for_signal = runtime_stop_tx.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        tracing::info!(
+            "seclab-agent remote listener received shutdown signal. Stopping all active simulation ports and resources..."
+        );
+        let _ = runtime_stop_tx_for_signal.send(true);
+        shutdown_handle.graceful_shutdown(None);
+    });
+
+    if let Err(err) = axum_server::bind_rustls(listen_addr, tls_config)
+        .handle(handle)
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+        .await
+    {
+        if err.kind() == std::io::ErrorKind::AddrInUse {
+            tracing::error!(
+                "Failed to start Agent server: Address {} is already in use. Please check if another instance of seclab-agent is running or choose a different port.",
+                listen_addr
+            );
+        } else {
+            tracing::error!("Failed to bind to {}: {}", listen_addr, err);
+        }
+        std::process::exit(1);
+    }
+
+    let _ = runtime_stop_tx.send(true);
+
+    tracing::info!("Attempting to close agent database connection pool...");
+    pools_for_shutdown.close().await;
+    tracing::info!("Agent database connection pool closed successfully.");
+}
+
+fn load_env() {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    for dir in cwd.ancestors() {
+        let path = dir.join(".env");
+        if path.is_file() {
+            let _ = dotenvy::from_path(path);
+            return;
+        }
+    }
+    let _ = dotenvy::dotenv();
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EnrollRequest {
+    enrollment_token: String,
+    node: RuntimeNode,
+    certificate_request: CertificateRequest,
+    compatibility: RuntimeAgentCompatibility,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RegisterRequest {
+    agent_id: String,
+    node: RuntimeNode,
+    compatibility: RuntimeAgentCompatibility,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HeartbeatRequest {
+    agent_id: String,
+    session_id: String,
+    lease_id: String,
+    sequence: i64,
+    node: RuntimeNode,
+    resource: Option<seclab_contracts::types::HostSystemSummary>,
+    compatibility: RuntimeAgentCompatibility,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeNode {
+    advertise_addr: Option<String>,
+    listen_port: Option<i64>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CertificateRequest {
+    public_key_algorithm: String,
+    csr_pem: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeAgentCompatibility {
+    agent_version: String,
+    runtime_protocol_version: String,
+    min_supported_controller_version: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeControllerCompatibility {
+    controller_version: String,
+    runtime_protocol_version: String,
+    min_supported_agent_version: String,
+    compatible: bool,
+    reason: String,
+    required_action: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeSessionResponse {
+    agent_id: String,
+    session_id: String,
+    lease_id: String,
+    heartbeat_interval_seconds: i64,
+    controller_compatibility: RuntimeControllerCompatibility,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeregisterRequest {
+    agent_id: String,
+    session_id: String,
+    reason: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RotateCertificateRequest {
+    agent_id: String,
+    session_id: String,
+    reason: String,
+    current_certificate_fingerprint: Option<String>,
+    certificate_request: CertificateRequest,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HeartbeatResponse {
+    lease_id: String,
+    lease_ttl_seconds: i64,
+    heartbeat_interval_seconds: i64,
+    require_re_register: bool,
+    require_certificate_rotation: bool,
+    sequence_ignored: Option<bool>,
+    controller_compatibility: RuntimeControllerCompatibility,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RotateCertificateResponse {
+    agent_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeSessionState {
+    seclab_url: String,
+    agent_id: String,
+    session_id: String,
+    lease_id: String,
+    heartbeat_interval_seconds: u64,
+    heartbeat_sequence: i64,
+    advertise_addr: Option<String>,
+    listen_port: Option<i64>,
+}
+
+async fn run_runtime_supervisor(pool: DbPool, mut stop_rx: watch::Receiver<bool>) {
+    let mut retry_delay_seconds = RUNTIME_RETRY_INITIAL_DELAY_SECONDS;
+    loop {
+        if *stop_rx.borrow() {
+            return;
+        }
+
+        match establish_runtime_session(&pool).await {
+            Ok(session) => {
+                retry_delay_seconds = RUNTIME_RETRY_INITIAL_DELAY_SECONDS;
+                let result = maintain_runtime_session(&pool, &mut stop_rx, session).await;
+                if let Err(err) = result {
+                    tracing::warn!("Runtime session dropped: {}", err);
+                    let _ = clear_runtime_session(&pool).await;
+                } else {
+                    return;
+                }
+            }
+            Err(err) => {
+                tracing::warn!("Runtime session bootstrap failed: {}", err);
+            }
+        }
+
+        let wait = tokio::time::sleep(std::time::Duration::from_secs(
+            retry_delay_seconds + runtime_retry_jitter_seconds(),
+        ));
+        tokio::pin!(wait);
+        tokio::select! {
+            _ = &mut wait => {}
+            changed = stop_rx.changed() => {
+                if changed.is_ok() && *stop_rx.borrow() {
+                    return;
+                }
+            }
+        }
+        retry_delay_seconds = (retry_delay_seconds * 2).min(RUNTIME_RETRY_MAX_DELAY_SECONDS);
+    }
+}
+
+fn runtime_retry_jitter_seconds() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.subsec_nanos() as u64)
+        .unwrap_or_default();
+    nanos % (RUNTIME_RETRY_JITTER_SECONDS + 1)
+}
+
+fn runtime_agent_compatibility() -> RuntimeAgentCompatibility {
+    let config = &config::get().controller_compatibility;
+    RuntimeAgentCompatibility {
+        agent_version: env!("CARGO_PKG_VERSION").to_string(),
+        runtime_protocol_version: config.runtime_protocol_version.clone(),
+        min_supported_controller_version: config.min_supported_controller_version.clone(),
+    }
+}
+
+fn ensure_controller_compatible(
+    compatibility: &RuntimeControllerCompatibility,
+) -> anyhow::Result<()> {
+    let config = &config::get().controller_compatibility;
+    if compatibility.runtime_protocol_version != config.runtime_protocol_version {
+        return Err(anyhow::anyhow!(
+            "controller runtime protocol mismatch: expected {}, got {}",
+            config.runtime_protocol_version,
+            compatibility.runtime_protocol_version
+        ));
+    }
+    if !compatibility.compatible {
+        return Err(anyhow::anyhow!(
+            "controller rejected agent compatibility: {} ({})",
+            compatibility.reason,
+            compatibility.required_action
+        ));
+    }
+
+    let controller = Version::parse(compatibility.controller_version.trim_start_matches('v'))
+        .map_err(|err| anyhow::anyhow!("controller version is not valid SemVer: {err}"))?;
+    let min_controller =
+        Version::parse(&config.min_supported_controller_version).map_err(|err| {
+            anyhow::anyhow!("minimum supported controller version is not valid SemVer: {err}")
+        })?;
+    if controller < min_controller {
+        return Err(anyhow::anyhow!(
+            "controller version {} is older than minimum supported {}",
+            controller,
+            min_controller
+        ));
+    }
+    let agent = Version::parse(env!("CARGO_PKG_VERSION"))
+        .map_err(|err| anyhow::anyhow!("agent version is not valid SemVer: {err}"))?;
+    let min_agent = Version::parse(&compatibility.min_supported_agent_version).map_err(|err| {
+        anyhow::anyhow!("controller minimum agent version is not valid SemVer: {err}")
+    })?;
+    if agent < min_agent {
+        return Err(anyhow::anyhow!(
+            "agent version {} is older than controller minimum supported {}",
+            agent,
+            min_agent
+        ));
+    }
+
+    // 项目初期由于在线与局部升级兼容性需要，放宽了零主版本（0.x.x）的兼容限制。
+    // 在 zero_major_requires_exact 为 false 时，仅要求首位主版本号一致；待以后项目文档或兼容矩阵明确后再行调整。
+    let compatible = if agent.major == 0 {
+        if config.zero_major_requires_exact {
+            agent.major == controller.major
+                && agent.minor == controller.minor
+                && agent.patch == controller.patch
+                && (!config.zero_major_requires_prerelease_match || agent.pre == controller.pre)
+        } else {
+            agent.major == controller.major
+        }
+    } else {
+        !config.stable_requires_same_major || agent.major == controller.major
+    };
+    if !compatible {
+        return Err(anyhow::anyhow!(
+            "controller version {} is not compatible with agent version {}",
+            controller,
+            agent
+        ));
+    }
+
+    Ok(())
+}
+
+async fn establish_runtime_session(pool: &DbPool) -> anyhow::Result<RuntimeSessionState> {
+    let identity = load_or_init_identity(pool, config::get()).await?;
+    if identity.mode != AgentMode::Remote {
+        return Err(anyhow::anyhow!(
+            "runtime supervisor only supports remote mode"
+        ));
+    }
+
+    let seclab_url = identity
+        .seclab_url
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("missing seclab_url"))?;
+    let client = build_tls_client()?;
+    let node = build_runtime_node(&identity);
+    let compatibility = runtime_agent_compatibility();
+    let clear_enrollment_token = identity.enrollment_token.is_some();
+
+    let session = if let Some(token) = identity.enrollment_token.clone() {
+        let response = client
+            .post(format!(
+                "{}/api/v1/runtime/enroll",
+                seclab_url.trim_end_matches('/')
+            ))
+            .json(&EnrollRequest {
+                enrollment_token: token,
+                node: node.clone(),
+                certificate_request: CertificateRequest {
+                    public_key_algorithm: "ed25519".to_string(),
+                    csr_pem: None,
+                },
+                compatibility: compatibility.clone(),
+            })
+            .send()
+            .await?
+            .error_for_status()?;
+        let payload = response
+            .json::<ApiResponse<RuntimeSessionResponse>>()
+            .await?;
+        if !payload.success {
+            return Err(anyhow::anyhow!(payload.message));
+        }
+        payload
+            .data
+            .ok_or_else(|| anyhow::anyhow!("missing enroll response data"))?
+    } else {
+        let agent_id = identity
+            .agent_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("missing agent_id"))?;
+        let response = client
+            .post(format!(
+                "{}/api/v1/runtime/register",
+                seclab_url.trim_end_matches('/')
+            ))
+            .json(&RegisterRequest {
+                agent_id,
+                node: node.clone(),
+                compatibility: compatibility.clone(),
+            })
+            .send()
+            .await?
+            .error_for_status()?;
+        let payload = response
+            .json::<ApiResponse<RuntimeSessionResponse>>()
+            .await?;
+        if !payload.success {
+            return Err(anyhow::anyhow!(payload.message));
+        }
+        payload
+            .data
+            .ok_or_else(|| anyhow::anyhow!("missing register response data"))?
+    };
+    ensure_controller_compatible(&session.controller_compatibility)?;
+
+    update_runtime_session(
+        pool,
+        &session.agent_id,
+        &session.session_id,
+        &session.lease_id,
+        clear_enrollment_token,
+    )
+    .await?;
+
+    Ok(RuntimeSessionState {
+        seclab_url,
+        agent_id: session.agent_id,
+        session_id: session.session_id,
+        lease_id: session.lease_id,
+        heartbeat_interval_seconds: session.heartbeat_interval_seconds.max(1) as u64,
+        heartbeat_sequence: 1,
+        advertise_addr: node.advertise_addr,
+        listen_port: node.listen_port,
+    })
+}
+
+async fn report_task_run_to_controller(
+    client: &reqwest::Client,
+    session: &RuntimeSessionState,
+    report: models::scheduled_tasks::TaskRunReportPayload,
+) -> anyhow::Result<()> {
+    let payload = serde_json::json!({
+        "agentId": session.agent_id,
+        "sessionId": session.session_id,
+        "runs": vec![report],
+    });
+
+    let url = format!(
+        "{}/api/v1/runtime/tasks/runs/report",
+        session.seclab_url.trim_end_matches('/')
+    );
+    let response = client
+        .post(&url)
+        .json(&payload)
+        .send()
+        .await?
+        .error_for_status()?;
+    let api_resp = response.json::<ApiResponse<()>>().await?;
+    if !api_resp.success {
+        return Err(anyhow::anyhow!(
+            "controller returned failure: {}",
+            api_resp.message
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentTaskSnapshotItem {
+    controller_task_id: i64,
+    revision: i64,
+    name: String,
+    command: String,
+    cron_expr: String,
+    enabled: bool,
+    timeout_secs: i64,
+    no_overlap: bool,
+}
+
+async fn pull_and_sync_tasks(
+    pool: &DbPool,
+    client: &reqwest::Client,
+    session: &RuntimeSessionState,
+) -> anyhow::Result<()> {
+    use chrono::Utc;
+    let url = format!(
+        "{}/api/v1/runtime/tasks/snapshot?agentId={}&sessionId={}",
+        session.seclab_url.trim_end_matches('/'),
+        session.agent_id,
+        session.session_id
+    );
+    let resp = client.get(url).send().await?.error_for_status()?;
+    let payload = resp
+        .json::<ApiResponse<Vec<AgentTaskSnapshotItem>>>()
+        .await?;
+    if !payload.success {
+        return Err(anyhow::anyhow!(
+            "snapshot query failed: {}",
+            payload.message
+        ));
+    }
+    let remote_tasks = payload.data.unwrap_or_default();
+
+    let local_tasks = models::scheduled_tasks::list_all_tasks(pool).await?;
+    let mut local_map: std::collections::HashMap<i64, models::scheduled_tasks::AgentScheduledTask> =
+        local_tasks
+            .into_iter()
+            .map(|t| (t.controller_task_id, t))
+            .collect();
+
+    for remote in remote_tasks {
+        let upsert_needed = if let Some(local) = local_map.remove(&remote.controller_task_id) {
+            local.revision != remote.revision
+        } else {
+            true
+        };
+
+        if upsert_needed {
+            let next_run_at = if remote.enabled {
+                match models::scheduled_tasks::compute_next_run_at(
+                    &remote.cron_expr,
+                    Utc::now().timestamp(),
+                ) {
+                    Ok(next) => next,
+                    Err(err) => {
+                        tracing::warn!(
+                            "Failed to compute next run for remote task {}: {:?}",
+                            remote.controller_task_id,
+                            err
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let payload = models::scheduled_tasks::UpsertTaskPayload {
+                controller_task_id: remote.controller_task_id,
+                revision: remote.revision,
+                name: remote.name,
+                command: remote.command,
+                cron_expr: remote.cron_expr,
+                enabled: remote.enabled,
+                timeout_secs: remote.timeout_secs,
+                no_overlap: remote.no_overlap,
+                force: Some(true),
+            };
+
+            if let Err(err) =
+                models::scheduled_tasks::upsert_task(pool, &payload, next_run_at).await
+            {
+                tracing::warn!(
+                    "Failed to align remote task {}: {:?}",
+                    payload.controller_task_id,
+                    err
+                );
+            }
+        }
+    }
+
+    // 清理本地多余的任务
+    for (controller_task_id, _) in local_map {
+        if let Err(err) = models::scheduled_tasks::delete_task(pool, controller_task_id).await {
+            tracing::warn!(
+                "Failed to clean up obsolete local task {}: {:?}",
+                controller_task_id,
+                err
+            );
+        }
+    }
+
+    Ok(())
+}
+
+async fn maintain_runtime_session(
+    pool: &DbPool,
+    stop_rx: &mut watch::Receiver<bool>,
+    mut session: RuntimeSessionState,
+) -> anyhow::Result<()> {
+    let client = build_tls_client()?;
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+        session.heartbeat_interval_seconds,
+    ));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // `interval` 首次 tick 会立即返回，先消费掉，避免重连后马上连续发送 heartbeat。
+    ticker.tick().await;
+
+    // 首次上线/重连时立即发起一次主动拉取对齐
+    if let Err(err) = pull_and_sync_tasks(pool, &client, &session).await {
+        tracing::warn!("Initial pull-based sync failed: {:?}", err);
+    }
+
+    let mut pull_sync_ticker = tokio::time::interval(std::time::Duration::from_secs(300));
+    pull_sync_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // 消费首次 tick
+    pull_sync_ticker.tick().await;
+
+    let mut task_run_rx = models::scheduled_tasks::take_task_run_receiver().await;
+
+    loop {
+        tokio::select! {
+            _ = pull_sync_ticker.tick() => {
+                if let Err(err) = pull_and_sync_tasks(pool, &client, &session).await {
+                    tracing::warn!("Scheduled pull-based sync failed: {:?}", err);
+                }
+            }
+            Some(report) = async {
+                if let Some(ref mut rx) = task_run_rx {
+                    rx.recv().await
+                } else {
+                    futures_util::future::pending().await
+                }
+            } => {
+                if let Err(err) = report_task_run_to_controller(&client, &session, report).await {
+                    tracing::warn!("Failed to report task run: {:?}", err);
+                }
+            }
+            _ = ticker.tick() => {
+                let resource = tokio::task::spawn_blocking(services::system_metrics::collect_snapshot)
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok());
+
+                let response = client
+                    .post(format!("{}/api/v1/runtime/heartbeat", session.seclab_url.trim_end_matches('/')))
+                    .json(&HeartbeatRequest {
+                        agent_id: session.agent_id.clone(),
+                        session_id: session.session_id.clone(),
+                        lease_id: session.lease_id.clone(),
+                        sequence: session.heartbeat_sequence,
+                        node: RuntimeNode {
+                            advertise_addr: session.advertise_addr.clone(),
+                            listen_port: session.listen_port,
+                        },
+                        resource,
+                        compatibility: runtime_agent_compatibility(),
+                    })
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                let payload = response
+                    .json::<ApiResponse<HeartbeatResponse>>()
+                    .await?;
+                if !payload.success {
+                    return Err(anyhow::anyhow!(payload.message));
+                }
+                let heartbeat = payload
+                    .data
+                    .ok_or_else(|| anyhow::anyhow!("missing heartbeat response data"))?;
+                if heartbeat.require_certificate_rotation {
+                    rotate_runtime_certificate(&client, &session).await?;
+                }
+                ensure_controller_compatible(&heartbeat.controller_compatibility)?;
+                if heartbeat.require_re_register {
+                    return Err(anyhow::anyhow!("seclab requested re-register"));
+                }
+                let _ = heartbeat.lease_ttl_seconds;
+                let _ = heartbeat.sequence_ignored;
+                session.lease_id = heartbeat.lease_id;
+                session.heartbeat_interval_seconds = heartbeat.heartbeat_interval_seconds.max(1) as u64;
+                session.heartbeat_sequence = session.heartbeat_sequence.saturating_add(1);
+                update_runtime_session(
+                    pool,
+                    &session.agent_id,
+                    &session.session_id,
+                    &session.lease_id,
+                    false,
+                )
+                .await?;
+                ticker = tokio::time::interval(std::time::Duration::from_secs(
+                    session.heartbeat_interval_seconds,
+                ));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                // 重建 interval 后同样先消费首次即时 tick，维持稳定发送间隔。
+                ticker.tick().await;
+            }
+            changed = stop_rx.changed() => {
+                if changed.is_ok() && *stop_rx.borrow() {
+                    let _ = deregister_runtime_session(&client, &session).await;
+                    let _ = clear_runtime_session(pool).await;
+                    return Ok(());
+                }
+                if changed.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+async fn deregister_runtime_session(
+    client: &reqwest::Client,
+    session: &RuntimeSessionState,
+) -> anyhow::Result<()> {
+    let response = client
+        .post(format!(
+            "{}/api/v1/runtime/deregister",
+            session.seclab_url.trim_end_matches('/')
+        ))
+        .json(&DeregisterRequest {
+            agent_id: session.agent_id.clone(),
+            session_id: session.session_id.clone(),
+            reason: "shutdown".to_string(),
+        })
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "deregister failed with status {}",
+            response.status()
+        ));
+    }
+
+    Ok(())
+}
+
+async fn rotate_runtime_certificate(
+    client: &reqwest::Client,
+    session: &RuntimeSessionState,
+) -> anyhow::Result<()> {
+    let csr = format!("rotate-{}", chrono::Utc::now().timestamp_millis());
+    let response = client
+        .post(format!(
+            "{}/api/v1/runtime/rotate-certificate",
+            session.seclab_url.trim_end_matches('/')
+        ))
+        .json(&RotateCertificateRequest {
+            agent_id: session.agent_id.clone(),
+            session_id: session.session_id.clone(),
+            reason: "requested_by_seclab".to_string(),
+            current_certificate_fingerprint: None,
+            certificate_request: CertificateRequest {
+                public_key_algorithm: "ed25519".to_string(),
+                csr_pem: Some(csr),
+            },
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+    let payload = response
+        .json::<ApiResponse<RotateCertificateResponse>>()
+        .await?;
+    if !payload.success {
+        return Err(anyhow::anyhow!(payload.message));
+    }
+    let rotated = payload
+        .data
+        .ok_or_else(|| anyhow::anyhow!("missing rotate-certificate response data"))?;
+    if rotated.agent_id != session.agent_id {
+        return Err(anyhow::anyhow!(
+            "rotate-certificate response agent mismatch"
+        ));
+    }
+    Ok(())
+}
+
+fn build_runtime_node(identity: &crate::models::identity::AgentIdentity) -> RuntimeNode {
+    RuntimeNode {
+        advertise_addr: identity.agent_ip.clone(),
+        listen_port: identity
+            .listen_addr
+            .as_deref()
+            .and_then(|value| value.rsplit(':').next())
+            .and_then(|value| value.parse::<i64>().ok()),
+    }
+}
+
+/// 为应用程序设置日志记录基础设施。
+fn init_logging() -> Option<WorkerGuard> {
+    let file_writer = init_file_log_writer("agent");
+
+    let registry = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                // axum logs rejections from built-in extractors with the `axum::rejection`
+                // target, at `TRACE` level. `axum::rejection=trace` enables showing those events
+                format!(
+                    "{}=info,tower_http=info,axum::rejection=trace",
+                    env!("CARGO_CRATE_NAME")
+                )
+                .into()
+            }),
+        )
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_timer(ChronoLocal::new("%Y-%m-%d %H:%M:%S%.3f".to_string())),
+        );
+
+    if let Some((writer, guard)) = file_writer {
+        registry
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_writer(writer)
+                    .with_timer(ChronoLocal::new("%Y-%m-%dT%H:%M:%S%.3f%:z".to_string())),
+            )
+            .init();
+        Some(guard)
+    } else {
+        registry.init();
+        None
+    }
+}
+
+fn runtime_log_dir(service: &str) -> std::path::PathBuf {
+    std::env::var_os("SECLAB_LOG_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("SECLAB_DATA_DIR")
+                .map(|value| std::path::PathBuf::from(value).join("logs"))
+        })
+        .unwrap_or_else(default_log_root)
+        .join(service)
+}
+
+fn default_log_root() -> std::path::PathBuf {
+    if std::env::var_os("SECLAB_HOME").is_some() {
+        return production_home().join("logs");
+    }
+    if cfg!(debug_assertions) {
+        workspace_dev_dir().join("logs")
+    } else {
+        production_home().join("logs")
+    }
+}
+
+fn production_home() -> std::path::PathBuf {
+    std::env::var_os("SECLAB_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_PRODUCTION_HOME))
+}
+
+fn workspace_dev_dir() -> std::path::PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    for ancestor in cwd.ancestors() {
+        if ancestor.join("crates").is_dir() && ancestor.join("frontend").is_dir() {
+            return ancestor.join(".seclab");
+        }
+    }
+    std::path::PathBuf::from(".seclab")
+}
+
+fn init_file_log_writer(service: &str) -> Option<(NonBlocking, WorkerGuard)> {
+    let dir = runtime_log_dir(service);
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(
+            log_dir = %dir.display(),
+            error = %err,
+            "Failed to create runtime log directory; file logging disabled"
+        );
+        return None;
+    }
+
+    Some(tracing_appender::non_blocking(
+        tracing_appender::rolling::daily(dir, format!("{service}.log")),
+    ))
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    tracing::info!("Received termination signal shutting down");
+}
+
+async fn build_tls_config(
+    identity: &mut crate::models::identity::AgentIdentity,
+    pool: &DbPool,
+) -> anyhow::Result<RustlsConfig> {
+    let sans = derive_sans(identity);
+    ensure_identity_certs(pool, identity, &sans).await?;
+
+    let cert_pem = identity
+        .cert_pem
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Missing agent certificate"))?;
+    let key_pem = identity
+        .key_pem
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Missing agent private key"))?;
+
+    let mut chain_pem = Vec::new();
+    chain_pem.extend_from_slice(cert_pem);
+    chain_pem.extend_from_slice(AGENT_CA_CERT_PEM);
+
+    let certs = load_certs_from_bytes(&chain_pem)?;
+    let key = load_private_key_from_bytes(key_pem)?;
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in load_certs_from_bytes(AGENT_CA_CERT_PEM)? {
+        roots.add(cert)?;
+    }
+
+    let client_auth = WebPkiClientVerifier::builder(roots.into())
+        .build()
+        .map_err(|err| anyhow::anyhow!("Failed to build client verifier: {}", err))?;
+    let config = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(client_auth)
+        .with_single_cert(certs, key)?;
+
+    Ok(RustlsConfig::from_config(std::sync::Arc::new(config)))
+}
+
+fn derive_sans(identity: &crate::models::identity::AgentIdentity) -> Vec<String> {
+    if let Some(ip) = identity.agent_ip.as_ref() {
+        return vec![ip.clone()];
+    }
+    if let Some(listen) = identity.listen_addr.as_ref()
+        && let Some((host, _)) = listen.split_once(':')
+        && host != "0.0.0.0"
+        && host != "127.0.0.1"
+    {
+        return vec![host.to_string()];
+    }
+    vec!["localhost".to_string()]
+}
+
+fn load_certs_from_bytes(data: &[u8]) -> anyhow::Result<Vec<CertificateDer<'static>>> {
+    let mut reader = std::io::Cursor::new(data);
+    Ok(rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?)
+}
+
+fn load_private_key_from_bytes(data: &[u8]) -> anyhow::Result<PrivateKeyDer<'static>> {
+    let mut reader = std::io::Cursor::new(data);
+    rustls_pemfile::private_key(&mut reader)?
+        .ok_or_else(|| anyhow::anyhow!("No private key found in embedded key"))
+}

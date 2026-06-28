@@ -1,0 +1,16 @@
+[package]
+name = "seclab-slctl"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "slctl"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+anyhow = { workspace = true }
+libc = { workspace = true }
+rusqlite = { version = "0.32.0", features = ["bundled"] }
+bcrypt = { workspace = true }

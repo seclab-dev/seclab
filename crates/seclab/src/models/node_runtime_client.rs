@@ -1,0 +1,510 @@
+//! 节点运行时客户端模型：封装 seclab 到节点执行面的 HTTP/WS 通信。
+
+use crate::models::node_sessions::resolve_active_session_endpoint;
+use crate::state::DbPool;
+use crate::types::{AgentClientError, ApiError, ApiResult, agent_socket_path};
+use axum::{
+    body::Body,
+    http::{HeaderMap, header},
+    response::Response,
+};
+use reqwest::{Client, Method};
+use seclab_security::client::build_mtls_client;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::Value;
+use std::error::Error;
+use std::time::Duration;
+use tokio_stream::StreamExt;
+
+const PROXY_CONNECT_TIMEOUT_SECS: u64 = 3;
+const PROXY_REQUEST_TIMEOUT_SECS: u64 = 20;
+const PROXY_LONG_RUNNING_REQUEST_TIMEOUT_SECS: u64 = 600;
+
+#[derive(Debug, Deserialize)]
+struct RuntimeErrorResponse {
+    success: bool,
+    message: String,
+    data: Option<Value>,
+    #[serde(rename = "errorCode")]
+    error_code: Option<Value>,
+}
+
+/// 封装与节点运行时的 HTTP/WS 通讯与认证。
+#[derive(Debug, Clone)]
+pub struct NodeRuntimeClient {
+    pub client: Client,
+    base_url: String,
+    ws_base_url: String,
+}
+
+impl NodeRuntimeClient {
+    /// 根据目标节点标识选择 UDS 或 TLS 连接。
+    pub async fn from_node_route(pool: &DbPool, node_id: Option<&str>) -> ApiResult<Self> {
+        if let Some(node_id) = node_id
+            && node_id != "local"
+        {
+            let api_url = resolve_active_session_endpoint(pool, node_id).await?;
+            if let Some(url) = api_url {
+                return Self::from_tls(url).map_err(|err| ApiError::Internal(err.to_string()));
+            }
+            return Err(AgentClientError::NotFound.into());
+        }
+        Self::from_uds().map_err(|err| ApiError::Internal(err.to_string()))
+    }
+
+    /// 从给定的 API 地址创建 TLS 客户端。
+    pub fn from_api_url(base_url: String) -> ApiResult<Self> {
+        Self::from_tls(base_url).map_err(|err| ApiError::Internal(err.to_string()))
+    }
+
+    fn from_uds() -> anyhow::Result<Self> {
+        let socket_path = agent_socket_path();
+        if !socket_path.exists() {
+            return Err(anyhow::anyhow!(
+                "agent unix socket not found: {}",
+                socket_path.display()
+            ));
+        }
+        let client = Client::builder()
+            .unix_socket(socket_path)
+            .connect_timeout(Duration::from_secs(PROXY_CONNECT_TIMEOUT_SECS))
+            .timeout(Duration::from_secs(PROXY_REQUEST_TIMEOUT_SECS))
+            .no_proxy()
+            .build()?;
+        Ok(Self {
+            client,
+            base_url: "http://local".to_string(),
+            ws_base_url: "ws://local".to_string(),
+        })
+    }
+
+    fn from_tls(base_url: String) -> anyhow::Result<Self> {
+        let client = build_mtls_client("seclab")?;
+
+        let base_url = base_url.trim_end_matches('/').to_string();
+        let ws_base_url = base_url.replace("https://", "wss://");
+        Ok(Self {
+            client,
+            base_url,
+            ws_base_url,
+        })
+    }
+
+    /// 构造运行时 WebSocket URI。
+    pub fn build_ws_uri(&self, path: &str) -> String {
+        if path.starts_with('/') {
+            format!("{}{}", self.ws_base_url, path)
+        } else {
+            format!("{}/{}", self.ws_base_url, path)
+        }
+    }
+
+    /// 构造运行时 HTTP URI。
+    pub fn build_uri(&self, path: &str) -> String {
+        if path.starts_with('/') {
+            format!("{}{}", self.base_url, path)
+        } else {
+            format!("{}/{}", self.base_url, path)
+        }
+    }
+
+    /// 发起 GET 请求并解析 JSON 响应。
+    pub async fn get_json<T: DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
+        let url = self.build_uri(path);
+        let resp = self.client.get(url).send().await?;
+        decode_json_response("GET", path, resp).await
+    }
+
+    /// 发起 POST 请求并解析 JSON 响应。
+    pub async fn post_json<T: DeserializeOwned, B: Serialize>(
+        &self,
+        path: &str,
+        payload: &B,
+    ) -> anyhow::Result<T> {
+        let url = self.build_uri(path);
+        let mut request = self.client.post(url).json(payload);
+        if is_long_running_request(path) {
+            request = request.timeout(Duration::from_secs(PROXY_LONG_RUNNING_REQUEST_TIMEOUT_SECS));
+        }
+        let resp = request.send().await?;
+        decode_json_response("POST", path, resp).await
+    }
+
+    /// 发起 PUT 请求并解析 JSON 响应。
+    pub async fn put_json<T: DeserializeOwned, B: Serialize>(
+        &self,
+        path: &str,
+        payload: &B,
+    ) -> anyhow::Result<T> {
+        let url = self.build_uri(path);
+        let resp = self.client.put(url).json(payload).send().await?;
+        decode_json_response("PUT", path, resp).await
+    }
+
+    /// 发起 DELETE 请求并解析 JSON 响应。
+    pub async fn delete_json<T: DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
+        let url = self.build_uri(path);
+        let resp = self.client.delete(url).send().await?;
+        decode_json_response("DELETE", path, resp).await
+    }
+
+    /// 通用请求转发
+    pub async fn forward_streaming(
+        &self,
+        method: Method,
+        uri_path: &str,
+        headers: HeaderMap,
+        body: Body,
+    ) -> ApiResult<Response> {
+        let url = self.build_uri(uri_path);
+
+        let reqwest_stream = body
+            .into_data_stream()
+            .map(|chunk| chunk.map_err(std::io::Error::other));
+
+        let reqwest_body = reqwest::Body::wrap_stream(reqwest_stream);
+
+        let mut req_builder = self
+            .client
+            .request(method, url)
+            .headers(headers)
+            .body(reqwest_body);
+
+        if is_long_running_request(uri_path) {
+            req_builder =
+                req_builder.timeout(Duration::from_secs(PROXY_LONG_RUNNING_REQUEST_TIMEOUT_SECS));
+        }
+
+        let result = req_builder.send().await;
+        let resp = match result {
+            Ok(resp) => resp,
+            Err(err) => {
+                let source = err.source().map(|value| value.to_string());
+                tracing::error!(
+                    "Request node runtime error: status: {:?} >>> {:?} source={:?}",
+                    err.status(),
+                    err,
+                    source
+                );
+                if err.is_connect() {
+                    return Err(AgentClientError::Refused.into());
+                } else if err.is_timeout() {
+                    return Err(AgentClientError::Timeout.into());
+                } else {
+                    return Err(AgentClientError::Other(err.to_string()).into());
+                };
+            }
+        };
+
+        reqwest_response_to_axum(resp).await
+    }
+}
+
+fn is_long_running_request(path: &str) -> bool {
+    path.contains("/agent/tasks/execute")
+        || path.contains("/agent/docker/install")
+        || path.contains("/agent/docker/suites/install")
+        || path.contains("/agent/docker/daemon/settings")
+        || is_suite_progress_stream(path)
+}
+
+fn is_suite_progress_stream(path: &str) -> bool {
+    path.contains("/agent/docker/suite/")
+        && path.contains("/proxy/")
+        && path
+            .split('?')
+            .next()
+            .is_some_and(|value| value.ends_with("/progress"))
+}
+
+async fn decode_json_response<T: DeserializeOwned>(
+    method: &'static str,
+    path: &str,
+    resp: reqwest::Response,
+) -> anyhow::Result<T> {
+    let status = resp.status();
+    let body = resp.text().await?;
+    match serde_json::from_str::<T>(&body) {
+        Ok(data) => Ok(data),
+        Err(err) => {
+            let preview = preview_body(&body);
+            if let Ok(error_response) = serde_json::from_str::<RuntimeErrorResponse>(&body)
+                && !error_response.success
+            {
+                let detail = runtime_error_detail(&error_response);
+                tracing::warn!(
+                    method,
+                    path,
+                    status = status.as_u16(),
+                    error = %err,
+                    response_body = %preview,
+                    "node runtime returned api error response"
+                );
+                return Err(anyhow::anyhow!(
+                    "runtime api error: status={}; message={}; detail={detail}",
+                    status.as_u16(),
+                    error_response.message
+                ));
+            }
+
+            tracing::error!(
+                method,
+                path,
+                status = status.as_u16(),
+                error = %err,
+                response_body = %preview,
+                "failed to decode node runtime json response"
+            );
+            Err(anyhow::anyhow!(
+                "error decoding response body: {err}; status={}; body={preview}",
+                status.as_u16()
+            ))
+        }
+    }
+}
+
+fn runtime_error_detail(response: &RuntimeErrorResponse) -> String {
+    if let Some(data) = &response.data {
+        return match data {
+            Value::String(value) => value.clone(),
+            other => other.to_string(),
+        };
+    }
+    if let Some(error_code) = &response.error_code {
+        return match error_code {
+            Value::String(value) => value.clone(),
+            other => other.to_string(),
+        };
+    }
+    "empty error detail".to_string()
+}
+
+fn preview_body(body: &str) -> String {
+    const MAX_CHARS: usize = 2048;
+    let mut preview: String = body.chars().take(MAX_CHARS).collect();
+    if body.chars().count() > MAX_CHARS {
+        preview.push_str("...[truncated]");
+    }
+    preview
+}
+
+async fn reqwest_response_to_axum(resp: reqwest::Response) -> ApiResult<Response> {
+    let status = resp.status();
+    let mut headers = resp.headers().clone();
+    dedupe_response_headers(&mut headers);
+
+    let stream = resp
+        .bytes_stream()
+        .map(|chunk| chunk.map_err(std::io::Error::other));
+
+    let body = Body::from_stream(stream);
+
+    let mut axum_resp = Response::builder().status(status).body(body)?;
+
+    *axum_resp.headers_mut() = headers;
+
+    Ok(axum_resp)
+}
+
+fn dedupe_response_headers(headers: &mut HeaderMap) {
+    dedupe_vary(headers);
+
+    const MERGE_HEADERS: &[header::HeaderName] = &[
+        header::ACCEPT,
+        header::ACCEPT_ENCODING,
+        header::ACCEPT_LANGUAGE,
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+    ];
+
+    for name in MERGE_HEADERS {
+        if headers.get(name).is_none() {
+            continue;
+        }
+        let values = headers.get_all(name);
+        let mut tokens = std::collections::BTreeSet::new();
+        for value in values.iter() {
+            if let Ok(text) = value.to_str() {
+                for token in text.split(',') {
+                    let trimmed = token.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    tokens.insert(trimmed.to_string());
+                }
+            }
+        }
+        headers.remove(name);
+        if !tokens.is_empty()
+            && let Ok(value) =
+                header::HeaderValue::from_str(&tokens.into_iter().collect::<Vec<_>>().join(", "))
+        {
+            headers.insert(name, value);
+        }
+    }
+}
+
+fn dedupe_vary(headers: &mut HeaderMap) {
+    if headers.get(header::VARY).is_none() {
+        return;
+    }
+    let values = headers.get_all(header::VARY);
+
+    let mut tokens = std::collections::BTreeSet::new();
+    let mut has_wildcard = false;
+    for value in values.iter() {
+        if let Ok(text) = value.to_str() {
+            for token in text.split(',') {
+                let trimmed = token.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed == "*" {
+                    has_wildcard = true;
+                    tokens.clear();
+                    break;
+                }
+                tokens.insert(trimmed.to_string());
+            }
+        }
+        if has_wildcard {
+            break;
+        }
+    }
+
+    headers.remove(header::VARY);
+    if has_wildcard {
+        headers.insert(header::VARY, header::HeaderValue::from_static("*"));
+        return;
+    }
+    if !tokens.is_empty()
+        && let Ok(value) =
+            header::HeaderValue::from_str(&tokens.into_iter().collect::<Vec<_>>().join(", "))
+    {
+        headers.insert(header::VARY, value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NodeRuntimeClient, is_long_running_request};
+    use crate::models::node_identities::{NodeIdentityRecord, insert_node_identity};
+    use crate::models::node_sessions::{NodeSessionRecord, insert_node_session};
+    use crate::models::nodes::{NewNodeRecord, insert_node};
+    use crate::test_support::setup_test_db;
+    use chrono::{Duration, Utc};
+    use seclab_contracts::api::ErrorCode;
+    use uuid::Uuid;
+
+    #[test]
+    fn suite_progress_stream_uses_long_timeout() {
+        assert!(is_long_running_request(
+            "/api/v1/agent/docker/suite/seclab-host-scanner/proxy/main/api/tasks/task_1/progress"
+        ));
+        assert!(is_long_running_request(
+            "/api/v1/agent/docker/suite/seclab-host-scanner/proxy/main/api/tasks/task_1/progress?lastEventId=1"
+        ));
+        assert!(!is_long_running_request(
+            "/api/v1/agent/docker/suite/seclab-host-scanner/proxy/main/api/tasks/task_1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn from_node_route_fails_without_active_session() {
+        let pool = setup_test_db().await;
+        let node_id = Uuid::new_v4().to_string();
+        insert_node(
+            &pool,
+            &NewNodeRecord {
+                node_id: node_id.clone(),
+                tenant_id: None,
+                name: "n1".to_string(),
+                normalized_name: "n1".to_string(),
+                group_name: "default".to_string(),
+                labels: "[]".to_string(),
+                description: None,
+                desired_role: None,
+                schedulable: true,
+                metadata: "{}".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = NodeRuntimeClient::from_node_route(&pool, Some(&node_id))
+            .await
+            .expect_err("missing session should fail");
+        assert_eq!(err.code, ErrorCode::AgentNotFound);
+    }
+
+    #[tokio::test]
+    async fn from_node_route_succeeds_with_active_session_endpoint() {
+        let pool = setup_test_db().await;
+        let node_id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        insert_node(
+            &pool,
+            &NewNodeRecord {
+                node_id: node_id.clone(),
+                tenant_id: None,
+                name: "n2".to_string(),
+                normalized_name: "n2".to_string(),
+                group_name: "default".to_string(),
+                labels: "[]".to_string(),
+                description: None,
+                desired_role: None,
+                schedulable: true,
+                metadata: "{}".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        insert_node_identity(
+            &pool,
+            &NodeIdentityRecord {
+                identity_id: Uuid::new_v4().to_string(),
+                node_id: node_id.clone(),
+                agent_id: node_id.clone(),
+                certificate_serial_number: None,
+                certificate_fingerprint: format!("SHA256:{}", Uuid::new_v4().simple()),
+                certificate_status: "active".to_string(),
+                public_key_algorithm: "ed25519".to_string(),
+                certificate_issued_at: Some(now.to_rfc3339()),
+                certificate_expires_at: None,
+                rotated_at: None,
+                created_at: now.to_rfc3339(),
+                updated_at: now.to_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+        insert_node_session(
+            &pool,
+            &NodeSessionRecord {
+                session_id: Uuid::new_v4().to_string(),
+                node_id: node_id.clone(),
+                agent_id: node_id.clone(),
+                lease_id: Uuid::new_v4().to_string(),
+                advertise_addr: Some("127.0.0.1".to_string()),
+                listen_addr: None,
+                listen_port: Some(18443),
+                server_name: None,
+                registered_at: now.to_rfc3339(),
+                lease_expires_at: (now + Duration::seconds(60)).to_rfc3339(),
+                last_heartbeat_at: Some(now.to_rfc3339()),
+                heartbeat_sequence: 1,
+                last_seen_at: Some(now.to_rfc3339()),
+                status: "active".to_string(),
+                close_reason: None,
+                closed_at: None,
+                created_at: now.to_rfc3339(),
+                updated_at: now.to_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let client = NodeRuntimeClient::from_node_route(&pool, Some(&node_id)).await;
+        assert!(client.is_ok());
+    }
+}

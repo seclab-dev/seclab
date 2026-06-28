@@ -1,0 +1,135 @@
+name: Publish Release
+
+run-name: "SecLab ${{ inputs.version }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version
+        required: true
+        default: 0.1.0-alpha.1
+        type: string
+      rust_target:
+        description: Rust target triple
+        required: true
+        default: x86_64-unknown-linux-musl
+        type: string
+      target_triple:
+        description: Release asset target name
+        required: true
+        default: linux-x86_64
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.34.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Validate release version
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid SemVer version: $RELEASE_VERSION"
+            exit 1
+          fi
+
+          CARGO_VERSION="$(grep -E '^version[[:space:]]*=' Cargo.toml | head -n 1 | awk -F '"' '{print $2}')"
+          FRONTEND_VERSION="$(node --input-type=module -e "import pkg from './frontend/package.json' with { type: 'json' }; console.log(pkg.version)")"
+
+          if [[ "$CARGO_VERSION" != "$RELEASE_VERSION" ]]; then
+            echo "Cargo.toml version is $CARGO_VERSION, expected $RELEASE_VERSION"
+            exit 1
+          fi
+
+          if [[ "$FRONTEND_VERSION" != "$RELEASE_VERSION" ]]; then
+            echo "frontend/package.json version is $FRONTEND_VERSION, expected $RELEASE_VERSION"
+            exit 1
+          fi
+
+      - name: Reject existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: v${{ inputs.version }}
+        shell: bash
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release already exists: $RELEASE_TAG"
+            exit 1
+          fi
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ inputs.rust_target }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools minisign
+
+      - name: Install frontend dependencies
+        run: pnpm -C frontend install --frozen-lockfile
+
+      - name: Build release package
+        env:
+          SECLAB_RUST_TARGET: ${{ inputs.rust_target }}
+          SECLAB_TARGET_TRIPLE: ${{ inputs.target_triple }}
+          SECLAB_SIGNING_PRIVATE_KEY: ${{ secrets.SECLAB_SIGNING_PRIVATE_KEY }}
+          SECLAB_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.SECLAB_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: ./scripts/build-release.sh
+
+      - name: Resolve release asset
+        id: asset
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          TARGET_TRIPLE: ${{ inputs.target_triple }}
+        shell: bash
+        run: |
+          ASSET="target/seclab-$RELEASE_VERSION-$TARGET_TRIPLE.tar.gz"
+          if [[ ! -f "$ASSET" ]]; then
+            echo "Release asset not found: $ASSET"
+            exit 1
+          fi
+          echo "path=$ASSET" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_TAG: v${{ inputs.version }}
+          RELEASE_ASSET: ${{ steps.asset.outputs.path }}
+        shell: bash
+        run: |
+          RELEASE_FLAGS=()
+          if [[ "$RELEASE_VERSION" == *-* ]]; then
+            RELEASE_FLAGS+=(--prerelease)
+          fi
+
+          gh release create "$RELEASE_TAG" "$RELEASE_ASSET" \
+            --title "SecLab $RELEASE_VERSION" \
+            --notes "SecLab $RELEASE_VERSION" \
+            "${RELEASE_FLAGS[@]}"

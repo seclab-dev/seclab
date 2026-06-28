@@ -1,0 +1,21 @@
+[package]
+name = "seclab-api"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+seclab-contracts = { workspace = true }
+seclab-security = { workspace = true }
+
+axum = { workspace = true }
+bcrypt = { workspace = true }
+bollard = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sqlx = { workspace = true, features = ["chrono", "json"] }
+jsonwebtoken = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

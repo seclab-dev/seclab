@@ -1,0 +1,7 @@
+[package]
+name = "seclab-scenario"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
