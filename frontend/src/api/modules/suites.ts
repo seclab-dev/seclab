@@ -14,10 +14,17 @@ export const suitesApi = {
     })
   },
   installSuite: (suiteId: string, nodeId = 'local') => {
-    return http.post<suites.SuiteInstanceSummary>(
+    return http.post<suites.SuiteInstallTaskResponse>(
       `/suites/${encodeURIComponent(suiteId)}/install`,
       { nodeId },
-      { timeout: 300000 },
+    )
+  },
+  fetchInstallProgress: (taskId: string) => {
+    return http.get<suites.SuiteInstallProgress>('/suites/install-progress', { taskId })
+  },
+  cancelInstall: (taskId: string) => {
+    return http.post<suites.SuiteInstallProgress>(
+      `/suites/install-progress/${encodeURIComponent(taskId)}/cancel`,
     )
   },
   deleteSuite: (suiteId: string) => {

@@ -296,6 +296,11 @@ pub fn docker_router() -> Router<Arc<AppState>> {
         )
         .route("/compose/validate", post(compose::validate_compose))
         .route("/suites/install", post(suites::install_suite))
+        .route("/suites/install-progress", get(suites::install_progress))
+        .route(
+            "/suites/install-progress/{instance_id}/cancel",
+            post(suites::cancel_install),
+        )
         .route("/suite/{project}/enable", post(suites::enable_suite))
         .route("/suite/{project}/disable", post(suites::disable_suite))
         .route("/suite/{project}/uninstall", post(suites::uninstall_suite))

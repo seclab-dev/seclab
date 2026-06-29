@@ -4,10 +4,14 @@
  * @description Compose 套件中心，负责套件包导入、安装与生命周期操作。
  */
 
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { suitesApi } from '@/api/modules/suites'
-import type { SuiteCatalogItem, SuiteInstanceSummary } from '@/api/interface/suites'
+import type {
+  SuiteCatalogItem,
+  SuiteInstallProgress,
+  SuiteInstanceSummary,
+} from '@/api/interface/suites'
 import {
   SecLabButton,
   SecLabCheckbox,
@@ -49,6 +53,9 @@ const selectedUninstallSuite = ref<SuiteCard | null>(null)
 const removeSuiteData = ref(false)
 const deleteDialogVisible = ref(false)
 const selectedDeleteSuite = ref<SuiteCard | null>(null)
+const installProgress = ref<SuiteInstallProgress | null>(null)
+const cancelingInstall = ref(false)
+let installProgressTimer: ReturnType<typeof window.setInterval> | null = null
 
 const hasSuites = computed(() => catalog.value.length > 0)
 const selectedSuite = computed(
@@ -123,6 +130,23 @@ function statusClass(status: string) {
   if (status === 'error') return 'is-error'
   if (status === 'installed' || status === 'disabled') return 'is-stopped'
   return 'is-working'
+}
+
+function isInstallingSuite(card: SuiteCard | null) {
+  return !!card && operatingId.value === `install:${card.suite.suiteId}`
+}
+
+function installProgressStepLabel(step: string) {
+  const key = `app.suiteCenter.installProgress.steps.${step}`
+  const translated = t(key)
+  return translated === key ? step : translated
+}
+
+function clearInstallProgressTimer() {
+  if (installProgressTimer) {
+    window.clearInterval(installProgressTimer)
+    installProgressTimer = null
+  }
 }
 
 function closeDetail() {
@@ -208,19 +232,95 @@ async function confirmImportSuite() {
 
 async function installSuite(card: SuiteCard) {
   operatingId.value = `install:${card.suite.suiteId}`
+  clearInstallProgressTimer()
+  installProgress.value = {
+    taskId: '',
+    instanceId: '',
+    nodeId: 'local',
+    progressPercent: 1,
+    status: 'queued',
+    currentStep: 'queued',
+    isFinished: false,
+    cancelRequested: false,
+  }
   try {
     const response = await suitesApi.installSuite(card.suite.suiteId)
-    if (!response.success) {
+    if (!response.success || !response.data) {
       notificationStore.error(response.message || t('app.suiteCenter.messages.installFailed'))
+      operatingId.value = ''
+      installProgress.value = null
       return
     }
-    notificationStore.success(t('app.suiteCenter.messages.installSuccess'))
-    await refreshSuites()
+    installProgress.value = {
+      taskId: response.data.taskId,
+      instanceId: response.data.instanceId,
+      nodeId: 'local',
+      progressPercent: 1,
+      status: 'queued',
+      currentStep: 'queued',
+      isFinished: false,
+      cancelRequested: false,
+    }
+    startInstallProgressPolling(response.data.taskId)
   } catch (error) {
     console.error('Failed to install suite', error)
     notificationStore.error(t('app.suiteCenter.messages.installFailed'))
-  } finally {
     operatingId.value = ''
+    installProgress.value = null
+    cancelingInstall.value = false
+  }
+}
+
+async function cancelInstallSuite() {
+  const taskId = installProgress.value?.taskId
+  if (!taskId || cancelingInstall.value) return
+  cancelingInstall.value = true
+  try {
+    const response = await suitesApi.cancelInstall(taskId)
+    if (response.success && response.data) {
+      installProgress.value = response.data
+    } else {
+      notificationStore.error(response.message || t('app.suiteCenter.messages.cancelInstallFailed'))
+    }
+  } catch (error) {
+    console.error('Failed to cancel suite install', error)
+    notificationStore.error(t('app.suiteCenter.messages.cancelInstallFailed'))
+  } finally {
+    cancelingInstall.value = false
+  }
+}
+
+function startInstallProgressPolling(taskId: string) {
+  clearInstallProgressTimer()
+  void pollInstallProgress(taskId)
+  installProgressTimer = window.setInterval(() => {
+    void pollInstallProgress(taskId)
+  }, 1000)
+}
+
+async function pollInstallProgress(taskId: string) {
+  try {
+    const response = await suitesApi.fetchInstallProgress(taskId)
+    if (!response.success || !response.data) {
+      return
+    }
+    installProgress.value = response.data
+    if (!response.data.isFinished) return
+
+    clearInstallProgressTimer()
+    if (response.data.status === 'success') {
+      notificationStore.success(t('app.suiteCenter.messages.installSuccess'))
+      await refreshSuites()
+    } else if (response.data.status === 'canceled') {
+      notificationStore.success(t('app.suiteCenter.messages.cancelInstallSuccess'))
+      await refreshSuites()
+    } else {
+      notificationStore.error(response.data.error || t('app.suiteCenter.messages.installFailed'))
+      await refreshSuites()
+    }
+    operatingId.value = ''
+  } catch (error) {
+    console.error('Failed to fetch suite install progress', error)
   }
 }
 
@@ -344,6 +444,10 @@ async function confirmUninstallInstance() {
 
 onMounted(() => {
   void refreshSuites()
+})
+
+onBeforeUnmount(() => {
+  clearInstallProgressTimer()
 })
 
 watch(
@@ -519,47 +623,77 @@ watch(
         </div>
       </div>
       <template #footer>
-        <SecLabButton type="secondary" @click="closeDetail">{{ t('common.close') }}</SecLabButton>
-        <template v-if="selectedSuite && !selectedSuite.instance">
-          <SecLabButton
-            type="danger"
-            :loading="operatingId === `delete:${selectedSuite.suite.suiteId}`"
-            @click="requestDeleteSuite(selectedSuite)"
+        <div class="suite-dialog-footer">
+          <div
+            v-if="isInstallingSuite(selectedSuite) && installProgress"
+            class="suite-install-progress"
+            data-ui="suite-install-progress"
           >
-            {{ t('app.suiteCenter.delete') }}
-          </SecLabButton>
-          <SecLabButton
-            type="primary"
-            :loading="operatingId === `install:${selectedSuite.suite.suiteId}`"
-            @click="installSuite(selectedSuite)"
-          >
-            {{ t('app.suiteCenter.install') }}
-          </SecLabButton>
-        </template>
-        <template v-else-if="selectedSuite?.instance">
-          <SecLabButton
-            type="primary"
-            :disabled="selectedSuite.instance.status === 'enabled'"
-            :loading="operatingId === `enable:${selectedSuite.instance.instanceId}`"
-            @click="enableInstance(selectedSuite.instance)"
-          >
-            {{ t('app.suiteCenter.enable') }}
-          </SecLabButton>
-          <SecLabButton
-            :disabled="selectedSuite.instance.status !== 'enabled'"
-            :loading="operatingId === `disable:${selectedSuite.instance.instanceId}`"
-            @click="disableInstance(selectedSuite.instance)"
-          >
-            {{ t('app.suiteCenter.disable') }}
-          </SecLabButton>
-          <SecLabButton
-            type="danger"
-            :loading="operatingId === `uninstall:${selectedSuite.instance.instanceId}`"
-            @click="requestUninstallInstance(selectedSuite)"
-          >
-            {{ t('app.suiteCenter.uninstall') }}
-          </SecLabButton>
-        </template>
+            <div class="suite-install-progress-line">
+              <span>{{ installProgressStepLabel(installProgress.currentStep) }}</span>
+            </div>
+            <div class="suite-install-progress-track">
+              <div class="suite-install-progress-bar" aria-hidden="true">
+                <div :style="{ width: `${installProgress.progressPercent}%` }"></div>
+              </div>
+              <strong>{{ installProgress.progressPercent }}%</strong>
+            </div>
+          </div>
+          <div class="suite-dialog-actions">
+            <template v-if="selectedSuite && isInstallingSuite(selectedSuite)">
+              <SecLabButton
+                type="danger"
+                :loading="cancelingInstall || installProgress?.status === 'canceling'"
+                @click="cancelInstallSuite"
+              >
+                {{ t('app.suiteCenter.cancelInstall') }}
+              </SecLabButton>
+              <SecLabButton type="primary" :loading="true" disabled>
+                {{ t('app.suiteCenter.install') }}
+              </SecLabButton>
+            </template>
+            <template v-else-if="selectedSuite && !selectedSuite.instance">
+              <SecLabButton
+                type="danger"
+                :loading="operatingId === `delete:${selectedSuite.suite.suiteId}`"
+                @click="requestDeleteSuite(selectedSuite)"
+              >
+                {{ t('app.suiteCenter.delete') }}
+              </SecLabButton>
+              <SecLabButton
+                type="primary"
+                :loading="operatingId === `install:${selectedSuite.suite.suiteId}`"
+                @click="installSuite(selectedSuite)"
+              >
+                {{ t('app.suiteCenter.install') }}
+              </SecLabButton>
+            </template>
+            <template v-else-if="selectedSuite?.instance">
+              <SecLabButton
+                type="primary"
+                :disabled="selectedSuite.instance.status === 'enabled'"
+                :loading="operatingId === `enable:${selectedSuite.instance.instanceId}`"
+                @click="enableInstance(selectedSuite.instance)"
+              >
+                {{ t('app.suiteCenter.enable') }}
+              </SecLabButton>
+              <SecLabButton
+                :disabled="selectedSuite.instance.status !== 'enabled'"
+                :loading="operatingId === `disable:${selectedSuite.instance.instanceId}`"
+                @click="disableInstance(selectedSuite.instance)"
+              >
+                {{ t('app.suiteCenter.disable') }}
+              </SecLabButton>
+              <SecLabButton
+                type="danger"
+                :loading="operatingId === `uninstall:${selectedSuite.instance.instanceId}`"
+                @click="requestUninstallInstance(selectedSuite)"
+              >
+                {{ t('app.suiteCenter.uninstall') }}
+              </SecLabButton>
+            </template>
+          </div>
+        </div>
       </template>
     </SecLabDialog>
 
@@ -877,6 +1011,77 @@ watch(
   gap: 14px;
 }
 
+.suite-dialog-footer {
+  width: 100%;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 14px;
+}
+
+.suite-dialog-actions {
+  margin-left: auto;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.suite-install-progress {
+  min-width: 0;
+  max-width: 360px;
+  flex: 1 1 auto;
+  color: var(--sdl-text-secondary);
+}
+
+.suite-install-progress-line {
+  display: flex;
+  align-items: center;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.suite-install-progress-line span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.suite-install-progress-track {
+  margin-top: 5px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.suite-install-progress-track strong {
+  flex: 0 0 auto;
+  min-width: 34px;
+  text-align: right;
+  color: var(--sdl-text-primary);
+  font-family: var(--sdl-font-mono);
+  font-size: 12px;
+}
+
+.suite-install-progress-bar {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--sdl-bg-muted);
+}
+
+.suite-install-progress-bar div {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--sdl-primary);
+  transition: width 0.2s ease;
+}
+
 .suite-detail-summary {
   color: var(--sdl-text-secondary);
 }
@@ -939,5 +1144,23 @@ watch(
 
 .status-pill.is-working {
   color: var(--sdl-warning);
+}
+
+@media (max-width: 680px) {
+  .suite-dialog-footer {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .suite-install-progress {
+    max-width: none;
+    flex: 0 1 auto;
+  }
+
+  .suite-dialog-actions {
+    margin-left: 0;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
 }
 </style>

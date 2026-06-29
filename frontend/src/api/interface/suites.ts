@@ -28,6 +28,24 @@ export interface SuiteListResponse {
   instances: SuiteInstanceSummary[]
 }
 
+export interface SuiteInstallTaskResponse {
+  taskId: string
+  instanceId: string
+}
+
+export interface SuiteInstallProgress {
+  taskId: string
+  instanceId: string
+  nodeId: string
+  progressPercent: number
+  status: string
+  currentStep: string
+  currentImage?: string
+  isFinished: boolean
+  error?: string
+  cancelRequested: boolean
+}
+
 export interface SuiteUninstallRequest {
   removeData: boolean
 }

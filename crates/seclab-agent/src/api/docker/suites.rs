@@ -4,23 +4,25 @@ use crate::config;
 use crate::state::AppState;
 use crate::types::{ApiError, ApiResponse, ApiResult};
 use axum::body::Body;
-use axum::extract::{Json, OriginalUri, Path, State};
+use axum::extract::{Json, OriginalUri, Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, Method, header};
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use bollard::models::NetworkCreateRequest;
-use bollard::query_parameters;
+use bollard::query_parameters::{self, CreateImageOptions};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use tokio::process::Command;
 
 const SUITE_NETWORK_NAME: &str = "seclab-suite-network";
 const COMPOSE_FILE_NAME: &str = "compose.yaml";
 const SUITE_METADATA_FILE: &str = "suite-agent.json";
+static SUITE_INSTALL_PROGRESS: LazyLock<Mutex<HashMap<String, SuiteInstallProgress>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// 套件包内二进制安全文件。
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -72,6 +74,27 @@ pub struct SuiteActionRequest {
     pub remove_data: bool,
 }
 
+/// 查询套件安装进度的请求参数。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuiteInstallProgressQuery {
+    pub instance_id: String,
+}
+
+/// 当前节点上的套件安装进度状态。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuiteInstallProgress {
+    pub instance_id: String,
+    pub progress_percent: u32,
+    pub status: String,
+    pub current_step: String,
+    pub current_image: Option<String>,
+    pub is_finished: bool,
+    pub error: Option<String>,
+    pub cancel_requested: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SuiteAgentMetadata {
@@ -88,6 +111,12 @@ pub struct SuiteProxyPath {
     entry_id: String,
 }
 
+/// 取消套件安装任务的路径参数。
+#[derive(Debug, Deserialize)]
+pub struct SuiteInstallCancelPath {
+    instance_id: String,
+}
+
 /// 安装套件文件、准备镜像并登记 Compose 项目。
 pub async fn install_suite(
     State(state): State<Arc<AppState>>,
@@ -95,17 +124,117 @@ pub async fn install_suite(
 ) -> ApiResult<Response> {
     validate_id("instance_id", &payload.instance_id)?;
     validate_project_name(&payload.compose_project_name)?;
+    upsert_install_progress(SuiteInstallProgress {
+        instance_id: payload.instance_id.clone(),
+        progress_percent: 1,
+        status: "running".to_string(),
+        current_step: "prepare".to_string(),
+        current_image: None,
+        is_finished: false,
+        error: None,
+        cancel_requested: false,
+    });
     ensure_suite_network(&state).await?;
 
     let dir = suite_project_dir(&payload.compose_project_name);
     ensure_suite_project_available(&state, &payload.compose_project_name, &dir).await?;
     let result = install_suite_inner(&state, &payload, &dir).await;
     if let Err(err) = result {
+        let canceled = is_install_cancel_requested(&payload.instance_id);
+        update_install_progress(
+            &payload.instance_id,
+            100,
+            if canceled { "canceled" } else { "failed" },
+            if canceled { "canceled" } else { "failed" },
+            None,
+            true,
+            if canceled {
+                None
+            } else {
+                Some(err.to_string())
+            },
+        );
         rollback_suite_install(&payload.compose_project_name, &dir).await;
         return Err(err);
     }
 
+    update_install_progress(
+        &payload.instance_id,
+        100,
+        "success",
+        "completed",
+        None,
+        true,
+        None,
+    );
     Ok(ApiResponse::ok("Suite installed").into_response())
+}
+
+/// 查询套件安装在当前节点执行面的实时进度。
+pub async fn install_progress(
+    Query(query): Query<SuiteInstallProgressQuery>,
+) -> ApiResult<Response> {
+    let sessions = SUITE_INSTALL_PROGRESS.lock().unwrap();
+    let progress = sessions
+        .get(&query.instance_id)
+        .cloned()
+        .ok_or(ApiError::NotFound)?;
+    Ok(ApiResponse::success_with_raw("Suite install progress fetched", progress).into_response())
+}
+
+/// 请求取消当前节点上的套件安装任务。
+pub async fn cancel_install(Path(path): Path<SuiteInstallCancelPath>) -> ApiResult<Response> {
+    let mut sessions = SUITE_INSTALL_PROGRESS.lock().unwrap();
+    let progress = sessions
+        .get_mut(&path.instance_id)
+        .ok_or(ApiError::NotFound)?;
+    progress.cancel_requested = true;
+    if !progress.is_finished {
+        progress.status = "canceling".to_string();
+        progress.current_step = "canceling".to_string();
+    }
+    Ok(
+        ApiResponse::success_with_raw("Suite install cancellation requested", progress.clone())
+            .into_response(),
+    )
+}
+
+/// 新建或覆盖当前节点内存中的套件安装进度。
+fn upsert_install_progress(progress: SuiteInstallProgress) {
+    let mut sessions = SUITE_INSTALL_PROGRESS.lock().unwrap();
+    sessions.insert(progress.instance_id.clone(), progress);
+}
+
+/// 更新当前节点内存中的安装进度，并保持百分比单调递增。
+fn update_install_progress(
+    instance_id: &str,
+    progress_percent: u32,
+    status: &str,
+    current_step: &str,
+    current_image: Option<String>,
+    is_finished: bool,
+    error: Option<String>,
+) {
+    let mut sessions = SUITE_INSTALL_PROGRESS.lock().unwrap();
+    if let Some(progress) = sessions.get_mut(instance_id) {
+        progress.progress_percent = progress.progress_percent.max(progress_percent.min(100));
+        progress.status = status.to_string();
+        progress.current_step = current_step.to_string();
+        progress.current_image = current_image;
+        progress.is_finished = is_finished;
+        progress.error = error;
+        if matches!(status, "canceled" | "failed" | "success") {
+            progress.cancel_requested = false;
+        }
+    }
+}
+
+/// 判断指定实例的安装任务是否已经收到取消请求。
+fn is_install_cancel_requested(instance_id: &str) -> bool {
+    let sessions = SUITE_INSTALL_PROGRESS.lock().unwrap();
+    sessions
+        .get(instance_id)
+        .is_some_and(|progress| progress.cancel_requested)
 }
 
 /// 执行套件安装事务，只有镜像全部可用后才持久化 Agent 元数据。
@@ -114,6 +243,7 @@ async fn install_suite_inner(
     payload: &SuiteInstallRequest,
     dir: &FsPath,
 ) -> ApiResult<()> {
+    ensure_install_not_canceled(&payload.instance_id)?;
     tokio::fs::create_dir_all(&dir).await?;
 
     for file in &payload.files {
@@ -143,7 +273,8 @@ async fn install_suite_inner(
         let compose_text = tokio::fs::read_to_string(&compose_source).await?;
         tokio::fs::write(&compose_target, compose_text).await?;
     }
-    prepare_compose_images(&payload.compose_project_name, &compose_target).await?;
+    prepare_compose_images(state, payload, &compose_target).await?;
+    ensure_install_not_canceled(&payload.instance_id)?;
 
     let metadata = SuiteAgentMetadata {
         instance_id: payload.instance_id.clone(),
@@ -165,6 +296,14 @@ async fn install_suite_inner(
     .execute(&state.metadata_db)
     .await?;
 
+    Ok(())
+}
+
+/// 在安装关键步骤前检查取消状态，已取消时中止安装事务。
+fn ensure_install_not_canceled(instance_id: &str) -> ApiResult<()> {
+    if is_install_cancel_requested(instance_id) {
+        return Err(ApiError::BadRequest("suite install canceled".to_string()));
+    }
     Ok(())
 }
 
@@ -500,17 +639,30 @@ fn validate_suite_project(path_project: &str, payload_project: &str) -> ApiResul
 }
 
 /// 解析 Compose 中的镜像，并确保每个镜像在目标节点本地可用。
-async fn prepare_compose_images(project: &str, compose_file: &FsPath) -> ApiResult<()> {
+async fn prepare_compose_images(
+    state: &Arc<AppState>,
+    payload: &SuiteInstallRequest,
+    compose_file: &FsPath,
+) -> ApiResult<()> {
+    update_install_progress(
+        &payload.instance_id,
+        10,
+        "running",
+        "resolve_images",
+        None,
+        false,
+        None,
+    );
     let output = Command::new("docker")
         .args(["compose", "-f"])
         .arg(compose_file)
-        .args(["-p", project, "config", "--images"])
+        .args(["-p", &payload.compose_project_name, "config", "--images"])
         .output()
         .await?;
     if !output.status.success() {
         let detail = command_error_detail(&output);
         tracing::error!(
-            project,
+            project = %payload.compose_project_name,
             compose_file = %compose_file.display(),
             status = ?output.status.code(),
             stderr = %String::from_utf8_lossy(&output.stderr).trim(),
@@ -528,8 +680,11 @@ async fn prepare_compose_images(project: &str, compose_file: &FsPath) -> ApiResu
         ));
     }
 
-    for image in images {
-        ensure_image_available(&image).await?;
+    let images: Vec<String> = images.into_iter().collect();
+    let image_count = images.len().max(1);
+    for (index, image) in images.iter().enumerate() {
+        ensure_install_not_canceled(&payload.instance_id)?;
+        ensure_image_available(state, &payload.instance_id, image, index, image_count).await?;
     }
     Ok(())
 }
@@ -545,34 +700,133 @@ fn parse_compose_images(output: &[u8]) -> BTreeSet<String> {
 }
 
 /// 本地镜像存在时直接复用，否则从镜像仓库拉取固定版本镜像。
-async fn ensure_image_available(image: &str) -> ApiResult<()> {
+async fn ensure_image_available(
+    state: &Arc<AppState>,
+    instance_id: &str,
+    image: &str,
+    image_index: usize,
+    image_count: usize,
+) -> ApiResult<()> {
+    ensure_install_not_canceled(instance_id)?;
+    let base_progress = image_progress(image_index, image_count, 0);
+    update_install_progress(
+        instance_id,
+        base_progress,
+        "running",
+        "check_image",
+        Some(image.to_string()),
+        false,
+        None,
+    );
     let inspect = Command::new("docker")
         .args(["image", "inspect", image])
         .output()
         .await?;
     if inspect.status.success() {
+        update_install_progress(
+            instance_id,
+            image_progress(image_index, image_count, 100),
+            "running",
+            "image_ready",
+            Some(image.to_string()),
+            false,
+            None,
+        );
         return Ok(());
     }
 
-    let pull = Command::new("docker")
-        .args(["pull", image])
-        .output()
-        .await?;
-    if pull.status.success() {
-        return Ok(());
-    }
+    ensure_install_not_canceled(instance_id)?;
+    pull_image_with_progress(state, instance_id, image, image_index, image_count).await
+}
 
-    let detail = command_error_detail(&pull);
-    tracing::error!(
-        image,
-        status = ?pull.status.code(),
-        stdout = %String::from_utf8_lossy(&pull.stdout).trim(),
-        stderr = %String::from_utf8_lossy(&pull.stderr).trim(),
-        "failed to prepare suite image"
+/// 通过 Docker API 拉取镜像，并把 pull stream 转换为套件安装进度。
+async fn pull_image_with_progress(
+    state: &Arc<AppState>,
+    instance_id: &str,
+    image: &str,
+    image_index: usize,
+    image_count: usize,
+) -> ApiResult<()> {
+    let docker = state.docker_client().await?;
+    let (from_image, tag) = split_image_name(image);
+    let options = CreateImageOptions {
+        from_image: Some(from_image),
+        tag: Some(tag),
+        ..Default::default()
+    };
+    let mut stream = docker.create_image(Some(options), None, None);
+
+    update_install_progress(
+        instance_id,
+        image_progress(image_index, image_count, 5),
+        "running",
+        "pull_image",
+        Some(image.to_string()),
+        false,
+        None,
     );
-    Err(ApiError::BadRequest(format!(
-        "suite image `{image}` is unavailable: {detail}"
-    )))
+
+    while let Some(message) = stream.next().await {
+        ensure_install_not_canceled(instance_id)?;
+        let info = message.map_err(|err| {
+            ApiError::BadRequest(format!("suite image `{image}` pull failed: {err}"))
+        })?;
+        if let Some(error) = info.error {
+            return Err(ApiError::BadRequest(format!(
+                "suite image `{image}` pull failed: {error}"
+            )));
+        }
+        if let Some(detail) = info.progress_detail
+            && let (Some(current), Some(total)) = (detail.current, detail.total)
+            && total > 0
+        {
+            let layer_percent = ((current as f64 / total as f64) * 100.0).round() as u32;
+            update_install_progress(
+                instance_id,
+                image_progress(image_index, image_count, layer_percent),
+                "running",
+                "pull_image",
+                Some(image.to_string()),
+                false,
+                None,
+            );
+        }
+    }
+
+    update_install_progress(
+        instance_id,
+        image_progress(image_index, image_count, 100),
+        "running",
+        "image_ready",
+        Some(image.to_string()),
+        false,
+        None,
+    );
+    Ok(())
+}
+
+/// 将单个镜像的拉取百分比映射到整个安装任务的进度区间。
+fn image_progress(image_index: usize, image_count: usize, image_percent: u32) -> u32 {
+    let span = 75.0 / image_count as f64;
+    let value = 15.0 + span * image_index as f64 + span * (image_percent.min(100) as f64 / 100.0);
+    value.round().clamp(15.0, 90.0) as u32
+}
+
+/// 拆分 Docker 镜像名和标签，兼容包含 registry 端口的镜像地址。
+fn split_image_name(image: &str) -> (String, String) {
+    let Some((head, tail)) = image.rsplit_once('/') else {
+        return split_image_tag(image);
+    };
+    let (name, tag) = split_image_tag(tail);
+    (format!("{head}/{name}"), tag)
+}
+
+/// 拆分不含路径前缀的镜像名和标签，未声明标签时默认 latest。
+fn split_image_tag(image: &str) -> (String, String) {
+    if let Some((name, tag)) = image.rsplit_once(':') {
+        return (name.to_string(), tag.to_string());
+    }
+    (image.to_string(), "latest".to_string())
 }
 
 /// 提取 Docker 命令的有效错误文本。

@@ -12,7 +12,7 @@ use crate::models::suites::{
 use crate::state::AppState;
 use crate::types::{ApiError, ApiResponse, ApiResult, new_uuid_v7};
 use axum::body::Body;
-use axum::extract::{Multipart, OriginalUri, Path, State};
+use axum::extract::{Multipart, OriginalUri, Path, Query, State};
 use axum::http::{HeaderMap, Method, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
@@ -22,19 +22,24 @@ use base64::engine::general_purpose::STANDARD;
 use flate2::read::GzDecoder;
 use ring::digest;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::{Cursor, Read};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
 const MAX_SUITE_PACKAGE_BYTES: usize = 50 * 1024 * 1024;
 const MAX_SUITE_UNPACKED_BYTES: usize = 50 * 1024 * 1024;
 const SUITE_PACKAGE_EXTENSION: &str = ".slsp";
 const MIN_SUITE_ICON_SIZE: u32 = 128;
+static SUITE_INSTALL_SESSIONS: LazyLock<Mutex<HashMap<String, SuiteInstallProgress>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// 构建套件中心路由集合。
 pub fn suites_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/list", get(list))
         .route("/import", post(import_suite))
+        .route("/install-progress", get(install_progress))
+        .route("/install-progress/{task_id}/cancel", post(cancel_install))
         .route("/{suite_id}/install", post(install_suite))
         .route("/{suite_id}/delete", post(delete_suite))
         .route("/{suite_id}/assets/{*asset_path}", get(read_catalog_asset))
@@ -62,10 +67,48 @@ pub fn suites_router() -> Router<Arc<AppState>> {
         )
 }
 
+/// 安装套件的请求参数。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstallSuiteRequest {
     pub node_id: Option<String>,
+}
+
+/// 查询套件安装进度的请求参数。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuiteInstallProgressQuery {
+    pub task_id: String,
+}
+
+/// 启动套件安装任务后的返回数据。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuiteInstallTaskResponse {
+    pub task_id: String,
+    pub instance_id: String,
+}
+
+/// 套件安装任务的实时进度状态。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuiteInstallProgress {
+    pub task_id: String,
+    pub instance_id: String,
+    pub node_id: String,
+    pub progress_percent: u32,
+    pub status: String,
+    pub current_step: String,
+    pub current_image: Option<String>,
+    pub is_finished: bool,
+    pub error: Option<String>,
+    pub cancel_requested: bool,
+}
+
+/// 套件安装任务路径参数。
+#[derive(Debug, Deserialize)]
+pub struct SuiteInstallTaskPath {
+    task_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -158,7 +201,7 @@ pub async fn delete_suite(
     Ok(ApiResponse::ok("Suite deleted").into_response())
 }
 
-/// 安装套件到目标节点，但不自动启用。
+/// 启动套件安装任务；套件安装完成后不自动启用。
 pub async fn install_suite(
     State(state): State<Arc<AppState>>,
     Path(suite_id): Path<String>,
@@ -178,6 +221,7 @@ pub async fn install_suite(
         )));
     }
     let instance_id = new_uuid_v7();
+    let task_id = new_uuid_v7();
     let compose_project_name = build_compose_project_name(&manifest.metadata.slug);
 
     let instance = SuiteInstanceSummary {
@@ -193,7 +237,6 @@ pub async fn install_suite(
     };
     insert_instance(&state.metadata_db, &instance).await?;
 
-    let client = NodeRuntimeClient::from_node_route(&state.metadata_db, Some(&node_id)).await?;
     let request = AgentSuiteInstallRequest {
         instance_id: instance_id.clone(),
         suite_id: manifest.metadata.suite_id.clone(),
@@ -204,6 +247,147 @@ pub async fn install_suite(
         app_entries: manifest.app_entries,
     };
 
+    upsert_install_progress(SuiteInstallProgress {
+        task_id: task_id.clone(),
+        instance_id: instance_id.clone(),
+        node_id: node_id.clone(),
+        progress_percent: 1,
+        status: "queued".to_string(),
+        current_step: "queued".to_string(),
+        current_image: None,
+        is_finished: false,
+        error: None,
+        cancel_requested: false,
+    });
+
+    let state_for_task = Arc::clone(&state);
+    let task_id_for_task = task_id.clone();
+    let instance_id_for_task = instance_id.clone();
+    tokio::spawn(async move {
+        run_suite_install_task(
+            state_for_task,
+            task_id_for_task,
+            node_id,
+            instance_id_for_task,
+            request,
+        )
+        .await;
+    });
+
+    let data = SuiteInstallTaskResponse {
+        task_id,
+        instance_id,
+    };
+    Ok(ApiResponse::success_with_raw("Suite install task started", data).into_response())
+}
+
+/// 查询套件安装任务的实时进度。
+pub async fn install_progress(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SuiteInstallProgressQuery>,
+) -> ApiResult<Response> {
+    let mut progress = {
+        let sessions = SUITE_INSTALL_SESSIONS.lock().unwrap();
+        sessions.get(&query.task_id).cloned()
+    }
+    .ok_or(ApiError::NotFound)?;
+
+    if !progress.is_finished
+        && let Ok(client) =
+            NodeRuntimeClient::from_node_route(&state.metadata_db, Some(&progress.node_id)).await
+    {
+        let path = format!(
+            "/api/v1/agent/docker/suites/install-progress?instanceId={}",
+            progress.instance_id
+        );
+        if let Ok(agent_response) = client.get_json::<serde_json::Value>(&path).await
+            && let Some(agent_progress) = parse_agent_install_progress(&agent_response, &progress)
+        {
+            progress = agent_progress;
+            upsert_install_progress(progress.clone());
+        }
+    }
+
+    Ok(ApiResponse::success_with_raw("Suite install progress fetched", progress).into_response())
+}
+
+/// 取消正在执行的套件安装任务，并尽力清理未完成的实例记录。
+pub async fn cancel_install(
+    State(state): State<Arc<AppState>>,
+    Path(path): Path<SuiteInstallTaskPath>,
+) -> ApiResult<Response> {
+    let progress = mark_install_canceling(&path.task_id).ok_or(ApiError::NotFound)?;
+    if progress.is_finished {
+        return Ok(
+            ApiResponse::success_with_raw("Suite install already finished", progress)
+                .into_response(),
+        );
+    }
+
+    if let Ok(client) =
+        NodeRuntimeClient::from_node_route(&state.metadata_db, Some(&progress.node_id)).await
+    {
+        let cancel_path = format!(
+            "/api/v1/agent/docker/suites/install-progress/{}/cancel",
+            progress.instance_id
+        );
+        if let Err(err) = client
+            .post_json::<serde_json::Value, _>(&cancel_path, &serde_json::json!({}))
+            .await
+        {
+            tracing::warn!(
+                task_id = %path.task_id,
+                instance_id = %progress.instance_id,
+                error = %err,
+                "failed to forward suite install cancellation to agent"
+            );
+        }
+    }
+
+    let _ = delete_instance(&state.metadata_db, &progress.instance_id).await;
+    update_install_progress(
+        &path.task_id,
+        progress.progress_percent,
+        "canceled",
+        "canceled",
+        progress.current_image,
+        true,
+        None,
+    );
+    let sessions = SUITE_INSTALL_SESSIONS.lock().unwrap();
+    let canceled = sessions
+        .get(&path.task_id)
+        .cloned()
+        .ok_or(ApiError::NotFound)?;
+    Ok(ApiResponse::success_with_raw("Suite install canceled", canceled).into_response())
+}
+
+/// 在后台执行套件安装，并把最终状态写入进度会话。
+async fn run_suite_install_task(
+    state: Arc<AppState>,
+    task_id: String,
+    node_id: String,
+    instance_id: String,
+    request: AgentSuiteInstallRequest,
+) {
+    if is_install_cancel_requested(&task_id) {
+        let _ = delete_instance(&state.metadata_db, &instance_id).await;
+        update_install_progress(&task_id, 100, "canceled", "canceled", None, true, None);
+        return;
+    }
+    update_install_progress(&task_id, 5, "running", "prepare", None, false, None);
+
+    let client = match NodeRuntimeClient::from_node_route(&state.metadata_db, Some(&node_id)).await
+    {
+        Ok(client) => client,
+        Err(err) => {
+            let detail = err.to_string();
+            let _ = delete_instance(&state.metadata_db, &instance_id).await;
+            update_install_progress(&task_id, 100, "failed", "failed", None, true, Some(detail));
+            return;
+        }
+    };
+
     let agent_response = match client
         .post_json::<serde_json::Value, _>("/api/v1/agent/docker/suites/install", &request)
         .await
@@ -212,18 +396,47 @@ pub async fn install_suite(
         Err(err) => {
             let detail = err.to_string();
             compensate_failed_install(&client, &request, &instance_id).await;
-            delete_instance(&state.metadata_db, &instance_id).await?;
-            return Err(ApiError::Internal(detail));
+            let _ = delete_instance(&state.metadata_db, &instance_id).await;
+            if is_install_cancel_requested(&task_id) || is_install_canceled_error(&detail) {
+                update_install_progress(&task_id, 100, "canceled", "canceled", None, true, None);
+            } else {
+                update_install_progress(
+                    &task_id,
+                    100,
+                    "failed",
+                    "failed",
+                    None,
+                    true,
+                    Some(detail),
+                );
+            }
+            return;
         }
     };
+    if is_install_cancel_requested(&task_id) {
+        let _ = delete_instance(&state.metadata_db, &instance_id).await;
+        update_install_progress(&task_id, 100, "canceled", "canceled", None, true, None);
+        return;
+    }
     if let Err(err) = ensure_agent_success(&agent_response) {
-        delete_instance(&state.metadata_db, &instance_id).await?;
-        return Err(ApiError::BadRequest(err));
+        let _ = delete_instance(&state.metadata_db, &instance_id).await;
+        if is_install_canceled_error(&err) {
+            update_install_progress(&task_id, 100, "canceled", "canceled", None, true, None);
+        } else {
+            update_install_progress(&task_id, 100, "failed", "failed", None, true, Some(err));
+        }
+        return;
     }
 
-    update_instance_status(&state.metadata_db, &instance_id, "installed", None).await?;
-    let installed = fetch_instance(&state.metadata_db, &instance_id).await?;
-    Ok(ApiResponse::success_with_raw("Suite installed", installed).into_response())
+    if let Err(err) =
+        update_instance_status(&state.metadata_db, &instance_id, "installed", None).await
+    {
+        let detail = err.to_string();
+        update_install_progress(&task_id, 100, "failed", "failed", None, true, Some(detail));
+        return;
+    }
+
+    update_install_progress(&task_id, 100, "success", "completed", None, true, None);
 }
 
 /// Agent 安装请求发生传输异常时，尽力清理可能已经写入的远端安装内容。
@@ -250,6 +463,104 @@ async fn compensate_failed_install(
             "failed to compensate interrupted suite installation"
         );
     }
+}
+
+/// 新建或覆盖主控内存中的套件安装进度会话。
+fn upsert_install_progress(progress: SuiteInstallProgress) {
+    let mut sessions = SUITE_INSTALL_SESSIONS.lock().unwrap();
+    sessions.insert(progress.task_id.clone(), progress);
+}
+
+/// 将安装任务标记为正在取消，供后台任务和前端轮询读取。
+fn mark_install_canceling(task_id: &str) -> Option<SuiteInstallProgress> {
+    let mut sessions = SUITE_INSTALL_SESSIONS.lock().unwrap();
+    let progress = sessions.get_mut(task_id)?;
+    progress.cancel_requested = true;
+    if !progress.is_finished {
+        progress.status = "canceling".to_string();
+        progress.current_step = "canceling".to_string();
+    }
+    Some(progress.clone())
+}
+
+/// 判断安装任务是否已经收到取消请求。
+fn is_install_cancel_requested(task_id: &str) -> bool {
+    let sessions = SUITE_INSTALL_SESSIONS.lock().unwrap();
+    sessions
+        .get(task_id)
+        .is_some_and(|progress| progress.cancel_requested)
+}
+
+/// 判断 Agent 返回的安装错误是否由用户取消触发。
+fn is_install_canceled_error(message: &str) -> bool {
+    message.contains("suite install canceled")
+}
+
+/// 更新主控内存中的安装任务进度，并保持百分比单调递增。
+fn update_install_progress(
+    task_id: &str,
+    progress_percent: u32,
+    status: &str,
+    current_step: &str,
+    current_image: Option<String>,
+    is_finished: bool,
+    error: Option<String>,
+) {
+    let mut sessions = SUITE_INSTALL_SESSIONS.lock().unwrap();
+    if let Some(progress) = sessions.get_mut(task_id) {
+        progress.progress_percent = progress.progress_percent.max(progress_percent.min(100));
+        progress.status = status.to_string();
+        progress.current_step = current_step.to_string();
+        progress.current_image = current_image;
+        progress.is_finished = is_finished;
+        progress.error = error;
+        if matches!(status, "canceled" | "failed" | "success") {
+            progress.cancel_requested = false;
+        }
+    }
+}
+
+/// 将 Agent 返回的安装进度合并到主控任务进度中。
+fn parse_agent_install_progress(
+    response: &serde_json::Value,
+    base: &SuiteInstallProgress,
+) -> Option<SuiteInstallProgress> {
+    let data = response.get("data")?;
+    let mut progress = base.clone();
+    progress.progress_percent = progress.progress_percent.max(
+        data.get("progressPercent")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(progress.progress_percent)
+            .min(100),
+    );
+    progress.status = data
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&progress.status)
+        .to_string();
+    progress.current_step = data
+        .get("currentStep")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&progress.current_step)
+        .to_string();
+    progress.current_image = data
+        .get("currentImage")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    progress.is_finished = data
+        .get("isFinished")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(progress.is_finished);
+    progress.error = data
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    progress.cancel_requested = data
+        .get("cancelRequested")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(progress.cancel_requested);
+    Some(progress)
 }
 
 /// 启用套件实例并注册应用入口。
