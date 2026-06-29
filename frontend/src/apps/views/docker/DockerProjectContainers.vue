@@ -149,9 +149,14 @@ const statusLabel = (status: string | undefined) => {
           border
         >
           <template #name="{ row }: { row: dockerType.ComposeProjectSummary }">
-            <span class="project-name-cell" @click="openDetailModal(row?.name)">{{
-              row?.name
-            }}</span>
+            <div class="resource-name-cell">
+              <span class="project-name-cell" @click="openDetailModal(row?.name)">{{
+                row?.name
+              }}</span>
+              <SecLabTag v-if="row?.projectType === 'suite'" type="primary" size="small">
+                {{ t('app.docker.suiteManaged') }}
+              </SecLabTag>
+            </div>
           </template>
 
           <template #status="{ row }: { row: dockerType.ComposeProjectSummary }">
@@ -325,6 +330,14 @@ const statusLabel = (status: string | undefined) => {
   color: var(--sdl-primary);
   cursor: pointer;
   font-weight: 500;
+}
+
+.resource-name-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sdl-space-2);
+  max-width: 100%;
+  min-width: 0;
 }
 
 .project-name-cell:hover {
