@@ -1,6 +1,7 @@
 //! Docker Compose 套件运行接口：安装、启停、卸载与入口代理。
 
 use crate::config;
+use crate::services::logging::{AgentLogModule, AgentLogStatus, LoggerEntry};
 use crate::state::AppState;
 use crate::types::{ApiError, ApiResponse, ApiResult};
 use axum::body::Body;
@@ -13,7 +14,9 @@ use bollard::models::NetworkCreateRequest;
 use bollard::query_parameters::{self, CreateImageOptions};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashMap};
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use tokio::process::Command;
@@ -63,6 +66,10 @@ pub struct SuiteInstallRequest {
     pub compose_file: String,
     pub files: Vec<SuitePackageFile>,
     pub app_entries: Vec<SuiteAppEntry>,
+    #[serde(default)]
+    pub operator: Option<String>,
+    #[serde(default)]
+    pub trace_id: Option<String>,
 }
 
 /// 套件生命周期动作请求。
@@ -72,6 +79,10 @@ pub struct SuiteActionRequest {
     pub compose_project_name: String,
     #[serde(default)]
     pub remove_data: bool,
+    #[serde(default)]
+    pub operator: Option<String>,
+    #[serde(default)]
+    pub trace_id: Option<String>,
 }
 
 /// 查询套件安装进度的请求参数。
@@ -117,6 +128,73 @@ pub struct SuiteInstallCancelPath {
     instance_id: String,
 }
 
+struct SuiteRuntimeLog<'a> {
+    event: &'a str,
+    target_type: &'a str,
+    target_id: &'a str,
+    operator: Option<&'a str>,
+    trace_id: Option<&'a str>,
+    request_path: &'a str,
+    metadata: Value,
+    error: Option<&'a str>,
+}
+
+/// 写入 Agent 侧套件事件日志。
+fn finish_suite_runtime_log(state: &Arc<AppState>, log: SuiteRuntimeLog<'_>) {
+    let mut metadata = log.metadata;
+    if let Some(error) = log.error {
+        if let Some(object) = metadata.as_object_mut() {
+            object.insert("error".to_string(), json!(error));
+        } else {
+            metadata = json!({ "value": metadata, "error": error });
+        }
+    }
+
+    let mut entry = LoggerEntry::new(
+        log.operator.unwrap_or("seclab"),
+        log.event,
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+    )
+    .module(AgentLogModule::Docker)
+    .target_type(log.target_type)
+    .target_id(log.target_id)
+    .request("POST", log.request_path)
+    .metadata(metadata);
+
+    if let Some(trace_id) = log.trace_id.filter(|value| !value.trim().is_empty()) {
+        entry = entry.trace_id(trace_id);
+    }
+    if log.error.is_none() {
+        entry = entry.set_success();
+    } else {
+        entry = entry.status(AgentLogStatus::Failed);
+    }
+    entry.finish(&state.metadata_db);
+}
+
+/// 构建 Agent 侧安装日志的基础元数据。
+fn install_log_metadata(payload: &SuiteInstallRequest) -> Value {
+    json!({
+        "suite_id": payload.suite_id,
+        "version": payload.version,
+        "instance_id": payload.instance_id,
+        "compose_project_name": payload.compose_project_name,
+    })
+}
+
+/// 构建 Agent 侧生命周期动作日志的基础元数据。
+fn action_log_metadata(payload: &SuiteActionRequest) -> Value {
+    json!({
+        "compose_project_name": payload.compose_project_name,
+        "remove_data": payload.remove_data,
+    })
+}
+
+/// 判断错误是否由套件安装取消触发。
+fn is_suite_install_canceled_error(message: &str) -> bool {
+    message.contains("suite install canceled")
+}
+
 /// 安装套件文件、准备镜像并登记 Compose 项目。
 pub async fn install_suite(
     State(state): State<Arc<AppState>>,
@@ -124,6 +202,9 @@ pub async fn install_suite(
 ) -> ApiResult<Response> {
     validate_id("instance_id", &payload.instance_id)?;
     validate_project_name(&payload.compose_project_name)?;
+    let log_metadata = install_log_metadata(&payload);
+    let operator = payload.operator.clone();
+    let trace_id = payload.trace_id.clone();
     upsert_install_progress(SuiteInstallProgress {
         instance_id: payload.instance_id.clone(),
         progress_percent: 1,
@@ -134,7 +215,13 @@ pub async fn install_suite(
         error: None,
         cancel_requested: false,
     });
-    ensure_suite_network(&state).await?;
+    ensure_suite_network(
+        &state,
+        operator.as_deref(),
+        trace_id.as_deref(),
+        Some(&payload.compose_project_name),
+    )
+    .await?;
 
     let dir = suite_project_dir(&payload.compose_project_name);
     ensure_suite_project_available(&state, &payload.compose_project_name, &dir).await?;
@@ -155,6 +242,29 @@ pub async fn install_suite(
             },
         );
         rollback_suite_install(&payload.compose_project_name, &dir).await;
+        let error = err.to_string();
+        let canceled = is_suite_install_canceled_error(&error);
+        let mut metadata = log_metadata;
+        if let Some(object) = metadata.as_object_mut() {
+            object.insert("canceled".to_string(), json!(canceled));
+        }
+        finish_suite_runtime_log(
+            &state,
+            SuiteRuntimeLog {
+                event: if canceled {
+                    "suite_runtime_install_canceled"
+                } else {
+                    "suite_runtime_install"
+                },
+                target_type: "suite_instance",
+                target_id: &payload.instance_id,
+                operator: operator.as_deref(),
+                trace_id: trace_id.as_deref(),
+                request_path: "/api/v1/agent/docker/suites/install",
+                metadata,
+                error: if canceled { None } else { Some(&error) },
+            },
+        );
         return Err(err);
     }
 
@@ -166,6 +276,19 @@ pub async fn install_suite(
         None,
         true,
         None,
+    );
+    finish_suite_runtime_log(
+        &state,
+        SuiteRuntimeLog {
+            event: "suite_runtime_install",
+            target_type: "suite_instance",
+            target_id: &payload.instance_id,
+            operator: operator.as_deref(),
+            trace_id: trace_id.as_deref(),
+            request_path: "/api/v1/agent/docker/suites/install",
+            metadata: log_metadata,
+            error: None,
+        },
     );
     Ok(ApiResponse::ok("Suite installed").into_response())
 }
@@ -354,20 +477,58 @@ pub async fn enable_suite(
     Json(payload): Json<SuiteActionRequest>,
 ) -> ApiResult<Response> {
     validate_suite_project(&project, &payload.compose_project_name)?;
-    ensure_suite_network(&state).await?;
+    ensure_suite_network(
+        &state,
+        payload.operator.as_deref(),
+        payload.trace_id.as_deref(),
+        Some(&payload.compose_project_name),
+    )
+    .await?;
     let compose_file = suite_project_dir(&project).join(COMPOSE_FILE_NAME);
-    run_compose_command(&payload.compose_project_name, &compose_file, &["up", "-d"]).await?;
+    let result =
+        run_compose_command(&payload.compose_project_name, &compose_file, &["up", "-d"]).await;
+    let error = result.as_ref().err().map(ToString::to_string);
+    finish_suite_runtime_log(
+        &state,
+        SuiteRuntimeLog {
+            event: "suite_runtime_enable",
+            target_type: "compose_project",
+            target_id: &payload.compose_project_name,
+            operator: payload.operator.as_deref(),
+            trace_id: payload.trace_id.as_deref(),
+            request_path: "/api/v1/agent/docker/suite/{project}/enable",
+            metadata: action_log_metadata(&payload),
+            error: error.as_deref(),
+        },
+    );
+    result?;
     Ok(ApiResponse::ok("Suite enabled").into_response())
 }
 
 /// 停用套件实例。
 pub async fn disable_suite(
+    State(state): State<Arc<AppState>>,
     Path(project): Path<String>,
     Json(payload): Json<SuiteActionRequest>,
 ) -> ApiResult<Response> {
     validate_suite_project(&project, &payload.compose_project_name)?;
     let compose_file = suite_project_dir(&project).join(COMPOSE_FILE_NAME);
-    run_compose_command(&payload.compose_project_name, &compose_file, &["stop"]).await?;
+    let result = run_compose_command(&payload.compose_project_name, &compose_file, &["stop"]).await;
+    let error = result.as_ref().err().map(ToString::to_string);
+    finish_suite_runtime_log(
+        &state,
+        SuiteRuntimeLog {
+            event: "suite_runtime_disable",
+            target_type: "compose_project",
+            target_id: &payload.compose_project_name,
+            operator: payload.operator.as_deref(),
+            trace_id: payload.trace_id.as_deref(),
+            request_path: "/api/v1/agent/docker/suite/{project}/disable",
+            metadata: action_log_metadata(&payload),
+            error: error.as_deref(),
+        },
+    );
+    result?;
     Ok(ApiResponse::ok("Suite disabled").into_response())
 }
 
@@ -378,23 +539,42 @@ pub async fn uninstall_suite(
     Json(payload): Json<SuiteActionRequest>,
 ) -> ApiResult<Response> {
     validate_suite_project(&project, &payload.compose_project_name)?;
-    let dir = suite_project_dir(&project);
-    let compose_file = dir.join(COMPOSE_FILE_NAME);
-    if tokio::fs::metadata(&compose_file).await.is_ok() {
-        let args = if payload.remove_data {
-            vec!["down", "-v"]
-        } else {
-            vec!["down"]
-        };
-        run_compose_command(&payload.compose_project_name, &compose_file, &args).await?;
+    let result = async {
+        let dir = suite_project_dir(&project);
+        let compose_file = dir.join(COMPOSE_FILE_NAME);
+        if tokio::fs::metadata(&compose_file).await.is_ok() {
+            let args = if payload.remove_data {
+                vec!["down", "-v"]
+            } else {
+                vec!["down"]
+            };
+            run_compose_command(&payload.compose_project_name, &compose_file, &args).await?;
+        }
+        sqlx::query("DELETE FROM docker_compose_projects WHERE name = ?1")
+            .bind(&payload.compose_project_name)
+            .execute(&state.metadata_db)
+            .await?;
+        if tokio::fs::metadata(&dir).await.is_ok() {
+            tokio::fs::remove_dir_all(dir).await?;
+        }
+        Ok::<(), ApiError>(())
     }
-    sqlx::query("DELETE FROM docker_compose_projects WHERE name = ?1")
-        .bind(&payload.compose_project_name)
-        .execute(&state.metadata_db)
-        .await?;
-    if tokio::fs::metadata(&dir).await.is_ok() {
-        tokio::fs::remove_dir_all(dir).await?;
-    }
+    .await;
+    let error = result.as_ref().err().map(ToString::to_string);
+    finish_suite_runtime_log(
+        &state,
+        SuiteRuntimeLog {
+            event: "suite_runtime_uninstall",
+            target_type: "compose_project",
+            target_id: &payload.compose_project_name,
+            operator: payload.operator.as_deref(),
+            trace_id: payload.trace_id.as_deref(),
+            request_path: "/api/v1/agent/docker/suite/{project}/uninstall",
+            metadata: action_log_metadata(&payload),
+            error: error.as_deref(),
+        },
+    );
+    result?;
     Ok(ApiResponse::ok("Suite uninstalled").into_response())
 }
 
@@ -479,7 +659,12 @@ fn strip_hop_by_hop_headers(headers: &mut HeaderMap) {
     headers.remove(HeaderName::from_static("keep-alive"));
 }
 
-async fn ensure_suite_network(state: &Arc<AppState>) -> ApiResult<()> {
+async fn ensure_suite_network(
+    state: &Arc<AppState>,
+    operator: Option<&str>,
+    trace_id: Option<&str>,
+    compose_project_name: Option<&str>,
+) -> ApiResult<()> {
     let docker = state.docker_client().await?;
     let labels = suite_network_labels();
     if let Ok(network) = docker
@@ -517,7 +702,26 @@ async fn ensure_suite_network(state: &Arc<AppState>) -> ApiResult<()> {
         labels: Some(labels),
         ..Default::default()
     };
-    docker.create_network(request).await?;
+    let result = docker.create_network(request).await;
+    let error = result.as_ref().err().map(ToString::to_string);
+    finish_suite_runtime_log(
+        state,
+        SuiteRuntimeLog {
+            event: "suite_network_create",
+            target_type: "docker_network",
+            target_id: SUITE_NETWORK_NAME,
+            operator,
+            trace_id,
+            request_path: "/api/v1/agent/docker/suites/install",
+            metadata: json!({
+                "network": SUITE_NETWORK_NAME,
+                "driver": "bridge",
+                "compose_project_name": compose_project_name,
+            }),
+            error: error.as_deref(),
+        },
+    );
+    result?;
     Ok(())
 }
 
@@ -684,7 +888,7 @@ async fn prepare_compose_images(
     let image_count = images.len().max(1);
     for (index, image) in images.iter().enumerate() {
         ensure_install_not_canceled(&payload.instance_id)?;
-        ensure_image_available(state, &payload.instance_id, image, index, image_count).await?;
+        ensure_image_available(state, payload, image, index, image_count).await?;
     }
     Ok(())
 }
@@ -702,15 +906,15 @@ fn parse_compose_images(output: &[u8]) -> BTreeSet<String> {
 /// 本地镜像存在时直接复用，否则从镜像仓库拉取固定版本镜像。
 async fn ensure_image_available(
     state: &Arc<AppState>,
-    instance_id: &str,
+    payload: &SuiteInstallRequest,
     image: &str,
     image_index: usize,
     image_count: usize,
 ) -> ApiResult<()> {
-    ensure_install_not_canceled(instance_id)?;
+    ensure_install_not_canceled(&payload.instance_id)?;
     let base_progress = image_progress(image_index, image_count, 0);
     update_install_progress(
-        instance_id,
+        &payload.instance_id,
         base_progress,
         "running",
         "check_image",
@@ -724,7 +928,7 @@ async fn ensure_image_available(
         .await?;
     if inspect.status.success() {
         update_install_progress(
-            instance_id,
+            &payload.instance_id,
             image_progress(image_index, image_count, 100),
             "running",
             "image_ready",
@@ -735,14 +939,14 @@ async fn ensure_image_available(
         return Ok(());
     }
 
-    ensure_install_not_canceled(instance_id)?;
-    pull_image_with_progress(state, instance_id, image, image_index, image_count).await
+    ensure_install_not_canceled(&payload.instance_id)?;
+    pull_image_with_progress(state, payload, image, image_index, image_count).await
 }
 
 /// 通过 Docker API 拉取镜像，并把 pull stream 转换为套件安装进度。
 async fn pull_image_with_progress(
     state: &Arc<AppState>,
-    instance_id: &str,
+    payload: &SuiteInstallRequest,
     image: &str,
     image_index: usize,
     image_count: usize,
@@ -757,7 +961,7 @@ async fn pull_image_with_progress(
     let mut stream = docker.create_image(Some(options), None, None);
 
     update_install_progress(
-        instance_id,
+        &payload.instance_id,
         image_progress(image_index, image_count, 5),
         "running",
         "pull_image",
@@ -766,35 +970,71 @@ async fn pull_image_with_progress(
         None,
     );
 
-    while let Some(message) = stream.next().await {
-        ensure_install_not_canceled(instance_id)?;
-        let info = message.map_err(|err| {
-            ApiError::BadRequest(format!("suite image `{image}` pull failed: {err}"))
-        })?;
-        if let Some(error) = info.error {
-            return Err(ApiError::BadRequest(format!(
-                "suite image `{image}` pull failed: {error}"
-            )));
+    let result = async {
+        while let Some(message) = stream.next().await {
+            ensure_install_not_canceled(&payload.instance_id)?;
+            let info = message.map_err(|err| {
+                ApiError::BadRequest(format!("suite image `{image}` pull failed: {err}"))
+            })?;
+            if let Some(error) = info.error {
+                return Err(ApiError::BadRequest(format!(
+                    "suite image `{image}` pull failed: {error}"
+                )));
+            }
+            if let Some(detail) = info.progress_detail
+                && let (Some(current), Some(total)) = (detail.current, detail.total)
+                && total > 0
+            {
+                let layer_percent = ((current as f64 / total as f64) * 100.0).round() as u32;
+                update_install_progress(
+                    &payload.instance_id,
+                    image_progress(image_index, image_count, layer_percent),
+                    "running",
+                    "pull_image",
+                    Some(image.to_string()),
+                    false,
+                    None,
+                );
+            }
         }
-        if let Some(detail) = info.progress_detail
-            && let (Some(current), Some(total)) = (detail.current, detail.total)
-            && total > 0
-        {
-            let layer_percent = ((current as f64 / total as f64) * 100.0).round() as u32;
-            update_install_progress(
-                instance_id,
-                image_progress(image_index, image_count, layer_percent),
-                "running",
-                "pull_image",
-                Some(image.to_string()),
-                false,
-                None,
-            );
-        }
+        Ok::<(), ApiError>(())
     }
+    .await;
+
+    let error = result.as_ref().err().map(ToString::to_string);
+    let canceled = error
+        .as_deref()
+        .is_some_and(is_suite_install_canceled_error);
+    finish_suite_runtime_log(
+        state,
+        SuiteRuntimeLog {
+            event: if canceled {
+                "suite_image_pull_canceled"
+            } else {
+                "suite_image_pull"
+            },
+            target_type: "docker_image",
+            target_id: image,
+            operator: payload.operator.as_deref(),
+            trace_id: payload.trace_id.as_deref(),
+            request_path: "/api/v1/agent/docker/suites/install",
+            metadata: json!({
+                "suite_id": payload.suite_id,
+                "version": payload.version,
+                "instance_id": payload.instance_id,
+                "compose_project_name": payload.compose_project_name,
+                "image": image,
+                "image_index": image_index + 1,
+                "image_count": image_count,
+                "canceled": canceled,
+            }),
+            error: if canceled { None } else { error.as_deref() },
+        },
+    );
+    result?;
 
     update_install_progress(
-        instance_id,
+        &payload.instance_id,
         image_progress(image_index, image_count, 100),
         "running",
         "image_ready",

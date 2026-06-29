@@ -115,6 +115,18 @@ impl LoggerEntry {
         self
     }
 
+    /// 请求 trace_id。
+    pub fn trace_id(mut self, trace_id: &str) -> Self {
+        self.inner = self.inner.trace_id(trace_id);
+        self
+    }
+
+    /// 请求上下文（方法 + 路径）。
+    pub fn request(mut self, method: &str, request_path: &str) -> Self {
+        self.inner = self.inner.request(method, request_path);
+        self
+    }
+
     /// 操作结果。
     pub fn status(mut self, status: AgentLogStatus) -> Self {
         self.inner = self.inner.status(status);
