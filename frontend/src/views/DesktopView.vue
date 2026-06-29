@@ -169,22 +169,19 @@ function handleLayerDrop(event: DragEvent) {
     dragState.value.initialIconY + dy,
   )
 
-  // 重叠检查：检查目标格子是否已有其他图标
-  const isOccupied = store.desktopShortcuts.some(
+  // 目标格子已有图标时交换位置，符合桌面图标拖拽排序习惯。
+  const occupiedShortcut = store.desktopShortcuts.find(
     (s) => s.appId !== draggingId && s.x === newX && s.y === newY,
   )
 
-  if (isOccupied) {
-    // 如果重叠，回到初始位置
+  if (occupiedShortcut) {
     store.updateDesktopShortcutPosition(
-      draggingId,
+      occupiedShortcut.appId,
       dragState.value.initialIconX,
       dragState.value.initialIconY,
     )
-  } else {
-    // 否则更新到新位置
-    store.updateDesktopShortcutPosition(draggingId, newX, newY)
   }
+  store.updateDesktopShortcutPosition(draggingId, newX, newY)
 }
 
 function handleDragEnd() {
