@@ -131,7 +131,7 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
   const hasLoadedDesktopShortcuts = ref(false)
   const isDesktopDragging = ref(false)
   const defaultDesktopApps: AppId[] = [
-    'node-manager',
+    'suite-center',
     'docker-manager',
     'system-monitor',
     'file-manager',
