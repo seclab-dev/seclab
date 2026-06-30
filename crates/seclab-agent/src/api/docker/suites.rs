@@ -620,7 +620,7 @@ pub async fn proxy_suite_entry(
     let target_url = format!("http://{container_ip}:{port}{suffix}");
 
     let client = reqwest::Client::new();
-    let mut request = client.request(method, target_url);
+    let mut request = client.request(method, target_url.clone());
     for (name, value) in headers.iter() {
         if name.as_str().eq_ignore_ascii_case("host") {
             continue;
@@ -630,14 +630,58 @@ pub async fn proxy_suite_entry(
     let body_stream = body
         .into_data_stream()
         .map(|chunk| chunk.map_err(std::io::Error::other));
-    let response = request
+    let response = match request
         .body(reqwest::Body::wrap_stream(body_stream))
         .send()
-        .await?;
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                project = %path.project,
+                entry_id = %path.entry_id,
+                service = %service,
+                target_url = %target_url,
+                "suite proxy request failed"
+            );
+            return Err(err.into());
+        }
+    };
 
     let status = response.status();
     let mut headers = response.headers().clone();
     strip_hop_by_hop_headers(&mut headers);
+    if status.is_server_error() && !is_event_stream_response(&headers) {
+        let body_bytes = response.bytes().await.map_err(|err| {
+            tracing::error!(
+                error = %err,
+                status = %status,
+                project = %path.project,
+                entry_id = %path.entry_id,
+                service = %service,
+                target_url = %target_url,
+                "suite proxy failed to read upstream error body"
+            );
+            ApiError::from(err)
+        })?;
+        let body_excerpt = response_body_excerpt(&body_bytes);
+        tracing::error!(
+            status = %status,
+            project = %path.project,
+            entry_id = %path.entry_id,
+            service = %service,
+            target_url = %target_url,
+            upstream_body = %body_excerpt,
+            "suite proxy upstream returned server error"
+        );
+        let mut proxied = Response::builder()
+            .status(status)
+            .body(Body::from(body_bytes))?;
+        *proxied.headers_mut() = headers;
+        return Ok(proxied);
+    }
+
     let stream = response
         .bytes_stream()
         .map(|chunk| chunk.map_err(std::io::Error::other));
@@ -645,6 +689,30 @@ pub async fn proxy_suite_entry(
     let mut proxied = Response::builder().status(status).body(body)?;
     *proxied.headers_mut() = headers;
     Ok(proxied)
+}
+
+fn is_event_stream_response(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
+        })
+}
+
+fn response_body_excerpt(body: &[u8]) -> String {
+    const MAX_EXCERPT_LEN: usize = 4096;
+
+    let text = String::from_utf8_lossy(body);
+    let excerpt: String = text.chars().take(MAX_EXCERPT_LEN).collect();
+    if text.chars().count() > MAX_EXCERPT_LEN {
+        format!("{excerpt}...[truncated]")
+    } else {
+        excerpt
+    }
 }
 
 fn strip_hop_by_hop_headers(headers: &mut HeaderMap) {
