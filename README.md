@@ -1,8 +1,8 @@
 # SecLab
 
-[![Project Status: Active](https://img.shields.io/badge/Project%20Status-Active-emerald.svg)](https://github.com/guowenju/seclab)
-[![Backend: Rust](https://img.shields.io/badge/Backend-Rust%202024-orange.svg)](https://github.com/guowenju/seclab/tree/main/crates)
-[![Frontend: Vue 3](https://img.shields.io/badge/Frontend-Vue%203%20%2B%20Vite-blue.svg)](https://github.com/guowenju/seclab/tree/main/frontend)
+[![Project Status: Active](https://img.shields.io/badge/Project%20Status-Active-emerald.svg)](https://github.com/seclab-dev/seclab)
+[![Backend: Rust](https://img.shields.io/badge/Backend-Rust%202024-orange.svg)](https://github.com/seclab-dev/seclab/tree/main/crates)
+[![Frontend: Vue 3](https://img.shields.io/badge/Frontend-Vue%203%20%2B%20Vite-blue.svg)](https://github.com/seclab-dev/seclab/tree/main/frontend)
 
 SecLab 是面向安全测试、协议仿真、漏洞验证和主机运维的分布式安全实验室平台。系统由主控 `seclab` 和节点执行面 `seclab-agent` 组成，主控负责控制面、Web 控制台和全局状态，Agent 负责本地 Docker、文件系统、进程、网络和任务执行。
 
