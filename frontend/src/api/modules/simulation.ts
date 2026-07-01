@@ -108,8 +108,11 @@ export const simulationApi = {
   listInstances: (nodeId: string) => {
     return http.get<SimInstance[]>(`/simulation/node/${nodeId}/instances`)
   },
-  listLogs: (nodeId: string) => {
-    return http.get<SimLog[]>(`/simulation/node/${nodeId}/logs`)
+  listLogs: (nodeId: string, params?: { page?: number; pageSize?: number }) => {
+    return http.get<{ total: number; page: number; pageSize: number; records: SimLog[] }>(
+      `/simulation/node/${nodeId}/logs`,
+      params,
+    )
   },
   startCapture: (instanceId: string) => {
     return http.post<unknown>('/simulation/capture/start', { instanceId })

@@ -1767,6 +1767,8 @@ const en = {
         },
         empty:
           'This compute node is currently secure. No exploit audits or brute-force attempts caught.',
+        autoRefresh: 'Auto Refresh (10s)',
+        refresh: 'Refresh Now',
         messages: {
           downloadSuccess: 'Binary PCAP forensics downloaded successfully',
           downloadFailed: 'Failed to download PCAP file',

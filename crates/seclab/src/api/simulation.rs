@@ -2,9 +2,10 @@
 
 use crate::api::auth::AuthenticatedAdmin;
 use crate::models::simulation::{
-    SimLogRecord, SimRuleRecord, delete_sim_rule, get_sim_instance_by_id, get_sim_rule_by_id,
-    insert_sim_log, insert_sim_rule, list_all_sim_instances, list_all_sim_logs,
-    list_sim_instances_by_node, list_sim_logs_by_node, list_sim_rules, update_sim_log_pcap,
+    SimLogRecord, SimRuleRecord, count_all_sim_logs, count_sim_logs_by_node, delete_sim_rule,
+    get_sim_instance_by_id, get_sim_rule_by_id, insert_sim_log, insert_sim_rule,
+    list_all_sim_instances, list_all_sim_logs_paginated, list_sim_instances_by_node,
+    list_sim_logs_by_node_paginated, list_sim_rules, update_sim_log_pcap,
 };
 use crate::services::logging::PlatformLogEntry;
 use crate::services::simulation::{deploy_simulation_service, undeploy_simulation_service};
@@ -13,13 +14,13 @@ use crate::state::AppState;
 use crate::types::{ApiError, ApiResponse, ApiResult};
 use axum::{
     Router,
-    extract::{Json, Multipart, Path, State, connect_info::ConnectInfo},
+    extract::{Json, Multipart, Path, Query, State, connect_info::ConnectInfo},
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, post},
 };
 use chrono::Utc;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -28,6 +29,22 @@ const CUSTOM_SIM_RULE_ID_BASE: i64 = 1_000_000;
 const SIM_RULE_PACKAGE_EXTENSION: &str = ".slrp";
 
 // --- 请求与响应载荷结构定义 ---
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SimLogQuery {
+    pub page: Option<i32>,
+    pub page_size: Option<i32>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SimLogListResponse {
+    pub total: i64,
+    pub page: i32,
+    pub page_size: i32,
+    pub records: Vec<SimLogRecord>,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -567,17 +584,41 @@ pub async fn list_instances_by_node_handler(
 pub async fn list_sim_logs_handler(
     State(state): State<Arc<AppState>>,
     Path(node_id): Path<String>,
+    Query(query): Query<SimLogQuery>,
 ) -> ApiResult<impl IntoResponse> {
-    let logs = if node_id == "all" {
-        list_all_sim_logs(&state.metadata_db, 100)
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(50).max(1);
+    let offset = ((page - 1) * page_size) as i64;
+    let limit = page_size as i64;
+
+    let (total, logs) = if node_id == "all" {
+        let total = count_all_sim_logs(&state.metadata_db)
             .await
-            .map_err(|err| ApiError::Internal(err.to_string()))?
+            .map_err(|err| ApiError::Internal(err.to_string()))?;
+        let records = list_all_sim_logs_paginated(&state.metadata_db, limit, offset)
+            .await
+            .map_err(|err| ApiError::Internal(err.to_string()))?;
+        (total, records)
     } else {
-        list_sim_logs_by_node(&state.metadata_db, &node_id, 100)
+        let total = count_sim_logs_by_node(&state.metadata_db, &node_id)
             .await
-            .map_err(|err| ApiError::Internal(err.to_string()))?
+            .map_err(|err| ApiError::Internal(err.to_string()))?;
+        let records = list_sim_logs_by_node_paginated(&state.metadata_db, &node_id, limit, offset)
+            .await
+            .map_err(|err| ApiError::Internal(err.to_string()))?;
+        (total, records)
     };
-    Ok(ApiResponse::success_with_raw("Simulation logs loaded", logs).into_response())
+
+    Ok(ApiResponse::success_with_raw(
+        "Simulation logs loaded",
+        SimLogListResponse {
+            total,
+            page,
+            page_size,
+            records: logs,
+        },
+    )
+    .into_response())
 }
 
 /// 安全地提供 PCAP 数据包文件下载，防范路径穿越风险。

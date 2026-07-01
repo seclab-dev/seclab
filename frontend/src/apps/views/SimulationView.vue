@@ -11,6 +11,7 @@ import {
   SecLabPagination,
   SecLabDialog,
   SecLabTooltip,
+  SecLabCheckbox,
 } from '@/components/ui'
 import type { SecLabTableColumn } from '@/components/ui/SecLabTable.vue'
 import {
@@ -233,6 +234,14 @@ const defaultDeployNodeId = computed(() => {
 /** 威胁审计日志数据列表 */
 const logs = ref<SimLog[]>([])
 
+// 威胁审计日志的分页及自动刷新相关状态
+const logPage = ref(1)
+const logPageSize = ref(50)
+const logTotal = ref(0)
+const logTotalPages = computed(() => Math.max(1, Math.ceil(logTotal.value / logPageSize.value)))
+const isAutoRefreshLogs = ref(false)
+let logRefreshTimer: ReturnType<typeof setInterval> | null = null
+
 /** 将在线节点转化为下拉框组件直接可用的选项数据源 */
 const nodeOptions = computed(() =>
   nodes.value.map((n) => ({
@@ -435,6 +444,28 @@ const loadNodes = async () => {
 }
 
 /**
+ * 获取指定节点上的威胁审计日志列表。
+ */
+const loadLogs = async (silent = false) => {
+  if (!selectedNodeId.value) return
+  if (!silent) isLoading.value = true
+  try {
+    const logRes = await simulationApi.listLogs(selectedNodeId.value, {
+      page: logPage.value,
+      pageSize: logPageSize.value,
+    })
+    if (logRes.success && logRes.data) {
+      logs.value = logRes.data.records
+      logTotal.value = logRes.data.total
+    }
+  } catch {
+    notificationStore.error(t('app.simulation.deployments.messages.loadInstancesFailed'))
+  } finally {
+    if (!silent) isLoading.value = false
+  }
+}
+
+/**
  * 获取指定节点上正在运行的仿真实例列表及威胁审计日志。
  * @param silent 若为 true，则启用静默加载，不展示可能导致屏幕闪烁的全局 Loading 遮罩层。这常用于静默轮询。
  */
@@ -443,16 +474,11 @@ const loadNodeInstancesAndLogs = async (silent = false) => {
   selectedInstanceIds.value = []
   if (!silent) isLoading.value = true
   try {
-    const [instRes, logRes] = await Promise.all([
-      simulationApi.listInstances(selectedNodeId.value),
-      simulationApi.listLogs(selectedNodeId.value),
-    ])
+    const instRes = await simulationApi.listInstances(selectedNodeId.value)
     if (instRes.success && instRes.data) {
       instances.value = instRes.data
     }
-    if (logRes.success && logRes.data) {
-      logs.value = logRes.data
-    }
+    await loadLogs(true)
   } catch {
     notificationStore.error(t('app.simulation.deployments.messages.loadInstancesFailed'))
   } finally {
@@ -470,11 +496,37 @@ watch(activeTab, (tab) => {
       void loadNodeInstancesAndLogs()
     }
   }
+  if (tab !== 'logs') {
+    isAutoRefreshLogs.value = false
+  }
 })
 
 watch(selectedNodeId, () => {
+  logPage.value = 1
   if (activeTab.value === 'deployments' || activeTab.value === 'logs') {
     void loadNodeInstancesAndLogs()
+  }
+})
+
+// 监听分页状态变化以更新日志
+watch([logPage, logPageSize], () => {
+  if (activeTab.value === 'logs') {
+    void loadLogs()
+  }
+})
+
+// 监听自动刷新开关
+watch(isAutoRefreshLogs, (val) => {
+  if (logRefreshTimer) {
+    clearInterval(logRefreshTimer)
+    logRefreshTimer = null
+  }
+  if (val) {
+    logRefreshTimer = setInterval(() => {
+      if (activeTab.value === 'logs' && selectedNodeId.value) {
+        void loadLogs(true)
+      }
+    }, 10000)
   }
 })
 
@@ -621,6 +673,9 @@ onMounted(() => {
 onUnmounted(() => {
   if (timerId) {
     clearInterval(timerId)
+  }
+  if (logRefreshTimer) {
+    clearInterval(logRefreshTimer)
   }
 })
 
@@ -1512,14 +1567,34 @@ const handleDownloadPcap = async (row: SimInstance) => {
       <!-- TAB 3: 诱捕审计与抓包取证 (Logs) -->
       <div v-if="activeTab === 'logs'" class="tab-content flex-column gap-layout">
         <!-- 顶部节点过滤栏 -->
-        <div class="control-header card-bg">
-          <div class="filter-item">
+        <div class="control-header card-bg flex-layout flex-align-center flex-between">
+          <div class="filter-item flex-layout flex-align-center gap-layout">
             <span class="label">{{ t('app.simulation.deployments.selectNode') }}</span>
             <SecLabSelect
               v-model="selectedNodeId"
               :options="filterNodeOptions"
               class="node-select-filter"
             />
+          </div>
+          <div class="flex-layout flex-align-center gap-layout" style="gap: 16px">
+            <div
+              class="flex-layout flex-align-center gap-layout"
+              style="gap: 6px; cursor: pointer; user-select: none"
+            >
+              <SecLabCheckbox
+                :model-value="isAutoRefreshLogs"
+                @change="(val) => (isAutoRefreshLogs = val)"
+              />
+              <span
+                style="font-size: 13px; color: var(--sdl-text-secondary)"
+                @click="isAutoRefreshLogs = !isAutoRefreshLogs"
+              >
+                {{ t('app.simulation.logs.autoRefresh') }}
+              </span>
+            </div>
+            <SecLabButton type="primary" size="small" @click="() => loadLogs()">
+              {{ t('app.simulation.logs.refresh') }}
+            </SecLabButton>
           </div>
         </div>
 
@@ -1554,6 +1629,19 @@ const handleDownloadPcap = async (row: SimInstance) => {
                 </div>
               </template>
             </SecLabTable>
+          </div>
+
+          <!-- 分页器 -->
+          <div
+            class="pagination-bar border-top flex-layout flex-align-center flex-end"
+            data-slot="footer"
+            style="padding: 10px 16px; display: flex; justify-content: flex-end"
+          >
+            <SecLabPagination
+              :current-page="logPage"
+              :total-pages="logTotalPages"
+              @page-change="(p) => (logPage = p)"
+            />
           </div>
         </div>
       </div>

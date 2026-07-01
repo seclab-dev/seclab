@@ -1732,6 +1732,8 @@ const zh: typeof en = {
           summary: '语义审计概要',
         },
         empty: '此计算节点目前安全状态优良，暂无入侵审计及爆破日志捕获。',
+        autoRefresh: '自动刷新 (10s)',
+        refresh: '立即刷新',
         messages: {
           downloadSuccess: '二进制 PCAP 取证下载成功',
           downloadFailed: '下载 PCAP 失败',

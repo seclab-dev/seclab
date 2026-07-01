@@ -368,6 +368,55 @@ pub async fn list_all_sim_logs(pool: &DbPool, limit: i64) -> sqlx::Result<Vec<Si
         .await
 }
 
+/// 查询特定节点的仿真日志总数。
+pub async fn count_sim_logs_by_node(pool: &DbPool, node_id: &str) -> sqlx::Result<i64> {
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sim_logs WHERE node_id = ?")
+        .bind(node_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(count)
+}
+
+/// 查询全部节点的仿真日志总数。
+pub async fn count_all_sim_logs(pool: &DbPool) -> sqlx::Result<i64> {
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sim_logs")
+        .fetch_one(pool)
+        .await?;
+    Ok(count)
+}
+
+/// 分页查询特定节点的仿真审计日志列表。
+pub async fn list_sim_logs_by_node_paginated(
+    pool: &DbPool,
+    node_id: &str,
+    limit: i64,
+    offset: i64,
+) -> sqlx::Result<Vec<SimLogRecord>> {
+    sqlx::query_as::<_, SimLogRecord>(
+        "SELECT * FROM sim_logs WHERE node_id = ? ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+    )
+    .bind(node_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await
+}
+
+/// 分页查询全部节点的仿真审计日志列表。
+pub async fn list_all_sim_logs_paginated(
+    pool: &DbPool,
+    limit: i64,
+    offset: i64,
+) -> sqlx::Result<Vec<SimLogRecord>> {
+    sqlx::query_as::<_, SimLogRecord>(
+        "SELECT * FROM sim_logs ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+    )
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await
+}
+
 // --- SimRulePackage CRUD ---
 
 /// 仿真规则包导入记录。
