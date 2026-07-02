@@ -2,7 +2,13 @@
 
 use crate::state::DbPool;
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
+use sqlx::{Error, FromRow};
+
+/// 内置仿真规则保留 ID 的最大值。
+pub const BUILTIN_SIM_RULE_MAX_ID: i64 = 999_999;
+
+/// 自定义仿真规则自动分配 ID 的起始值。
+pub const CUSTOM_SIM_RULE_ID_BASE: i64 = 1_000_000;
 
 /// 仿真配置规则记录。
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -116,6 +122,126 @@ pub async fn insert_sim_rule(pool: &DbPool, record: &SimRuleRecord) -> sqlx::Res
     .await?;
 
     Ok(())
+}
+
+/// 插入自定义仿真规则，并对等价重复提交做幂等保护。
+///
+/// 若已存在同名、同协议、同端口、同配置的活跃自定义规则，则直接返回已有记录；
+/// 否则在事务中分配递增 ID 并插入新规则。
+pub async fn insert_custom_sim_rule_deduplicated(
+    pool: &DbPool,
+    mut record: SimRuleRecord,
+    requested_id: Option<i64>,
+) -> sqlx::Result<SimRuleRecord> {
+    for attempt in 0..5 {
+        let mut tx = pool.begin().await?;
+
+        if let Some(existing) = sqlx::query_as::<_, SimRuleRecord>(
+            r#"
+            SELECT *
+              FROM sim_rules
+             WHERE source_type = 'custom'
+               AND rule_status = 'active'
+               AND name = ?
+               AND protocol = ?
+               AND default_port IS ?
+               AND config_yaml = ?
+             ORDER BY created_at DESC
+             LIMIT 1
+            "#,
+        )
+        .bind(&record.name)
+        .bind(&record.protocol)
+        .bind(record.default_port)
+        .bind(&record.config_yaml)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            tx.commit().await?;
+            return Ok(existing);
+        }
+
+        record.id = match requested_id {
+            Some(id) => id,
+            None => {
+                let used_ids = sqlx::query_scalar::<_, i64>(
+                    "SELECT id FROM sim_rules WHERE id >= ? ORDER BY id ASC",
+                )
+                .bind(CUSTOM_SIM_RULE_ID_BASE)
+                .fetch_all(&mut *tx)
+                .await?;
+                let mut next_id = CUSTOM_SIM_RULE_ID_BASE;
+                for used_id in used_ids {
+                    if used_id == next_id {
+                        next_id += 1;
+                    } else if used_id > next_id {
+                        break;
+                    }
+                }
+                next_id
+            }
+        };
+
+        let insert_result = sqlx::query(
+            r#"
+            INSERT INTO sim_rules (
+                id,
+                name,
+                name_en,
+                cve,
+                category,
+                description_zh,
+                description_en,
+                protocol,
+                default_port,
+                config_yaml,
+                source_type,
+                source_package_id,
+                rule_status,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(record.id)
+        .bind(&record.name)
+        .bind(&record.name_en)
+        .bind(&record.cve)
+        .bind(&record.category)
+        .bind(&record.description_zh)
+        .bind(&record.description_en)
+        .bind(&record.protocol)
+        .bind(record.default_port)
+        .bind(&record.config_yaml)
+        .bind(&record.source_type)
+        .bind(&record.source_package_id)
+        .bind(&record.rule_status)
+        .bind(&record.created_at)
+        .bind(&record.updated_at)
+        .execute(&mut *tx)
+        .await;
+
+        match insert_result {
+            Ok(_) => {
+                tx.commit().await?;
+                return Ok(record);
+            }
+            Err(err)
+                if requested_id.is_none()
+                    && attempt < 4
+                    && err
+                        .as_database_error()
+                        .is_some_and(|db_err| db_err.is_unique_violation()) =>
+            {
+                tx.rollback().await?;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(Error::Protocol(
+        "failed to allocate custom simulation rule id".to_string(),
+    ))
 }
 
 /// 根据 ID 获取仿真配置规则。

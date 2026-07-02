@@ -1,32 +1,12 @@
 //! Redis 协议仿真运行器。
 
 use super::common::{SimLogDraft, report_sim_log_async};
-use std::collections::HashMap;
+use seclab_contracts::simulation::SimRedisConfig;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::oneshot;
 use tracing::{error, info};
-
-/// Redis 仿真自定义命令响应配置。
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct RedisCommandResponse {
-    pub command: String,
-    pub args_contains: Option<Vec<String>>,
-    pub response: String,
-    pub event_type: Option<String>,
-}
-
-/// Redis 协议仿真配置。
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SimRedisConfig {
-    pub banner: Option<String>,
-    pub require_auth: Option<bool>,
-    pub password: Option<String>,
-    pub server_info: Option<HashMap<String, String>>,
-    pub keys: Option<HashMap<String, String>>,
-    pub command_responses: Option<Vec<RedisCommandResponse>>,
-}
 
 /// 全局共享的 Redis 仿真参数，由 TCP 连接处理器消费。
 struct RedisSimulationContext {

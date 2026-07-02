@@ -4,33 +4,13 @@
 //! 弱口令检测与审计日志上报。
 
 use super::common::{SimLogDraft, report_sim_log_async};
-use serde::{Deserialize, Serialize};
+use seclab_contracts::simulation::SimFtpConfig;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::oneshot;
 use tracing::{error, info};
-
-/// FTP 弱口令凭据。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FtpCredential {
-    pub username: String,
-    pub password: String,
-}
-
-/// FTP 协议仿真配置。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SimFtpConfig {
-    /// 220 欢迎 banner 文本。
-    pub banner: Option<String>,
-    /// 弱口令凭据列表。
-    pub credentials: Option<Vec<FtpCredential>>,
-    /// SYST 响应中的服务器系统名称。
-    pub server_name: Option<String>,
-    /// 是否允许匿名登录。
-    pub allow_anonymous: Option<bool>,
-}
 
 /// FTP 仿真运行器共享上下文。
 struct FtpSimulationContext {

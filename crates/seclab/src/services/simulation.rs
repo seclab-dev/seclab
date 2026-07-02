@@ -221,7 +221,8 @@ pub async fn undeploy_simulation_service(pool: &DbPool, instance_id: &str) -> Ap
 mod tests {
     use super::*;
     use crate::models::simulation::{
-        SimInstanceRecord, SimLogRecord, SimRuleRecord, get_sim_instance_by_id, get_sim_rule_by_id,
+        BUILTIN_SIM_RULE_MAX_ID, SimInstanceRecord, SimLogRecord, SimRuleRecord,
+        get_sim_instance_by_id, get_sim_rule_by_id, insert_custom_sim_rule_deduplicated,
         insert_sim_instance, insert_sim_log, insert_sim_rule, list_sim_logs_by_node,
         list_sim_rules,
     };
@@ -260,6 +261,72 @@ mod tests {
 
         let list = list_sim_rules(&pool).await.unwrap();
         assert!(!list.is_empty());
+    }
+
+    #[tokio::test]
+    async fn custom_rule_creation_uses_incremental_ids_and_deduplicates() {
+        let pool = setup_test_db().await;
+        let now = Utc::now().to_rfc3339();
+
+        let legacy_timestamp_rule = SimRuleRecord {
+            id: 1_782_972_862_272_802,
+            name: "Legacy Timestamp Rule".to_string(),
+            name_en: "Legacy Timestamp Rule".to_string(),
+            cve: None,
+            category: "custom".to_string(),
+            description_zh: "Legacy Timestamp Rule".to_string(),
+            description_en: "".to_string(),
+            protocol: "rdp".to_string(),
+            default_port: Some(3389),
+            config_yaml: r#"{"flags":9}"#.to_string(),
+            source_type: "custom".to_string(),
+            source_package_id: None,
+            rule_status: "active".to_string(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        insert_sim_rule(&pool, &legacy_timestamp_rule)
+            .await
+            .unwrap();
+
+        let first = SimRuleRecord {
+            id: 0,
+            name: "RDP Rule".to_string(),
+            name_en: "RDP Rule".to_string(),
+            cve: None,
+            category: "custom".to_string(),
+            description_zh: "RDP Rule".to_string(),
+            description_en: "".to_string(),
+            protocol: "rdp".to_string(),
+            default_port: Some(3389),
+            config_yaml: r#"{"flags":1}"#.to_string(),
+            source_type: "custom".to_string(),
+            source_package_id: None,
+            rule_status: "active".to_string(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+
+        let inserted = insert_custom_sim_rule_deduplicated(&pool, first.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(inserted.id, BUILTIN_SIM_RULE_MAX_ID + 1);
+
+        let duplicate = insert_custom_sim_rule_deduplicated(&pool, first, None)
+            .await
+            .unwrap();
+        assert_eq!(duplicate.id, inserted.id);
+
+        let second = SimRuleRecord {
+            id: 0,
+            name: "RDP Rule 2".to_string(),
+            config_yaml: r#"{"flags":2}"#.to_string(),
+            ..inserted.clone()
+        };
+        let inserted_second = insert_custom_sim_rule_deduplicated(&pool, second, None)
+            .await
+            .unwrap();
+        assert_eq!(inserted_second.id, BUILTIN_SIM_RULE_MAX_ID + 2);
     }
 
     #[tokio::test]

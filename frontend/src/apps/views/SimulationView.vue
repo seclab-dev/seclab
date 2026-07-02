@@ -16,10 +16,14 @@ import {
 import type { SecLabTableColumn } from '@/components/ui/SecLabTable.vue'
 import {
   simulationApi,
+  SIMULATION_PROTOCOL_DEFAULT_PORTS,
+  SIMULATION_PROTOCOL_OPTIONS,
   type SimRule,
   type SimInstance,
   type SimLog,
   type SimRulePackage,
+  type SimulationProtocolCapability,
+  type SimulationProtocol,
 } from '@/api/modules/simulation'
 import { nodesApi, type NodeSummaryResponse } from '@/api/modules/nodes'
 import { formatDateTime } from '@/utils/time'
@@ -75,6 +79,22 @@ const isLoading = ref(false)
 /** 仿真诱捕规则集合 */
 const rules = ref<SimRule[]>([])
 
+/** 主控返回的协议仿真能力清单，失败时使用前端内置兜底常量。 */
+const protocolCapabilities = ref<SimulationProtocolCapability[]>(
+  SIMULATION_PROTOCOL_OPTIONS.map((item) => ({
+    protocol: item.value,
+    label: item.label,
+    defaultPort: SIMULATION_PROTOCOL_DEFAULT_PORTS[item.value],
+    deployable: true,
+    customRuleCreatable: true,
+    eventTypes: [],
+  })),
+)
+
+const customRuleProtocolCapabilities = computed(() =>
+  protocolCapabilities.value.filter((item) => item.customRuleCreatable),
+)
+
 /** 规则列表分页：当前页码 */
 const rulesCurrentPage = ref(1)
 
@@ -101,14 +121,10 @@ const categoryFilterOptions = computed(() => [
 /** 协议类型筛选选项 */
 const protocolFilterOptions = computed(() => [
   { value: 'all', label: t('app.simulation.rules.filters.allProtocols') },
-  { value: 'http', label: 'HTTP' },
-  { value: 'redis', label: 'Redis' },
-  { value: 'smtp', label: 'SMTP' },
-  { value: 'pop3', label: 'POP3' },
-  { value: 'imap', label: 'IMAP' },
-  { value: 'ssh', label: 'SSH' },
-  { value: 'ftp', label: 'FTP' },
-  { value: 'rdp', label: 'RDP' },
+  ...protocolCapabilities.value.map((item) => ({
+    value: item.protocol,
+    label: item.label,
+  })),
 ])
 
 /** 根据检索条件过滤后的规则列表 */
@@ -360,6 +376,17 @@ const loadCurrentPackage = async () => {
 
 const triggerPackageUpload = () => {
   packageFileInput.value?.click()
+}
+
+const loadProtocols = async () => {
+  try {
+    const res = await simulationApi.listProtocols()
+    if (res.success && res.data && res.data.length > 0) {
+      protocolCapabilities.value = res.data
+    }
+  } catch {
+    // 保留前端内置协议能力作为兜底，避免接口异常阻断规则创建。
+  }
 }
 
 const handleUploadPackage = async (event: Event) => {
@@ -657,6 +684,7 @@ onMounted(() => {
   // 动态拼装用于与沙箱仿真配合的 SecLab 系统回调监听端点
   deployForm.value.callbackUrl = simulationApi.getCallbackUrl(window.location.origin)
 
+  void loadProtocols()
   void loadNodes()
   void loadCurrentPackage()
   void loadRules()
@@ -684,13 +712,22 @@ const toInstance = (row: unknown) => row as SimInstance
 
 /** 控制新建自定义规则弹窗（Dialog）的打开状态 */
 const isRuleDialogOpen = ref(false)
+const isCreatingRule = ref(false)
 
 /** 新建诱捕规则的数据表单模型 */
 const ruleForm = ref({
   name: '',
-  protocol: 'http',
+  protocol: 'http' as SimulationProtocol,
+  defaultPort: SIMULATION_PROTOCOL_DEFAULT_PORTS.http,
   serverHeader: 'nginx/1.24.0 (Ubuntu)',
   html: '',
+  banner: '',
+  hostname: 'mail.seclab.local',
+  requireAuth: false,
+  password: '',
+  serverName: 'UNIX Type: L8',
+  allowAnonymous: false,
+  rdpFlags: '',
 })
 
 interface ExploitPathForm {
@@ -700,8 +737,103 @@ interface ExploitPathForm {
   responseBody: string
 }
 
+interface KeyValueForm {
+  key: string
+  value: string
+}
+
+interface CommandResponseForm {
+  command: string
+  argsContains: string
+  response: string
+}
+
+interface CredentialForm {
+  username: string
+  password: string
+  displayName: string
+}
+
+interface MailMessageForm {
+  from: string
+  to: string
+  subject: string
+  body: string
+}
+
 /** 动态添加/删除的蜜罐特定触发蜜饵路径及其静态伪装响应内容数据模型 */
 const exploitPaths = ref<ExploitPathForm[]>([])
+const redisKeys = ref<KeyValueForm[]>([])
+const commandResponses = ref<CommandResponseForm[]>([])
+const credentials = ref<CredentialForm[]>([])
+const mailMessages = ref<MailMessageForm[]>([])
+
+const isHttpRuleForm = computed(() => ruleForm.value.protocol === 'http')
+const isRedisRuleForm = computed(() => ruleForm.value.protocol === 'redis')
+const isMailRuleForm = computed(() => ['smtp', 'pop3', 'imap'].includes(ruleForm.value.protocol))
+const isCredentialRuleForm = computed(() =>
+  ['smtp', 'pop3', 'imap', 'ssh', 'ftp', 'rdp'].includes(ruleForm.value.protocol),
+)
+const showBannerField = computed(() =>
+  ['redis', 'smtp', 'pop3', 'imap', 'ssh', 'ftp'].includes(ruleForm.value.protocol),
+)
+
+const currentProtocolDefaultPort = computed(() => getProtocolDefaultPort(ruleForm.value.protocol))
+
+const getProtocolDefaultPort = (protocol: SimulationProtocol) =>
+  protocolCapabilities.value.find((item) => item.protocol === protocol)?.defaultPort ??
+  SIMULATION_PROTOCOL_DEFAULT_PORTS[protocol]
+
+const ruleNamePlaceholder = computed(() => {
+  const key = `app.simulation.rules.namePlaceholders.${ruleForm.value.protocol}`
+  const label = t(key)
+  return label === key ? t('app.simulation.rules.fields.namePlaceholder') : label
+})
+
+const resetProtocolSpecificForm = (protocol: SimulationProtocol) => {
+  ruleForm.value.defaultPort = getProtocolDefaultPort(protocol)
+  ruleForm.value.serverHeader = 'nginx/1.24.0 (Ubuntu)'
+  ruleForm.value.html = ''
+  ruleForm.value.banner = defaultProtocolBanner(protocol)
+  ruleForm.value.hostname = 'mail.seclab.local'
+  ruleForm.value.requireAuth = ['redis', 'smtp', 'pop3', 'imap'].includes(protocol)
+  ruleForm.value.password = protocol === 'redis' ? 'redis123' : ''
+  ruleForm.value.serverName = 'UNIX Type: L8'
+  ruleForm.value.allowAnonymous = false
+  ruleForm.value.rdpFlags = protocol === 'rdp' ? '1' : ''
+  exploitPaths.value = []
+  redisKeys.value = []
+  commandResponses.value = []
+  credentials.value = isCredentialRuleForm.value
+    ? [{ username: defaultCredentialUsername(protocol), password: 'password', displayName: '' }]
+    : []
+  mailMessages.value = isMailRuleForm.value
+    ? [
+        {
+          from: 'alerts@seclab.local',
+          to: 'admin@seclab.local',
+          subject: 'Security Alert',
+          body: 'Suspicious login detected.',
+        },
+      ]
+    : []
+}
+
+const defaultProtocolBanner = (protocol: SimulationProtocol) => {
+  if (protocol === 'smtp') return '220 mail.seclab.local ESMTP'
+  if (protocol === 'pop3') return '+OK POP3 server ready'
+  if (protocol === 'imap') return '* OK IMAP4rev1 Service Ready'
+  if (protocol === 'ssh') return 'SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.1'
+  if (protocol === 'ftp') return 'ProFTPD 1.3.5e Server ready.'
+  if (protocol === 'redis') return 'Redis server ready'
+  return ''
+}
+
+const defaultCredentialUsername = (protocol: SimulationProtocol) => {
+  if (protocol === 'ssh') return 'root'
+  if (protocol === 'rdp') return 'administrator'
+  return 'admin'
+}
 
 /**
  * 重置表单状态，调起创建自定义仿真协议规则弹窗
@@ -710,12 +842,27 @@ const openNewRuleDialog = () => {
   ruleForm.value = {
     name: '',
     protocol: 'http',
+    defaultPort: SIMULATION_PROTOCOL_DEFAULT_PORTS.http,
     serverHeader: 'nginx/1.24.0 (Ubuntu)',
     html: '',
+    banner: '',
+    hostname: 'mail.seclab.local',
+    requireAuth: false,
+    password: '',
+    serverName: 'UNIX Type: L8',
+    allowAnonymous: false,
+    rdpFlags: '',
   }
-  exploitPaths.value = []
+  resetProtocolSpecificForm('http')
   isRuleDialogOpen.value = true
 }
+
+watch(
+  () => ruleForm.value.protocol,
+  (protocol) => {
+    resetProtocolSpecificForm(protocol)
+  },
+)
 
 /**
  * 为当前自定义规则的配置项动态新增一条漏洞模拟响应路径
@@ -737,19 +884,90 @@ const removeExploitPath = (index: number) => {
   exploitPaths.value.splice(index, 1)
 }
 
-/**
- * 向控制端提交创建新的诱捕仿真规则请求。
- * 转换前台模型数据至符合后端接口定义的 YAML/JSON 序列化配置结构。
- */
-const handleCreateRule = async () => {
-  if (!ruleForm.value.name) {
-    notificationStore.error(t('app.simulation.rules.messages.nameRequired'))
-    return
-  }
+const addRedisKey = () => {
+  redisKeys.value.push({ key: '', value: '' })
+}
 
-  isLoading.value = true
-  try {
-    const config = {
+const removeRedisKey = (index: number) => {
+  redisKeys.value.splice(index, 1)
+}
+
+const addCommandResponse = () => {
+  commandResponses.value.push({ command: '', argsContains: '', response: '' })
+}
+
+const removeCommandResponse = (index: number) => {
+  commandResponses.value.splice(index, 1)
+}
+
+const addCredential = () => {
+  credentials.value.push({
+    username: defaultCredentialUsername(ruleForm.value.protocol),
+    password: '',
+    displayName: '',
+  })
+}
+
+const removeCredential = (index: number) => {
+  credentials.value.splice(index, 1)
+}
+
+const addMailMessage = () => {
+  mailMessages.value.push({
+    from: 'alerts@seclab.local',
+    to: 'admin@seclab.local',
+    subject: '',
+    body: '',
+  })
+}
+
+const removeMailMessage = (index: number) => {
+  mailMessages.value.splice(index, 1)
+}
+
+const buildCredentialsConfig = () =>
+  credentials.value
+    .filter((item) => item.username || item.password)
+    .map((item) => ({
+      username: item.username,
+      password: item.password,
+      display_name: item.displayName || undefined,
+    }))
+
+const buildCommandResponsesConfig = () =>
+  commandResponses.value
+    .filter((item) => item.command && item.response)
+    .map((item) => ({
+      command: item.command,
+      args_contains: item.argsContains
+        ? item.argsContains
+            .split(',')
+            .map((value) => value.trim())
+            .filter(Boolean)
+        : undefined,
+      response: item.response,
+      event_type: 'exploit_attempt',
+    }))
+
+const buildMailMessagesConfig = () =>
+  mailMessages.value
+    .filter((item) => item.subject || item.body)
+    .map((item, index) => ({
+      uid: String(index + 1),
+      from: item.from || 'alerts@seclab.local',
+      to: item.to
+        .split(',')
+        .map((value) => value.trim())
+        .filter(Boolean),
+      subject: item.subject,
+      body: item.body,
+      flags: [],
+    }))
+
+const buildRuleConfig = () => {
+  const protocol = ruleForm.value.protocol
+  if (protocol === 'http') {
+    return {
       server_header: ruleForm.value.serverHeader || undefined,
       html: ruleForm.value.html || undefined,
       exploit_paths: exploitPaths.value.map((ep) => ({
@@ -759,10 +977,97 @@ const handleCreateRule = async () => {
         response_body: ep.responseBody,
       })),
     }
+  }
 
+  if (protocol === 'redis') {
+    const keys = Object.fromEntries(
+      redisKeys.value.filter((item) => item.key).map((item) => [item.key, item.value]),
+    )
+    return {
+      banner: ruleForm.value.banner || undefined,
+      require_auth: ruleForm.value.requireAuth,
+      password: ruleForm.value.password || undefined,
+      keys,
+      command_responses: buildCommandResponsesConfig(),
+    }
+  }
+
+  if (protocol === 'smtp') {
+    return {
+      banner: ruleForm.value.banner || undefined,
+      hostname: ruleForm.value.hostname || undefined,
+      require_auth: ruleForm.value.requireAuth,
+      credentials: buildCredentialsConfig(),
+      custom_responses: buildCommandResponsesConfig(),
+    }
+  }
+
+  if (protocol === 'pop3') {
+    return {
+      banner: ruleForm.value.banner || undefined,
+      require_auth: ruleForm.value.requireAuth,
+      credentials: buildCredentialsConfig(),
+      messages: buildMailMessagesConfig(),
+      custom_responses: buildCommandResponsesConfig(),
+    }
+  }
+
+  if (protocol === 'imap') {
+    const messages = buildMailMessagesConfig()
+    return {
+      banner: ruleForm.value.banner || undefined,
+      require_auth: ruleForm.value.requireAuth,
+      credentials: buildCredentialsConfig(),
+      mailboxes: {
+        INBOX: messages,
+      },
+      messages,
+      custom_responses: buildCommandResponsesConfig(),
+    }
+  }
+
+  if (protocol === 'ssh') {
+    return {
+      banner: ruleForm.value.banner || undefined,
+      credentials: buildCredentialsConfig(),
+    }
+  }
+
+  if (protocol === 'ftp') {
+    return {
+      banner: ruleForm.value.banner || undefined,
+      credentials: buildCredentialsConfig(),
+      server_name: ruleForm.value.serverName || undefined,
+      allow_anonymous: ruleForm.value.allowAnonymous,
+    }
+  }
+
+  return {
+    flags: parseInt(ruleForm.value.rdpFlags, 10) || undefined,
+    credentials: buildCredentialsConfig(),
+  }
+}
+
+/**
+ * 向控制端提交创建新的诱捕仿真规则请求。
+ * 转换前台模型数据至符合后端接口定义的 YAML/JSON 序列化配置结构。
+ */
+const handleCreateRule = async () => {
+  if (isCreatingRule.value) return
+
+  if (!ruleForm.value.name) {
+    notificationStore.error(t('app.simulation.rules.messages.nameRequired'))
+    return
+  }
+
+  isCreatingRule.value = true
+  isLoading.value = true
+  try {
+    const config = buildRuleConfig()
     const res = await simulationApi.createRule({
       name: ruleForm.value.name,
-      protocol: 'http',
+      protocol: ruleForm.value.protocol,
+      defaultPort: ruleForm.value.defaultPort || currentProtocolDefaultPort.value,
       configYaml: JSON.stringify(config),
     })
 
@@ -776,6 +1081,7 @@ const handleCreateRule = async () => {
   } catch {
     notificationStore.error(t('app.simulation.rules.messages.createError'))
   } finally {
+    isCreatingRule.value = false
     isLoading.value = false
   }
 }
@@ -1109,7 +1415,12 @@ const getCategoryTagType = (category: string) => {
 }
 
 /** 当前支持的仿真网络协议族源下拉框选项 */
-const protocolOptions = [{ value: 'http', label: 'HTTP' }]
+const protocolOptions = computed(() =>
+  customRuleProtocolCapabilities.value.map((item) => ({
+    value: item.protocol,
+    label: item.label,
+  })),
+)
 
 /** 自定义仿真规则触发路径中的支持匹配方法 */
 const methodOptions = computed(() => [
@@ -1710,23 +2021,46 @@ const handleDownloadPcap = async (row: SimInstance) => {
           <h4>{{ t('app.simulation.rules.title') }}</h4>
           <div class="form-group">
             <label>{{ t('app.simulation.rules.fields.name') }}</label>
-            <SecLabInput
-              v-model="ruleForm.name"
-              :placeholder="t('app.simulation.rules.fields.namePlaceholder')"
-            />
+            <SecLabInput v-model="ruleForm.name" :placeholder="ruleNamePlaceholder" />
           </div>
           <div class="form-group">
             <label>{{ t('app.simulation.rules.fields.protocol') }}</label>
-            <SecLabSelect v-model="ruleForm.protocol" :options="protocolOptions" disabled />
+            <SecLabSelect
+              v-model="ruleForm.protocol"
+              :options="protocolOptions"
+              data-ui="simulation-rule-protocol-select"
+            />
           </div>
           <div class="form-group">
+            <label>{{ t('app.simulation.rules.fields.defaultPort') }}</label>
+            <SecLabInput
+              v-model="ruleForm.defaultPort"
+              type="number"
+              :placeholder="String(currentProtocolDefaultPort)"
+            />
+          </div>
+          <div v-if="showBannerField" class="form-group">
+            <label>{{ t('app.simulation.rules.fields.banner') }}</label>
+            <SecLabInput
+              v-model="ruleForm.banner"
+              :placeholder="t('app.simulation.rules.fields.bannerPlaceholder')"
+            />
+          </div>
+          <div v-if="isMailRuleForm" class="form-group">
+            <label>{{ t('app.simulation.rules.fields.hostname') }}</label>
+            <SecLabInput
+              v-model="ruleForm.hostname"
+              :placeholder="t('app.simulation.rules.fields.hostnamePlaceholder')"
+            />
+          </div>
+          <div v-if="isHttpRuleForm" class="form-group">
             <label>{{ t('app.simulation.rules.fields.serverHeader') }}</label>
             <SecLabInput
               v-model="ruleForm.serverHeader"
               :placeholder="t('app.simulation.rules.fields.serverHeaderPlaceholder')"
             />
           </div>
-          <div class="form-group">
+          <div v-if="isHttpRuleForm" class="form-group">
             <label>{{ t('app.simulation.rules.fields.html') }}</label>
             <textarea
               v-model="ruleForm.html"
@@ -1734,10 +2068,52 @@ const handleDownloadPcap = async (row: SimInstance) => {
               :placeholder="t('app.simulation.rules.fields.htmlPlaceholder')"
             ></textarea>
           </div>
+          <div v-if="isRedisRuleForm" class="form-group">
+            <label>{{ t('app.simulation.rules.fields.requireAuth') }}</label>
+            <div class="inline-check-row">
+              <SecLabCheckbox
+                :model-value="ruleForm.requireAuth"
+                @change="(val) => (ruleForm.requireAuth = val)"
+              />
+              <span>{{ t('app.simulation.rules.fields.requireAuthHint') }}</span>
+            </div>
+          </div>
+          <div v-if="isRedisRuleForm && ruleForm.requireAuth" class="form-group">
+            <label>{{ t('app.simulation.rules.fields.password') }}</label>
+            <SecLabInput
+              v-model="ruleForm.password"
+              :placeholder="t('app.simulation.rules.fields.passwordPlaceholder')"
+            />
+          </div>
+          <div v-if="ruleForm.protocol === 'ftp'" class="form-group">
+            <label>{{ t('app.simulation.rules.fields.serverName') }}</label>
+            <SecLabInput
+              v-model="ruleForm.serverName"
+              :placeholder="t('app.simulation.rules.fields.serverNamePlaceholder')"
+            />
+          </div>
+          <div v-if="ruleForm.protocol === 'ftp'" class="form-group">
+            <label>{{ t('app.simulation.rules.fields.allowAnonymous') }}</label>
+            <div class="inline-check-row">
+              <SecLabCheckbox
+                :model-value="ruleForm.allowAnonymous"
+                @change="(val) => (ruleForm.allowAnonymous = val)"
+              />
+              <span>{{ t('app.simulation.rules.fields.allowAnonymousHint') }}</span>
+            </div>
+          </div>
+          <div v-if="ruleForm.protocol === 'rdp'" class="form-group">
+            <label>{{ t('app.simulation.rules.fields.rdpFlags') }}</label>
+            <SecLabInput
+              v-model="ruleForm.rdpFlags"
+              type="number"
+              :placeholder="t('app.simulation.rules.fields.rdpFlagsPlaceholder')"
+            />
+          </div>
         </div>
 
         <!-- 漏洞路由添加 -->
-        <div class="section-card card-box">
+        <div v-if="isHttpRuleForm" class="section-card card-box">
           <div class="drawer-card-header" data-slot="header">
             <h4>{{ t('app.simulation.rules.exploitPaths.title') }}</h4>
             <SecLabButton type="secondary" size="small" @click="addExploitPath">
@@ -1788,6 +2164,194 @@ const handleDownloadPcap = async (row: SimInstance) => {
             </div>
           </div>
         </div>
+
+        <div v-if="isRedisRuleForm" class="section-card card-box">
+          <div class="drawer-card-header" data-slot="header">
+            <h4>{{ t('app.simulation.rules.redisKeys.title') }}</h4>
+            <SecLabButton type="secondary" size="small" @click="addRedisKey">
+              + {{ t('app.simulation.rules.redisKeys.addBtn') }}
+            </SecLabButton>
+          </div>
+          <div class="protocol-list">
+            <div
+              v-for="(item, idx) in redisKeys"
+              :key="idx"
+              class="protocol-list-item card-box border-dashed"
+            >
+              <div class="card-title flex-layout flex-between">
+                <h5>{{ t('app.simulation.rules.redisKeys.itemTitle') }} #{{ idx + 1 }}</h5>
+                <SecLabButton type="danger" size="small" @click="removeRedisKey(idx)">
+                  {{ t('common.delete') }}
+                </SecLabButton>
+              </div>
+              <div class="flex-layout gap-layout">
+                <div class="form-group flex-1">
+                  <label>{{ t('app.simulation.rules.redisKeys.key') }}</label>
+                  <SecLabInput
+                    v-model="item.key"
+                    :placeholder="t('app.simulation.rules.redisKeys.keyPlaceholder')"
+                  />
+                </div>
+                <div class="form-group flex-1">
+                  <label>{{ t('app.simulation.rules.redisKeys.value') }}</label>
+                  <SecLabInput
+                    v-model="item.value"
+                    :placeholder="t('app.simulation.rules.redisKeys.valuePlaceholder')"
+                  />
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div v-if="isCredentialRuleForm" class="section-card card-box">
+          <div class="drawer-card-header" data-slot="header">
+            <h4>{{ t('app.simulation.rules.credentials.title') }}</h4>
+            <SecLabButton type="secondary" size="small" @click="addCredential">
+              + {{ t('app.simulation.rules.credentials.addBtn') }}
+            </SecLabButton>
+          </div>
+          <div class="protocol-list">
+            <div
+              v-for="(item, idx) in credentials"
+              :key="idx"
+              class="protocol-list-item card-box border-dashed"
+            >
+              <div class="card-title flex-layout flex-between">
+                <h5>{{ t('app.simulation.rules.credentials.itemTitle') }} #{{ idx + 1 }}</h5>
+                <SecLabButton type="danger" size="small" @click="removeCredential(idx)">
+                  {{ t('common.delete') }}
+                </SecLabButton>
+              </div>
+              <div class="flex-layout gap-layout">
+                <div class="form-group flex-1">
+                  <label>{{ t('app.simulation.rules.credentials.username') }}</label>
+                  <SecLabInput
+                    v-model="item.username"
+                    :placeholder="t('app.simulation.rules.credentials.usernamePlaceholder')"
+                  />
+                </div>
+                <div class="form-group flex-1">
+                  <label>{{ t('app.simulation.rules.credentials.password') }}</label>
+                  <SecLabInput
+                    v-model="item.password"
+                    :placeholder="t('app.simulation.rules.credentials.passwordPlaceholder')"
+                  />
+                </div>
+              </div>
+              <div v-if="isMailRuleForm" class="form-group">
+                <label>{{ t('app.simulation.rules.credentials.displayName') }}</label>
+                <SecLabInput
+                  v-model="item.displayName"
+                  :placeholder="t('app.simulation.rules.credentials.displayNamePlaceholder')"
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div v-if="isMailRuleForm" class="section-card card-box">
+          <div class="drawer-card-header" data-slot="header">
+            <h4>{{ t('app.simulation.rules.mailMessages.title') }}</h4>
+            <SecLabButton type="secondary" size="small" @click="addMailMessage">
+              + {{ t('app.simulation.rules.mailMessages.addBtn') }}
+            </SecLabButton>
+          </div>
+          <div class="protocol-list">
+            <div
+              v-for="(item, idx) in mailMessages"
+              :key="idx"
+              class="protocol-list-item card-box border-dashed"
+            >
+              <div class="card-title flex-layout flex-between">
+                <h5>{{ t('app.simulation.rules.mailMessages.itemTitle') }} #{{ idx + 1 }}</h5>
+                <SecLabButton type="danger" size="small" @click="removeMailMessage(idx)">
+                  {{ t('common.delete') }}
+                </SecLabButton>
+              </div>
+              <div class="flex-layout gap-layout">
+                <div class="form-group flex-1">
+                  <label>{{ t('app.simulation.rules.mailMessages.from') }}</label>
+                  <SecLabInput
+                    v-model="item.from"
+                    :placeholder="t('app.simulation.rules.mailMessages.fromPlaceholder')"
+                  />
+                </div>
+                <div class="form-group flex-1">
+                  <label>{{ t('app.simulation.rules.mailMessages.to') }}</label>
+                  <SecLabInput
+                    v-model="item.to"
+                    :placeholder="t('app.simulation.rules.mailMessages.toPlaceholder')"
+                  />
+                </div>
+              </div>
+              <div class="form-group">
+                <label>{{ t('app.simulation.rules.mailMessages.subject') }}</label>
+                <SecLabInput
+                  v-model="item.subject"
+                  :placeholder="t('app.simulation.rules.mailMessages.subjectPlaceholder')"
+                />
+              </div>
+              <div class="form-group">
+                <label>{{ t('app.simulation.rules.mailMessages.body') }}</label>
+                <textarea
+                  v-model="item.body"
+                  class="textarea-input-sm"
+                  :placeholder="t('app.simulation.rules.mailMessages.bodyPlaceholder')"
+                ></textarea>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div v-if="isRedisRuleForm || isMailRuleForm" class="section-card card-box">
+          <div class="drawer-card-header" data-slot="header">
+            <h4>{{ t('app.simulation.rules.commandResponses.title') }}</h4>
+            <SecLabButton type="secondary" size="small" @click="addCommandResponse">
+              + {{ t('app.simulation.rules.commandResponses.addBtn') }}
+            </SecLabButton>
+          </div>
+          <div class="protocol-list">
+            <div
+              v-for="(item, idx) in commandResponses"
+              :key="idx"
+              class="protocol-list-item card-box border-dashed"
+            >
+              <div class="card-title flex-layout flex-between">
+                <h5>{{ t('app.simulation.rules.commandResponses.itemTitle') }} #{{ idx + 1 }}</h5>
+                <SecLabButton type="danger" size="small" @click="removeCommandResponse(idx)">
+                  {{ t('common.delete') }}
+                </SecLabButton>
+              </div>
+              <div class="flex-layout gap-layout">
+                <div class="form-group flex-1">
+                  <label>{{ t('app.simulation.rules.commandResponses.command') }}</label>
+                  <SecLabInput
+                    v-model="item.command"
+                    :placeholder="t('app.simulation.rules.commandResponses.commandPlaceholder')"
+                  />
+                </div>
+                <div class="form-group flex-1">
+                  <label>{{ t('app.simulation.rules.commandResponses.argsContains') }}</label>
+                  <SecLabInput
+                    v-model="item.argsContains"
+                    :placeholder="
+                      t('app.simulation.rules.commandResponses.argsContainsPlaceholder')
+                    "
+                  />
+                </div>
+              </div>
+              <div class="form-group">
+                <label>{{ t('app.simulation.rules.commandResponses.response') }}</label>
+                <textarea
+                  v-model="item.response"
+                  class="textarea-input-sm"
+                  :placeholder="t('app.simulation.rules.commandResponses.responsePlaceholder')"
+                ></textarea>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
 
       <template #footer>
@@ -1795,7 +2359,7 @@ const handleDownloadPcap = async (row: SimInstance) => {
           <SecLabButton type="secondary" @click="isRuleDialogOpen = false">
             {{ t('confirmation.cancel') }}
           </SecLabButton>
-          <SecLabButton type="primary" @click="handleCreateRule">
+          <SecLabButton type="primary" :disabled="isCreatingRule" @click="handleCreateRule">
             {{ t('common.create') }}
           </SecLabButton>
         </div>
@@ -2236,6 +2800,31 @@ const handleDownloadPcap = async (row: SimInstance) => {
   display: flex;
   flex-direction: column;
   gap: var(--sdl-space-4);
+}
+
+.protocol-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sdl-space-4);
+}
+
+.protocol-list-item {
+  position: relative;
+}
+
+.protocol-list-item h5 {
+  margin: 0 0 12px;
+  font-size: 13px;
+  color: var(--sdl-text-primary);
+  font-weight: 600;
+}
+
+.inline-check-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sdl-space-2);
+  color: var(--sdl-text-secondary);
+  font-size: 13px;
 }
 
 .exploit-path-card {

@@ -1,28 +1,16 @@
 //! SMTP 协议仿真运行器。
 
 use super::mail_common::{
-    MailCredential, MailCustomResponse, credentials_match, custom_response, decode_auth_plain,
-    decode_base64_text, read_line, report_mail_command, report_mail_connection, write_line,
+    MailCredential, credentials_match, custom_response, decode_auth_plain, decode_base64_text,
+    read_line, report_mail_command, report_mail_connection, write_line,
 };
-use serde::{Deserialize, Serialize};
+use seclab_contracts::simulation::SimSmtpConfig;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::BufReader;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::oneshot;
 use tracing::{error, info};
-
-/// SMTP 协议仿真配置。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SimSmtpConfig {
-    pub banner: Option<String>,
-    pub hostname: Option<String>,
-    pub require_auth: Option<bool>,
-    pub credentials: Option<Vec<MailCredential>>,
-    pub capabilities: Option<Vec<String>>,
-    pub accepted_recipients: Option<Vec<String>>,
-    pub custom_responses: Option<Vec<MailCustomResponse>>,
-}
 
 struct SmtpContext {
     rule_id: String,

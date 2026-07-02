@@ -3,39 +3,9 @@
 use super::common::{SimLogDraft, report_sim_log_async};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+pub use seclab_contracts::simulation::{MailCredential, MailCustomResponse, MailMessage};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-
-/// 邮件协议静态认证凭据。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct MailCredential {
-    pub username: String,
-    pub password: String,
-    pub display_name: Option<String>,
-}
-
-/// 邮件协议静态邮件数据。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct MailMessage {
-    pub uid: Option<String>,
-    pub from: String,
-    pub to: Vec<String>,
-    pub subject: String,
-    pub date: Option<String>,
-    pub body: String,
-    pub flags: Option<Vec<String>>,
-}
-
-/// 邮件协议自定义命令响应。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct MailCustomResponse {
-    pub command: String,
-    pub args_contains: Option<Vec<String>>,
-    pub response: String,
-    pub event_type: Option<String>,
-}
 
 /// 按 CRLF 行协议读取一行输入。
 pub(super) async fn read_line(
@@ -205,6 +175,3 @@ pub(super) fn report_mail_command(
         },
     );
 }
-
-/// 静态邮箱字典类型。
-pub type Mailboxes = HashMap<String, Vec<MailMessage>>;

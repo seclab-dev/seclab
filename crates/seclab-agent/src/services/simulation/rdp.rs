@@ -6,28 +6,12 @@
 //! 不实现完整的 MCS/Security Exchange/认证流程。
 
 use super::common::{SimLogDraft, report_sim_log_async};
-use serde::{Deserialize, Serialize};
+use seclab_contracts::simulation::SimRdpConfig;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::oneshot;
 use tracing::{error, info};
-
-/// RDP 弱口令凭据（保留字段，初版不用于交互校验）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RdpCredential {
-    pub username: String,
-    pub password: String,
-}
-
-/// RDP 协议仿真配置。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SimRdpConfig {
-    /// X.224 协商 flags（保留字段）。
-    pub flags: Option<u32>,
-    /// 弱口令凭据列表（保留字段，初版不用于交互校验）。
-    pub credentials: Option<Vec<RdpCredential>>,
-}
 
 /// RDP 仿真运行器共享上下文。
 struct RdpSimulationContext {

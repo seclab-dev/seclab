@@ -1,28 +1,15 @@
 //! IMAP 协议仿真运行器。
 
 use super::mail_common::{
-    MailCredential, MailCustomResponse, MailMessage, Mailboxes, credentials_match, custom_response,
-    decode_auth_plain, imap_flags, read_line, report_mail_command, report_mail_connection,
-    rfc822_message, write_line, write_raw,
+    MailMessage, credentials_match, custom_response, decode_auth_plain, imap_flags, read_line,
+    report_mail_command, report_mail_connection, rfc822_message, write_line, write_raw,
 };
-use serde::{Deserialize, Serialize};
+use seclab_contracts::simulation::SimImapConfig;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::BufReader;
 use tokio::sync::oneshot;
 use tracing::{error, info};
-
-/// IMAP 协议仿真配置。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SimImapConfig {
-    pub banner: Option<String>,
-    pub require_auth: Option<bool>,
-    pub credentials: Option<Vec<MailCredential>>,
-    pub capabilities: Option<Vec<String>>,
-    pub mailboxes: Option<Mailboxes>,
-    pub messages: Option<Vec<MailMessage>>,
-    pub custom_responses: Option<Vec<MailCustomResponse>>,
-}
 
 struct ImapContext {
     rule_id: String,

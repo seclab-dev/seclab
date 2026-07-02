@@ -9,30 +9,11 @@ use axum::{
     response::{IntoResponse, Response},
     routing::any,
 };
-use std::collections::HashMap;
+use seclab_contracts::simulation::SimHttpConfig;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::info;
-
-/// HTTP 仿真漏洞路径配置。
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ExploitPathConfig {
-    pub path: String,
-    pub trigger_method: Option<String>, // 若为 None，则匹配所有方法
-    pub response_status: u16,
-    pub response_body: String,
-    pub response_headers: Option<HashMap<String, String>>,
-}
-
-/// HTTP 仿真总体 YAML 配置。
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SimHttpConfig {
-    pub server_header: Option<String>,
-    pub headers: Option<HashMap<String, String>>,
-    pub html: Option<String>,
-    pub exploit_paths: Option<Vec<ExploitPathConfig>>,
-}
 
 /// 全局共享的 HTTP 仿真参数，由 Axum 路由 Handler 消费。
 struct SimulationContext {

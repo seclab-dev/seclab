@@ -2,14 +2,17 @@
 
 use crate::api::auth::AuthenticatedAdmin;
 use crate::models::simulation::{
-    SimLogRecord, SimRuleRecord, count_all_sim_logs, count_sim_logs_by_node, delete_sim_rule,
-    get_sim_instance_by_id, get_sim_rule_by_id, insert_sim_log, insert_sim_rule,
-    list_all_sim_instances, list_all_sim_logs_paginated, list_sim_instances_by_node,
-    list_sim_logs_by_node_paginated, list_sim_rules, update_sim_log_pcap,
+    BUILTIN_SIM_RULE_MAX_ID, SimLogRecord, SimRuleRecord, count_all_sim_logs,
+    count_sim_logs_by_node, delete_sim_rule, get_sim_instance_by_id, get_sim_rule_by_id,
+    insert_custom_sim_rule_deduplicated, insert_sim_log, list_all_sim_instances,
+    list_all_sim_logs_paginated, list_sim_instances_by_node, list_sim_logs_by_node_paginated,
+    list_sim_rules, update_sim_log_pcap,
 };
 use crate::services::logging::PlatformLogEntry;
 use crate::services::simulation::{deploy_simulation_service, undeploy_simulation_service};
-use crate::services::simulation_protocols::{custom_rule_protocols_label, is_custom_rule_protocol};
+use crate::services::simulation_protocols::{
+    custom_rule_protocols_label, is_custom_rule_protocol, list_simulation_protocols,
+};
 use crate::state::AppState;
 use crate::types::{ApiError, ApiResponse, ApiResult};
 use axum::{
@@ -20,12 +23,14 @@ use axum::{
     routing::{delete, get, post},
 };
 use chrono::Utc;
+use seclab_contracts::simulation::{
+    SimulationEventType, SimulationProtocol, SimulationProtocolCapability, parse_simulation_config,
+};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 
-const BUILTIN_SIM_RULE_MAX_ID: i64 = 999_999;
-const CUSTOM_SIM_RULE_ID_BASE: i64 = 1_000_000;
 const SIM_RULE_PACKAGE_EXTENSION: &str = ".slrp";
 
 // --- 请求与响应载荷结构定义 ---
@@ -44,6 +49,29 @@ pub struct SimLogListResponse {
     pub page: i32,
     pub page_size: i32,
     pub records: Vec<SimLogRecord>,
+}
+
+/// 将协议能力注册表转换为 API 响应载荷。
+fn simulation_protocol_responses() -> Vec<SimulationProtocolCapability> {
+    list_simulation_protocols()
+        .iter()
+        .map(|item| SimulationProtocolCapability {
+            protocol: SimulationProtocol::from_str(item.protocol)
+                .expect("simulation protocol registry must use contract protocol identifiers"),
+            label: item.label.to_string(),
+            default_port: item.default_port,
+            deployable: item.deployable,
+            custom_rule_creatable: item.custom_rule_creatable,
+            event_types: item
+                .event_types
+                .iter()
+                .map(|event_type| {
+                    SimulationEventType::from_str(event_type)
+                        .expect("simulation protocol registry must use contract event identifiers")
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>()
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,7 +117,47 @@ pub struct ReportSimLogRequest {
     pub payload_hex: Option<String>,
 }
 
+/// 校验自定义仿真规则配置必须是可被 Agent 解析的协议 JSON 对象。
+fn validate_custom_rule_config(protocol: &str, config_yaml: &str) -> ApiResult<()> {
+    let value: serde_json::Value = serde_json::from_str(config_yaml).map_err(|err| {
+        ApiError::BadRequest(format!(
+            "Invalid {} simulation config JSON: {}",
+            protocol.to_uppercase(),
+            err
+        ))
+    })?;
+
+    if !value.is_object() {
+        return Err(ApiError::BadRequest(format!(
+            "{} simulation config must be a JSON object.",
+            protocol.to_uppercase()
+        )));
+    }
+
+    let protocol_kind = SimulationProtocol::from_str(protocol)
+        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+
+    parse_simulation_config(protocol_kind, value).map_err(|err| {
+        ApiError::BadRequest(format!(
+            "Invalid {} simulation config: {}",
+            protocol.to_uppercase(),
+            err
+        ))
+    })?;
+
+    Ok(())
+}
+
 // --- 控制端管理接口处理器 ---
+
+/// 列出主控当前认识的协议仿真能力。
+pub async fn list_protocols_handler() -> ApiResult<impl IntoResponse> {
+    Ok(ApiResponse::success_with_raw(
+        "Simulation protocols loaded",
+        simulation_protocol_responses(),
+    )
+    .into_response())
+}
 
 /// 创建仿真规则。
 pub async fn create_rule_handler(
@@ -102,21 +170,18 @@ pub async fn create_rule_handler(
             custom_rule_protocols_label()
         )));
     }
+    validate_custom_rule_config(&payload.protocol, &payload.config_yaml)?;
 
-    let now = Utc::now().to_rfc3339();
-    let custom_id = payload.id.unwrap_or_else(|| {
-        // 自动分配 1,000,000+ ID，避开所有内置协议规则保留区间。
-        CUSTOM_SIM_RULE_ID_BASE + Utc::now().timestamp_micros()
-    });
-    if custom_id <= BUILTIN_SIM_RULE_MAX_ID {
+    if payload.id.is_some_and(|id| id <= BUILTIN_SIM_RULE_MAX_ID) {
         return Err(ApiError::BadRequest(format!(
             "Custom simulation rule id must be greater than {}.",
             BUILTIN_SIM_RULE_MAX_ID
         )));
     }
 
+    let now = Utc::now().to_rfc3339();
     let record = SimRuleRecord {
-        id: custom_id,
+        id: payload.id.unwrap_or(BUILTIN_SIM_RULE_MAX_ID + 1),
         name: payload.name.clone(),
         name_en: payload.name_en.unwrap_or_else(|| payload.name.clone()),
         cve: payload.cve,
@@ -135,7 +200,7 @@ pub async fn create_rule_handler(
         updated_at: now,
     };
 
-    insert_sim_rule(&state.metadata_db, &record)
+    let record = insert_custom_sim_rule_deduplicated(&state.metadata_db, record, payload.id)
         .await
         .map_err(|err| ApiError::Internal(err.to_string()))?;
 
@@ -901,6 +966,7 @@ pub async fn report_sim_pcap_handler(
 
 pub fn simulation_router() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/protocols", get(list_protocols_handler))
         .route("/rule", post(create_rule_handler))
         .route("/rules", get(list_rules_handler))
         .route("/rule/{id}", delete(delete_rule_handler))
@@ -932,4 +998,74 @@ pub fn simulation_public_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/log", post(report_sim_log_handler))
         .route("/pcap", post(report_sim_pcap_handler))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simulation_protocol_responses_match_registered_capabilities() {
+        let responses = simulation_protocol_responses();
+
+        assert_eq!(responses.len(), list_simulation_protocols().len());
+        assert!(
+            responses
+                .iter()
+                .any(|item| item.protocol == SimulationProtocol::Redis)
+        );
+        assert!(responses.iter().all(|item| item.custom_rule_creatable));
+
+        let first = serde_json::to_value(&responses[0]).unwrap();
+        assert!(first.get("defaultPort").is_some());
+        assert!(first.get("customRuleCreatable").is_some());
+        assert!(first.get("eventTypes").is_some());
+    }
+
+    #[test]
+    fn validate_custom_rule_config_accepts_minimal_protocol_configs() {
+        let cases = [
+            ("http", r#"{"server_header":"nginx","exploit_paths":[]}"#),
+            (
+                "redis",
+                r#"{"require_auth":true,"password":"redis123","keys":{"session":"admin"}}"#,
+            ),
+            (
+                "smtp",
+                r#"{"hostname":"mail.seclab.local","credentials":[{"username":"admin","password":"password"}]}"#,
+            ),
+            (
+                "pop3",
+                r#"{"messages":[{"from":"alerts@seclab.local","to":["admin@seclab.local"],"subject":"Alert","body":"Body"}]}"#,
+            ),
+            (
+                "imap",
+                r#"{"mailboxes":{"INBOX":[{"from":"alerts@seclab.local","to":["admin@seclab.local"],"subject":"Alert","body":"Body"}]}}"#,
+            ),
+            (
+                "ssh",
+                r#"{"banner":"SSH-2.0-OpenSSH_8.9","credentials":[{"username":"root","password":"toor"}]}"#,
+            ),
+            (
+                "ftp",
+                r#"{"server_name":"UNIX Type: L8","allow_anonymous":false,"credentials":[{"username":"admin","password":"password"}]}"#,
+            ),
+            (
+                "rdp",
+                r#"{"flags":1,"credentials":[{"username":"administrator","password":"Password123"}]}"#,
+            ),
+        ];
+
+        for (protocol, config) in cases {
+            validate_custom_rule_config(protocol, config)
+                .unwrap_or_else(|err| panic!("{} config should be valid: {}", protocol, err));
+        }
+    }
+
+    #[test]
+    fn validate_custom_rule_config_rejects_invalid_json_shape() {
+        assert!(validate_custom_rule_config("http", "[]").is_err());
+        assert!(validate_custom_rule_config("redis", r#"{"keys":[]}"#).is_err());
+        assert!(validate_custom_rule_config("rdp", r#"{"flags":"tls"}"#).is_err());
+    }
 }

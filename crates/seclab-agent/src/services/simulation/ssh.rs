@@ -5,28 +5,12 @@
 //! 不实现完整的密钥交换和加密通道。
 
 use super::common::{SimLogDraft, report_sim_log_async};
-use serde::{Deserialize, Serialize};
+use seclab_contracts::simulation::SimSshConfig;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::oneshot;
 use tracing::{error, info};
-
-/// SSH 弱口令凭据。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SshCredential {
-    pub username: String,
-    pub password: String,
-}
-
-/// SSH 协议仿真配置。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SimSshConfig {
-    /// SSH 版本字符串，默认 "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.1"。
-    pub banner: Option<String>,
-    /// 弱口令凭据列表（保留字段，用于后续完整认证交互）。
-    pub credentials: Option<Vec<SshCredential>>,
-}
 
 /// SSH 仿真运行器共享上下文。
 struct SshSimulationContext {

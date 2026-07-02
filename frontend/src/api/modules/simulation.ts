@@ -1,6 +1,39 @@
 import http from '@/api'
 import { DEFAULT_CONTROLLER_PORT } from '@/utils/constants'
 
+export type SimulationProtocol = 'http' | 'redis' | 'smtp' | 'pop3' | 'imap' | 'ssh' | 'ftp' | 'rdp'
+
+export const SIMULATION_PROTOCOL_OPTIONS: { value: SimulationProtocol; label: string }[] = [
+  { value: 'http', label: 'HTTP' },
+  { value: 'redis', label: 'Redis' },
+  { value: 'smtp', label: 'SMTP' },
+  { value: 'pop3', label: 'POP3' },
+  { value: 'imap', label: 'IMAP' },
+  { value: 'ssh', label: 'SSH' },
+  { value: 'ftp', label: 'FTP' },
+  { value: 'rdp', label: 'RDP' },
+]
+
+export const SIMULATION_PROTOCOL_DEFAULT_PORTS: Record<SimulationProtocol, number> = {
+  http: 8080,
+  redis: 6379,
+  smtp: 25,
+  pop3: 110,
+  imap: 143,
+  ssh: 22,
+  ftp: 21,
+  rdp: 3389,
+}
+
+export interface SimulationProtocolCapability {
+  protocol: SimulationProtocol
+  label: string
+  defaultPort: number
+  deployable: boolean
+  customRuleCreatable: boolean
+  eventTypes: string[]
+}
+
 export interface SimRule {
   id: number
   name: string
@@ -75,6 +108,9 @@ export interface DeploySimReq {
 }
 
 export const simulationApi = {
+  listProtocols: () => {
+    return http.get<SimulationProtocolCapability[]>('/simulation/protocols')
+  },
   createRule: (data: CreateRuleReq) => {
     return http.post<SimRule>('/simulation/rule', data)
   },

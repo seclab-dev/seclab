@@ -60,7 +60,7 @@ const SIMULATION_PROTOCOLS: &[SimulationProtocolCapability] = &[
         label: "Redis",
         default_port: 6379,
         deployable: true,
-        custom_rule_creatable: false,
+        custom_rule_creatable: true,
         event_types: REDIS_EVENT_TYPES,
     },
     SimulationProtocolCapability {
@@ -68,7 +68,7 @@ const SIMULATION_PROTOCOLS: &[SimulationProtocolCapability] = &[
         label: "SMTP",
         default_port: 25,
         deployable: true,
-        custom_rule_creatable: false,
+        custom_rule_creatable: true,
         event_types: SMTP_EVENT_TYPES,
     },
     SimulationProtocolCapability {
@@ -76,7 +76,7 @@ const SIMULATION_PROTOCOLS: &[SimulationProtocolCapability] = &[
         label: "POP3",
         default_port: 110,
         deployable: true,
-        custom_rule_creatable: false,
+        custom_rule_creatable: true,
         event_types: POP3_EVENT_TYPES,
     },
     SimulationProtocolCapability {
@@ -84,7 +84,7 @@ const SIMULATION_PROTOCOLS: &[SimulationProtocolCapability] = &[
         label: "IMAP",
         default_port: 143,
         deployable: true,
-        custom_rule_creatable: false,
+        custom_rule_creatable: true,
         event_types: IMAP_EVENT_TYPES,
     },
     SimulationProtocolCapability {
@@ -92,7 +92,7 @@ const SIMULATION_PROTOCOLS: &[SimulationProtocolCapability] = &[
         label: "SSH",
         default_port: 22,
         deployable: true,
-        custom_rule_creatable: false,
+        custom_rule_creatable: true,
         event_types: SSH_EVENT_TYPES,
     },
     SimulationProtocolCapability {
@@ -100,7 +100,7 @@ const SIMULATION_PROTOCOLS: &[SimulationProtocolCapability] = &[
         label: "FTP",
         default_port: 21,
         deployable: true,
-        custom_rule_creatable: false,
+        custom_rule_creatable: true,
         event_types: FTP_EVENT_TYPES,
     },
     SimulationProtocolCapability {
@@ -108,7 +108,7 @@ const SIMULATION_PROTOCOLS: &[SimulationProtocolCapability] = &[
         label: "RDP",
         default_port: 3389,
         deployable: true,
-        custom_rule_creatable: false,
+        custom_rule_creatable: true,
         event_types: RDP_EVENT_TYPES,
     },
 ];
@@ -157,4 +157,23 @@ pub fn custom_rule_protocols_label() -> String {
         .map(|item| item.label)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_deployable_protocols_can_be_created_as_custom_rules() {
+        for protocol in list_simulation_protocols()
+            .iter()
+            .filter(|item| item.deployable)
+        {
+            assert!(
+                is_custom_rule_protocol(protocol.protocol),
+                "{} should support custom rule creation",
+                protocol.protocol
+            );
+        }
+    }
 }
