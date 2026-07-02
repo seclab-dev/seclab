@@ -16,6 +16,7 @@ body:
     id: scope
     attributes:
       label: 影响模块
+      multiple: true
       options:
         - 主控服务
         - Agent

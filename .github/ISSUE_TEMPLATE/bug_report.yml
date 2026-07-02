@@ -20,6 +20,7 @@ body:
     id: scope
     attributes:
       label: 影响范围
+      multiple: true
       options:
         - 主控服务
         - Agent
