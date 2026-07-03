@@ -1876,8 +1876,6 @@ const en = {
       switchBlockedRest: '; {count} more windows need attention',
       switchFailed: 'Node switch failed',
       switchSuccess: 'Current node switched to {name}',
-      currentDeleted:
-        'The current node was deleted. Please select a new current node in Node Manager.',
       noTags: 'No tags',
       status: {
         draft: 'Draft',
@@ -1908,7 +1906,10 @@ const en = {
         uninstall: 'Uninstall',
         confirmTitle: 'Node Operation',
         confirmMessage: 'Confirm executing "{action}" on node {name}?',
+        confirmCurrentUninstallMessage:
+          'Node {name} is currently in use. After uninstall, it will be unavailable and the current node will switch to Local Node. Uninstall it?',
         success: '{action} submitted',
+        currentUninstallSuccess: 'Node uninstall submitted. Current node switched to Local Node.',
         failed: '{action} failed',
       },
       detail: {

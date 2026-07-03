@@ -765,9 +765,6 @@ const handleDeleteAction = async (node: NodeSummary) => {
       return
     }
     notificationStore.success(t('app.nodes.delete.success'))
-    if (currentNodeId.value === node.id) {
-      notificationStore.error(t('app.nodes.currentDeleted'))
-    }
     await fetchNodes()
   } catch {
     notificationStore.error(t('app.nodes.delete.failed'))
@@ -1092,8 +1089,19 @@ const precheckPrimaryFailureMessage = computed(() => {
 
 const executeNodeAction = async (node: NodeSummary, action: 'repair' | 'retire' | 'uninstall') => {
   const actionLabel = t(`app.nodes.actions.${action}`)
+  const isUninstallingCurrentNode = action === 'uninstall' && currentNodeId.value === node.id
+  if (isUninstallingCurrentNode) {
+    const guardMessage = buildNodeSwitchBlockMessage()
+    if (guardMessage) {
+      notificationStore.error(guardMessage)
+      return
+    }
+  }
+  const confirmMessage = isUninstallingCurrentNode
+    ? t('app.nodes.actions.confirmCurrentUninstallMessage', { name: node.name })
+    : t('app.nodes.actions.confirmMessage', { action: actionLabel, name: node.name })
   const confirmed = await confirmationModal.showConfirmation(
-    t('app.nodes.actions.confirmMessage', { action: actionLabel, name: node.name }),
+    confirmMessage,
     t('app.nodes.actions.confirmTitle'),
     actionLabel,
     t('confirmation.cancel'),
@@ -1113,7 +1121,16 @@ const executeNodeAction = async (node: NodeSummary, action: 'repair' | 'retire' 
       notificationStore.error(res.message || t('app.nodes.actions.failed', { action: actionLabel }))
       return
     }
-    notificationStore.success(t('app.nodes.actions.success', { action: actionLabel }))
+    if (isUninstallingCurrentNode) {
+      const switchResult = nodeStore.requestSwitchCurrentNode('local')
+      if (switchResult.switched) {
+        notificationStore.success(t('app.nodes.actions.currentUninstallSuccess'))
+      } else {
+        notificationStore.error(switchResult.reason || t('app.nodes.switchFailed'))
+      }
+    } else {
+      notificationStore.success(t('app.nodes.actions.success', { action: actionLabel }))
+    }
     await fetchNodes()
   } catch {
     notificationStore.error(t('app.nodes.actions.failed', { action: actionLabel }))

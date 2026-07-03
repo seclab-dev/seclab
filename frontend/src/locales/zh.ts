@@ -1840,7 +1840,6 @@ const zh: typeof en = {
       switchBlockedRest: '；另有 {count} 个窗口需要处理',
       switchFailed: '节点切换失败',
       switchSuccess: '当前节点已切换为 {name}',
-      currentDeleted: '当前节点已删除，请在节点管理中选择新的当前节点。',
       noTags: '无标签',
       status: {
         draft: '草稿',
@@ -1871,7 +1870,10 @@ const zh: typeof en = {
         uninstall: '卸载',
         confirmTitle: '节点运维确认',
         confirmMessage: '确认对节点 {name} 执行“{action}”吗？',
+        confirmCurrentUninstallMessage:
+          '当前正在使用节点 {name}。卸载后该节点将不可用，并自动切换到本地节点，确认卸载吗？',
         success: '{action}操作已提交',
+        currentUninstallSuccess: '节点卸载操作已提交，当前节点已切换为本地节点',
         failed: '{action}操作失败',
       },
       detail: {
