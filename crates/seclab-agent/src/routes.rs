@@ -102,7 +102,7 @@ pub async fn create_router() -> Result<(Router, DbPool)> {
         )
         .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(
-            100 * 1024 * 1024, /* 100MB */
+            10 * 1024 * 1024 * 1024, /* 10GB */
         ));
 
     Ok((router, pool_for_shutdown))

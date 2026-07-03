@@ -653,6 +653,7 @@ const zh: typeof en = {
             waiting: '等待中',
             exporting: '主控导出中...',
             uploading: '传输中 {percent}%',
+            loading: '节点载入中...',
             success: '成功',
             failed: '失败',
             empty: '暂无可用的边缘子节点',

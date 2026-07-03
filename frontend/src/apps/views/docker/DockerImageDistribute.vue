@@ -226,30 +226,33 @@ const startDistribute = async () => {
 const startPolling = () => {
   if (timer) clearInterval(timer)
 
-  timer = window.setInterval(async () => {
-    if (!taskId.value) return
+  void fetchDistributeProgress()
+  timer = window.setInterval(fetchDistributeProgress, 1000)
+}
 
-    try {
-      const res = await dockerApi.fetchDistributeStatus(taskId.value)
-      if (res && res.success && res.data && res.data.nodeStatuses) {
-        distributeProgress.value = res.data.nodeStatuses
+const fetchDistributeProgress = async () => {
+  if (!taskId.value) return
 
-        const allFinished = Object.values(res.data.nodeStatuses).every(
-          (node) => node.status === 'success' || node.status === 'failed',
-        )
+  try {
+    const res = await dockerApi.fetchDistributeStatus(taskId.value)
+    if (res && res.success && res.data && res.data.nodeStatuses) {
+      distributeProgress.value = res.data.nodeStatuses
 
-        if (allFinished) {
-          if (timer) {
-            clearInterval(timer)
-            timer = null
-          }
-          isSubmitting.value = false
+      const allFinished = Object.values(res.data.nodeStatuses).every(
+        (node) => node.status === 'success' || node.status === 'failed',
+      )
+
+      if (allFinished) {
+        if (timer) {
+          clearInterval(timer)
+          timer = null
         }
+        isSubmitting.value = false
       }
-    } catch (e) {
-      console.error('Polling status failed:', e)
     }
-  }, 1500)
+  } catch (e) {
+    console.error('Polling status failed:', e)
+  }
 }
 
 onMounted(() => {
@@ -463,6 +466,12 @@ watch(
                     percent: distributeProgress[node.nodeId].progressPercent,
                   })
                 }}
+              </SecLabTag>
+              <SecLabTag
+                v-else-if="distributeProgress[node.nodeId].status === 'loading'"
+                type="warning"
+              >
+                {{ t('app.docker.images.distribute.nodes.loading') }}
               </SecLabTag>
               <SecLabTag
                 v-else-if="distributeProgress[node.nodeId].status === 'success'"
@@ -800,6 +809,22 @@ watch(
 
 .progress-bar-fill.uploading {
   background-color: var(--sdl-primary);
+  background-image: linear-gradient(
+    45deg,
+    rgba(255, 255, 255, 0.15) 25%,
+    transparent 25%,
+    transparent 50%,
+    rgba(255, 255, 255, 0.15) 50%,
+    rgba(255, 255, 255, 0.15) 75%,
+    transparent 75%,
+    transparent
+  );
+  background-size: 1rem 1rem;
+  animation: progress-bar-stripes 1s linear infinite;
+}
+
+.progress-bar-fill.loading {
+  background-color: var(--sdl-warning);
   background-image: linear-gradient(
     45deg,
     rgba(255, 255, 255, 0.15) 25%,

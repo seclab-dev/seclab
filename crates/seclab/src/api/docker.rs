@@ -13,6 +13,7 @@ use bollard::Docker;
 use bollard::query_parameters::{CreateImageOptions, ListImagesOptions};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::SystemTime;
@@ -40,6 +41,7 @@ pub struct DistributeSession {
 
 static DISTRIBUTE_SESSIONS: LazyLock<Mutex<HashMap<String, DistributeSession>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+const AGENT_DOCKER_IMAGE_LOAD_PATH: &str = "/api/v1/agent/docker/images/load";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -255,8 +257,13 @@ pub async fn distribute_image(
 
             update_node_status(&task_id_clone, &node_id, "uploading", 10, None);
 
-            let result =
-                distribute_to_single_node(&state_clone, &node_id, &temp_file_path_clone).await;
+            let result = distribute_to_single_node(
+                &state_clone,
+                &task_id_clone,
+                &node_id,
+                &temp_file_path_clone,
+            )
+            .await;
 
             match result {
                 Ok(_) => {
@@ -389,8 +396,13 @@ pub async fn distribute_local_image(
 
             update_node_status(&task_id_clone, &node_id, "uploading", 10, None);
 
-            let result =
-                distribute_to_single_node(&state_clone, &node_id, &temp_file_path_clone).await;
+            let result = distribute_to_single_node(
+                &state_clone,
+                &task_id_clone,
+                &node_id,
+                &temp_file_path_clone,
+            )
+            .await;
 
             match result {
                 Ok(_) => {
@@ -449,13 +461,39 @@ fn update_node_status(
 
 async fn distribute_to_single_node(
     state: &Arc<AppState>,
+    task_id: &str,
     node_id: &str,
     file_path: &std::path::Path,
 ) -> anyhow::Result<()> {
     let client = NodeRuntimeClient::from_node_route(&state.metadata_db, Some(node_id)).await?;
 
     let file = File::open(file_path).await?;
-    let file_stream = FramedRead::new(file, BytesCodec::new());
+    let file_size = file.metadata().await?.len();
+    let progress_task_id = task_id.to_string();
+    let progress_node_id = node_id.to_string();
+    let mut uploaded_bytes = 0_u64;
+    let mut last_progress = 10_u32;
+    let file_stream = FramedRead::new(file, BytesCodec::new()).map(move |chunk| {
+        if let Ok(bytes) = &chunk {
+            uploaded_bytes = uploaded_bytes.saturating_add(bytes.len() as u64);
+            let next_progress = upload_progress_percent(uploaded_bytes, file_size);
+            if next_progress > last_progress {
+                update_node_status(
+                    &progress_task_id,
+                    &progress_node_id,
+                    "uploading",
+                    next_progress,
+                    None,
+                );
+                last_progress = next_progress;
+            }
+            if uploaded_bytes >= file_size && last_progress < 95 {
+                update_node_status(&progress_task_id, &progress_node_id, "loading", 95, None);
+                last_progress = 95;
+            }
+        }
+        chunk
+    });
     let file_body = reqwest::Body::wrap_stream(file_stream);
 
     let part = reqwest::multipart::Part::stream(file_body)
@@ -464,7 +502,7 @@ async fn distribute_to_single_node(
 
     let form = reqwest::multipart::Form::new().part("file", part);
 
-    let url = client.build_uri("/api/v1/docker/images/load");
+    let url = client.build_uri(AGENT_DOCKER_IMAGE_LOAD_PATH);
 
     info!("Sending POST request to node {} URL: {}", node_id, url);
     let response = client
@@ -476,9 +514,156 @@ async fn distribute_to_single_node(
         .await?;
 
     if !response.status().is_success() {
-        let err_text = response.text().await.unwrap_or_default();
-        return Err(anyhow::anyhow!("Agent returned error: {}", err_text));
+        return Err(anyhow::anyhow!(
+            "Agent image load request failed: url={}; {}",
+            url,
+            agent_error_response_message(response).await
+        ));
     }
 
     Ok(())
+}
+
+fn upload_progress_percent(uploaded_bytes: u64, total_bytes: u64) -> u32 {
+    if total_bytes == 0 {
+        return 90;
+    }
+
+    let uploaded = u128::from(uploaded_bytes.min(total_bytes));
+    let total = u128::from(total_bytes);
+    let scaled = 10 + ((uploaded * 80) / total) as u32;
+    scaled.clamp(10, 90)
+}
+
+async fn agent_error_response_message(response: reqwest::Response) -> String {
+    let status = response.status().as_u16();
+    match response.text().await {
+        Ok(body) => format_agent_error_body(status, &body),
+        Err(err) => format!(
+            "Agent returned error: status={}; failed to read response body: {}",
+            status, err
+        ),
+    }
+}
+
+fn format_agent_error_body(status: u16, body: &str) -> String {
+    let body = body.trim();
+    if body.is_empty() {
+        return format!("Agent returned empty error response: status={status}");
+    }
+
+    if let Ok(value) = serde_json::from_str::<Value>(body)
+        && let Some(message) = value.get("message").and_then(Value::as_str)
+    {
+        let detail = response_json_detail(&value, message);
+        if detail.is_empty() {
+            return format!("Agent returned error: status={status}; message={message}");
+        }
+        return format!(
+            "Agent returned error: status={status}; message={message}; detail={detail}"
+        );
+    }
+
+    format!(
+        "Agent returned error: status={}; body={}",
+        status,
+        response_body_excerpt(body)
+    )
+}
+
+fn response_json_detail(value: &Value, message: &str) -> String {
+    ["data", "errorCode"]
+        .iter()
+        .filter_map(|key| {
+            let raw_value = value.get(*key)?;
+            let detail = match raw_value {
+                Value::Null => return None,
+                Value::String(text) => text.trim().to_string(),
+                other => other.to_string(),
+            };
+            if detail.is_empty() || detail == message {
+                None
+            } else {
+                Some(detail)
+            }
+        })
+        .fold(Vec::new(), |mut details, detail| {
+            if !details.contains(&detail) {
+                details.push(detail);
+            }
+            details
+        })
+        .join("; ")
+}
+
+fn response_body_excerpt(body: &str) -> String {
+    const MAX_CHARS: usize = 2048;
+
+    let mut chars = body.chars();
+    let excerpt: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{}... [truncated]", excerpt)
+    } else {
+        excerpt
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AGENT_DOCKER_IMAGE_LOAD_PATH, format_agent_error_body, response_body_excerpt,
+        upload_progress_percent,
+    };
+
+    #[test]
+    fn uses_agent_prefixed_image_load_path() {
+        assert_eq!(
+            AGENT_DOCKER_IMAGE_LOAD_PATH,
+            "/api/v1/agent/docker/images/load"
+        );
+    }
+
+    #[test]
+    fn formats_agent_api_error_body() {
+        let body = r#"{"success":false,"code":502,"message":"Docker operation failed","errorCode":"DockerOperationFailed","data":"DockerOperationFailed"}"#;
+
+        assert_eq!(
+            format_agent_error_body(502, body),
+            "Agent returned error: status=502; message=Docker operation failed; detail=DockerOperationFailed"
+        );
+    }
+
+    #[test]
+    fn maps_upload_progress_to_transfer_range() {
+        assert_eq!(upload_progress_percent(0, 100), 10);
+        assert_eq!(upload_progress_percent(50, 100), 50);
+        assert_eq!(upload_progress_percent(100, 100), 90);
+        assert_eq!(upload_progress_percent(120, 100), 90);
+    }
+
+    #[test]
+    fn formats_empty_agent_error_body() {
+        assert_eq!(
+            format_agent_error_body(413, ""),
+            "Agent returned empty error response: status=413"
+        );
+    }
+
+    #[test]
+    fn formats_plain_text_agent_error_body() {
+        assert_eq!(
+            format_agent_error_body(413, "request body too large"),
+            "Agent returned error: status=413; body=request body too large"
+        );
+    }
+
+    #[test]
+    fn truncates_large_plain_text_agent_error_body() {
+        let body = "a".repeat(2050);
+
+        assert_eq!(
+            response_body_excerpt(&body),
+            format!("{}... [truncated]", "a".repeat(2048))
+        );
+    }
 }

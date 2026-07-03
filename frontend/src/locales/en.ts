@@ -667,6 +667,7 @@ const en = {
             waiting: 'Waiting',
             exporting: 'Exporting on main control...',
             uploading: 'Uploading {percent}%',
+            loading: 'Loading on node...',
             success: 'Success',
             failed: 'Failed',
             empty: 'No available edge nodes',
