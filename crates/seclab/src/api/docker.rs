@@ -60,6 +60,7 @@ pub struct PullRequest {
 pub struct LocalDistributeRequest {
     pub image_name: String,
     pub node_ids: Vec<String>,
+    pub source_node_id: Option<String>,
 }
 
 pub fn docker_router() -> Router<Arc<AppState>> {
@@ -304,9 +305,10 @@ pub async fn distribute_local_image(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<LocalDistributeRequest>,
 ) -> ApiResult<Response> {
+    let source_node_id = normalize_node_id(payload.source_node_id.as_deref());
     info!(
-        "Starting docker local image distribution: {}",
-        payload.image_name
+        "Starting docker image distribution from node {}: {}",
+        source_node_id, payload.image_name
     );
 
     let task_id = Uuid::new_v4().to_string();
@@ -318,6 +320,16 @@ pub async fn distribute_local_image(
         return Err(seclab_api::error::ApiError::bad_request(
             seclab_contracts::api::ErrorCode::BadRequest,
             "node_ids must not be empty".to_string(),
+        ));
+    }
+    if payload
+        .node_ids
+        .iter()
+        .any(|node_id| node_id == &source_node_id)
+    {
+        return Err(seclab_api::error::ApiError::bad_request(
+            seclab_contracts::api::ErrorCode::BadRequest,
+            "target nodeIds must not contain sourceNodeId".to_string(),
         ));
     }
 
@@ -354,6 +366,7 @@ pub async fn distribute_local_image(
     let state_clone = state.clone();
     let temp_file_path_clone = temp_file_path.clone();
     let image_name_clone = payload.image_name.clone();
+    let source_node_id_clone = source_node_id.clone();
     let node_ids = payload.node_ids;
 
     tokio::spawn(async move {
@@ -362,20 +375,21 @@ pub async fn distribute_local_image(
         }
 
         let export_result: Result<(), anyhow::Error> = async {
-            let docker = get_local_docker()?;
-            let mut stream = docker.export_image(&image_name_clone);
-            let mut file = File::create(&temp_file_path_clone).await?;
-            while let Some(chunk) = stream.next().await {
-                let bytes = chunk?;
-                file.write_all(&bytes).await?;
-            }
-            file.flush().await?;
-            Ok(())
+            export_image_to_file(
+                &state_clone,
+                &source_node_id_clone,
+                &image_name_clone,
+                &temp_file_path_clone,
+            )
+            .await
         }
         .await;
 
         if let Err(e) = export_result {
-            error!("Failed to export local image {}: {}", image_name_clone, e);
+            error!(
+                "Failed to export image {} from node {}: {}",
+                image_name_clone, source_node_id_clone, e
+            );
             for node_id in &node_ids {
                 update_node_status(
                     &task_id_clone,
@@ -442,6 +456,14 @@ pub async fn distribute_local_image(
     )
 }
 
+fn normalize_node_id(node_id: Option<&str>) -> String {
+    node_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("local")
+        .to_string()
+}
+
 fn update_node_status(
     task_id: &str,
     node_id: &str,
@@ -457,6 +479,53 @@ fn update_node_status(
         node_status.progress_percent = progress;
         node_status.error = error;
     }
+}
+
+async fn export_image_to_file(
+    state: &Arc<AppState>,
+    source_node_id: &str,
+    image_name: &str,
+    file_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    if source_node_id == "local" {
+        let docker = get_local_docker()?;
+        let mut stream = docker.export_image(image_name);
+        let mut file = File::create(file_path).await?;
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk?;
+            file.write_all(&bytes).await?;
+        }
+        file.flush().await?;
+        return Ok(());
+    }
+
+    let client =
+        NodeRuntimeClient::from_node_route(&state.metadata_db, Some(source_node_id)).await?;
+    let url = client.build_uri("/api/v1/agent/docker/images/export");
+    let response = client
+        .client
+        .get(&url)
+        .query(&[("imageName", image_name)])
+        .timeout(std::time::Duration::from_secs(600))
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "Agent image export request failed: url={}; {}",
+            url,
+            agent_error_response_message(response).await
+        ));
+    }
+
+    let mut file = File::create(file_path).await?;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk?;
+        file.write_all(&bytes).await?;
+    }
+    file.flush().await?;
+    Ok(())
 }
 
 async fn distribute_to_single_node(
@@ -639,6 +708,14 @@ mod tests {
         assert_eq!(upload_progress_percent(50, 100), 50);
         assert_eq!(upload_progress_percent(100, 100), 90);
         assert_eq!(upload_progress_percent(120, 100), 90);
+    }
+
+    #[test]
+    fn normalizes_empty_source_node_to_local() {
+        assert_eq!(super::normalize_node_id(None), "local");
+        assert_eq!(super::normalize_node_id(Some("")), "local");
+        assert_eq!(super::normalize_node_id(Some("  ")), "local");
+        assert_eq!(super::normalize_node_id(Some("node-a")), "node-a");
     }
 
     #[test]

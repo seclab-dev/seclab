@@ -40,7 +40,7 @@ const { t } = useI18n()
 const store = useDockerStore()
 const nodeStore = useNodeStore()
 const notificationStore = useNotificationStore()
-const activeTab = ref<'local' | 'distribute'>('local')
+const activeTab = ref<'local' | 'registry' | 'distribute'>('local')
 const settingsVisible = ref(false)
 const settingsLoading = ref(false)
 const settingsSaving = ref(false)
@@ -53,6 +53,7 @@ const settingsTab = ref<'registry' | 'proxy'>('registry')
 // ─── Tab 配置 ───
 const tabOptions = computed(() => [
   { label: t('app.docker.images.tabs.local', { count: store.imagesList.length }), name: 'local' },
+  { label: t('app.docker.images.tabs.registry'), name: 'registry' },
   { label: t('app.docker.images.tabs.distribute'), name: 'distribute' },
 ])
 const settingsTabOptions = computed(() => [
@@ -62,6 +63,7 @@ const settingsTabOptions = computed(() => [
 
 // ─── 动态异步导入子组件 ───
 const DockerImageList = defineAsyncComponent(() => import('./DockerImageList.vue'))
+const DockerImageRegistry = defineAsyncComponent(() => import('./DockerImageRegistry.vue'))
 const DockerImageDistribute = defineAsyncComponent(() => import('./DockerImageDistribute.vue'))
 
 /** 打开并读取当前节点的 Docker daemon 设置。 */
@@ -176,6 +178,7 @@ function closeSettings() {
 
       <div class="card-scroll-wrapper">
         <DockerImageList v-if="activeTab === 'local'" />
+        <DockerImageRegistry v-else-if="activeTab === 'registry'" />
         <DockerImageDistribute v-else-if="activeTab === 'distribute'" />
       </div>
     </div>

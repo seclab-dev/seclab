@@ -5,16 +5,20 @@ use crate::state::AppState;
 use crate::types::{AgentError, ApiResponse, ApiResult};
 
 use axum::{
+    Json,
+    body::Body,
     extract::{Multipart, Query, State},
+    http::header,
     response::{IntoResponse, Response},
 };
 
 use bollard::query_parameters;
+use bollard::query_parameters::{CreateImageOptions, ImportImageOptions};
+use futures_util::{StreamExt, TryStreamExt};
+use serde::Deserialize;
 use serde_json::json;
 
 use crate::services::logging::{AgentLogModule, LoggerEntry};
-use bollard::query_parameters::ImportImageOptions;
-use futures_util::{StreamExt, TryStreamExt};
 use std::default::Default;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
@@ -23,6 +27,18 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::codec::{BytesCodec, FramedRead};
 use tracing::info;
 use uuid::Uuid;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullRequest {
+    pub image_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportQuery {
+    pub image_name: String,
+}
 
 /// 获取本地所有 Docker 镜像的摘要信息列表。
 ///
@@ -76,6 +92,72 @@ pub async fn remove_image(
     info!("{} image removed", query.name);
 
     Ok(ApiResponse::success_with_raw("Image removed", Some(images)).into_response())
+}
+
+/// 从仓库拉取镜像到当前节点 Docker。
+pub async fn pull_image(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<PullRequest>,
+) -> ApiResult<Response> {
+    let image_name = payload.image_name.trim();
+    if image_name.is_empty() {
+        return Err(AgentError::BadRequest("imageName must not be empty".to_string()).into());
+    }
+
+    let (from_image, tag) = if let Some((img, tg)) = image_name.split_once(':') {
+        (img.to_string(), tg.to_string())
+    } else {
+        (image_name.to_string(), "latest".to_string())
+    };
+
+    let docker = state.docker_client().await?;
+    let options = CreateImageOptions {
+        from_image: Some(from_image),
+        tag: Some(tag),
+        ..Default::default()
+    };
+    let mut stream = docker.create_image(Some(options), None, None);
+    let mut logs = Vec::new();
+
+    while let Some(msg) = stream.next().await {
+        let info = msg.map_err(|err| AgentError::DockerOperation(err.to_string()))?;
+        if let Some(status) = info.status {
+            logs.push(status);
+        }
+        if let Some(error) = info.error {
+            return Err(AgentError::DockerOperation(error).into());
+        }
+    }
+
+    Ok(
+        ApiResponse::success_with_raw("Image pulled successfully", Some(logs.join("\n")))
+            .into_response(),
+    )
+}
+
+/// 将当前节点 Docker 镜像导出为 tar 流。
+pub async fn export_image(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ExportQuery>,
+) -> ApiResult<Response> {
+    let image_name = query.image_name.trim();
+    if image_name.is_empty() {
+        return Err(AgentError::BadRequest("imageName must not be empty".to_string()).into());
+    }
+
+    let docker = state.docker_client().await?;
+    let stream = docker
+        .export_image(image_name)
+        .map(|chunk| chunk.map_err(std::io::Error::other));
+    let body = Body::from_stream(stream);
+
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, "application/x-tar")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"image.tar\"",
+        )
+        .body(body)?)
 }
 
 /// 接收流式上传的镜像 tar 包，并导入到本地 Docker 中。

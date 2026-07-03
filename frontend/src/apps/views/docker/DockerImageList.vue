@@ -1,14 +1,12 @@
 <script setup lang="ts">
 /**
  * @file DockerImageList.vue
- * @description Docker 本地镜像列表组件，支持搜索、删除镜像及拉取新镜像，符合 SDL 设计规范。
+ * @description Docker 本地镜像列表组件，支持搜索和删除镜像，符合 SDL 设计规范。
  */
 
 import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useDockerStore } from '@/stores/docker'
-import { useNotificationStore } from '@/stores/notification'
-import { dockerApi } from '@/api/modules/docker'
 import { formatImageTags, formatBytes } from '@/utils/docker-format'
 import { SecLabTable, SecLabTag, SecLabButton, SecLabEmpty, SecLabInput } from '@/components/ui'
 import { isSuiteManagedResource } from './docker-suite-labels'
@@ -17,7 +15,6 @@ import type * as dockerType from '@/api/interface/docker'
 
 const { t, locale } = useI18n()
 const store = useDockerStore()
-const notificationStore = useNotificationStore()
 
 // ─── 搜索过滤 ───
 const searchQuery = ref('')
@@ -32,36 +29,6 @@ const filteredImages = computed(() => {
     return id.includes(query) || shortId.includes(query) || tags.includes(query)
   })
 })
-
-// ─── 镜像拉取 ───
-const newImageToPull = ref('')
-const isPulling = ref(false)
-
-const pullImage = async () => {
-  const imageName = newImageToPull.value.trim()
-  if (!imageName) return
-  isPulling.value = true
-  try {
-    const res = await dockerApi.pullLocalImage(imageName)
-    if (res.success) {
-      notificationStore.success(t('app.docker.images.distribute.pull.success'))
-      newImageToPull.value = ''
-      await store.fetchImagesList()
-    } else {
-      notificationStore.error(
-        t('app.docker.images.distribute.pull.failed', {
-          error: res.message || t('common.unknownError'),
-        }),
-      )
-    }
-  } catch (e) {
-    console.error('Failed to pull image:', e)
-    const errMsg = e instanceof Error ? e.message : String(e)
-    notificationStore.error(t('app.docker.images.distribute.pull.failed', { error: errMsg }))
-  } finally {
-    isPulling.value = false
-  }
-}
 
 // ─── 本地镜像表格列定义 ───
 const columns = computed<SecLabTableColumn[]>(() => [
@@ -100,7 +67,7 @@ const handleDelete = async (row: dockerType.ImageSummary) => {
 
 <template>
   <div class="image-list-wrapper" data-ui="docker-image-list">
-    <!-- 操作栏（搜索与拉取） -->
+    <!-- 操作栏（搜索） -->
     <div class="card-actions">
       <div class="search-wrapper">
         <SecLabInput
@@ -110,29 +77,6 @@ const handleDelete = async (row: dockerType.ImageSummary) => {
           data-ui="image-search-input"
           class="search-input"
         />
-      </div>
-
-      <div class="pull-wrapper">
-        <SecLabInput
-          v-model="newImageToPull"
-          :placeholder="t('app.docker.images.distribute.pull.placeholder')"
-          :disabled="isPulling"
-          class="input-pull"
-          data-ui="image-pull-input"
-        />
-        <SecLabButton
-          type="primary"
-          :disabled="!newImageToPull || isPulling"
-          @click="pullImage"
-          data-ui="image-pull-btn"
-        >
-          <span v-if="isPulling" class="spinner">⏳</span>
-          <span>{{
-            isPulling
-              ? t('app.docker.images.distribute.pull.btnPulling')
-              : t('app.docker.images.distribute.pull.btnPull')
-          }}</span>
-        </SecLabButton>
       </div>
     </div>
 
@@ -214,16 +158,6 @@ const handleDelete = async (row: dockerType.ImageSummary) => {
 .search-wrapper {
   margin-right: auto;
   width: 280px;
-}
-
-.pull-wrapper {
-  display: flex;
-  gap: var(--sdl-space-2);
-  width: 420px;
-}
-
-.input-pull {
-  flex: 1;
 }
 
 .resource-name-cell {

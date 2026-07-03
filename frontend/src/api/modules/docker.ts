@@ -262,6 +262,9 @@ const createScopedDockerApi = (nodeId?: string) => ({
       payload,
     )
   },
+  pullImage: (imageName: string) => {
+    return http.post<string>(buildDockerPath('/agent/docker/images/pull', nodeId), { imageName })
+  },
 })
 
 export interface DistributeNodeStatus {
@@ -294,7 +297,11 @@ export const dockerApi = Object.assign(createScopedDockerApi(), {
   pullLocalImage: (imageName: string) => {
     return http.post<string>('/docker/local-images/pull', { imageName })
   },
-  distributeLocalImage: (payload: { imageName: string; nodeIds: string[] }) => {
+  distributeLocalImage: (payload: {
+    imageName: string
+    nodeIds: string[]
+    sourceNodeId?: string
+  }) => {
     return http.post<string>('/docker/images/distribute/local', payload)
   },
 })

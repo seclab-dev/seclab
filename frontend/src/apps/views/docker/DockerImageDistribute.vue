@@ -7,27 +7,20 @@
 import { computed, ref, onMounted, onUnmounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useDockerStore } from '@/stores/docker'
+import { useNodeStore } from '@/stores/node'
 import { useNotificationStore } from '@/stores/notification'
 import { nodesApi, type NodeSummaryResponse } from '@/api/modules/nodes'
 import { dockerApi, type DistributeNodeStatus } from '@/api/modules/docker'
 import { formatBytes } from '@/utils/docker-format'
-import {
-  SecLabButton,
-  SecLabCheckbox,
-  SecLabTag,
-  SecLabEmpty,
-  SecLabSelect,
-  SecLabInput,
-} from '@/components/ui'
+import { SecLabButton, SecLabCheckbox, SecLabTag, SecLabEmpty, SecLabSelect } from '@/components/ui'
 
 const { t } = useI18n()
 const store = useDockerStore()
+const nodeStore = useNodeStore()
 const notificationStore = useNotificationStore()
 
-// ─── 分发模式选择与本地镜像 ───
+// ─── 分发模式选择与当前节点镜像 ───
 const distMode = ref<'file' | 'local'>('local')
-const newImageToPull = ref('')
-const isPulling = ref(false)
 const selectedLocalImage = ref<string | null>(null)
 
 // ─── 节点选择与上传 ───
@@ -40,6 +33,7 @@ const taskId = ref<string | null>(null)
 const distributeProgress = ref<Record<string, DistributeNodeStatus>>({})
 
 let timer: number | null = null
+const sourceNodeId = computed(() => nodeStore.currentNodeId || 'local')
 
 // ─── 镜像选项 ───
 const localImageOptions = computed(() => {
@@ -67,37 +61,10 @@ const fetchNodes = async () => {
   }
 }
 
-// ─── 拉取镜像 ───
-const pullImage = async () => {
-  const imageName = newImageToPull.value.trim()
-  if (!imageName) return
-  isPulling.value = true
-  try {
-    const res = await dockerApi.pullLocalImage(imageName)
-    if (res.success) {
-      notificationStore.success(t('app.docker.images.distribute.pull.success'))
-      newImageToPull.value = ''
-      await store.fetchImagesList()
-    } else {
-      notificationStore.error(
-        t('app.docker.images.distribute.pull.failed', {
-          error: res.message || t('common.unknownError'),
-        }),
-      )
-    }
-  } catch (e) {
-    console.error('Failed to pull image:', e)
-    const errMsg = e instanceof Error ? e.message : String(e)
-    notificationStore.error(t('app.docker.images.distribute.pull.failed', { error: errMsg }))
-  } finally {
-    isPulling.value = false
-  }
-}
-
-// ─── 过滤非本地节点 ───
+// ─── 分发目标过滤 ───
 const filteredNodeList = computed(() => {
   if (distMode.value === 'local') {
-    return nodeList.value.filter((n) => n.nodeId !== 'local')
+    return nodeList.value.filter((n) => n.nodeId !== sourceNodeId.value)
   }
   return nodeList.value
 })
@@ -163,7 +130,23 @@ const handleDrop = (e: DragEvent) => {
 const triggerSelectFile = () => {
   const input = document.createElement('input')
   input.type = 'file'
-  input.accept = '.tar'
+  input.accept = [
+    '.tar',
+    '.tar.gz',
+    '.tgz',
+    '.tar.bz2',
+    '.tbz',
+    '.tbz2',
+    '.tar.xz',
+    '.txz',
+    '.tar.zst',
+    '.tar.zstd',
+    'application/x-tar',
+    'application/gzip',
+    'application/x-bzip2',
+    'application/x-xz',
+    'application/zstd',
+  ].join(',')
   input.onchange = handleFileChange
   input.click()
 }
@@ -204,6 +187,7 @@ const startDistribute = async () => {
       const res = await dockerApi.distributeLocalImage({
         imageName: String(selectedLocalImage.value),
         nodeIds: selectedNodeIds.value,
+        sourceNodeId: sourceNodeId.value,
       })
       resData = res.data ?? ''
     }
@@ -281,6 +265,11 @@ watch(
   },
   { immediate: true },
 )
+
+watch(sourceNodeId, () => {
+  selectedNodeIds.value = []
+  selectedLocalImage.value = null
+})
 </script>
 
 <template>
@@ -321,7 +310,6 @@ watch(
           <div class="upload-title">
             {{ t('app.docker.images.distribute.upload.placeholder') }}
           </div>
-          <div class="upload-hint">{{ t('app.docker.images.distribute.upload.hint') }}</div>
         </div>
         <div v-else class="upload-file-info" @click.stop>
           <div class="file-icon">📦</div>
@@ -343,40 +331,20 @@ watch(
       <!-- 本地镜像分发模式 -->
       <div v-else class="local-distribute-panel" data-ui="distribute-local-panel">
         <div class="panel-section">
-          <label class="section-label">{{ t('app.docker.images.distribute.pull.title') }}</label>
-          <div class="pull-image-row">
-            <SecLabInput
-              v-model="newImageToPull"
-              :placeholder="t('app.docker.images.distribute.pull.placeholder')"
-              :disabled="isPulling"
-              class="input-pull"
-            />
-            <SecLabButton
-              type="primary"
-              :disabled="!newImageToPull || isPulling"
-              @click="pullImage"
-            >
-              <span v-if="isPulling" class="spinner">⏳</span>
-              <span>{{
-                isPulling
-                  ? t('app.docker.images.distribute.pull.btnPulling')
-                  : t('app.docker.images.distribute.pull.btnPull')
-              }}</span>
-            </SecLabButton>
-          </div>
-        </div>
-
-        <div class="panel-section">
           <label class="section-label">{{
             t('app.docker.images.distribute.selectLocal.title')
           }}</label>
           <SecLabSelect
+            v-if="localImageOptions.length > 0"
             v-model="selectedLocalImage"
             :options="localImageOptions"
             :placeholder="t('app.docker.images.distribute.selectLocal.placeholder')"
             class="select-local"
             data-ui="distribute-select-image"
           />
+          <div v-else class="select-empty-state" data-ui="distribute-select-image-empty">
+            {{ t('app.docker.images.distribute.selectLocal.empty') }}
+          </div>
         </div>
       </div>
 
@@ -569,13 +537,15 @@ watch(
 }
 
 .local-distribute-panel {
+  flex: 1;
+  min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: var(--sdl-space-5);
+  gap: var(--sdl-space-3);
   background-color: rgba(255, 255, 255, 0.02);
   border: 1px dashed var(--sdl-border-default);
-  border-radius: var(--sdl-radius-lg);
-  padding: var(--sdl-space-5);
+  border-radius: var(--sdl-radius-md);
+  padding: var(--sdl-space-4);
 }
 
 .panel-section {
@@ -585,18 +555,21 @@ watch(
 }
 
 .section-label {
-  font-size: var(--sdl-font-body-sm);
+  font-size: var(--sdl-font-body-xs);
   font-weight: 600;
   color: var(--sdl-text-secondary);
 }
 
-.pull-image-row {
+.select-empty-state {
+  min-height: 38px;
   display: flex;
-  gap: var(--sdl-space-3);
-}
-
-.input-pull {
-  flex: 1;
+  align-items: center;
+  padding: 0 var(--sdl-space-3);
+  border: 1px solid var(--sdl-border-default);
+  border-radius: var(--sdl-radius-sm);
+  background-color: rgba(255, 255, 255, 0.02);
+  color: var(--sdl-text-muted);
+  font-size: var(--sdl-font-body-sm);
 }
 
 .upload-dropzone {
@@ -644,7 +617,7 @@ watch(
 }
 
 .upload-title {
-  font-size: var(--sdl-font-body-md);
+  font-size: var(--sdl-font-body-sm);
   font-weight: 500;
   color: var(--sdl-text-primary);
 }
@@ -697,7 +670,7 @@ watch(
 .btn-start {
   width: 100%;
   height: 44px;
-  font-size: var(--sdl-font-body-md);
+  font-size: var(--sdl-font-body-sm);
   font-weight: 600;
 }
 

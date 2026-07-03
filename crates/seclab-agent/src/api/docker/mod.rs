@@ -269,7 +269,9 @@ pub fn docker_router() -> Router<Arc<AppState>> {
             get(containers::latest_container_logs),
         )
         .route("/images", get(images::list_images))
+        .route("/images/export", get(images::export_image))
         .route("/images/load", post(images::load_image))
+        .route("/images/pull", post(images::pull_image))
         .route("/image/remove", delete(images::remove_image))
         .route(
             "/networks",
