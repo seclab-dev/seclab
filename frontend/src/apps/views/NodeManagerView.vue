@@ -830,13 +830,24 @@ const getNodeActions = (node: NodeSummary) => {
     })
   }
 
-  // 6. 删除 (Delete) - 部署中节点禁止删除，防止写冲突
-  actions.push({
-    label: isDeleting(node.id) ? t('app.nodes.delete.submitting') : t('app.nodes.actions.delete'),
-    handler: () => handleDeleteAction(node),
-    disabled: isDeleting(node.id) || status === 'deploying',
-    class: 'btn-delete',
-  })
+  // 6. 删除 (Delete) 只用于清理主控侧记录。在线类节点必须先卸载或退役，
+  // 避免远端 agent 继续运行并重新注册，形成孤儿节点或会话冲突。
+  const canDelete = [
+    'draft',
+    'deploy_failed',
+    'offline',
+    'unknown',
+    'conflict',
+    'retired',
+  ].includes(status)
+  if (canDelete) {
+    actions.push({
+      label: isDeleting(node.id) ? t('app.nodes.delete.submitting') : t('app.nodes.actions.delete'),
+      handler: () => handleDeleteAction(node),
+      disabled: isDeleting(node.id),
+      class: 'btn-delete',
+    })
+  }
 
   return actions
 }
