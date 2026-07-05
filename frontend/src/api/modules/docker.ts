@@ -262,10 +262,110 @@ const createScopedDockerApi = (nodeId?: string) => ({
       payload,
     )
   },
+  resolveImage: (imageName: string) => {
+    return http.post<ImageResolveResponse>(
+      buildDockerPath('/agent/docker/images/resolve', nodeId),
+      {
+        imageName,
+      },
+    )
+  },
+  searchImages: (payload: { keyword: string; page: number; pageSize: number }) => {
+    return http.post<ImageSearchResponse>(
+      buildDockerPath('/agent/docker/images/search', nodeId),
+      payload,
+    )
+  },
+  fetchImageTags: (payload: { repository: string; page: number; pageSize: number }) => {
+    return http.post<ImageTagsResponse>(
+      buildDockerPath('/agent/docker/images/tags', nodeId),
+      payload,
+    )
+  },
   pullImage: (imageName: string) => {
-    return http.post<string>(buildDockerPath('/agent/docker/images/pull', nodeId), { imageName })
+    return http.post<ImagePullStartResponse>(buildDockerPath('/agent/docker/images/pull', nodeId), {
+      imageName,
+    })
+  },
+  startImagePull: (payload: { imageName: string; tag: string }) => {
+    return http.post<ImagePullStartResponse>(
+      buildDockerPath('/agent/docker/images/pull', nodeId),
+      payload,
+    )
+  },
+  fetchImagePullProgress: (taskId: string) => {
+    return http.get<ImagePullProgress>(
+      buildDockerPath(`/agent/docker/images/pull/${encodeURIComponent(taskId)}/progress`, nodeId),
+    )
+  },
+  cancelImagePull: (taskId: string) => {
+    return http.post<ImagePullProgress>(
+      buildDockerPath(`/agent/docker/images/pull/${encodeURIComponent(taskId)}/cancel`, nodeId),
+    )
   },
 })
+
+export interface ImageTagInfo {
+  name: string
+  fullSize?: number
+  lastUpdated?: string
+}
+
+export interface ImageSearchResult {
+  repository: string
+  displayName: string
+  description?: string
+  starCount?: number
+  pullCount?: number
+  isOfficial: boolean
+  isAutomated: boolean
+}
+
+export interface ImageSearchResponse {
+  page: number
+  pageSize: number
+  hasMore: boolean
+  results: ImageSearchResult[]
+}
+
+export interface ImageTagsResponse {
+  repository: string
+  page: number
+  pageSize: number
+  hasMore: boolean
+  tags: ImageTagInfo[]
+}
+
+export interface ImageResolveResponse {
+  repository: string
+  displayName: string
+  requestedTag?: string
+  defaultTag?: string
+  tags: ImageTagInfo[]
+}
+
+export interface ImagePullStartResponse {
+  taskId: string
+}
+
+export type ImagePullStatus = 'pending' | 'pulling' | 'success' | 'failed' | 'cancelled'
+
+export interface ImagePullLayerProgress {
+  id: string
+  status?: string
+  progressPercent?: number
+}
+
+export interface ImagePullProgress {
+  taskId: string
+  imageName: string
+  tag: string
+  status: ImagePullStatus
+  progressPercent: number
+  statusText?: string
+  error?: string
+  layers: ImagePullLayerProgress[]
+}
 
 export interface DistributeNodeStatus {
   progressPercent: number
