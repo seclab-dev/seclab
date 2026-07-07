@@ -25,21 +25,27 @@ BEGIN
 END;
 
 CREATE TABLE IF NOT EXISTS desktop_apps (
-    app_id TEXT NOT NULL PRIMARY KEY,
+    node_id TEXT NOT NULL DEFAULT 'local',
+    app_id TEXT NOT NULL,
     sort_order INTEGER NOT NULL DEFAULT 0,
     pinned INTEGER NOT NULL DEFAULT 0,
     visible INTEGER NOT NULL DEFAULT 1,
     metadata TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (node_id, app_id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_desktop_apps_node_sort
+    ON desktop_apps (node_id, sort_order, app_id);
 
 CREATE TRIGGER IF NOT EXISTS set_desktop_apps_updated_at
 AFTER UPDATE ON desktop_apps FOR EACH ROW
 BEGIN
     UPDATE desktop_apps
        SET updated_at = (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-     WHERE app_id = OLD.app_id;
+     WHERE node_id = OLD.node_id
+       AND app_id = OLD.app_id;
 END;
 
 INSERT OR IGNORE INTO apps (

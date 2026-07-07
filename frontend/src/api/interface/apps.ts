@@ -12,6 +12,7 @@ export interface AppItem {
   sortOrder: number
   sourceType: 'builtin' | 'suite'
   suiteInstanceId?: string
+  nodeId?: string
   appEntryId?: string
   entryType?: 'proxied_web' | 'compose_detail'
   entryTarget?: string

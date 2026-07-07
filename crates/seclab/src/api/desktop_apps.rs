@@ -7,8 +7,8 @@ use crate::models::desktop_apps::{
 };
 use crate::state::AppState;
 use crate::types::{ApiResponse, ApiResult};
-use axum::{Json, Router, extract::State, response::IntoResponse, routing::get};
-use serde::Serialize;
+use axum::{Json, Router, extract::Query, extract::State, response::IntoResponse, routing::get};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -20,14 +20,25 @@ pub struct DesktopAppsResponse {
     pub has_record: bool,
 }
 
+/// 桌面快捷方式保存范围。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopAppsQuery {
+    pub node_id: Option<String>,
+}
+
 /// 构建桌面应用相关的路由集合。
 pub fn desktop_apps_router() -> Router<Arc<AppState>> {
     Router::new().route("/shortcuts", get(list).put(update))
 }
 
 /// 返回当前桌面应用排序与可见性配置。
-pub async fn list(State(state): State<Arc<AppState>>) -> ApiResult<impl IntoResponse> {
-    let app_ids = fetch_desktop_apps(&state.metadata_db).await?;
+pub async fn list(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<DesktopAppsQuery>,
+) -> ApiResult<impl IntoResponse> {
+    let node_id = query.node_id.as_deref().unwrap_or("local");
+    let app_ids = fetch_desktop_apps(&state.metadata_db, node_id).await?;
     let response = DesktopAppsResponse {
         apps: app_ids.clone().unwrap_or_default(),
         has_record: app_ids.is_some(),
@@ -38,21 +49,22 @@ pub async fn list(State(state): State<Arc<AppState>>) -> ApiResult<impl IntoResp
 /// 保存桌面应用排序与可见性，并补全缺失项的默认值。
 pub async fn update(
     State(state): State<Arc<AppState>>,
+    Query(query): Query<DesktopAppsQuery>,
     Json(payload): Json<DesktopAppsPayload>,
 ) -> ApiResult<impl IntoResponse> {
+    let node_id = query.node_id.as_deref().unwrap_or("local");
     let mut seen = HashSet::new();
     let payload_items: Vec<DesktopAppItemPayload> = payload
         .apps
         .into_iter()
         .filter(|item| seen.insert(item.app_id.clone()))
         .collect();
-    let catalog = list_apps(&state.metadata_db, None).await?;
+    let catalog = list_apps(&state.metadata_db, None, Some(node_id)).await?;
     let payload_map: HashMap<String, DesktopAppItemPayload> = payload_items
         .into_iter()
         .map(|item| (item.app_id.clone(), item))
         .collect();
-    let catalog_ids: HashSet<String> = catalog.iter().map(|app| app.app_id.clone()).collect();
-    let mut items: Vec<DesktopAppItemPayload> = catalog
+    let items: Vec<DesktopAppItemPayload> = catalog
         .into_iter()
         .map(|app| {
             payload_map
@@ -68,25 +80,6 @@ pub async fn update(
                 })
         })
         .collect();
-    if let Some(existing_items) = fetch_desktop_apps(&state.metadata_db).await? {
-        items.extend(
-            existing_items
-                .into_iter()
-                .filter(|item| {
-                    item.app_id.starts_with("suite:")
-                        && !catalog_ids.contains(&item.app_id)
-                        && !payload_map.contains_key(&item.app_id)
-                })
-                .map(|item| DesktopAppItemPayload {
-                    app_id: item.app_id,
-                    sort_order: item.sort_order,
-                    visible: item.visible,
-                    x: item.x,
-                    y: item.y,
-                    suite_visible_before_disable: item.suite_visible_before_disable,
-                }),
-        );
-    }
-    replace_desktop_apps(&state.metadata_db, &items).await?;
+    replace_desktop_apps(&state.metadata_db, node_id, &items).await?;
     Ok(ApiResponse::ok("Desktop applications saved").into_response())
 }

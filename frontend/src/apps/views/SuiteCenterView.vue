@@ -21,6 +21,7 @@ import {
 } from '@/components/ui'
 import AppIcon from '@/components/icons/AppIcon.vue'
 import SecLabIcon from '@/components/icons/SecLabIcon.vue'
+import { useNodeStore } from '@/stores/node'
 import { useNotificationStore } from '@/stores/notification'
 import { useWindowManagerStore } from '@/stores/window-manager'
 
@@ -38,6 +39,7 @@ interface SuiteCard {
 const { t, locale } = useI18n()
 const notificationStore = useNotificationStore()
 const windowStore = useWindowManagerStore()
+const nodeStore = useNodeStore()
 
 const loading = ref(false)
 const operatingId = ref('')
@@ -58,9 +60,15 @@ const cancelingInstall = ref(false)
 let installProgressTimer: ReturnType<typeof window.setInterval> | null = null
 
 const hasSuites = computed(() => catalog.value.length > 0)
+const currentNodeId = computed(() => nodeStore.currentNodeId || 'local')
+const currentNodeUnavailable = computed(() => nodeStore.currentNodeUnavailable)
 const selectedSuite = computed(
   () => suiteCards.value.find((item) => item.suite.suiteId === selectedSuiteId.value) ?? null,
 )
+const visibleInstallProgress = computed(() => {
+  if (!installProgress.value) return null
+  return installProgress.value.nodeId === currentNodeId.value ? installProgress.value : null
+})
 
 const suiteCards = computed<SuiteCard[]>(() => {
   return catalog.value.map((suite) => {
@@ -133,7 +141,11 @@ function statusClass(status: string) {
 }
 
 function isInstallingSuite(card: SuiteCard | null) {
-  return !!card && operatingId.value === `install:${card.suite.suiteId}`
+  return (
+    !!card &&
+    operatingId.value === `install:${card.suite.suiteId}` &&
+    installProgress.value?.nodeId === currentNodeId.value
+  )
 }
 
 function installProgressStepLabel(step: string) {
@@ -156,7 +168,7 @@ function closeDetail() {
 async function refreshSuites() {
   loading.value = true
   try {
-    const response = await suitesApi.fetchSuites()
+    const response = await suitesApi.fetchSuites(currentNodeId.value)
     if (!response.success || !response.data) {
       notificationStore.error(response.message || t('app.suiteCenter.messages.loadFailed'))
       return
@@ -231,12 +243,17 @@ async function confirmImportSuite() {
 }
 
 async function installSuite(card: SuiteCard) {
+  if (currentNodeUnavailable.value) {
+    notificationStore.error(t('app.suiteCenter.messages.loadFailed'))
+    return
+  }
   operatingId.value = `install:${card.suite.suiteId}`
   clearInstallProgressTimer()
+  const targetNodeId = currentNodeId.value
   installProgress.value = {
     taskId: '',
     instanceId: '',
-    nodeId: 'local',
+    nodeId: targetNodeId,
     progressPercent: 1,
     status: 'queued',
     currentStep: 'queued',
@@ -244,7 +261,7 @@ async function installSuite(card: SuiteCard) {
     cancelRequested: false,
   }
   try {
-    const response = await suitesApi.installSuite(card.suite.suiteId)
+    const response = await suitesApi.installSuite(card.suite.suiteId, targetNodeId)
     if (!response.success || !response.data) {
       notificationStore.error(response.message || t('app.suiteCenter.messages.installFailed'))
       operatingId.value = ''
@@ -254,7 +271,7 @@ async function installSuite(card: SuiteCard) {
     installProgress.value = {
       taskId: response.data.taskId,
       instanceId: response.data.instanceId,
-      nodeId: 'local',
+      nodeId: targetNodeId,
       progressPercent: 1,
       status: 'queued',
       currentStep: 'queued',
@@ -456,6 +473,13 @@ watch(
     void refreshSuites()
   },
 )
+
+watch(
+  () => currentNodeId.value,
+  () => {
+    void refreshSuites()
+  },
+)
 </script>
 
 <template>
@@ -625,18 +649,18 @@ watch(
       <template #footer>
         <div class="suite-dialog-footer">
           <div
-            v-if="isInstallingSuite(selectedSuite) && installProgress"
+            v-if="isInstallingSuite(selectedSuite) && visibleInstallProgress"
             class="suite-install-progress"
             data-ui="suite-install-progress"
           >
             <div class="suite-install-progress-line">
-              <span>{{ installProgressStepLabel(installProgress.currentStep) }}</span>
+              <span>{{ installProgressStepLabel(visibleInstallProgress.currentStep) }}</span>
             </div>
             <div class="suite-install-progress-track">
               <div class="suite-install-progress-bar" aria-hidden="true">
-                <div :style="{ width: `${installProgress.progressPercent}%` }"></div>
+                <div :style="{ width: `${visibleInstallProgress.progressPercent}%` }"></div>
               </div>
-              <strong>{{ installProgress.progressPercent }}%</strong>
+              <strong>{{ visibleInstallProgress.progressPercent }}%</strong>
             </div>
           </div>
           <div class="suite-dialog-actions">
@@ -662,7 +686,8 @@ watch(
               </SecLabButton>
               <SecLabButton
                 type="primary"
-                :loading="operatingId === `install:${selectedSuite.suite.suiteId}`"
+                :loading="isInstallingSuite(selectedSuite)"
+                :disabled="currentNodeUnavailable"
                 @click="installSuite(selectedSuite)"
               >
                 {{ t('app.suiteCenter.install') }}

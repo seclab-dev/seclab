@@ -22,6 +22,7 @@ export interface AppConfig {
   hidden?: boolean
   sourceType?: 'builtin' | 'suite'
   suiteInstanceId?: string
+  nodeId?: string
   appEntryId?: string
   entryType?: 'proxied_web' | 'compose_detail'
   entryTarget?: string

@@ -46,6 +46,8 @@ pub fn state_api_router(app_state: Arc<AppState>) -> Router<Arc<AppState>> {
         .nest("/scripts", scripts::scripts_router())
         .nest("/simulation", simulation::simulation_router())
         .nest("/suites", suites::suites_router())
+        .nest("/suite-instances", suites::suite_instances_router())
+        .nest("/suite-install-tasks", suites::suite_install_tasks_router())
         .layer(middleware::from_fn_with_state(
             Arc::clone(&app_state),
             auth::auth_layer,

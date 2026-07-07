@@ -7,9 +7,9 @@ use crate::models::logging::LogModule;
 use crate::models::suites::{
     SuiteAppEntryManifest, SuiteAppEntryRecord, SuiteInstanceSummary, SuiteManifest,
     SuitePackageFile, SuitePackageSnapshot, delete_catalog_item, delete_instance,
-    delete_instance_app_entries, fetch_catalog_payload, fetch_instance, fetch_instance_by_suite_id,
-    insert_instance, list_suites, replace_instance_app_entries, update_instance_status,
-    upsert_catalog_item,
+    delete_instance_app_entries, fetch_catalog_payload, fetch_instance,
+    fetch_instance_by_suite_and_node, insert_instance, list_suites, replace_instance_app_entries,
+    suite_has_instances, update_instance_status, upsert_catalog_item,
 };
 use crate::services::logging::{self, PlatformLogEntry};
 use crate::state::AppState;
@@ -18,12 +18,13 @@ use axum::body::Body;
 use axum::extract::{Multipart, OriginalUri, Path, Query, State, connect_info::ConnectInfo};
 use axum::http::{HeaderMap, Method, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get, post};
+use axum::routing::{any, delete, get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use flate2::read::GzDecoder;
 use ring::digest;
+use seclab_contracts::types::DockerStatusSummary;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
@@ -42,33 +43,31 @@ pub fn suites_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/list", get(list))
         .route("/import", post(import_suite))
-        .route("/install-progress", get(install_progress))
-        .route("/install-progress/{task_id}/cancel", post(cancel_install))
         .route("/{suite_id}/install", post(install_suite))
-        .route("/{suite_id}/delete", post(delete_suite))
+        .route("/{suite_id}", delete(delete_suite))
         .route("/{suite_id}/assets/{*asset_path}", get(read_catalog_asset))
-        .route("/instance/{instance_id}/enable", post(enable_instance))
-        .route("/instance/{instance_id}/disable", post(disable_instance))
+}
+
+/// 构建套件实例路由集合。
+pub fn suite_instances_router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/{instance_id}/enable", post(enable_instance))
+        .route("/{instance_id}/disable", post(disable_instance))
+        .route("/{instance_id}/uninstall", post(uninstall_instance))
+        .route("/{instance_id}/assets/{*asset_path}", get(read_suite_asset))
+        .route("/{instance_id}/proxy/{entry_id}/", any(proxy_suite_entry))
         .route(
-            "/instance/{instance_id}/uninstall",
-            post(uninstall_instance),
-        )
-        .route(
-            "/instance/{instance_id}/assets/{*asset_path}",
-            get(read_suite_asset),
-        )
-        .route(
-            "/instance/{instance_id}/proxy/{entry_id}/",
+            "/{instance_id}/proxy/{entry_id}/{*path}",
             any(proxy_suite_entry),
         )
-        .route(
-            "/instance/{instance_id}/proxy/{entry_id}/{*path}",
-            any(proxy_suite_entry),
-        )
-        .route(
-            "/instance/{instance_id}/proxy/{entry_id}",
-            any(proxy_suite_entry),
-        )
+        .route("/{instance_id}/proxy/{entry_id}", any(proxy_suite_entry))
+}
+
+/// 构建套件安装任务路由集合。
+pub fn suite_install_tasks_router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/{task_id}", get(install_progress))
+        .route("/{task_id}/cancel", post(cancel_install))
 }
 
 /// 安装套件的请求参数。
@@ -78,11 +77,11 @@ pub struct InstallSuiteRequest {
     pub node_id: Option<String>,
 }
 
-/// 查询套件安装进度的请求参数。
+/// 查询套件列表的请求参数。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SuiteInstallProgressQuery {
-    pub task_id: String,
+pub struct SuiteListQuery {
+    pub node_id: Option<String>,
 }
 
 /// 启动套件安装任务后的返回数据。
@@ -267,10 +266,15 @@ fn suite_instance_log_metadata(instance: &SuiteInstanceSummary) -> serde_json::V
 }
 
 /// 返回套件目录和实例列表。
-pub async fn list(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Response> {
+pub async fn list(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<SuiteListQuery>,
+) -> ApiResult<Response> {
     // 套件清单本地化只依赖请求语言，不把语言状态写入数据库。
     let locale = resolve_request_locale(&headers);
-    let data = list_suites(&state.metadata_db, locale.as_deref()).await?;
+    let node_id = query.node_id.as_deref().unwrap_or("local");
+    let data = list_suites(&state.metadata_db, locale.as_deref(), Some(node_id)).await?;
     Ok(ApiResponse::success_with_raw("Suites loaded", data).into_response())
 }
 
@@ -341,10 +345,7 @@ pub async fn delete_suite(
 ) -> ApiResult<Response> {
     let ctx = SuiteAuditContext::from_request(&admin, &headers, conn);
     let result = async {
-        if fetch_instance_by_suite_id(&state.metadata_db, &path.suite_id)
-            .await?
-            .is_some()
-        {
+        if suite_has_instances(&state.metadata_db, &path.suite_id).await? {
             return Err(ApiError::BadRequest(
                 "suite is installed; uninstall it before deleting".to_string(),
             ));
@@ -365,8 +366,8 @@ pub async fn delete_suite(
         &ctx,
         SuitePlatformLog {
             event: "suite_delete",
-            method: "POST",
-            request_path: "/api/v1/suites/{suite_id}/delete",
+            method: "DELETE",
+            request_path: "/api/v1/suites/{suite_id}",
             target_type: "suite_catalog",
             target_id: &path.suite_id,
             metadata,
@@ -411,14 +412,34 @@ pub async fn install_suite(
             return Err(err);
         }
     };
-    if fetch_instance_by_suite_id(&state.metadata_db, &manifest.metadata.suite_id)
+    if fetch_instance_by_suite_and_node(&state.metadata_db, &manifest.metadata.suite_id, &node_id)
         .await?
         .is_some()
     {
         let err = ApiError::BadRequest(format!(
-            "suite is already installed: {}",
-            manifest.metadata.suite_id
+            "suite is already installed on node {node_id}: {}",
+            manifest.metadata.suite_id,
         ));
+        let mut metadata = suite_manifest_log_metadata(&manifest);
+        if let Some(object) = metadata.as_object_mut() {
+            object.insert("node_id".to_string(), serde_json::json!(node_id));
+        }
+        finish_suite_platform_log(
+            &state,
+            &ctx,
+            SuitePlatformLog {
+                event: "suite_install_start",
+                method: "POST",
+                request_path: "/api/v1/suites/{suite_id}/install",
+                target_type: "suite_catalog",
+                target_id: &manifest.metadata.suite_id,
+                metadata,
+                error: Some(&err.to_string()),
+            },
+        );
+        return Err(err);
+    }
+    if let Err(err) = ensure_suite_node_ready(&state, &node_id).await {
         let mut metadata = suite_manifest_log_metadata(&manifest);
         if let Some(object) = metadata.as_object_mut() {
             object.insert("node_id".to_string(), serde_json::json!(node_id));
@@ -528,11 +549,11 @@ pub async fn install_suite(
 /// 查询套件安装任务的实时进度。
 pub async fn install_progress(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<SuiteInstallProgressQuery>,
+    Path(path): Path<SuiteInstallTaskPath>,
 ) -> ApiResult<Response> {
     let mut progress = {
         let sessions = SUITE_INSTALL_SESSIONS.lock().unwrap();
-        sessions.get(&query.task_id).cloned()
+        sessions.get(&path.task_id).cloned()
     }
     .ok_or(ApiError::NotFound)?;
 
@@ -572,7 +593,7 @@ pub async fn cancel_install(
             SuitePlatformLog {
                 event: "suite_install_canceled",
                 method: "POST",
-                request_path: "/api/v1/suites/install-progress/{task_id}/cancel",
+                request_path: "/api/v1/suite-install-tasks/{task_id}/cancel",
                 target_type: "suite_instance",
                 target_id: &progress.instance_id,
                 metadata: serde_json::json!({
@@ -632,7 +653,7 @@ pub async fn cancel_install(
         SuitePlatformLog {
             event: "suite_install_canceled",
             method: "POST",
-            request_path: "/api/v1/suites/install-progress/{task_id}/cancel",
+            request_path: "/api/v1/suite-install-tasks/{task_id}/cancel",
             target_type: "suite_instance",
             target_id: &canceled.instance_id,
             metadata: serde_json::json!({
@@ -1036,6 +1057,7 @@ pub async fn enable_instance(
     let instance = fetch_instance(&state.metadata_db, &instance_id)
         .await?
         .ok_or_else(|| ApiError::BadRequest(format!("suite instance not found: {instance_id}")))?;
+    validate_instance_transition(&instance, "enable")?;
     update_instance_status(&state.metadata_db, &instance_id, "enabling", None).await?;
 
     let client =
@@ -1095,7 +1117,7 @@ pub async fn enable_instance(
         SuitePlatformLog {
             event: "suite_enable",
             method: "POST",
-            request_path: "/api/v1/suites/instance/{instance_id}/enable",
+            request_path: "/api/v1/suite-instances/{instance_id}/enable",
             target_type: "suite_instance",
             target_id: &instance_id,
             metadata: suite_instance_log_metadata(&instance),
@@ -1118,6 +1140,7 @@ pub async fn disable_instance(
     let instance = fetch_instance(&state.metadata_db, &instance_id)
         .await?
         .ok_or_else(|| ApiError::BadRequest(format!("suite instance not found: {instance_id}")))?;
+    validate_instance_transition(&instance, "disable")?;
     update_instance_status(&state.metadata_db, &instance_id, "disabling", None).await?;
 
     let client =
@@ -1158,7 +1181,7 @@ pub async fn disable_instance(
                 ApiError::BadRequest(format!("suite not found: {}", instance.suite_id))
             })?;
         let app_ids = build_suite_app_ids(&instance_id, &manifest.app_entries);
-        hide_suite_desktop_apps(&state.metadata_db, &app_ids).await?;
+        hide_suite_desktop_apps(&state.metadata_db, &instance.node_id, &app_ids).await?;
         delete_instance_app_entries(&state.metadata_db, &instance_id).await?;
         update_instance_status(&state.metadata_db, &instance_id, "disabled", None).await?;
         Ok::<_, ApiError>(fetch_instance(&state.metadata_db, &instance_id).await?)
@@ -1171,7 +1194,7 @@ pub async fn disable_instance(
         SuitePlatformLog {
             event: "suite_disable",
             method: "POST",
-            request_path: "/api/v1/suites/instance/{instance_id}/disable",
+            request_path: "/api/v1/suite-instances/{instance_id}/disable",
             target_type: "suite_instance",
             target_id: &instance_id,
             metadata: suite_instance_log_metadata(&instance),
@@ -1195,6 +1218,8 @@ pub async fn uninstall_instance(
     let instance = fetch_instance(&state.metadata_db, &instance_id)
         .await?
         .ok_or_else(|| ApiError::BadRequest(format!("suite instance not found: {instance_id}")))?;
+    validate_instance_transition(&instance, "uninstall")?;
+    update_instance_status(&state.metadata_db, &instance_id, "uninstalling", None).await?;
     let client =
         NodeRuntimeClient::from_node_route(&state.metadata_db, Some(&instance.node_id)).await?;
     let request = AgentSuiteActionRequest {
@@ -1240,7 +1265,7 @@ pub async fn uninstall_instance(
             fetch_catalog_payload(&state.metadata_db, &instance.suite_id).await?
         {
             let app_ids = build_suite_app_ids(&instance_id, &manifest.app_entries);
-            delete_desktop_apps(&state.metadata_db, &app_ids).await?;
+            delete_desktop_apps(&state.metadata_db, &instance.node_id, &app_ids).await?;
         }
         delete_instance_app_entries(&state.metadata_db, &instance_id).await?;
         delete_instance(&state.metadata_db, &instance_id).await?;
@@ -1261,7 +1286,7 @@ pub async fn uninstall_instance(
         SuitePlatformLog {
             event: "suite_uninstall",
             method: "POST",
-            request_path: "/api/v1/suites/instance/{instance_id}/uninstall",
+            request_path: "/api/v1/suite-instances/{instance_id}/uninstall",
             target_type: "suite_instance",
             target_id: &instance_id,
             metadata,
@@ -1345,7 +1370,7 @@ pub async fn proxy_suite_entry(
         .path_and_query()
         .map(|value| value.as_str())
         .unwrap_or(uri.path());
-    let public_prefix = format!("/api/v1/suites/instance/{}", path.instance_id);
+    let public_prefix = format!("/api/v1/suite-instances/{}", path.instance_id);
     let agent_prefix = format!(
         "/api/v1/agent/docker/suite/{}",
         instance.compose_project_name
@@ -1726,6 +1751,7 @@ fn build_app_entry_records(
             SuiteAppEntryRecord {
                 app_id,
                 suite_instance_id: instance.instance_id.clone(),
+                node_id: instance.node_id.clone(),
                 app_entry_id: entry.id.clone(),
                 title: manifest.localized_app_entry_title(entry, locale),
                 icon: resolve_suite_icon(instance, suite_icon, entry),
@@ -1775,7 +1801,7 @@ fn resolve_suite_icon(
 }
 
 fn build_suite_asset_url(instance_id: &str, asset_path: &str) -> String {
-    format!("/api/v1/suites/instance/{instance_id}/{asset_path}")
+    format!("/api/v1/suite-instances/{instance_id}/{asset_path}")
 }
 
 fn normalize_asset_path(asset_path: &str) -> ApiResult<String> {
@@ -1803,7 +1829,7 @@ fn content_type_for_asset(asset_path: &str) -> &'static str {
 }
 
 fn build_suite_proxy_target(instance_id: &str, entry_id: &str, entry_path: Option<&str>) -> String {
-    let base = format!("/api/v1/suites/instance/{instance_id}/proxy/{entry_id}");
+    let base = format!("/api/v1/suite-instances/{instance_id}/proxy/{entry_id}");
     let Some(path) = entry_path.map(str::trim).filter(|value| !value.is_empty()) else {
         return format!("{base}/");
     };
@@ -1815,6 +1841,59 @@ fn build_suite_proxy_target(instance_id: &str, entry_id: &str, entry_path: Optio
     } else {
         format!("{base}/{path}")
     }
+}
+
+/// 校验实例生命周期操作是否允许从当前状态进入。
+fn validate_instance_transition(instance: &SuiteInstanceSummary, action: &str) -> ApiResult<()> {
+    let allowed = match action {
+        "enable" => matches!(instance.status.as_str(), "installed" | "disabled" | "error"),
+        "disable" => matches!(instance.status.as_str(), "enabled" | "error"),
+        "uninstall" => matches!(
+            instance.status.as_str(),
+            "installed" | "enabled" | "disabled" | "error"
+        ),
+        _ => false,
+    };
+    if allowed {
+        return Ok(());
+    }
+    Err(ApiError::BadRequest(format!(
+        "cannot {action} suite instance {} while status is {}",
+        instance.instance_id, instance.status
+    )))
+}
+
+/// 安装前确认目标节点和 Docker 运行时可用。
+async fn ensure_suite_node_ready(state: &Arc<AppState>, node_id: &str) -> ApiResult<()> {
+    let client = NodeRuntimeClient::from_node_route(&state.metadata_db, Some(node_id)).await?;
+    let response: ApiResponse<DockerStatusSummary> = client
+        .get_json("/api/v1/agent/docker/status")
+        .await
+        .map_err(|err| {
+            ApiError::BadRequest(format!(
+                "failed to check docker status on node {node_id}: {err}"
+            ))
+        })?;
+    if !response.success {
+        let message = if response.message.trim().is_empty() {
+            format!("docker status check failed on node {node_id}")
+        } else {
+            response.message
+        };
+        return Err(ApiError::BadRequest(message));
+    }
+    let status = response.data.ok_or_else(|| {
+        ApiError::BadRequest(format!(
+            "docker status check returned empty data on node {node_id}"
+        ))
+    })?;
+    if !status.docker_available {
+        return Err(ApiError::BadRequest(format!(
+            "docker is not available on node {node_id}: {:?}",
+            status.docker_status
+        )));
+    }
+    Ok(())
 }
 
 fn ensure_agent_success(value: &serde_json::Value) -> Result<(), String> {
@@ -1924,7 +2003,7 @@ mod suite_asset_tests {
         };
         assert_eq!(
             resolve_suite_icon(&instance, "assets/suite-icon.png", &entry),
-            "/api/v1/suites/instance/instance-1/assets/suite-icon.png"
+            "/api/v1/suite-instances/instance-1/assets/suite-icon.png"
         );
     }
 }
@@ -1945,15 +2024,15 @@ mod tests {
     fn suite_proxy_target_keeps_web_entry_as_directory() {
         assert_eq!(
             build_suite_proxy_target("instance-1", "main", Some("/")),
-            "/api/v1/suites/instance/instance-1/proxy/main/"
+            "/api/v1/suite-instances/instance-1/proxy/main/"
         );
         assert_eq!(
             build_suite_proxy_target("instance-1", "main", None),
-            "/api/v1/suites/instance/instance-1/proxy/main/"
+            "/api/v1/suite-instances/instance-1/proxy/main/"
         );
         assert_eq!(
             build_suite_proxy_target("instance-1", "main", Some("/console")),
-            "/api/v1/suites/instance/instance-1/proxy/main/console"
+            "/api/v1/suite-instances/instance-1/proxy/main/console"
         );
     }
 }

@@ -120,6 +120,7 @@ function calculateCenteredY(windowHeight: number): number {
 
 export const useWindowManagerStore = defineStore('windowManager', () => {
   const { t, locale, messages } = useI18n()
+  const nodeStore = useNodeStore()
   // 存储所有打开的窗口实例
   const openWindows = ref<WindowInstance[]>([])
   const globalOperations = ref<GlobalOperationState[]>([])
@@ -151,6 +152,13 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
       }
     })
   })
+
+  watch(
+    () => nodeStore.currentNodeId,
+    () => {
+      void refreshDesktopState()
+    },
+  )
 
   const maxZIndex = computed(() => {
     return openWindows.value.reduce((max, window) => Math.max(max, window.zIndex), BASE_Z_INDEX)
@@ -228,6 +236,7 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
     hidden: boolean
     sourceType?: 'builtin' | 'suite'
     suiteInstanceId?: string
+    nodeId?: string
     appEntryId?: string
     entryType?: 'proxied_web' | 'compose_detail'
     entryTarget?: string
@@ -289,6 +298,7 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
       config.hidden = item.hidden
       config.sourceType = item.sourceType ?? 'builtin'
       config.suiteInstanceId = item.suiteInstanceId
+      config.nodeId = item.nodeId
       config.appEntryId = item.appEntryId
       config.entryType = item.entryType
       config.entryTarget = item.entryTarget
@@ -554,7 +564,7 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
 
   async function loadAppCatalog() {
     try {
-      const response = await appsApi.fetchApps()
+      const response = await appsApi.fetchApps(nodeStore.currentNodeId || 'local')
       if (response.success && response.data) {
         applyAppCatalog(response.data)
       }
@@ -616,13 +626,13 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
 
   async function loadDesktopShortcuts() {
     try {
-      const response = await desktopApi.fetchDesktopApps()
+      const currentNodeId = nodeStore.currentNodeId || 'local'
+      const response = await desktopApi.fetchDesktopApps(currentNodeId)
       if (response.success && response.data) {
         const filtered = normalizeDesktopAppItems(response.data.apps)
         if (response.data.hasRecord) {
-          const visible = filtered.filter((item) => item.visible)
-          const currentShortcutMap = new Map(
-            desktopShortcuts.value.map((shortcut) => [shortcut.appId, shortcut]),
+          const visible = filtered.filter(
+            (item) => item.visible && !availableAppsState[item.appId]?.hidden,
           )
           // 检查是否有缺失坐标的项，如果有，尝试布局它们
           const shortcuts: DesktopAppShortcut[] = []
@@ -631,15 +641,6 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
           visible.forEach((item) => {
             if (item.x !== undefined && item.y !== undefined) {
               shortcuts.push({ appId: item.appId, x: item.x, y: item.y })
-            } else if (currentShortcutMap.has(item.appId)) {
-              // 后端新增套件入口时不会推断桌面坐标；刷新时优先复用当前桌面上的真实位置，
-              // 再把完全没有坐标的新入口交给统一的桌面补位算法。
-              const currentShortcut = currentShortcutMap.get(item.appId)!
-              shortcuts.push({
-                appId: item.appId,
-                x: currentShortcut.x,
-                y: currentShortcut.y,
-              })
             } else {
               needsLayout.push(item.appId)
             }
@@ -652,13 +653,9 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
             (appId) => !availableAppsState[appId].hidden,
           )
           visibleCatalogIds.forEach((appId) => {
-            if (!availableAppsState[appId].hidden && !existingAppIds.has(appId)) {
-              const currentShortcut = currentShortcutMap.get(appId)
-              if (currentShortcut) {
-                shortcuts.push(currentShortcut)
-              } else {
-                needsLayout.push(appId)
-              }
+            const alreadyOnDesktop = shortcuts.some((shortcut) => shortcut.appId === appId)
+            if (!alreadyOnDesktop && !existingAppIds.has(appId)) {
+              needsLayout.push(appId)
             }
           })
 
@@ -708,9 +705,12 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
 
   async function persistDesktopShortcuts() {
     try {
-      await desktopApi.saveDesktopApps({
-        apps: buildDesktopItemsPayload(),
-      })
+      await desktopApi.saveDesktopApps(
+        {
+          apps: buildDesktopItemsPayload(),
+        },
+        nodeStore.currentNodeId || 'local',
+      )
     } catch (error) {
       console.warn('Failed to save desktop shortcuts', error)
     }
@@ -901,6 +901,7 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
             url: appConfig.entryTarget,
             title: resolveAppTitle(appConfig),
             suiteInstanceId: appConfig.suiteInstanceId,
+            nodeId: appConfig.nodeId,
             appEntryId: appConfig.appEntryId,
           },
           {

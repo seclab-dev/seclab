@@ -4,8 +4,21 @@ use crate::models::apps::list_apps;
 use crate::state::AppState;
 use crate::types::{ApiResponse, ApiResult};
 use axum::http::{HeaderMap, header};
-use axum::{Router, extract::State, response::IntoResponse, routing::get};
+use axum::{
+    Router,
+    extract::{Query, State},
+    response::IntoResponse,
+    routing::get,
+};
+use serde::Deserialize;
 use std::sync::Arc;
+
+/// 应用目录查询参数。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppListQuery {
+    pub node_id: Option<String>,
+}
 
 /// 构建应用目录相关的路由集合。
 pub fn apps_router() -> Router<Arc<AppState>> {
@@ -16,9 +29,11 @@ pub fn apps_router() -> Router<Arc<AppState>> {
 pub async fn list(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(query): Query<AppListQuery>,
 ) -> ApiResult<impl IntoResponse> {
     let locale = resolve_request_locale(&headers);
-    let apps = list_apps(&state.metadata_db, locale.as_deref()).await?;
+    let node_id = query.node_id.as_deref().unwrap_or("local");
+    let apps = list_apps(&state.metadata_db, locale.as_deref(), Some(node_id)).await?;
     Ok(ApiResponse::success_with_raw("Applications loaded", apps).into_response())
 }
 

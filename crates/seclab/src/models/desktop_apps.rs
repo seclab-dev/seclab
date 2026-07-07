@@ -6,6 +6,7 @@ use sqlx::FromRow;
 
 #[derive(Debug, FromRow)]
 struct DesktopAppItemRecord {
+    pub node_id: String,
     pub app_id: String,
     pub sort_order: i64,
     pub visible: i64,
@@ -50,6 +51,7 @@ pub struct DesktopAppsPayload {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopAppItem {
+    pub node_id: String,
     pub app_id: String,
     pub sort_order: i64,
     pub visible: bool,
@@ -61,14 +63,19 @@ pub struct DesktopAppItem {
 }
 
 /// 读取已保存的桌面应用配置，按排序返回。
-pub async fn fetch_desktop_apps(pool: &DbPool) -> sqlx::Result<Option<Vec<DesktopAppItem>>> {
+pub async fn fetch_desktop_apps(
+    pool: &DbPool,
+    node_id: &str,
+) -> sqlx::Result<Option<Vec<DesktopAppItem>>> {
     let records = sqlx::query_as::<_, DesktopAppItemRecord>(
         r#"
-        SELECT app_id, sort_order, visible, metadata
+        SELECT node_id, app_id, sort_order, visible, metadata
         FROM desktop_apps
+        WHERE node_id = ?1
         ORDER BY sort_order ASC, app_id ASC
         "#,
     )
+    .bind(node_id)
     .fetch_all(pool)
     .await?;
 
@@ -90,6 +97,7 @@ pub async fn fetch_desktop_apps(pool: &DbPool) -> sqlx::Result<Option<Vec<Deskto
                 };
 
                 DesktopAppItem {
+                    node_id: record.node_id,
                     app_id: record.app_id,
                     sort_order: record.sort_order,
                     visible: record.visible != 0,
@@ -105,14 +113,17 @@ pub async fn fetch_desktop_apps(pool: &DbPool) -> sqlx::Result<Option<Vec<Deskto
 /// 用新配置覆盖桌面应用列表并写入数据库。
 pub async fn replace_desktop_apps(
     pool: &DbPool,
+    node_id: &str,
     items: &[DesktopAppItemPayload],
 ) -> sqlx::Result<()> {
     let mut tx = pool.begin().await?;
     sqlx::query(
         r#"
         DELETE FROM desktop_apps
+        WHERE node_id = ?1
         "#,
     )
+    .bind(node_id)
     .execute(&mut *tx)
     .await?;
 
@@ -126,10 +137,11 @@ pub async fn replace_desktop_apps(
 
         sqlx::query(
             r#"
-            INSERT INTO desktop_apps (app_id, sort_order, visible, pinned, metadata)
-            VALUES (?, ?, ?, 0, ?)
+            INSERT INTO desktop_apps (node_id, app_id, sort_order, visible, pinned, metadata)
+            VALUES (?, ?, ?, ?, 0, ?)
             "#,
         )
+        .bind(node_id)
         .bind(&item.app_id)
         .bind(item.sort_order)
         .bind(if item.visible { 1 } else { 0 })
@@ -144,15 +156,21 @@ pub async fn replace_desktop_apps(
 }
 
 /// 隐藏套件应用的桌面快捷方式，并记录停用前的可见状态。
-pub async fn hide_suite_desktop_apps(pool: &DbPool, app_ids: &[String]) -> sqlx::Result<()> {
+pub async fn hide_suite_desktop_apps(
+    pool: &DbPool,
+    node_id: &str,
+    app_ids: &[String],
+) -> sqlx::Result<()> {
     for app_id in app_ids {
         let existing = sqlx::query_as::<_, DesktopAppItemRecord>(
             r#"
-            SELECT app_id, sort_order, visible, metadata
+            SELECT node_id, app_id, sort_order, visible, metadata
             FROM desktop_apps
-            WHERE app_id = ?1
+            WHERE node_id = ?1
+              AND app_id = ?2
             "#,
         )
+        .bind(node_id)
         .bind(app_id)
         .fetch_optional(pool)
         .await?;
@@ -165,10 +183,12 @@ pub async fn hide_suite_desktop_apps(pool: &DbPool, app_ids: &[String]) -> sqlx:
                 r#"
                 UPDATE desktop_apps
                    SET visible = 0,
-                       metadata = ?2
-                 WHERE app_id = ?1
+                       metadata = ?3
+                 WHERE node_id = ?1
+                   AND app_id = ?2
                 "#,
             )
+            .bind(node_id)
             .bind(app_id)
             .bind(metadata_str)
             .execute(pool)
@@ -179,9 +199,14 @@ pub async fn hide_suite_desktop_apps(pool: &DbPool, app_ids: &[String]) -> sqlx:
 }
 
 /// 删除套件应用的桌面快捷方式状态。
-pub async fn delete_desktop_apps(pool: &DbPool, app_ids: &[String]) -> sqlx::Result<()> {
+pub async fn delete_desktop_apps(
+    pool: &DbPool,
+    node_id: &str,
+    app_ids: &[String],
+) -> sqlx::Result<()> {
     for app_id in app_ids {
-        sqlx::query("DELETE FROM desktop_apps WHERE app_id = ?1")
+        sqlx::query("DELETE FROM desktop_apps WHERE node_id = ?1 AND app_id = ?2")
+            .bind(node_id)
             .bind(app_id)
             .execute(pool)
             .await?;
@@ -203,7 +228,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_returns_none_when_empty() {
         let pool = setup_test_db().await;
-        let items = fetch_desktop_apps(&pool).await.unwrap();
+        let items = fetch_desktop_apps(&pool, "local").await.unwrap();
         assert!(items.is_none());
     }
 
@@ -228,9 +253,11 @@ mod tests {
                 suite_visible_before_disable: None,
             },
         ];
-        replace_desktop_apps(&pool, &payload).await.unwrap();
+        replace_desktop_apps(&pool, "local", &payload)
+            .await
+            .unwrap();
 
-        let items = fetch_desktop_apps(&pool).await.unwrap().unwrap();
+        let items = fetch_desktop_apps(&pool, "local").await.unwrap().unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].app_id, "file-editor");
         assert_eq!(items[0].sort_order, 1);

@@ -57,6 +57,7 @@ END;
 CREATE TABLE IF NOT EXISTS suite_app_entries (
     app_id TEXT PRIMARY KEY,
     suite_instance_id TEXT NOT NULL,
+    node_id TEXT NOT NULL DEFAULT 'local',
     app_entry_id TEXT NOT NULL,
     title TEXT NOT NULL,
     icon TEXT NOT NULL,
@@ -83,3 +84,12 @@ BEGIN
        SET updated_at = (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
      WHERE app_id = OLD.app_id;
 END;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_suite_instances_suite_node
+    ON suite_instances (suite_id, node_id);
+
+CREATE INDEX IF NOT EXISTS idx_suite_instances_node
+    ON suite_instances (node_id);
+
+CREATE INDEX IF NOT EXISTS idx_suite_app_entries_node
+    ON suite_app_entries (node_id, enabled);

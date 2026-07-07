@@ -183,6 +183,7 @@ pub struct SuiteListResponse {
 pub struct SuiteAppEntryRecord {
     pub app_id: String,
     pub suite_instance_id: String,
+    pub node_id: String,
     pub app_entry_id: String,
     pub title: String,
     pub icon: String,
@@ -197,7 +198,11 @@ pub struct SuiteAppEntryRecord {
 }
 
 /// 读取套件中心列表。
-pub async fn list_suites(pool: &DbPool, locale: Option<&str>) -> sqlx::Result<SuiteListResponse> {
+pub async fn list_suites(
+    pool: &DbPool,
+    locale: Option<&str>,
+    node_id: Option<&str>,
+) -> sqlx::Result<SuiteListResponse> {
     let catalog_rows = sqlx::query_as::<_, SuiteCatalogRow>(
         r#"
         SELECT suite_id,
@@ -219,23 +224,45 @@ pub async fn list_suites(pool: &DbPool, locale: Option<&str>) -> sqlx::Result<Su
         .map(|row| row.into_catalog_item(locale))
         .collect::<sqlx::Result<Vec<_>>>()?;
 
-    let instances = sqlx::query_as::<_, SuiteInstanceSummary>(
-        r#"
-        SELECT instance_id,
-               suite_id,
-               version,
-               node_id,
-               compose_project_name,
-               status,
-               last_error,
-               created_at,
-               updated_at
-        FROM suite_instances
-        ORDER BY updated_at DESC, instance_id ASC
-        "#,
-    )
-    .fetch_all(pool)
-    .await?;
+    let instances = if let Some(node_id) = node_id {
+        sqlx::query_as::<_, SuiteInstanceSummary>(
+            r#"
+            SELECT instance_id,
+                   suite_id,
+                   version,
+                   node_id,
+                   compose_project_name,
+                   status,
+                   last_error,
+                   created_at,
+                   updated_at
+            FROM suite_instances
+            WHERE node_id = ?1
+            ORDER BY updated_at DESC, instance_id ASC
+            "#,
+        )
+        .bind(node_id)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as::<_, SuiteInstanceSummary>(
+            r#"
+            SELECT instance_id,
+                   suite_id,
+                   version,
+                   node_id,
+                   compose_project_name,
+                   status,
+                   last_error,
+                   created_at,
+                   updated_at
+            FROM suite_instances
+            ORDER BY updated_at DESC, instance_id ASC
+            "#,
+        )
+        .fetch_all(pool)
+        .await?
+    };
 
     Ok(SuiteListResponse { catalog, instances })
 }
@@ -450,10 +477,11 @@ pub async fn fetch_instance(
     .await
 }
 
-/// 按套件 ID 读取已安装实例。当前套件系统按单例运行，最多返回一个实例。
-pub async fn fetch_instance_by_suite_id(
+/// 按套件 ID 和节点 ID 读取已安装实例。
+pub async fn fetch_instance_by_suite_and_node(
     pool: &DbPool,
     suite_id: &str,
+    node_id: &str,
 ) -> sqlx::Result<Option<SuiteInstanceSummary>> {
     sqlx::query_as::<_, SuiteInstanceSummary>(
         r#"
@@ -467,14 +495,24 @@ pub async fn fetch_instance_by_suite_id(
                created_at,
                updated_at
         FROM suite_instances
-        WHERE suite_id = ?1
+        WHERE suite_id = ?1 AND node_id = ?2
         ORDER BY created_at ASC
         LIMIT 1
         "#,
     )
     .bind(suite_id)
+    .bind(node_id)
     .fetch_optional(pool)
     .await
+}
+
+/// 判断套件是否仍存在任意节点实例。
+pub async fn suite_has_instances(pool: &DbPool, suite_id: &str) -> sqlx::Result<bool> {
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM suite_instances WHERE suite_id = ?1")
+        .bind(suite_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(count > 0)
 }
 
 /// 更新实例状态。
@@ -518,6 +556,7 @@ pub async fn replace_instance_app_entries(
             INSERT INTO suite_app_entries (
                 app_id,
                 suite_instance_id,
+                node_id,
                 app_entry_id,
                 title,
                 icon,
@@ -530,11 +569,12 @@ pub async fn replace_instance_app_entries(
                 sort_order,
                 enabled
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
             "#,
         )
         .bind(&entry.app_id)
         .bind(&entry.suite_instance_id)
+        .bind(&entry.node_id)
         .bind(&entry.app_entry_id)
         .bind(&entry.title)
         .bind(&entry.icon)
