@@ -13,17 +13,24 @@ use base64::engine::general_purpose::STANDARD;
 use bollard::models::NetworkCreateRequest;
 use bollard::query_parameters::{self, CreateImageOptions};
 use futures_util::StreamExt;
+use seclab_contracts::api::ErrorCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashMap};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
+use tokio::net::TcpStream;
 use tokio::process::Command;
+use tokio::time::{sleep, timeout};
 
 const SUITE_NETWORK_NAME: &str = "seclab-suite-network";
 const COMPOSE_FILE_NAME: &str = "compose.yaml";
 const SUITE_METADATA_FILE: &str = "suite-agent.json";
+const SUITE_ENTRY_READY_TIMEOUT: Duration = Duration::from_secs(60);
+const SUITE_ENTRY_READY_INTERVAL: Duration = Duration::from_secs(1);
+const SUITE_ENTRY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 static SUITE_INSTALL_PROGRESS: LazyLock<Mutex<HashMap<String, SuiteInstallProgress>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -487,6 +494,11 @@ pub async fn enable_suite(
     let compose_file = suite_project_dir(&project).join(COMPOSE_FILE_NAME);
     let result =
         run_compose_command(&payload.compose_project_name, &compose_file, &["up", "-d"]).await;
+    let result = async {
+        result?;
+        wait_for_suite_entries_ready(&state, &project, &payload.compose_project_name).await
+    }
+    .await;
     let error = result.as_ref().err().map(ToString::to_string);
     finish_suite_runtime_log(
         &state,
@@ -578,6 +590,95 @@ pub async fn uninstall_suite(
     Ok(ApiResponse::ok("Suite uninstalled").into_response())
 }
 
+/// 等待套件 Web 入口端口就绪，避免入口已注册但应用进程尚未监听导致立即打开 502。
+async fn wait_for_suite_entries_ready(
+    state: &Arc<AppState>,
+    project: &str,
+    compose_project_name: &str,
+) -> ApiResult<()> {
+    let metadata = read_suite_metadata(project).await?;
+    for entry in metadata
+        .app_entries
+        .iter()
+        .filter(|entry| entry.entry_type == "proxied_web")
+    {
+        let service = entry
+            .service
+            .as_deref()
+            .ok_or_else(|| ApiError::BadRequest("suite entry service is missing".to_string()))?;
+        let port = entry
+            .port
+            .ok_or_else(|| ApiError::BadRequest("suite entry port is missing".to_string()))?;
+        wait_for_suite_entry_ready(state, compose_project_name, entry, service, port).await?;
+    }
+    Ok(())
+}
+
+async fn wait_for_suite_entry_ready(
+    state: &Arc<AppState>,
+    compose_project_name: &str,
+    entry: &SuiteAppEntry,
+    service: &str,
+    port: u16,
+) -> ApiResult<()> {
+    let deadline = Instant::now() + SUITE_ENTRY_READY_TIMEOUT;
+
+    loop {
+        let last_error = match resolve_service_ip(state, compose_project_name, service).await {
+            Ok(container_ip) => match container_ip.parse::<IpAddr>() {
+                Ok(ip) => {
+                    let socket = SocketAddr::new(ip, port);
+                    match timeout(SUITE_ENTRY_CONNECT_TIMEOUT, TcpStream::connect(socket)).await {
+                        Ok(Ok(stream)) => {
+                            drop(stream);
+                            tracing::info!(
+                                entry_id = %entry.id,
+                                service = %service,
+                                port = port,
+                                compose_project_name = %compose_project_name,
+                                "suite entry is ready"
+                            );
+                            return Ok(());
+                        }
+                        Ok(Err(err)) => err.to_string(),
+                        Err(err) => err.to_string(),
+                    }
+                }
+                Err(err) => {
+                    format!("invalid container ip {container_ip}: {err}")
+                }
+            },
+            Err(err) => err.to_string(),
+        };
+
+        if Instant::now() >= deadline {
+            let detail = format!(
+                "suite entry did not become ready within {} seconds: entry_id={}, service={}, port={}, last_error={}",
+                SUITE_ENTRY_READY_TIMEOUT.as_secs(),
+                entry.id,
+                service,
+                port,
+                last_error
+            );
+            tracing::error!(
+                entry_id = %entry.id,
+                service = %service,
+                port = port,
+                compose_project_name = %compose_project_name,
+                error = %last_error,
+                "suite entry readiness timed out"
+            );
+            return Err(ApiError::bad_gateway(
+                ErrorCode::ExternalRequestFailed,
+                "suite entry is not ready",
+            )
+            .with_detail(detail));
+        }
+
+        sleep(SUITE_ENTRY_READY_INTERVAL).await;
+    }
+}
+
 /// 代理套件 Web 入口。
 pub async fn proxy_suite_entry(
     State(state): State<Arc<AppState>>,
@@ -637,15 +738,23 @@ pub async fn proxy_suite_entry(
     {
         Ok(response) => response,
         Err(err) => {
+            let detail = format!(
+                "suite entry is not ready: failed to connect to {service}:{port} via {target_url}: {err}"
+            );
             tracing::error!(
                 error = %err,
                 project = %path.project,
                 entry_id = %path.entry_id,
                 service = %service,
+                port = port,
                 target_url = %target_url,
                 "suite proxy request failed"
             );
-            return Err(err.into());
+            return Err(ApiError::bad_gateway(
+                ErrorCode::ExternalRequestFailed,
+                "suite entry is not ready",
+            )
+            .with_detail(detail));
         }
     };
 
