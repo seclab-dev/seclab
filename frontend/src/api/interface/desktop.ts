@@ -12,5 +12,6 @@ export interface DesktopAppsResponse {
 }
 
 export interface DesktopAppsPayload {
+  nodeId?: string
   apps: DesktopAppItem[]
 }

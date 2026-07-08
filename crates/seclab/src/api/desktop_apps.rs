@@ -2,8 +2,7 @@
 
 use crate::models::apps::list_apps;
 use crate::models::desktop_apps::{
-    DesktopAppItem, DesktopAppItemPayload, DesktopAppsPayload, fetch_desktop_apps,
-    replace_desktop_apps,
+    DesktopAppItem, DesktopAppItemPayload, fetch_desktop_apps, replace_desktop_apps,
 };
 use crate::state::AppState;
 use crate::types::{ApiResponse, ApiResult};
@@ -25,6 +24,14 @@ pub struct DesktopAppsResponse {
 #[serde(rename_all = "camelCase")]
 pub struct DesktopAppsQuery {
     pub node_id: Option<String>,
+}
+
+/// 桌面快捷方式保存请求体。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopAppsUpdateRequest {
+    pub node_id: Option<String>,
+    pub apps: Vec<DesktopAppItemPayload>,
 }
 
 /// 构建桌面应用相关的路由集合。
@@ -49,10 +56,9 @@ pub async fn list(
 /// 保存桌面应用排序与可见性，并补全缺失项的默认值。
 pub async fn update(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<DesktopAppsQuery>,
-    Json(payload): Json<DesktopAppsPayload>,
+    Json(payload): Json<DesktopAppsUpdateRequest>,
 ) -> ApiResult<impl IntoResponse> {
-    let node_id = query.node_id.as_deref().unwrap_or("local");
+    let node_id = payload.node_id.as_deref().unwrap_or("local");
     let mut seen = HashSet::new();
     let payload_items: Vec<DesktopAppItemPayload> = payload
         .apps
