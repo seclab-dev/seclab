@@ -1,0 +1,3 @@
+[alias]
+seclab = "run -p seclab -- start"
+agent = "run -p seclab-agent -- start"
