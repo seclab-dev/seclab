@@ -3,6 +3,7 @@ import { SecLabButton, SecLabTabs, SecLabLoading } from '@/components/ui'
 import { onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useContainerLogs, type LogMode } from './composables/useContainerLogs'
+import { ansiToHtml } from '@/utils/ansi'
 
 /**
  * @file DockerContainerLogsModal.vue
@@ -153,7 +154,8 @@ onBeforeUnmount(() => {
           <pre v-if="logLines.length" class="log-lines"><span
               v-for="(line, idx) in logLines"
               :key="idx"
-            >{{ line }}</span></pre>
+              v-html="ansiToHtml(line)"
+            ></span></pre>
           <div v-else class="log-empty">{{ t('app.docker.containers.logsPanel.empty') }}</div>
         </div>
       </div>

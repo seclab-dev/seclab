@@ -3,6 +3,7 @@ import { SecLabButton, SecLabTabs, SecLabLoading } from '@/components/ui'
 import { computed, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useContainerLogs, type LogMode } from './composables/useContainerLogs'
+import { ansiToHtml } from '@/utils/ansi'
 
 /**
  * @file DockerContainerLogsPanel.vue
@@ -32,7 +33,6 @@ const activeRef = computed(() => props.active ?? false)
 
 const {
   logLines,
-  logText,
   isLoading,
   logMode,
   logModeTabs,
@@ -45,6 +45,10 @@ const {
   containerId: containerIdRef,
   nodeId: nodeIdRef,
   active: activeRef,
+})
+
+const logHtml = computed(() => {
+  return logLines.value.map(ansiToHtml).join('\n')
 })
 
 // --- Panel-specific Logic ---
@@ -106,7 +110,7 @@ watch(
     <div class="logs-body">
       <SecLabLoading :loading="isLoading" />
       <div class="log-scroll" data-native-context-menu>
-        <pre v-if="logLines.length" ref="autoScrollEl" class="log-content">{{ logText }}</pre>
+        <pre v-if="logLines.length" ref="autoScrollEl" class="log-content" v-html="logHtml"></pre>
         <div v-else class="log-empty">{{ t('app.docker.containers.logsPanel.empty') }}</div>
       </div>
     </div>
