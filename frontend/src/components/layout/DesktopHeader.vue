@@ -336,7 +336,7 @@ function isAppOnDesktop(id: AppId | null): boolean {
               data-ui="suite-app-group"
             >
               <div class="library-section-title">{{ $t('desktop.header.suiteApps') }}</div>
-              <div class="library-grid library-grid-left">
+              <div class="library-grid">
                 <button
                   v-for="app in suiteAppList"
                   :key="app.id"
@@ -771,12 +771,8 @@ function isAppOnDesktop(id: AppId | null): boolean {
   column-gap: 18px;
   row-gap: 12px;
   grid-template-columns: repeat(auto-fit, 120px);
-  justify-content: center;
-  align-content: start;
-}
-
-.library-grid-left {
   justify-content: start;
+  align-content: start;
 }
 
 .library-item {
