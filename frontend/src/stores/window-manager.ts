@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { ref, markRaw, computed, watch, reactive } from 'vue'
+import { ref, markRaw, computed, watch, reactive, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { desktopApi } from '@/api/modules/desktop'
 import { appsApi } from '@/api/modules/apps'
@@ -131,6 +131,9 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
   const appCatalogOrder = ref<AppId[]>([])
   const hasLoadedDesktopShortcuts = ref(false)
   const isDesktopDragging = ref(false)
+  const isApplyingDesktopShortcuts = ref(false)
+  let desktopShortcutsLoadPromise: Promise<void> | null = null
+  let desktopShortcutsPersistPromise: Promise<void> | null = null
   const defaultDesktopApps: AppId[] = [
     'suite-center',
     'docker-manager',
@@ -177,6 +180,7 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
       () => {
         if (!hasLoadedDesktopShortcuts.value) return
         if (isDesktopDragging.value) return
+        if (isApplyingDesktopShortcuts.value) return
         void persistDesktopShortcuts()
       },
       { deep: true },
@@ -625,6 +629,14 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
   }
 
   async function loadDesktopShortcuts() {
+    if (desktopShortcutsLoadPromise) return desktopShortcutsLoadPromise
+    desktopShortcutsLoadPromise = loadDesktopShortcutsInner().finally(() => {
+      desktopShortcutsLoadPromise = null
+    })
+    return desktopShortcutsLoadPromise
+  }
+
+  async function loadDesktopShortcutsInner() {
     try {
       const currentNodeId = nodeStore.currentNodeId || 'local'
       const response = await desktopApi.fetchDesktopApps(currentNodeId)
@@ -665,34 +677,43 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
               const shortcut = { appId, ...position }
               shortcuts.push(shortcut)
             })
-            desktopShortcuts.value = shortcuts
+            await applyDesktopShortcuts(shortcuts)
             await persistDesktopShortcuts()
           } else {
-            desktopShortcuts.value = shortcuts
+            await applyDesktopShortcuts(shortcuts)
           }
         } else {
           const defaultIds = defaultDesktopApps.filter((appId) => appId in availableAppsState)
-          desktopShortcuts.value = generateDefaultLayout(
-            defaultIds.length > 0
-              ? defaultIds
-              : (Object.keys(availableAppsState) as AppId[]).filter(
-                  (id) => !availableAppsState[id].hidden,
-                ),
+          await applyDesktopShortcuts(
+            generateDefaultLayout(
+              defaultIds.length > 0
+                ? defaultIds
+                : (Object.keys(availableAppsState) as AppId[]).filter(
+                    (id) => !availableAppsState[id].hidden,
+                  ),
+            ),
           )
           await persistDesktopShortcuts()
         }
       } else if (desktopShortcuts.value.length === 0) {
         const defaultIds = defaultDesktopApps.filter((appId) => appId in availableAppsState)
-        desktopShortcuts.value = generateDefaultLayout(defaultIds)
+        await applyDesktopShortcuts(generateDefaultLayout(defaultIds))
         await persistDesktopShortcuts()
       }
     } catch (error) {
       console.warn('Failed to load desktop shortcuts', error)
       if (desktopShortcuts.value.length === 0) {
         const defaultIds = defaultDesktopApps.filter((appId) => appId in availableAppsState)
-        desktopShortcuts.value = generateDefaultLayout(defaultIds)
+        await applyDesktopShortcuts(generateDefaultLayout(defaultIds))
       }
     }
+  }
+
+  async function applyDesktopShortcuts(shortcuts: DesktopAppShortcut[]) {
+    isApplyingDesktopShortcuts.value = true
+    desktopShortcuts.value = shortcuts
+    await nextTick()
+    isApplyingDesktopShortcuts.value = false
   }
 
   /**
@@ -704,13 +725,19 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
   }
 
   async function persistDesktopShortcuts() {
+    if (desktopShortcutsPersistPromise) return desktopShortcutsPersistPromise
+    desktopShortcutsPersistPromise = persistDesktopShortcutsInner().finally(() => {
+      desktopShortcutsPersistPromise = null
+    })
+    return desktopShortcutsPersistPromise
+  }
+
+  async function persistDesktopShortcutsInner() {
     try {
-      await desktopApi.saveDesktopApps(
-        {
-          apps: buildDesktopItemsPayload(),
-        },
-        nodeStore.currentNodeId || 'local',
-      )
+      await desktopApi.saveDesktopApps({
+        nodeId: nodeStore.currentNodeId || 'local',
+        apps: buildDesktopItemsPayload(),
+      })
     } catch (error) {
       console.warn('Failed to save desktop shortcuts', error)
     }
@@ -776,8 +803,9 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
   function autoArrangeDesktopShortcuts() {
     const currentIds = desktopShortcuts.value.map((s) => s.appId)
     if (currentIds.length === 0) return
-    desktopShortcuts.value = generateDefaultLayout(currentIds)
-    void persistDesktopShortcuts()
+    void applyDesktopShortcuts(generateDefaultLayout(currentIds)).then(() =>
+      persistDesktopShortcuts(),
+    )
   }
 
   // --- Actions ---
@@ -917,7 +945,10 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
         return
       }
       if (appConfig.entryType === 'compose_detail' && appConfig.entryTarget) {
-        openWindowWithPayload('docker-manager', { composeProject: appConfig.entryTarget })
+        openWindowWithPayload('docker-manager', {
+          composeProject: appConfig.entryTarget,
+          nodeId: appConfig.nodeId || nodeStore.currentNodeId || 'local',
+        })
         return
       }
     }
@@ -941,7 +972,11 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
         title,
       })
     } else {
-      openWindowWithPayload(id)
+      const currentNodePayload =
+        appConfig?.nodeScope === 'current-node'
+          ? { nodeId: nodeStore.currentNodeId || 'local' }
+          : undefined
+      openWindowWithPayload(id, currentNodePayload)
     }
   }
 

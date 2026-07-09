@@ -12,8 +12,8 @@ importers:
         specifier: 0.1.0-alpha.1
         version: 0.1.0-alpha.1
       '@seclab-dev/suite-sdk':
-        specifier: 0.1.0-alpha.1
-        version: 0.1.0-alpha.1
+        specifier: 0.1.0-alpha.2
+        version: 0.1.0-alpha.2
       '@seclab-dev/tokens':
         specifier: 0.1.0-alpha.1
         version: 0.1.0-alpha.1
@@ -476,8 +476,8 @@ packages:
   '@seclab-dev/icons@0.1.0-alpha.1':
     resolution: {integrity: sha512-C4d/MFEX2Al8AOzKuGRm5tYe37ONolEZqxnwn9E6b2qTKAKaDCnkhMKagDAgUyNgFLZ4+ySH2MboaTSlJYOvyg==}
 
-  '@seclab-dev/suite-sdk@0.1.0-alpha.1':
-    resolution: {integrity: sha512-UmnAQpjkmoqd22OeMS9SmWRyNBqfK6puPmYoH/RWjBXx+o3kl4V0OEvoLMHFzlKsd6bflrEnbgcXfrXX02vViQ==}
+  '@seclab-dev/suite-sdk@0.1.0-alpha.2':
+    resolution: {integrity: sha512-whxJX+12OlwMnAHcRNAQDz2XINm3Y5OwLI6AhGQ0vypQpTJmjZFWfAB1mmnWyZqtMZgqlFVF8ro1MerxHhCUHg==}
 
   '@seclab-dev/tokens@0.1.0-alpha.1':
     resolution: {integrity: sha512-e2C9Q9y9dmH3vmCoiIhatMEbo7/Pmoo5nrb+GxN8p2gssbfqqQXFW9h9ucloYKiySChLhqRMq5nYXlqklggw6g==}
@@ -2193,7 +2193,7 @@ snapshots:
 
   '@seclab-dev/icons@0.1.0-alpha.1': {}
 
-  '@seclab-dev/suite-sdk@0.1.0-alpha.1': {}
+  '@seclab-dev/suite-sdk@0.1.0-alpha.2': {}
 
   '@seclab-dev/tokens@0.1.0-alpha.1': {}
 

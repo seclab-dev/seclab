@@ -71,7 +71,6 @@ VALUES
     ('terminal', 'app.terminal.appName', '/images/apps/terminal.png', 1024, 720, 860, 560, 0, 90),
     ('task-scheduler', 'app.taskScheduler.appName', '/images/apps/task-scheduler.png', 1024, 720, 860, 560, 0, 100),
     ('script-manager', 'app.scriptManager.appName', '/images/apps/script-manager.png', 1024, 720, 860, 560, 0, 110),
-    ('simulation', 'app.simulation.appName', '/images/apps/simulation.png', 1200, 800, 1024, 720, 0, 120),
     ('web-browser', 'app.webBrowser.appName', '/images/apps/web-browser.png', 960, 600, 400, 300, 0, 130),
     ('platform-log', 'app.platformLog.appName', '/images/apps/platform-log.png', 1024, 720, 860, 560, 0, 140),
     ('notification-history', 'app.notificationHistory.appName', '/images/apps/notification-history.png', 1024, 720, 860, 560, 0, 150),

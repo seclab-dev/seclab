@@ -65,6 +65,7 @@ export const useWebSocketStore = defineStore('webSocket', () => {
    * 这是实现引用计数的核心。
    */
   const subscriptions = ref(new Set<string>())
+  const activeNodeId = ref<string | null>(null)
 
   const nodeStore = useNodeStore()
   /**
@@ -89,7 +90,7 @@ export const useWebSocketStore = defineStore('webSocket', () => {
     return `${origin}${prefix}${path}`
   }
 
-  const wsUrl = computed(() => buildWsUrl(nodeStore.currentNodeId))
+  const wsUrl = computed(() => buildWsUrl(activeNodeId.value ?? nodeStore.currentNodeId))
 
   const {
     connect,
@@ -143,7 +144,7 @@ export const useWebSocketStore = defineStore('webSocket', () => {
     () => nodeStore.currentNodeId,
     (newId, oldId) => {
       if (newId === oldId) return
-      if (connected.value || connecting.value) {
+      if (!activeNodeId.value && (connected.value || connecting.value)) {
         disconnect()
         if (subscriptions.value.size > 0) {
           connect()
@@ -171,7 +172,13 @@ export const useWebSocketStore = defineStore('webSocket', () => {
    * 如果已连接，则直接发送订阅消息。
    * @param containerId - 要订阅日志的容器 ID。
    */
-  const subscribeToContainerLogs = (containerId: string) => {
+  const subscribeToContainerLogs = (containerId: string, nodeId?: string) => {
+    const targetNodeId = nodeId || nodeStore.currentNodeId || 'local'
+    if (activeNodeId.value && activeNodeId.value !== targetNodeId) {
+      disconnect()
+      subscriptions.value.clear()
+    }
+    activeNodeId.value = targetNodeId
     subscriptions.value.add(containerId)
     if (!connected.value && !connecting.value) {
       connect()
@@ -190,7 +197,8 @@ export const useWebSocketStore = defineStore('webSocket', () => {
    * 如果这是最后一个活跃的订阅，此函数会断开 WebSocket 连接。
    * @param containerId - 要取消订阅的容器 ID。
    */
-  const unsubscribeFromContainerLogs = (containerId: string) => {
+  const unsubscribeFromContainerLogs = (containerId: string, nodeId?: string) => {
+    if (nodeId && activeNodeId.value && nodeId !== activeNodeId.value) return
     if (connected.value) {
       sendMessage({
         type: 'unsubscribeLogs',
@@ -200,6 +208,7 @@ export const useWebSocketStore = defineStore('webSocket', () => {
     subscriptions.value.delete(containerId)
     if (subscriptions.value.size === 0) {
       disconnect()
+      activeNodeId.value = null
     }
   }
 

@@ -21,7 +21,7 @@ export const suitesApi = {
   },
   fetchInstallProgress: (taskId: string) => {
     return http.get<suites.SuiteInstallProgress>(
-      `/suite-install-tasks/${encodeURIComponent(taskId)}`,
+      `/suite-install-tasks/${encodeURIComponent(taskId)}/progress`,
     )
   },
   cancelInstall: (taskId: string) => {

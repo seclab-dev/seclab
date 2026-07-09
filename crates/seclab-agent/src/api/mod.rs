@@ -5,7 +5,7 @@ pub mod fs;
 pub mod process;
 pub mod runtime_logs;
 pub mod scheduled_tasks;
-pub mod simulation;
+pub mod suite_workloads;
 pub mod system;
 pub mod tasks;
 pub mod upgrade;

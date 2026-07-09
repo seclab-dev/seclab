@@ -276,12 +276,3 @@ pub fn certs_dir() -> PathBuf {
         production_home().join("config").join("certs")
     }
 }
-
-/// 返回仿真规则包存放物理目录路径。
-pub fn sim_rules_dir() -> PathBuf {
-    if cfg!(debug_assertions) {
-        dev_base_dir().join("data").join("sim-rules")
-    } else {
-        production_home().join("data").join("sim-rules")
-    }
-}

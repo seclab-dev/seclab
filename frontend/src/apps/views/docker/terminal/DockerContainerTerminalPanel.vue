@@ -13,6 +13,7 @@ type ShellType = 'bash' | 'sh'
 const props = defineProps<{
   containerId: string | null
   containerName?: string | null
+  nodeId: string
   active?: boolean
 }>()
 
@@ -32,7 +33,7 @@ const {
   writeInput,
   resizeTerminal,
   closeSession,
-} = useDockerTerminalWs()
+} = useDockerTerminalWs(computed(() => props.nodeId))
 
 const selectedShell = ref<ShellType>('bash')
 const actualShell = ref<ShellType | null>(null)

@@ -49,6 +49,7 @@ defineProps<{
       networkSettings: dockerType.ContainerSummaryNetworkSettings | null | undefined,
     ) => string
   }
+  nodeId: string
 }>()
 
 defineEmits<{
@@ -99,6 +100,7 @@ const DockerContainerDetail = defineAsyncComponent(() => import('./DockerContain
     <DockerContainerDetail
       v-else-if="store.isContainerDetailActive && selectedContainerId"
       :container-id="selectedContainerId"
+      :node-id="nodeId"
       @back="
         () => {
           store.isContainerDetailActive = false

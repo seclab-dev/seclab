@@ -34,7 +34,6 @@ pub async fn setup_test_state() -> AppState {
         system_metrics_enabled: RwLock::new(false),
         metadata_db: setup_test_db().await,
         websocket_sender: websocket::create_channel(),
-        simulation_listeners: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         running_task_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
     }
 }

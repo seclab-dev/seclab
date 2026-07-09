@@ -1,9 +1,11 @@
 //! Docker Compose 套件运行接口：安装、启停、卸载与入口代理。
 
+use crate::api::suite_workloads;
 use crate::config;
+use crate::models::identity::load_or_init_identity;
 use crate::services::logging::{AgentLogModule, AgentLogStatus, LoggerEntry};
 use crate::state::AppState;
-use crate::types::{ApiError, ApiResponse, ApiResult};
+use crate::types::{AgentError, AgentMode, ApiError, ApiResponse, ApiResult};
 use axum::body::Body;
 use axum::extract::{Json, OriginalUri, Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, Method, header};
@@ -14,6 +16,7 @@ use bollard::models::NetworkCreateRequest;
 use bollard::query_parameters::{self, CreateImageOptions};
 use futures_util::StreamExt;
 use seclab_contracts::api::ErrorCode;
+use seclab_security::certs::{AGENT_CA_CERT_PEM, issue_client_cert};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashMap};
@@ -28,6 +31,8 @@ use tokio::time::{sleep, timeout};
 const SUITE_NETWORK_NAME: &str = "seclab-suite-network";
 const COMPOSE_FILE_NAME: &str = "compose.yaml";
 const SUITE_METADATA_FILE: &str = "suite-agent.json";
+const SUITE_RUNTIME_DIR_NAME: &str = "runtime";
+const SUITE_ENV_FILE_NAME: &str = ".env";
 const SUITE_ENTRY_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const SUITE_ENTRY_READY_INTERVAL: Duration = Duration::from_secs(1);
 const SUITE_ENTRY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -71,6 +76,8 @@ pub struct SuiteInstallRequest {
     pub version: String,
     pub compose_project_name: String,
     pub compose_file: String,
+    #[serde(default)]
+    pub runtime_images: Vec<String>,
     pub files: Vec<SuitePackageFile>,
     pub app_entries: Vec<SuiteAppEntry>,
     #[serde(default)]
@@ -83,6 +90,8 @@ pub struct SuiteInstallRequest {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SuiteActionRequest {
+    pub suite_id: String,
+    pub suite_instance_id: String,
     pub compose_project_name: String,
     #[serde(default)]
     pub remove_data: bool,
@@ -115,9 +124,9 @@ pub struct SuiteInstallProgress {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SuiteAgentMetadata {
-    instance_id: String,
-    suite_id: String,
+pub(crate) struct SuiteAgentMetadata {
+    pub(crate) instance_id: String,
+    pub(crate) suite_id: String,
     version: String,
     compose_project_name: String,
     app_entries: Vec<SuiteAppEntry>,
@@ -192,6 +201,8 @@ fn install_log_metadata(payload: &SuiteInstallRequest) -> Value {
 /// 构建 Agent 侧生命周期动作日志的基础元数据。
 fn action_log_metadata(payload: &SuiteActionRequest) -> Value {
     json!({
+        "suite_id": payload.suite_id,
+        "suite_instance_id": payload.suite_instance_id,
         "compose_project_name": payload.compose_project_name,
         "remove_data": payload.remove_data,
     })
@@ -403,6 +414,7 @@ async fn install_suite_inner(
         let compose_text = tokio::fs::read_to_string(&compose_source).await?;
         tokio::fs::write(&compose_target, compose_text).await?;
     }
+    prepare_suite_runtime_files(state, payload, dir).await?;
     prepare_compose_images(state, payload, &compose_target).await?;
     ensure_install_not_canceled(&payload.instance_id)?;
 
@@ -525,7 +537,13 @@ pub async fn disable_suite(
 ) -> ApiResult<Response> {
     validate_suite_project(&project, &payload.compose_project_name)?;
     let compose_file = suite_project_dir(&project).join(COMPOSE_FILE_NAME);
-    let result = run_compose_command(&payload.compose_project_name, &compose_file, &["stop"]).await;
+    let result = async {
+        let docker = state.docker_client().await?;
+        suite_workloads::cleanup_suite_workloads_by_instance(&docker, &payload.suite_instance_id)
+            .await?;
+        run_compose_command(&payload.compose_project_name, &compose_file, &["stop"]).await
+    }
+    .await;
     let error = result.as_ref().err().map(ToString::to_string);
     finish_suite_runtime_log(
         &state,
@@ -552,6 +570,9 @@ pub async fn uninstall_suite(
 ) -> ApiResult<Response> {
     validate_suite_project(&project, &payload.compose_project_name)?;
     let result = async {
+        let docker = state.docker_client().await?;
+        suite_workloads::cleanup_suite_workloads_by_instance(&docker, &payload.suite_instance_id)
+            .await?;
         let dir = suite_project_dir(&project);
         let compose_file = dir.join(COMPOSE_FILE_NAME);
         if tokio::fs::metadata(&compose_file).await.is_ok() {
@@ -950,11 +971,127 @@ async fn resolve_service_ip(
     Ok(ip)
 }
 
-async fn read_suite_metadata(project: &str) -> ApiResult<SuiteAgentMetadata> {
+pub(crate) async fn read_suite_metadata(project: &str) -> ApiResult<SuiteAgentMetadata> {
     let text =
         tokio::fs::read_to_string(suite_project_dir(project).join(SUITE_METADATA_FILE)).await?;
     serde_json::from_str::<SuiteAgentMetadata>(&text)
         .map_err(|err| ApiError::BadRequest(format!("invalid suite metadata: {err}")))
+}
+
+pub(crate) async fn find_suite_metadata_by_identity(
+    suite_id: &str,
+    instance_id: &str,
+) -> ApiResult<Option<SuiteAgentMetadata>> {
+    let root = config::compose_root_dir().join("suite");
+    let mut entries = match tokio::fs::read_dir(&root).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(AgentError::FileOperation(err).into()),
+    };
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(AgentError::FileOperation)?
+    {
+        let metadata_path = entry.path().join(SUITE_METADATA_FILE);
+        let text = match tokio::fs::read_to_string(&metadata_path).await {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(AgentError::FileOperation(err).into()),
+        };
+        let metadata = serde_json::from_str::<SuiteAgentMetadata>(&text).map_err(|err| {
+            ApiError::BadRequest(format!(
+                "invalid suite metadata: {}: {err}",
+                metadata_path.display()
+            ))
+        })?;
+        if metadata.suite_id == suite_id && metadata.instance_id == instance_id {
+            return Ok(Some(metadata));
+        }
+    }
+    Ok(None)
+}
+
+pub(crate) fn suite_project_dir(project: &str) -> PathBuf {
+    config::compose_root_dir().join("suite").join(project)
+}
+
+async fn prepare_suite_runtime_files(
+    state: &Arc<AppState>,
+    payload: &SuiteInstallRequest,
+    dir: &FsPath,
+) -> ApiResult<()> {
+    let runtime_dir = dir.join(SUITE_RUNTIME_DIR_NAME);
+    tokio::fs::create_dir_all(&runtime_dir).await?;
+    let cert = issue_client_cert(&format!(
+        "suite:{}:{}",
+        payload.suite_id, payload.instance_id
+    ))
+    .map_err(|err| ApiError::Internal(format!("failed to issue suite client cert: {err}")))?;
+    tokio::fs::write(runtime_dir.join("agent-client.crt"), &cert.cert_pem).await?;
+    tokio::fs::write(runtime_dir.join("agent-client.key"), &cert.key_pem).await?;
+    tokio::fs::write(runtime_dir.join("agent-ca.crt"), AGENT_CA_CERT_PEM).await?;
+    write_suite_env_file(state, payload, dir, &runtime_dir).await?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let key_path = runtime_dir.join("agent-client.key");
+        tokio::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600)).await?;
+    }
+
+    Ok(())
+}
+
+async fn write_suite_env_file(
+    state: &Arc<AppState>,
+    payload: &SuiteInstallRequest,
+    dir: &FsPath,
+    runtime_dir: &FsPath,
+) -> ApiResult<()> {
+    let identity = load_or_init_identity(&state.metadata_db, config::get())
+        .await
+        .map_err(|err| ApiError::Internal(format!("failed to load agent identity: {err}")))?;
+    let runtime_dir = runtime_dir.to_string_lossy();
+    let mut content = format!(
+        "SUITE_INSTANCE_ID={}\nSECLAB_SUITE_RUNTIME_DIR={}\n",
+        escape_env_value(&payload.instance_id),
+        escape_env_value(&runtime_dir),
+    );
+    match identity.mode {
+        AgentMode::Local => {
+            let agent_socket_path = seclab_contracts::types::agent_socket_path();
+            let agent_socket_path = agent_socket_path.to_string_lossy();
+            content.push_str(&format!(
+                "SECLAB_AGENT_SOCKET_HOST_PATH={}\nSECLAB_AGENT_SOCKET_PATH=/run/seclab-agent.sock\n",
+                escape_env_value(&agent_socket_path),
+            ));
+        }
+        AgentMode::Remote => {
+            content.push_str(&format!(
+                "SECLAB_AGENT_BASE_URL={}\nSECLAB_AGENT_ACCEPT_INVALID_HOSTNAMES=true\n",
+                escape_env_value(&suite_agent_base_url(&identity)),
+            ));
+        }
+    }
+    tokio::fs::write(dir.join(SUITE_ENV_FILE_NAME), content).await?;
+    Ok(())
+}
+
+fn suite_agent_base_url(identity: &crate::models::identity::AgentIdentity) -> String {
+    let port = identity
+        .listen_addr
+        .as_deref()
+        .unwrap_or(config::DEFAULT_AGENT_LISTEN_ADDR)
+        .rsplit(':')
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(7311);
+    format!("https://host.docker.internal:{port}")
+}
+
+fn escape_env_value(value: &str) -> String {
+    value.replace('\\', "\\\\").replace(['\n', '\r'], "")
 }
 
 fn proxy_suffix(path_with_query: &str, project: &str, entry_id: &str) -> String {
@@ -965,10 +1102,6 @@ fn proxy_suffix(path_with_query: &str, project: &str, entry_id: &str) -> String 
     } else {
         suffix.to_string()
     }
-}
-
-fn suite_project_dir(project: &str) -> PathBuf {
-    config::compose_root_dir().join("suite").join(project)
 }
 
 fn normalize_relative_path(path: &str) -> ApiResult<PathBuf> {
@@ -1054,7 +1187,7 @@ async fn prepare_compose_images(
         )));
     }
 
-    let images = parse_compose_images(&output.stdout);
+    let images = collect_install_images(&output.stdout, &payload.runtime_images);
     if images.is_empty() {
         return Err(ApiError::BadRequest(
             "suite compose configuration must declare at least one image".to_string(),
@@ -1078,6 +1211,21 @@ fn parse_compose_images(output: &[u8]) -> BTreeSet<String> {
         .filter(|image| !image.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn collect_install_images(
+    compose_images_output: &[u8],
+    runtime_images: &[String],
+) -> BTreeSet<String> {
+    let mut images = parse_compose_images(compose_images_output);
+    images.extend(
+        runtime_images
+            .iter()
+            .map(|image| image.trim())
+            .filter(|image| !image.is_empty())
+            .map(ToOwned::to_owned),
+    );
+    images
 }
 
 /// 本地镜像存在时直接复用，否则从镜像仓库拉取固定版本镜像。
@@ -1299,7 +1447,7 @@ async fn run_compose_command(project: &str, compose_file: &FsPath, args: &[&str]
 
 #[cfg(test)]
 mod tests {
-    use super::parse_compose_images;
+    use super::{collect_install_images, parse_compose_images};
 
     #[test]
     fn parse_compose_images_removes_blank_lines_and_duplicates() {
@@ -1312,6 +1460,26 @@ mod tests {
             vec![
                 "custom/app:0.1.0-alpha.1".to_string(),
                 "docker.io/library/nginx:1.27-alpine".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_install_images_merges_compose_and_runtime_images() {
+        let images = collect_install_images(
+            b"guowenju/seclab-protocol-simulation:0.1.0-alpha.1\n",
+            &[
+                " guowenju/seclab-protocol-simulation-engine:0.1.0-alpha.1 ".to_string(),
+                "guowenju/seclab-protocol-simulation:0.1.0-alpha.1".to_string(),
+                "".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            images.into_iter().collect::<Vec<_>>(),
+            vec![
+                "guowenju/seclab-protocol-simulation:0.1.0-alpha.1".to_string(),
+                "guowenju/seclab-protocol-simulation-engine:0.1.0-alpha.1".to_string(),
             ]
         );
     }

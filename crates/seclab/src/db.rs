@@ -41,7 +41,6 @@ async fn create_pool(path: &str) -> DbPool {
         .unwrap();
 
     tracing::info!("Running database migrations for {}...", path);
-    // Force rebuild to re-embed new simulation tables migrations
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
     tracing::info!("Database migrations for {} completed.", path);
 

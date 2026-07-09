@@ -1,20 +1,23 @@
 import { dockerApi } from '@/api/modules/docker'
 import type * as dockerType from '@/api/interface/docker'
-import { ref, watch, type Ref } from 'vue'
+import { computed, ref, watch, type ComputedRef, type Ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 type UseContainerInspectDataOptions = {
   selectedContainerId: Ref<string | null>
+  nodeId: Ref<string> | ComputedRef<string>
   onError: (message: string) => void
 }
 
 export const useContainerInspectData = ({
   selectedContainerId,
+  nodeId,
   onError,
 }: UseContainerInspectDataOptions) => {
   const { t } = useI18n()
   const inspectDetail = ref<dockerType.ContainerInspect | null>(null)
   const isInspectLoading = ref(false)
+  const dockerClient = computed(() => dockerApi.forNode(nodeId.value))
 
   let requestVersion = 0
 
@@ -29,7 +32,7 @@ export const useContainerInspectData = ({
     isInspectLoading.value = true
 
     try {
-      const res = await dockerApi.inspectContainer(id)
+      const res = await dockerClient.value.inspectContainer(id)
 
       if (currentRequest !== requestVersion) return
       if (selectedContainerId.value !== id) return
@@ -53,8 +56,8 @@ export const useContainerInspectData = ({
   }
 
   watch(
-    selectedContainerId,
-    (id) => {
+    () => [selectedContainerId.value, nodeId.value] as const,
+    ([id]) => {
       if (!id) {
         reset()
         return

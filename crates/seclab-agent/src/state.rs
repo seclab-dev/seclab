@@ -27,9 +27,6 @@ pub struct AppState {
     pub system_metrics_enabled: RwLock<bool>,
     pub metadata_db: DbPool,
     pub websocket_sender: tokio::sync::broadcast::Sender<websocket::WebsocketEvent>,
-    pub simulation_listeners: tokio::sync::Mutex<
-        std::collections::HashMap<u16, (String, tokio::sync::oneshot::Sender<()>)>,
-    >,
     pub running_task_ids: tokio::sync::Mutex<std::collections::HashSet<i64>>,
 }
 

@@ -198,18 +198,6 @@ export const appRegistry = {
     nodeScope: 'global',
     nodeSwitchPolicy: 'allow',
   },
-  simulation: {
-    component: markRaw(defineAsyncComponent(() => import('@/apps/views/SimulationView.vue'))),
-    title: '',
-    i18nTitleKey: 'app.simulation.appName',
-    icon: '',
-    minWidth: 0,
-    minHeight: 0,
-    defaultWidth: 0,
-    defaultHeight: 0,
-    nodeScope: 'global',
-    nodeSwitchPolicy: 'allow',
-  },
   'script-manager': {
     component: markRaw(defineAsyncComponent(() => import('@/apps/views/ScriptManagerView.vue'))),
     title: '',

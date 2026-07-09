@@ -81,6 +81,8 @@ pub struct SuiteRuntime {
     pub compose_file: String,
     #[serde(default)]
     pub project_name_template: Option<String>,
+    #[serde(default)]
+    pub images: Vec<String>,
 }
 
 /// 套件应用入口声明。

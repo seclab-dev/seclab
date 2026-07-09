@@ -25,7 +25,7 @@ import { useNodeStore } from '@/stores/node'
 import { useNotificationStore } from '@/stores/notification'
 import { useWindowManagerStore } from '@/stores/window-manager'
 
-type SuiteCategory = 'all' | 'scanners' | 'tools' | 'infra' | 'forensics' | 'protocol' | 'other'
+type SuiteCategory = 'all' | 'tools' | 'other'
 
 interface SuiteCard {
   suite: SuiteCatalogItem
@@ -90,15 +90,7 @@ const filteredSuiteCards = computed(() => {
 })
 
 const categoryItems = computed(() => {
-  const categories: SuiteCategory[] = [
-    'all',
-    'scanners',
-    'tools',
-    'infra',
-    'forensics',
-    'protocol',
-    'other',
-  ]
+  const categories: SuiteCategory[] = ['all', 'tools', 'other']
   return categories.map((category) => ({
     key: category,
     label: t(`app.suiteCenter.categories.${category}`),
@@ -112,14 +104,7 @@ const categoryItems = computed(() => {
 function resolveSuiteCategory(suite: SuiteCatalogItem): SuiteCategory {
   if (suite.category) {
     const cat = suite.category.toLowerCase() as SuiteCategory
-    const validCategories: SuiteCategory[] = [
-      'scanners',
-      'tools',
-      'infra',
-      'forensics',
-      'protocol',
-      'other',
-    ]
+    const validCategories: SuiteCategory[] = ['tools', 'other']
     if (validCategories.includes(cat)) {
       return cat
     }
@@ -138,6 +123,10 @@ function statusClass(status: string) {
   if (status === 'error') return 'is-error'
   if (status === 'installed' || status === 'disabled') return 'is-stopped'
   return 'is-working'
+}
+
+function nodeDisplayName(nodeId: string) {
+  return nodeStore.nodes.find((node) => node.id === nodeId)?.name || nodeId
 }
 
 function isInstallingSuite(card: SuiteCard | null) {
@@ -635,7 +624,7 @@ watch(
           </div>
           <div v-if="selectedSuite.instance">
             <span>{{ t('app.suiteCenter.fields.node') }}</span>
-            <strong>{{ selectedSuite.instance.nodeId }}</strong>
+            <strong>{{ nodeDisplayName(selectedSuite.instance.nodeId) }}</strong>
           </div>
           <div v-if="selectedSuite.instance">
             <span>{{ t('app.suiteCenter.fields.project') }}</span>

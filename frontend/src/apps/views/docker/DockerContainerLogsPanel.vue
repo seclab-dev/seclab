@@ -13,6 +13,7 @@ import { useContainerLogs, type LogMode } from './composables/useContainerLogs'
 const props = defineProps<{
   containerId: string | null
   containerName?: string | null
+  nodeId: string
   active?: boolean
 }>()
 
@@ -26,6 +27,7 @@ const { t } = useI18n()
 
 /** 将 props 映射为响应式 ref / computed，驱动 composable */
 const containerIdRef = computed(() => props.containerId)
+const nodeIdRef = computed(() => props.nodeId)
 const activeRef = computed(() => props.active ?? false)
 
 const {
@@ -41,6 +43,7 @@ const {
   switchMode,
 } = useContainerLogs({
   containerId: containerIdRef,
+  nodeId: nodeIdRef,
   active: activeRef,
 })
 

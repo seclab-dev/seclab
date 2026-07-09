@@ -7,7 +7,6 @@ pub mod notification;
 pub mod process;
 pub mod runtime_logs;
 pub mod seclab;
-pub mod simulation;
 pub mod telemetry;
 pub mod types;
 

@@ -60,8 +60,6 @@ pub enum ErrorCode {
     InternalServerError,
     DatabaseError,
     ExternalRequestFailed,
-    SimulationRuleNotFound,
-    SimulationPortUnavailable,
 }
 
 impl ErrorCode {
@@ -115,8 +113,6 @@ impl ErrorCode {
             ErrorCode::InternalServerError => "INTERNAL_SERVER_ERROR",
             ErrorCode::DatabaseError => "DATABASE_ERROR",
             ErrorCode::ExternalRequestFailed => "EXTERNAL_REQUEST_FAILED",
-            ErrorCode::SimulationRuleNotFound => "SIMULATION_RULE_NOT_FOUND",
-            ErrorCode::SimulationPortUnavailable => "SIMULATION_PORT_UNAVAILABLE",
         }
     }
 }

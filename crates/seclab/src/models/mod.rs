@@ -14,7 +14,6 @@ pub mod node_sessions;
 pub mod node_tasks;
 pub mod nodes;
 pub mod scripts;
-pub mod simulation;
 pub mod suites;
 pub mod task_scheduler;
 pub mod upgrades;

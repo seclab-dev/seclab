@@ -227,7 +227,7 @@ async fn main() {
     tokio::spawn(async move {
         shutdown_signal().await;
         tracing::info!(
-            "seclab-agent remote listener received shutdown signal. Stopping all active simulation ports and resources..."
+            "seclab-agent remote listener received shutdown signal. Stopping runtime resources..."
         );
         let _ = runtime_stop_tx_for_signal.send(true);
         shutdown_handle.graceful_shutdown(None);
@@ -1098,17 +1098,28 @@ async fn build_tls_config(
 }
 
 fn derive_sans(identity: &crate::models::identity::AgentIdentity) -> Vec<String> {
+    let mut sans = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "host.docker.internal".to_string(),
+    ];
     if let Some(ip) = identity.agent_ip.as_ref() {
-        return vec![ip.clone()];
+        if !sans.contains(ip) {
+            sans.push(ip.clone());
+        }
+        return sans;
     }
     if let Some(listen) = identity.listen_addr.as_ref()
         && let Some((host, _)) = listen.split_once(':')
         && host != "0.0.0.0"
         && host != "127.0.0.1"
     {
-        return vec![host.to_string()];
+        let host = host.trim_matches(['[', ']']);
+        if !sans.iter().any(|value| value == host) {
+            sans.push(host.to_string());
+        }
     }
-    vec!["localhost".to_string()]
+    sans
 }
 
 fn load_certs_from_bytes(data: &[u8]) -> anyhow::Result<Vec<CertificateDer<'static>>> {

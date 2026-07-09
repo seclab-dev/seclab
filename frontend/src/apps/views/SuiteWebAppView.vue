@@ -36,6 +36,8 @@ const failed = ref(false)
 const supportsWindowFocus = ref(false)
 // 套件声明 notification capability 后，主控才承载该套件的统一弹窗通知。
 const supportsNotification = ref(false)
+// 套件声明 navigation capability 后，主控才执行套件发起的导航请求。
+const supportsNavigation = ref(false)
 let suiteBridge: SuiteHostBridge | null = null
 
 const suiteUrl = computed(() => {
@@ -117,6 +119,25 @@ function handleSuiteNotification(payload: unknown) {
   )
 }
 
+function handleSuiteNavigation(payload: unknown) {
+  if (!supportsNavigation.value || !payload || typeof payload !== 'object') return
+
+  const navigation = payload as {
+    target?: unknown
+    value?: unknown
+    payload?: unknown
+  }
+  if (navigation.target !== 'app' || typeof navigation.value !== 'string') return
+
+  const appId = navigation.value.trim()
+  if (!appId) return
+  const appPayload =
+    navigation.payload && typeof navigation.payload === 'object'
+      ? (navigation.payload as Record<string, unknown>)
+      : {}
+  windowManagerStore.openWindowWithPayload(appId, appPayload)
+}
+
 watch(
   suiteUrl,
   () => {
@@ -133,6 +154,7 @@ watch(
     suiteBridge = null
     supportsWindowFocus.value = false
     supportsNotification.value = false
+    supportsNavigation.value = false
     await nextTick()
     suiteBridge = createSuiteHostBridge({
       iframe: () => iframeRef.value,
@@ -141,6 +163,7 @@ watch(
       onReady: (payload) => {
         supportsWindowFocus.value = payload.capabilities.includes('window')
         supportsNotification.value = payload.capabilities.includes('notification')
+        supportsNavigation.value = payload.capabilities.includes('navigation')
       },
       onMessage: (message) => {
         // 套件 iframe 内部交互通过 SDK 消息回传，主控据此把窗口置顶。
@@ -149,6 +172,9 @@ watch(
         }
         if (message.type === SUITE_MESSAGE_TYPES.suiteNotificationShow) {
           handleSuiteNotification(message.payload)
+        }
+        if (message.type === SUITE_MESSAGE_TYPES.suiteNavigationOpen) {
+          handleSuiteNavigation(message.payload)
         }
       },
     })

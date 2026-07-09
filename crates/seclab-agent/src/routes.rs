@@ -1,7 +1,7 @@
 //! 路由注册：挂载所有 API 子路由并拼装主路由器。
 
 use super::api::{
-    docker, fs, runtime_logs, scheduled_tasks, simulation, system, tasks, upgrade, websocket,
+    docker, fs, runtime_logs, scheduled_tasks, suite_workloads, system, tasks, upgrade, websocket,
 };
 use crate::db;
 use crate::state::DbPool;
@@ -35,7 +35,10 @@ pub fn state_api_router() -> Router<Arc<AppState>> {
         )
         .nest("/upgrade", upgrade::upgrade_router())
         .nest("/websocket", websocket::websocket_router())
-        .nest("/simulation", simulation::simulation_router())
+        .nest(
+            "/suite-workloads",
+            suite_workloads::suite_workloads_router(),
+        )
 }
 
 /// 创建路由
@@ -59,7 +62,6 @@ pub async fn create_router() -> Result<(Router, DbPool)> {
         system_metrics_enabled: tokio::sync::RwLock::new(system_metrics_enabled),
         metadata_db: pool,
         websocket_sender,
-        simulation_listeners: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         running_task_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
     });
 

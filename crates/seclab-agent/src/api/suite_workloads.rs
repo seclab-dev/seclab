@@ -1,0 +1,759 @@
+//! 套件工作负载 API：允许已安装套件请求 Agent 创建和回收受控容器。
+
+use crate::api::docker::suites;
+use crate::services::pcap::PcapMuxHub;
+use crate::state::AppState;
+use crate::types::{ApiError, ApiResult};
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    response::IntoResponse,
+    routing::{get, post},
+};
+use base64::Engine;
+use bollard::models::{ContainerCreateBody, HostConfig, PortBinding, RestartPolicy};
+use bollard::query_parameters;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use uuid::Uuid;
+
+const SUITE_NETWORK_NAME: &str = "seclab-suite-network";
+const WORKLOAD_LABEL: &str = "seclab.workload_type";
+const WORKLOAD_LABEL_VALUE: &str = "suite-workload";
+const MAX_WORKLOAD_CONTAINER_NAME_LEN: usize = 96;
+type ExposedPorts = HashMap<String, HashMap<(), ()>>;
+type PortBindings = HashMap<String, Option<Vec<PortBinding>>>;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartWorkloadRequest {
+    pub suite_id: String,
+    pub suite_instance_id: String,
+    pub workload_kind: String,
+    pub workload_name: String,
+    pub image: String,
+    #[serde(default)]
+    pub ports: Vec<WorkloadPort>,
+    #[serde(default)]
+    pub env: serde_json::Value,
+    #[serde(default)]
+    pub config_json: serde_json::Value,
+    #[serde(default)]
+    pub resources: WorkloadResources,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkloadPort {
+    pub host_port: u16,
+    pub container_port: u16,
+    pub protocol: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkloadResources {
+    pub memory_mb: Option<u32>,
+    pub cpu_shares: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartWorkloadResponse {
+    pub workload_id: String,
+    pub container_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopWorkloadRequest {
+    pub suite_id: String,
+    pub suite_instance_id: String,
+    pub workload_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartPcapRequest {
+    pub suite_id: String,
+    pub suite_instance_id: String,
+    pub workload_id: String,
+    pub host_port: u16,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartPcapResponse {
+    pub capture_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopPcapRequest {
+    pub suite_id: String,
+    pub suite_instance_id: String,
+    pub workload_id: String,
+    pub capture_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopPcapResponse {
+    pub capture_id: String,
+    pub pcap_bytes_base64: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkloadSummary {
+    pub workload_id: String,
+    pub suite_id: String,
+    pub suite_instance_id: String,
+    pub workload_kind: String,
+    pub name: String,
+    pub image: String,
+    pub status: String,
+    pub container_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkloadPath {
+    workload_id: String,
+}
+
+/// 组装 suite workload 路由。
+pub fn suite_workloads_router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/start", post(start_workload))
+        .route("/stop", post(stop_workload))
+        .route("/list", get(list_workloads))
+        .route("/pcap/start", post(start_pcap))
+        .route("/pcap/stop", post(stop_pcap))
+        .route(
+            "/{workload_id}",
+            get(detail_workload).delete(delete_workload),
+        )
+}
+
+async fn start_workload(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<StartWorkloadRequest>,
+) -> ApiResult<impl IntoResponse> {
+    validate_suite_request(&payload.suite_id, &payload.suite_instance_id).await?;
+    validate_workload_request(&payload)?;
+
+    let docker = state.docker_client().await?;
+    let workload_id = format!("workload-{}", Uuid::now_v7());
+    let container_name = workload_container_name(&payload.workload_name, &workload_id);
+    let labels = workload_labels(&payload, &workload_id);
+    let (exposed_ports, port_bindings) = port_maps(&payload.ports);
+    let mut env = env_map_to_vec(&payload.env)?;
+    env.push(format!(
+        "SECLAB_SIM_CONFIG_JSON={}",
+        serde_json::to_string(&payload.config_json).unwrap_or_else(|_| "{}".to_string())
+    ));
+
+    let host_config = HostConfig {
+        port_bindings: if port_bindings.is_empty() {
+            None
+        } else {
+            Some(port_bindings)
+        },
+        network_mode: Some(SUITE_NETWORK_NAME.to_string()),
+        restart_policy: Some(RestartPolicy {
+            name: Some(bollard::models::RestartPolicyNameEnum::UNLESS_STOPPED),
+            maximum_retry_count: None,
+        }),
+        memory: payload
+            .resources
+            .memory_mb
+            .map(|value| i64::from(value) * 1024 * 1024),
+        cpu_shares: payload.resources.cpu_shares.map(i64::from),
+        privileged: Some(false),
+        ..Default::default()
+    };
+
+    let config = ContainerCreateBody {
+        image: Some(payload.image.clone()),
+        env: Some(env),
+        labels: Some(labels),
+        exposed_ports: if exposed_ports.is_empty() {
+            None
+        } else {
+            Some(exposed_ports)
+        },
+        host_config: Some(host_config),
+        ..Default::default()
+    };
+
+    let options = query_parameters::CreateContainerOptionsBuilder::new()
+        .name(&container_name)
+        .build();
+    let created = docker.create_container(Some(options), config).await?;
+    docker
+        .start_container(
+            &container_name,
+            None::<query_parameters::StartContainerOptions>,
+        )
+        .await?;
+
+    Ok(Json(StartWorkloadResponse {
+        workload_id,
+        container_id: created.id,
+        status: "running".to_string(),
+    }))
+}
+
+async fn stop_workload(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<StopWorkloadRequest>,
+) -> ApiResult<impl IntoResponse> {
+    validate_suite_request(&payload.suite_id, &payload.suite_instance_id).await?;
+    let docker = state.docker_client().await?;
+    let container_id =
+        find_owned_container(&docker, &payload.suite_instance_id, &payload.workload_id)
+            .await?
+            .ok_or(ApiError::NotFound)?;
+    if let Err(err) = docker
+        .stop_container(
+            &container_id,
+            Some(query_parameters::StopContainerOptions {
+                signal: None,
+                t: Some(5),
+            }),
+        )
+        .await
+    {
+        tracing::debug!(
+            container_id,
+            error = %err,
+            "suite workload stop returned an error before removal"
+        );
+    }
+    docker
+        .remove_container(
+            &container_id,
+            Some(query_parameters::RemoveContainerOptions {
+                force: true,
+                v: false,
+                link: false,
+            }),
+        )
+        .await?;
+    Ok(Json(serde_json::json!({ "status": "deleted" })))
+}
+
+async fn start_pcap(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<StartPcapRequest>,
+) -> ApiResult<impl IntoResponse> {
+    validate_suite_request(&payload.suite_id, &payload.suite_instance_id).await?;
+    validate_id("workload_id", &payload.workload_id)?;
+    let docker = state.docker_client().await?;
+    find_owned_container(&docker, &payload.suite_instance_id, &payload.workload_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+
+    let capture_id = format!("pcap-{}", Uuid::now_v7());
+    PcapMuxHub::global()
+        .start_capture_for_workload(
+            capture_id.clone(),
+            payload.host_port,
+            Some(payload.suite_instance_id.clone()),
+            Some(payload.workload_id.clone()),
+        )
+        .await
+        .map_err(|err| ApiError::BadRequest(format!("failed to start pcap capture: {err:#}")))?;
+
+    Ok(Json(StartPcapResponse {
+        capture_id,
+        status: "capturing".to_string(),
+    }))
+}
+
+async fn stop_pcap(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<StopPcapRequest>,
+) -> ApiResult<impl IntoResponse> {
+    validate_suite_request(&payload.suite_id, &payload.suite_instance_id).await?;
+    validate_id("workload_id", &payload.workload_id)?;
+    validate_id("capture_id", &payload.capture_id)?;
+    let docker = state.docker_client().await?;
+    find_owned_container(&docker, &payload.suite_instance_id, &payload.workload_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+
+    let bytes = PcapMuxHub::global()
+        .stop_capture(&payload.capture_id)
+        .await
+        .map_err(|err| ApiError::BadRequest(format!("failed to stop pcap capture: {err:#}")))?;
+    Ok(Json(StopPcapResponse {
+        capture_id: payload.capture_id,
+        pcap_bytes_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+    }))
+}
+
+async fn list_workloads(State(state): State<Arc<AppState>>) -> ApiResult<impl IntoResponse> {
+    let docker = state.docker_client().await?;
+    let mut filters = HashMap::new();
+    filters.insert(
+        "label".to_string(),
+        vec![format!("{WORKLOAD_LABEL}={WORKLOAD_LABEL_VALUE}")],
+    );
+    let containers = docker
+        .list_containers(Some(
+            query_parameters::ListContainersOptionsBuilder::new()
+                .all(true)
+                .filters(&filters)
+                .build(),
+        ))
+        .await?;
+    let items = containers
+        .into_iter()
+        .filter_map(|container| {
+            let labels = container.labels?;
+            Some(WorkloadSummary {
+                workload_id: labels.get("seclab.workload_id")?.clone(),
+                suite_id: labels.get("seclab.suite_id")?.clone(),
+                suite_instance_id: labels.get("seclab.suite_instance_id")?.clone(),
+                workload_kind: labels.get("seclab.workload_kind")?.clone(),
+                name: labels
+                    .get("seclab.workload_name")
+                    .cloned()
+                    .unwrap_or_default(),
+                image: container.image.unwrap_or_default(),
+                status: container.status.unwrap_or_default(),
+                container_id: container.id.unwrap_or_default(),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(items))
+}
+
+async fn detail_workload(
+    State(state): State<Arc<AppState>>,
+    Path(path): Path<WorkloadPath>,
+) -> ApiResult<impl IntoResponse> {
+    let docker = state.docker_client().await?;
+    let container_id = find_container_by_workload(&docker, &path.workload_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let detail = docker
+        .inspect_container(
+            &container_id,
+            None::<query_parameters::InspectContainerOptions>,
+        )
+        .await?;
+    Ok(Json(detail))
+}
+
+async fn delete_workload(
+    State(state): State<Arc<AppState>>,
+    Path(path): Path<WorkloadPath>,
+) -> ApiResult<impl IntoResponse> {
+    let docker = state.docker_client().await?;
+    let container_id = find_container_by_workload(&docker, &path.workload_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    docker
+        .remove_container(
+            &container_id,
+            Some(query_parameters::RemoveContainerOptions {
+                force: true,
+                v: false,
+                link: false,
+            }),
+        )
+        .await?;
+    Ok(Json(serde_json::json!({ "deleted": true })))
+}
+
+/// 清理指定套件实例下由 suite workload API 创建的所有容器和抓包任务。
+pub(crate) async fn cleanup_suite_workloads_by_instance(
+    docker: &bollard::Docker,
+    suite_instance_id: &str,
+) -> ApiResult<usize> {
+    validate_id("suite_instance_id", suite_instance_id)?;
+    let stopped_captures = PcapMuxHub::global()
+        .stop_captures_for_suite_instance(suite_instance_id)
+        .await;
+    if !stopped_captures.is_empty() {
+        tracing::info!(
+            suite_instance_id,
+            stopped_count = stopped_captures.len(),
+            "stopped suite workload pcap captures before cleanup"
+        );
+    }
+
+    let filters = suite_workload_cleanup_filters(suite_instance_id);
+    let containers = docker
+        .list_containers(Some(
+            query_parameters::ListContainersOptionsBuilder::new()
+                .all(true)
+                .filters(&filters)
+                .build(),
+        ))
+        .await?;
+
+    let mut removed = 0usize;
+    for container in containers {
+        let Some(container_id) = container.id else {
+            continue;
+        };
+        if let Err(err) = docker
+            .stop_container(
+                &container_id,
+                Some(query_parameters::StopContainerOptions {
+                    signal: None,
+                    t: Some(5),
+                }),
+            )
+            .await
+        {
+            tracing::debug!(
+                suite_instance_id,
+                container_id,
+                error = %err,
+                "suite workload cleanup stop returned an error before removal"
+            );
+        }
+        docker
+            .remove_container(
+                &container_id,
+                Some(query_parameters::RemoveContainerOptions {
+                    force: true,
+                    v: false,
+                    link: false,
+                }),
+            )
+            .await?;
+        removed += 1;
+    }
+
+    if removed > 0 {
+        tracing::info!(
+            suite_instance_id,
+            removed_count = removed,
+            "removed suite workload containers"
+        );
+    }
+    Ok(removed)
+}
+
+fn suite_workload_cleanup_filters(suite_instance_id: &str) -> HashMap<String, Vec<String>> {
+    let mut filters = HashMap::new();
+    filters.insert(
+        "label".to_string(),
+        vec![
+            format!("{WORKLOAD_LABEL}={WORKLOAD_LABEL_VALUE}"),
+            format!("seclab.suite_instance_id={suite_instance_id}"),
+        ],
+    );
+    filters
+}
+
+async fn validate_suite_request(suite_id: &str, suite_instance_id: &str) -> ApiResult<()> {
+    validate_id("suite_id", suite_id)?;
+    validate_id("suite_instance_id", suite_instance_id)?;
+    if suites::find_suite_metadata_by_identity(suite_id, suite_instance_id)
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::BadRequest(
+            "suite workload identity does not match installed suite".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_workload_request(payload: &StartWorkloadRequest) -> ApiResult<()> {
+    validate_id("workload_kind", &payload.workload_kind)?;
+    if payload.workload_name.trim().is_empty() {
+        return Err(ApiError::BadRequest("workloadName is required".to_string()));
+    }
+    if !payload.image.contains("seclab-") {
+        return Err(ApiError::BadRequest(
+            "suite workload image is not allowed".to_string(),
+        ));
+    }
+    for port in &payload.ports {
+        if !matches!(port.protocol.as_str(), "tcp" | "udp") {
+            return Err(ApiError::BadRequest(format!(
+                "unsupported workload port protocol: {}",
+                port.protocol
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn workload_container_name(workload_name: &str, workload_id: &str) -> String {
+    let suffix = compact_container_id(workload_id);
+    let max_readable_len = MAX_WORKLOAD_CONTAINER_NAME_LEN
+        .saturating_sub("seclab".len())
+        .saturating_sub(suffix.len())
+        .saturating_sub(2);
+    let readable =
+        truncate_container_segment(&sanitize_container_segment(workload_name), max_readable_len)
+            .unwrap_or_else(|| "workload".to_string());
+    format!("seclab-{readable}-{suffix}")
+}
+
+fn sanitize_container_segment(value: &str) -> String {
+    let mut output = String::new();
+    let mut previous_dash = false;
+    for ch in value.trim().chars().flat_map(char::to_lowercase) {
+        let normalized = if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_') {
+            ch
+        } else {
+            '-'
+        };
+        if normalized == '-' {
+            if previous_dash {
+                continue;
+            }
+            previous_dash = true;
+        } else {
+            previous_dash = false;
+        }
+        output.push(normalized);
+    }
+    output
+        .trim_matches(|ch| matches!(ch, '-' | '.' | '_'))
+        .to_string()
+}
+
+fn truncate_container_segment(value: &str, max_len: usize) -> Option<String> {
+    if value.is_empty() || max_len == 0 {
+        return None;
+    }
+    let truncated = if value.len() > max_len {
+        &value[..max_len]
+    } else {
+        value
+    }
+    .trim_matches(|ch| matches!(ch, '-' | '.' | '_'))
+    .to_string();
+    if truncated.is_empty() {
+        None
+    } else {
+        Some(truncated)
+    }
+}
+
+fn compact_container_id(value: &str) -> String {
+    let normalized = value
+        .chars()
+        .filter(|value| value.is_ascii_alphanumeric())
+        .collect::<String>();
+    let compact = if normalized.len() > 12 {
+        &normalized[normalized.len() - 12..]
+    } else {
+        normalized.as_str()
+    };
+    compact
+        .chars()
+        .map(|value| {
+            if value.is_ascii_alphanumeric() {
+                value
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn workload_labels(payload: &StartWorkloadRequest, workload_id: &str) -> HashMap<String, String> {
+    HashMap::from([
+        ("seclab.managed_by".to_string(), "seclab-agent".to_string()),
+        (WORKLOAD_LABEL.to_string(), WORKLOAD_LABEL_VALUE.to_string()),
+        ("seclab.suite_id".to_string(), payload.suite_id.clone()),
+        (
+            "seclab.suite_instance_id".to_string(),
+            payload.suite_instance_id.clone(),
+        ),
+        ("seclab.workload_id".to_string(), workload_id.to_string()),
+        (
+            "seclab.workload_kind".to_string(),
+            payload.workload_kind.clone(),
+        ),
+        (
+            "seclab.workload_name".to_string(),
+            payload.workload_name.clone(),
+        ),
+    ])
+}
+
+fn port_maps(ports: &[WorkloadPort]) -> (ExposedPorts, PortBindings) {
+    let mut exposed = HashMap::new();
+    let mut bindings = HashMap::new();
+    for port in ports {
+        let key = format!("{}/{}", port.container_port, port.protocol);
+        exposed.insert(key.clone(), HashMap::new());
+        bindings.insert(
+            key,
+            Some(vec![PortBinding {
+                host_ip: Some("0.0.0.0".to_string()),
+                host_port: Some(port.host_port.to_string()),
+            }]),
+        );
+    }
+    (exposed, bindings)
+}
+
+fn env_map_to_vec(value: &serde_json::Value) -> ApiResult<Vec<String>> {
+    let Some(object) = value.as_object() else {
+        return Ok(Vec::new());
+    };
+    let mut env = Vec::with_capacity(object.len());
+    for (key, value) in object {
+        validate_env_key(key)?;
+        let value = value
+            .as_str()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| value.to_string());
+        env.push(format!("{key}={value}"));
+    }
+    Ok(env)
+}
+
+fn validate_env_key(key: &str) -> ApiResult<()> {
+    if key.trim().is_empty()
+        || !key
+            .chars()
+            .all(|value| value.is_ascii_uppercase() || value.is_ascii_digit() || value == '_')
+    {
+        return Err(ApiError::BadRequest(format!(
+            "invalid workload env key: {key}"
+        )));
+    }
+    Ok(())
+}
+
+async fn find_owned_container(
+    docker: &bollard::Docker,
+    suite_instance_id: &str,
+    workload_id: &str,
+) -> ApiResult<Option<String>> {
+    let mut filters = HashMap::new();
+    filters.insert(
+        "label".to_string(),
+        vec![
+            format!("{WORKLOAD_LABEL}={WORKLOAD_LABEL_VALUE}"),
+            format!("seclab.suite_instance_id={suite_instance_id}"),
+            format!("seclab.workload_id={workload_id}"),
+        ],
+    );
+    find_container_with_filters(docker, filters).await
+}
+
+async fn find_container_by_workload(
+    docker: &bollard::Docker,
+    workload_id: &str,
+) -> ApiResult<Option<String>> {
+    let mut filters = HashMap::new();
+    filters.insert(
+        "label".to_string(),
+        vec![
+            format!("{WORKLOAD_LABEL}={WORKLOAD_LABEL_VALUE}"),
+            format!("seclab.workload_id={workload_id}"),
+        ],
+    );
+    find_container_with_filters(docker, filters).await
+}
+
+async fn find_container_with_filters(
+    docker: &bollard::Docker,
+    filters: HashMap<String, Vec<String>>,
+) -> ApiResult<Option<String>> {
+    let containers = docker
+        .list_containers(Some(
+            query_parameters::ListContainersOptionsBuilder::new()
+                .all(true)
+                .filters(&filters)
+                .build(),
+        ))
+        .await?;
+    Ok(containers
+        .first()
+        .and_then(|container| container.id.as_ref())
+        .cloned())
+}
+
+fn validate_id(label: &str, value: &str) -> ApiResult<()> {
+    if value.trim().is_empty()
+        || !value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err(ApiError::BadRequest(format!(
+            "{label} may only contain letters, digits, hyphen, underscore, and dot"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MAX_WORKLOAD_CONTAINER_NAME_LEN, sanitize_container_segment,
+        suite_workload_cleanup_filters, workload_container_name,
+    };
+
+    #[test]
+    fn workload_container_name_uses_rule_id_and_short_workload_id() {
+        assert_eq!(
+            workload_container_name(
+                "sim-rule-427001",
+                "workload-019f409d-8e1d-73e0-f3dc45e75209"
+            ),
+            "seclab-sim-rule-427001-f3dc45e75209"
+        );
+    }
+
+    #[test]
+    fn workload_container_name_sanitizes_readable_segment() {
+        assert_eq!(
+            workload_container_name(
+                "  Sim Rule/邮件:427001  ",
+                "workload-019f409d-8e1d-73e0-f3dc45e75209"
+            ),
+            "seclab-sim-rule-427001-f3dc45e75209"
+        );
+        assert_eq!(sanitize_container_segment("...___---"), "");
+    }
+
+    #[test]
+    fn workload_container_name_truncates_long_readable_segment() {
+        let name = workload_container_name(
+            "sim-rule-very-long-name-that-keeps-going-until-it-would-make-the-docker-container-name-too-long",
+            "workload-019f409d-8e1d-73e0-f3dc45e75209",
+        );
+        assert!(name.starts_with("seclab-sim-rule-very-long-name"));
+        assert!(name.ends_with("-f3dc45e75209"));
+        assert!(name.len() <= MAX_WORKLOAD_CONTAINER_NAME_LEN);
+    }
+
+    #[test]
+    fn workload_container_name_falls_back_when_name_has_no_safe_chars() {
+        assert_eq!(
+            workload_container_name("邮件规则", "workload-019f409d-8e1d-73e0-f3dc45e75209"),
+            "seclab-workload-f3dc45e75209"
+        );
+    }
+
+    #[test]
+    fn suite_workload_cleanup_filters_scope_to_suite_instance() {
+        let filters = suite_workload_cleanup_filters("suite-instance-1");
+        assert_eq!(
+            filters.get("label"),
+            Some(&vec![
+                "seclab.workload_type=suite-workload".to_string(),
+                "seclab.suite_instance_id=suite-instance-1".to_string()
+            ])
+        );
+    }
+}

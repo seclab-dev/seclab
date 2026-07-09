@@ -275,18 +275,18 @@ mod tests {
     #[test]
     fn test_rewrite_url() {
         // 1. 正常替换 host, port, scheme
-        let orig = "https://10.0.0.43:7310/api/v1/simulation-public/log";
+        let orig = "https://10.0.0.43:7310/api/v1/runtime/heartbeat";
         let target = "http://10.121.7.7:8888";
         assert_eq!(
             rewrite_url(orig, target),
-            "http://10.121.7.7:8888/api/v1/simulation-public/log"
+            "http://10.121.7.7:8888/api/v1/runtime/heartbeat"
         );
 
         // 2. 目标无 port，应清除原 port
         let target_no_port = "https://seclab-server.local";
         assert_eq!(
             rewrite_url(orig, target_no_port),
-            "https://seclab-server.local/api/v1/simulation-public/log"
+            "https://seclab-server.local/api/v1/runtime/heartbeat"
         );
 
         // 3. 无效 target url 应返回原样

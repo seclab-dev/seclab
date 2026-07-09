@@ -15,12 +15,6 @@ use seclab_contracts::{
     },
     runtime_logs::{RuntimeLogFile, RuntimeLogLine, RuntimeLogQuery, RuntimeLogQueryResult},
     seclab::{SeclabNetworkConfig, SeclabNetworkUpdateResult},
-    simulation::{
-        Credential, HttpExploitPathConfig, MailCredential, MailCustomResponse, MailMessage,
-        RedisCommandResponse, SimFtpConfig, SimHttpConfig, SimImapConfig, SimPop3Config,
-        SimRdpConfig, SimRedisConfig, SimSmtpConfig, SimSshConfig, SimulationConfig,
-        SimulationEventType, SimulationProtocol, SimulationProtocolCapability,
-    },
     telemetry::{LogModule, LogStatus},
     types::HostSystemSummary,
 };
@@ -75,22 +69,4 @@ fn export_contract_bindings() {
     export_type::<RuntimeLogQuery>(&cfg);
     export_type::<RuntimeLogLine>(&cfg);
     export_type::<RuntimeLogQueryResult>(&cfg);
-    export_type::<SimulationProtocol>(&cfg);
-    export_type::<SimulationEventType>(&cfg);
-    export_type::<SimulationProtocolCapability>(&cfg);
-    export_type::<HttpExploitPathConfig>(&cfg);
-    export_type::<SimHttpConfig>(&cfg);
-    export_type::<RedisCommandResponse>(&cfg);
-    export_type::<SimRedisConfig>(&cfg);
-    export_type::<MailCredential>(&cfg);
-    export_type::<MailMessage>(&cfg);
-    export_type::<MailCustomResponse>(&cfg);
-    export_type::<SimSmtpConfig>(&cfg);
-    export_type::<SimPop3Config>(&cfg);
-    export_type::<SimImapConfig>(&cfg);
-    export_type::<Credential>(&cfg);
-    export_type::<SimSshConfig>(&cfg);
-    export_type::<SimFtpConfig>(&cfg);
-    export_type::<SimRdpConfig>(&cfg);
-    export_type::<SimulationConfig>(&cfg);
 }

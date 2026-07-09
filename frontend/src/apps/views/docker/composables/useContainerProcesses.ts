@@ -1,8 +1,9 @@
 import { dockerApi } from '@/api/modules/docker'
-import { computed, ref, watch, type Ref } from 'vue'
+import { computed, ref, watch, type ComputedRef, type Ref } from 'vue'
 
 type UseContainerProcessesOptions = {
   selectedContainerId: Ref<string | null>
+  nodeId: Ref<string> | ComputedRef<string>
   activeTab: Ref<'basic' | 'processes' | 'logs' | 'terminal'>
   t: (key: string) => string
 }
@@ -11,6 +12,7 @@ type ProcessSort = { index: number; direction: 'asc' | 'desc' } | null
 
 export const useContainerProcesses = ({
   selectedContainerId,
+  nodeId,
   activeTab,
   t,
 }: UseContainerProcessesOptions) => {
@@ -19,6 +21,7 @@ export const useContainerProcesses = ({
   const processColumns = ref<string[]>([])
   const processRows = ref<string[][]>([])
   const processSort = ref<ProcessSort>(null)
+  const dockerClient = computed(() => dockerApi.forNode(nodeId.value))
 
   let requestVersion = 0
 
@@ -40,7 +43,7 @@ export const useContainerProcesses = ({
     processError.value = null
 
     try {
-      const res = await dockerApi.fetchContainerTop(id)
+      const res = await dockerClient.value.fetchContainerTop(id)
 
       if (currentRequest !== requestVersion) return
       if (selectedContainerId.value !== id) return
@@ -92,7 +95,7 @@ export const useContainerProcesses = ({
     }
   }
 
-  watch(selectedContainerId, () => {
+  watch([selectedContainerId, nodeId], () => {
     reset()
     if (activeTab.value === 'processes' && selectedContainerId.value) {
       void loadProcessList()

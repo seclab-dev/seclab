@@ -2,7 +2,7 @@
 
 use super::{
     apps, auth, desktop_apps, docker, nodes, notifications, platform, runtime, scripts, seclab,
-    simulation, suites, task_scheduler, upgrades,
+    suites, task_scheduler, upgrades,
 };
 use crate::api::node_proxy;
 use crate::db::init_db_pool;
@@ -44,7 +44,6 @@ pub fn state_api_router(app_state: Arc<AppState>) -> Router<Arc<AppState>> {
         .nest("/tasks", task_scheduler::task_scheduler_router())
         .nest("/upgrades", upgrades::upgrades_router())
         .nest("/scripts", scripts::scripts_router())
-        .nest("/simulation", simulation::simulation_router())
         .nest("/suites", suites::suites_router())
         .nest("/suite-instances", suites::suite_instances_router())
         .nest("/suite-install-tasks", suites::suite_install_tasks_router())
@@ -56,7 +55,6 @@ pub fn state_api_router(app_state: Arc<AppState>) -> Router<Arc<AppState>> {
     Router::new()
         .nest("/auth", auth::auth_router())
         .nest("/runtime", runtime::runtime_router())
-        .nest("/simulation-public", simulation::simulation_public_router())
         .merge(protected)
 }
 

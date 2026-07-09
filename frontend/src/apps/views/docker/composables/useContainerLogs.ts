@@ -236,7 +236,7 @@ export function useContainerLogs(options: UseContainerLogsOptions) {
     streamEnded.value = false
     isLoading.value = true
     logLines.value = []
-    wsStore.subscribeToContainerLogs(containerId.value)
+    wsStore.subscribeToContainerLogs(containerId.value, resolvedNodeId.value)
     realtimeSubscribed.value = true
   }
 
@@ -247,7 +247,7 @@ export function useContainerLogs(options: UseContainerLogsOptions) {
   const stopRealtime = (id?: string | null) => {
     const target = id ?? containerId.value
     if (target) {
-      wsStore.unsubscribeFromContainerLogs(target)
+      wsStore.unsubscribeFromContainerLogs(target, resolvedNodeId.value)
     }
     realtimeSubscribed.value = false
   }

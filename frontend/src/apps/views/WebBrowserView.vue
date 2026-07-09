@@ -19,7 +19,7 @@ const props = defineProps<{
 const { t } = useI18n()
 
 /** 地址栏当前输入的 URL */
-const inputUrl = ref('simulation://rule-preview')
+const inputUrl = ref('about:blank')
 /** iframe 实际指向的目标 URL */
 const iframeUrl = ref('')
 /** iframe 实际需要通过 srcdoc 静态高保真渲染的 HTML 字符串 */
@@ -85,7 +85,7 @@ const loadFromPayload = () => {
 
     iframeSrcdoc.value = rawHtml
     iframeUrl.value = ''
-    inputUrl.value = 'simulation://rules/mock-preview.html'
+    inputUrl.value = 'about:blank'
   } else if (props.payload?.url) {
     const urlStr = props.payload.url as string
     iframeUrl.value = urlStr
@@ -99,16 +99,11 @@ const loadFromPayload = () => {
 }
 
 /**
- * 触发地址栏导航。支持对虚拟 simulation 协议的识别以及非 HTTP 域名的补全。
+ * 触发地址栏导航。支持非 HTTP 域名的补全。
  */
 const handleNavigate = () => {
   let target = inputUrl.value.trim()
   if (!target) return
-
-  if (target === 'simulation://rules/mock-preview.html' || target.startsWith('simulation://')) {
-    loadFromPayload()
-    return
-  }
 
   if (target === 'about:blank') {
     iframeSrcdoc.value = buildDefaultWelcomeHtml()

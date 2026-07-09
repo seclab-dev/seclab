@@ -29,6 +29,7 @@ import SecLabIcon from '@/components/icons/SecLabIcon.vue'
 
 const props = defineProps<{
   windowId?: string
+  payload?: Record<string, unknown>
 }>()
 
 const { t } = useI18n()
@@ -83,6 +84,10 @@ const menuItems = computed(() => [
 ])
 
 const activeMenu = ref('overview')
+const targetNodeId = computed(() => {
+  const payloadNodeId = typeof props.payload?.nodeId === 'string' ? props.payload.nodeId : ''
+  return payloadNodeId || nodeStore.currentNodeId || 'local'
+})
 
 /** 切换当前激活的菜单项 */
 function switchMenu(key: string) {
@@ -234,7 +239,7 @@ watch(
 // ─── 节点切换重新初始化 ───
 
 watch(
-  () => nodeStore.currentNodeId,
+  targetNodeId,
   async () => {
     store.stopAllPolling()
     store.isLoading = true
@@ -325,6 +330,7 @@ onUnmounted(() => {
         :project-form-compose="store.projectFormCompose"
         :compose-yaml-error="store.composeYamlError"
         :network-form="store.networkForm"
+        :node-id="targetNodeId"
         @action="store.handleContainerAction"
         @project-action="store.handleComposeProjectAction"
         @edit-compose="store.handleEditComposeConfig"

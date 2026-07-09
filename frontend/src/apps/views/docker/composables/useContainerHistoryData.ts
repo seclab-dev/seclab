@@ -1,23 +1,26 @@
 import { dockerApi } from '@/api/modules/docker'
 import type * as dockerType from '@/api/interface/docker'
-import { computed, ref, watch, type Ref } from 'vue'
+import { computed, ref, watch, type ComputedRef, type Ref } from 'vue'
 
 export type HistoryStatus = 'idle' | 'loading' | 'ready' | 'error'
 
 type UseContainerHistoryDataOptions = {
   selectedContainerId: Ref<string | null>
+  nodeId: Ref<string> | ComputedRef<string>
   activeTab: Ref<'basic' | 'processes' | 'logs' | 'terminal'>
   t: (key: string) => string
 }
 
 export const useContainerHistoryData = ({
   selectedContainerId,
+  nodeId,
   activeTab,
   t,
 }: UseContainerHistoryDataOptions) => {
   const historyStatus = ref<HistoryStatus>('idle')
   const historyError = ref<string | null>(null)
   const containerHistory = ref<dockerType.ResourceUsageHistory | null>(null)
+  const dockerClient = computed(() => dockerApi.forNode(nodeId.value))
 
   let requestVersion = 0
 
@@ -37,7 +40,7 @@ export const useContainerHistoryData = ({
     }
     historyError.value = null
 
-    const res = await dockerApi.fetchContainerResourceUsageHistory(id)
+    const res = await dockerClient.value.fetchContainerResourceUsageHistory(id)
 
     if (currentRequest !== requestVersion) return
     if (selectedContainerId.value !== id) return
@@ -54,8 +57,8 @@ export const useContainerHistoryData = ({
   }
 
   watch(
-    selectedContainerId,
-    (id) => {
+    () => [selectedContainerId.value, nodeId.value] as const,
+    ([id]) => {
       requestVersion += 1
 
       if (!id) {

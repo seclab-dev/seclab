@@ -2,10 +2,10 @@
 
 pub mod docker_stats;
 pub mod logging;
+pub mod pcap;
 pub mod process_manager;
 pub mod runtime_logs;
 pub mod settings;
-pub mod simulation;
 pub mod system_metrics;
 pub mod task_scheduler;
 pub mod upgrade;

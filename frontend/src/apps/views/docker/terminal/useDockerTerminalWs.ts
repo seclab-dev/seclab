@@ -1,4 +1,4 @@
-import { computed, ref } from 'vue'
+import { computed, ref, type ComputedRef, type Ref } from 'vue'
 import { useWebSocket } from '@/composables/useWebSocket'
 import { useNodeStore } from '@/stores/node'
 
@@ -69,9 +69,9 @@ const buildTerminalWsUrl = (nodeId?: string) => {
   return `${origin}${prefix}${path}`
 }
 
-export const useDockerTerminalWs = () => {
+export const useDockerTerminalWs = (nodeId?: Ref<string> | ComputedRef<string>) => {
   const nodeStore = useNodeStore()
-  const wsUrl = computed(() => buildTerminalWsUrl(nodeStore.currentNodeId))
+  const wsUrl = computed(() => buildTerminalWsUrl(nodeId?.value ?? nodeStore.currentNodeId))
 
   const lastTerminalMessage = ref<TerminalServerMessage | null>(null)
   const sessionId = ref<string | null>(null)

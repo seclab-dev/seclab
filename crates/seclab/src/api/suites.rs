@@ -35,6 +35,8 @@ const MAX_SUITE_PACKAGE_BYTES: usize = 50 * 1024 * 1024;
 const MAX_SUITE_UNPACKED_BYTES: usize = 50 * 1024 * 1024;
 const SUITE_PACKAGE_EXTENSION: &str = ".slsp";
 const MIN_SUITE_ICON_SIZE: u32 = 128;
+const SUITE_DELETE_BLOCKED_MESSAGE_KEY: &str =
+    "app.suiteCenter.messages.deleteBlockedByInstalledInstances";
 static SUITE_INSTALL_SESSIONS: LazyLock<Mutex<HashMap<String, SuiteInstallProgress>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -66,7 +68,7 @@ pub fn suite_instances_router() -> Router<Arc<AppState>> {
 /// 构建套件安装任务路由集合。
 pub fn suite_install_tasks_router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/{task_id}", get(install_progress))
+        .route("/{task_id}/progress", get(install_progress))
         .route("/{task_id}/cancel", post(cancel_install))
 }
 
@@ -129,6 +131,7 @@ struct AgentSuiteInstallRequest {
     version: String,
     compose_project_name: String,
     compose_file: String,
+    runtime_images: Vec<String>,
     files: Vec<SuitePackageFile>,
     app_entries: Vec<SuiteAppEntryManifest>,
     operator: Option<String>,
@@ -138,6 +141,8 @@ struct AgentSuiteInstallRequest {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AgentSuiteActionRequest {
+    suite_id: String,
+    suite_instance_id: String,
     compose_project_name: String,
     #[serde(default)]
     remove_data: bool,
@@ -346,9 +351,7 @@ pub async fn delete_suite(
     let ctx = SuiteAuditContext::from_request(&admin, &headers, conn);
     let result = async {
         if suite_has_instances(&state.metadata_db, &path.suite_id).await? {
-            return Err(ApiError::BadRequest(
-                "suite is installed; uninstall it before deleting".to_string(),
-            ));
+            return Err(suite_delete_blocked_by_instances_error());
         }
         let (manifest, _) = fetch_catalog_payload(&state.metadata_db, &path.suite_id)
             .await?
@@ -376,6 +379,12 @@ pub async fn delete_suite(
     );
     result?;
     Ok(ApiResponse::ok("Suite deleted").into_response())
+}
+
+/// 构建删除套件包时存在任意节点实例的冲突提示。
+fn suite_delete_blocked_by_instances_error() -> ApiError {
+    ApiError::BadRequest("suite is installed; uninstall all instances before deleting".to_string())
+        .with_message_key(SUITE_DELETE_BLOCKED_MESSAGE_KEY)
 }
 
 /// 启动套件安装任务；套件安装完成后不自动启用。
@@ -482,6 +491,7 @@ pub async fn install_suite(
         version: manifest.metadata.version.clone(),
         compose_project_name,
         compose_file: manifest.runtime.compose_file.clone(),
+        runtime_images: normalize_runtime_images(&manifest.runtime.images),
         files: package.files,
         app_entries: manifest.app_entries,
         operator: Some(ctx.username.clone()),
@@ -926,6 +936,8 @@ async fn compensate_failed_install(
     instance_id: &str,
 ) {
     let action = AgentSuiteActionRequest {
+        suite_id: request.suite_id.clone(),
+        suite_instance_id: instance_id.to_string(),
         compose_project_name: request.compose_project_name.clone(),
         remove_data: false,
         operator: request.operator.clone(),
@@ -1063,6 +1075,8 @@ pub async fn enable_instance(
     let client =
         NodeRuntimeClient::from_node_route(&state.metadata_db, Some(&instance.node_id)).await?;
     let request = AgentSuiteActionRequest {
+        suite_id: instance.suite_id.clone(),
+        suite_instance_id: instance.instance_id.clone(),
         compose_project_name: instance.compose_project_name.clone(),
         remove_data: false,
         operator: Some(ctx.username.clone()),
@@ -1146,6 +1160,8 @@ pub async fn disable_instance(
     let client =
         NodeRuntimeClient::from_node_route(&state.metadata_db, Some(&instance.node_id)).await?;
     let request = AgentSuiteActionRequest {
+        suite_id: instance.suite_id.clone(),
+        suite_instance_id: instance.instance_id.clone(),
         compose_project_name: instance.compose_project_name.clone(),
         remove_data: false,
         operator: Some(ctx.username.clone()),
@@ -1223,6 +1239,8 @@ pub async fn uninstall_instance(
     let client =
         NodeRuntimeClient::from_node_route(&state.metadata_db, Some(&instance.node_id)).await?;
     let request = AgentSuiteActionRequest {
+        suite_id: instance.suite_id.clone(),
+        suite_instance_id: instance.instance_id.clone(),
         compose_project_name: instance.compose_project_name.clone(),
         remove_data: payload.remove_data,
         operator: Some(ctx.username.clone()),
@@ -1542,6 +1560,7 @@ fn validate_manifest(manifest: &SuiteManifest, files: &[SuitePackageFile]) -> Ap
             "suite compose file must be compose.yaml".to_string(),
         ));
     }
+    validate_runtime_images(&manifest.runtime.images)?;
     if manifest.app_entries.is_empty() {
         return Err(ApiError::BadRequest(
             "suite must declare at least one app entry".to_string(),
@@ -1565,6 +1584,26 @@ fn validate_manifest(manifest: &SuiteManifest, files: &[SuitePackageFile]) -> Ap
         }
     }
     validate_i18n(manifest)?;
+    Ok(())
+}
+
+fn normalize_runtime_images(images: &[String]) -> Vec<String> {
+    images
+        .iter()
+        .map(|image| image.trim())
+        .filter(|image| !image.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn validate_runtime_images(images: &[String]) -> ApiResult<()> {
+    for image in images {
+        if image.trim().is_empty() {
+            return Err(ApiError::BadRequest(
+                "suite runtime image must not be empty".to_string(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -2006,11 +2045,33 @@ mod suite_asset_tests {
             "/api/v1/suite-instances/instance-1/assets/suite-icon.png"
         );
     }
+
+    #[test]
+    fn runtime_images_are_optional_but_entries_must_not_be_empty() {
+        assert!(validate_runtime_images(&[]).is_ok());
+        assert!(
+            validate_runtime_images(&[
+                " guowenju/seclab-protocol-simulation-engine:0.1.0-alpha.1 ".to_string()
+            ])
+            .is_ok()
+        );
+        assert!(validate_runtime_images(&[" ".to_string()]).is_err());
+        assert_eq!(
+            normalize_runtime_images(&[
+                " guowenju/seclab-protocol-simulation-engine:0.1.0-alpha.1 ".to_string(),
+                "".to_string(),
+            ]),
+            vec!["guowenju/seclab-protocol-simulation-engine:0.1.0-alpha.1".to_string()]
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{build_compose_project_name, build_suite_proxy_target};
+    use super::{
+        SUITE_DELETE_BLOCKED_MESSAGE_KEY, build_compose_project_name, build_suite_proxy_target,
+        suite_delete_blocked_by_instances_error,
+    };
 
     #[test]
     fn compose_project_name_uses_slug_and_does_not_include_instance_id() {
@@ -2033,6 +2094,19 @@ mod tests {
         assert_eq!(
             build_suite_proxy_target("instance-1", "main", Some("/console")),
             "/api/v1/suite-instances/instance-1/proxy/main/console"
+        );
+    }
+
+    #[test]
+    fn delete_suite_blocked_error_has_message_key() {
+        let err = suite_delete_blocked_by_instances_error();
+        assert_eq!(
+            err.message_key.as_deref(),
+            Some(SUITE_DELETE_BLOCKED_MESSAGE_KEY)
+        );
+        assert_eq!(
+            err.message,
+            "suite is installed; uninstall all instances before deleting"
         );
     }
 }

@@ -22,6 +22,8 @@ import type * as dockerType from '@/api/interface/docker'
 const props = defineProps<{
   /** 容器 ID */
   containerId: string
+  /** 目标节点 ID */
+  nodeId: string
 }>()
 
 const emit = defineEmits<{
@@ -35,6 +37,7 @@ const notificationStore = useNotificationStore()
 
 const activeTab = ref<'basic' | 'processes' | 'logs' | 'terminal'>('basic')
 const containerIdRef = computed(() => props.containerId)
+const nodeIdRef = computed(() => props.nodeId)
 
 const selectedContainer = computed(() => {
   return store.containers.find((c) => c.Id === props.containerId) || null
@@ -49,6 +52,7 @@ const selectedContainerName = computed(() => {
 // ─── 容器审查信息 Composable ───
 const { inspectDetail, isInspectLoading } = useContainerInspectData({
   selectedContainerId: containerIdRef,
+  nodeId: nodeIdRef,
   onError: (message) => notificationStore.error(message),
 })
 
@@ -61,6 +65,7 @@ const {
   dispose: disposeContainerHistory,
 } = useContainerHistoryData({
   selectedContainerId: containerIdRef,
+  nodeId: nodeIdRef,
   activeTab,
   t,
 })
@@ -87,6 +92,7 @@ const {
   getProcessColumnLabel,
 } = useContainerProcesses({
   selectedContainerId: containerIdRef,
+  nodeId: nodeIdRef,
   activeTab,
   t,
 })
@@ -389,6 +395,7 @@ onUnmounted(() => {
           <DockerContainerLogsPanel
             :container-id="props.containerId"
             :container-name="selectedContainerName"
+            :node-id="props.nodeId"
             :active="activeTab === 'logs'"
           />
         </div>
@@ -401,6 +408,7 @@ onUnmounted(() => {
           <DockerContainerTerminalPanel
             :container-id="props.containerId"
             :container-name="selectedContainerName"
+            :node-id="props.nodeId"
             :active="activeTab === 'terminal'"
           />
         </div>
