@@ -73,7 +73,7 @@ jobs:
       - name: Reject existing release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: v${{ inputs.version }}
+          RELEASE_TAG: ${{ inputs.version }}
         shell: bash
         run: |
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
