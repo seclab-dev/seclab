@@ -135,11 +135,11 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
   let desktopShortcutsLoadPromise: Promise<void> | null = null
   let desktopShortcutsPersistPromise: Promise<void> | null = null
   const defaultDesktopApps: AppId[] = [
-    'suite-center',
+    'node-manager',
     'docker-manager',
     'system-monitor',
-    'file-manager',
     'terminal',
+    'file-manager',
     'settings',
   ]
 

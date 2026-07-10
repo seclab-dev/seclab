@@ -60,19 +60,19 @@ INSERT OR IGNORE INTO apps (
     sort_order
 )
 VALUES
-    ('node-manager', 'app.nodes.appName', '/images/apps/node-manager.png', 1024, 720, 860, 560, 0, 10),
-    ('docker-manager', 'app.docker.appName', '/images/apps/docker-manager.png', 1024, 720, 860, 560, 0, 20),
-    ('system-monitor', 'app.systemMonitor.appName', '/images/apps/system-monitor.png', 1024, 720, 860, 560, 0, 30),
-    ('firewall-manager', 'app.firewallManager.appName', '/images/apps/firewall-manager.png', 1024, 720, 860, 560, 0, 40),
-    ('process-manager', 'app.processManager.appName', '/images/apps/process-manager.png', 1024, 720, 860, 560, 0, 50),
-    ('disk-manager', 'app.diskManager.appName', '/images/apps/disk-manager.png', 1024, 720, 860, 560, 0, 60),
-    ('file-manager', 'app.fileManager.appName', '/images/apps/file-manager.png', 1024, 720, 860, 560, 0, 70),
-    ('file-editor', 'app.fileEditor.appName', '/images/apps/file-editor.png', 1024, 720, 860, 560, 0, 80),
-    ('terminal', 'app.terminal.appName', '/images/apps/terminal.png', 1024, 720, 860, 560, 0, 90),
-    ('task-scheduler', 'app.taskScheduler.appName', '/images/apps/task-scheduler.png', 1024, 720, 860, 560, 0, 100),
-    ('script-manager', 'app.scriptManager.appName', '/images/apps/script-manager.png', 1024, 720, 860, 560, 0, 110),
+    ('suite-center', 'app.suiteCenter.appName', '/images/apps/suite-center.png', 1120, 760, 900, 620, 0, 10),
+    ('node-manager', 'app.nodes.appName', '/images/apps/node-manager.png', 1024, 720, 860, 560, 0, 20),
+    ('docker-manager', 'app.docker.appName', '/images/apps/docker-manager.png', 1024, 720, 860, 560, 0, 30),
+    ('system-monitor', 'app.systemMonitor.appName', '/images/apps/system-monitor.png', 1024, 720, 860, 560, 0, 40),
+    ('terminal', 'app.terminal.appName', '/images/apps/terminal.png', 1024, 720, 860, 560, 0, 50),
+    ('file-manager', 'app.fileManager.appName', '/images/apps/file-manager.png', 1024, 720, 860, 560, 0, 60),
+    ('file-editor', 'app.fileEditor.appName', '/images/apps/file-editor.png', 1024, 720, 860, 560, 0, 70),
+    ('process-manager', 'app.processManager.appName', '/images/apps/process-manager.png', 1024, 720, 860, 560, 0, 80),
+    ('disk-manager', 'app.diskManager.appName', '/images/apps/disk-manager.png', 1024, 720, 860, 560, 0, 90),
+    ('firewall-manager', 'app.firewallManager.appName', '/images/apps/firewall-manager.png', 1024, 720, 860, 560, 0, 100),
+    ('task-scheduler', 'app.taskScheduler.appName', '/images/apps/task-scheduler.png', 1024, 720, 860, 560, 0, 110),
+    ('script-manager', 'app.scriptManager.appName', '/images/apps/script-manager.png', 1024, 720, 860, 560, 0, 120),
     ('web-browser', 'app.webBrowser.appName', '/images/apps/web-browser.png', 960, 600, 400, 300, 0, 130),
     ('platform-log', 'app.platformLog.appName', '/images/apps/platform-log.png', 1024, 720, 860, 560, 0, 140),
     ('notification-history', 'app.notificationHistory.appName', '/images/apps/notification-history.png', 1024, 720, 860, 560, 0, 150),
-    ('settings', 'app.settings.appName', '/images/apps/settings.png', 1024, 720, 860, 560, 0, 160),
-    ('suite-center', 'app.suiteCenter.appName', '/images/apps/suite-center.png', 1120, 760, 900, 620, 0, 170);
+    ('settings', 'app.settings.appName', '/images/apps/settings.png', 1024, 720, 860, 560, 0, 160);
