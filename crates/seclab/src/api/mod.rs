@@ -13,6 +13,7 @@ pub mod routes;
 pub mod runtime;
 pub mod scripts;
 pub mod seclab;
+pub mod security;
 pub mod suites;
 pub mod task_scheduler;
 pub mod upgrades;

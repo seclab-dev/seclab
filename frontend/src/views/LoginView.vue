@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import type { AuthBody } from '@/api/interface'
 import http from '@/api'
+import { markAuthState } from '@/router'
 import { versionStaticAsset } from '@/utils/static-assets'
 import { useI18n } from 'vue-i18n'
 
@@ -10,8 +11,45 @@ const { t } = useI18n()
 const loginLogo = versionStaticAsset('/images/seclab-login-logo.png')
 const username = ref('')
 const password = ref('')
+const captcha = ref('')
+const captchaId = ref('')
+const captchaImage = ref('')
+const captchaRequired = ref(false)
+const locked = ref(false)
 const errorMessage = ref('')
 const router = useRouter()
+
+interface CaptchaPayload {
+  captcha_id: string
+  image: string
+}
+
+interface CaptchaStatusPayload {
+  captchaRequired: boolean
+  locked: boolean
+  lockoutRemaining?: number | null
+}
+
+async function loadCaptchaStatus() {
+  const res = await http.get<CaptchaStatusPayload>('/auth/captcha-status')
+  if (!res.success || !res.data) return
+  captchaRequired.value = res.data.captchaRequired
+  locked.value = res.data.locked
+  if (res.data.locked) {
+    errorMessage.value = t('login.error.locked')
+  }
+  if (res.data.captchaRequired) {
+    await refreshCaptcha()
+  }
+}
+
+async function refreshCaptcha() {
+  const res = await http.get<CaptchaPayload>('/captcha')
+  if (!res.success || !res.data) return
+  captchaId.value = res.data.captcha_id
+  captchaImage.value = res.data.image
+  captcha.value = ''
+}
 
 /**
  * @description 处理登录逻辑，向后端 API 发送请求
@@ -22,18 +60,41 @@ async function handleLogin() {
     errorMessage.value = t('login.error.emptyCredentials')
     return
   }
+  if (captchaRequired.value && captcha.value === '') {
+    errorMessage.value = t('login.error.emptyCaptcha')
+    return
+  }
 
   const res = await http.post<AuthBody>('/auth/login', {
     username: username.value,
     password: password.value,
+    captcha_id: captchaRequired.value ? captchaId.value : undefined,
+    captcha: captchaRequired.value ? captcha.value : undefined,
   })
 
   if (res.success) {
-    router.push('/')
+    const session = await http.get<AuthBody>('/auth/me')
+    if (!session.success) {
+      errorMessage.value = session.message || t('login.error.loginFailed')
+      markAuthState(false)
+      return
+    }
+    markAuthState(true)
+    router.replace('/')
   } else {
     errorMessage.value = res.message || t('login.error.loginFailed')
+    const data = res.data as unknown as CaptchaStatusPayload | undefined
+    captchaRequired.value = Boolean(data?.captchaRequired)
+    locked.value = Boolean(data?.locked)
+    if (captchaRequired.value && !locked.value) {
+      await refreshCaptcha()
+    }
   }
 }
+
+onMounted(() => {
+  void loadCaptchaStatus()
+})
 </script>
 
 <template>
@@ -82,12 +143,35 @@ async function handleLogin() {
           </div>
         </div>
 
+        <div v-if="captchaRequired" class="form-group" data-ui="captcha-field">
+          <label for="captcha">{{ $t('login.captcha') }}</label>
+          <div class="captcha-row">
+            <div class="input-wrapper captcha-input">
+              <input
+                id="captcha"
+                type="text"
+                v-model="captcha"
+                class="input"
+                :placeholder="$t('login.captchaPlaceholder')"
+                inputmode="numeric"
+                maxlength="4"
+                autocomplete="off"
+                required
+              />
+            </div>
+            <button type="button" class="captcha-image-button" @click="refreshCaptcha">
+              <img v-if="captchaImage" :src="captchaImage" alt="" class="captcha-image" />
+              <span v-else>{{ $t('login.refreshCaptcha') }}</span>
+            </button>
+          </div>
+        </div>
+
         <div v-if="errorMessage" class="error-box" role="alert">
           <span class="error-icon" aria-hidden="true">!</span>
           <span class="error-text">{{ errorMessage }}</span>
         </div>
 
-        <button type="submit" class="login-button" data-ui="login-submit">
+        <button type="submit" class="login-button" data-ui="login-submit" :disabled="locked">
           {{ $t('login.loginButton') }}
         </button>
       </form>
@@ -240,6 +324,35 @@ async function handleLogin() {
   margin-top: 4px;
 }
 
+.captcha-row {
+  display: grid;
+  grid-template-columns: 1fr 144px;
+  gap: 10px;
+  align-items: center;
+}
+
+.captcha-input {
+  min-width: 0;
+}
+
+.captcha-image-button {
+  height: 44px;
+  padding: 0;
+  border: 1px solid var(--sdl-border-default);
+  border-radius: var(--sdl-radius-md);
+  background: var(--sdl-bg-input);
+  color: var(--sdl-text-secondary);
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.captcha-image {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
 .error-icon {
   display: grid;
   place-items: center;
@@ -278,6 +391,11 @@ async function handleLogin() {
 
 .login-button:active {
   transform: translateY(0);
+}
+
+.login-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
 }
 
 .login-footer {

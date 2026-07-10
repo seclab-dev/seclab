@@ -9,6 +9,7 @@ import http from '@/api'
 import { resetAuthState } from '@/router'
 import { useWindowManagerStore } from '@/stores/window-manager'
 import { SecLabTag } from '@/components/ui'
+import { getLoginEntryPath } from '@/utils/login-entry'
 
 const router = useRouter()
 const route = useRoute()
@@ -45,7 +46,7 @@ const leaveUpgradePage = () => {
     timerId = null
   }
   resetAuthState()
-  window.location.replace('/login')
+  window.location.replace(getLoginEntryPath())
 }
 
 const cachePlan = (plan: UpgradePlanDetail) => {
@@ -138,7 +139,7 @@ const handleFinishAction = async () => {
     const windowsToClose = [...windowStore.openWindows]
     windowsToClose.forEach((w) => windowStore.closeWindow(w.id))
 
-    window.location.replace('/login')
+    window.location.replace(getLoginEntryPath())
   } else {
     window.sessionStorage.removeItem(UPGRADE_PLAN_ID_KEY)
     window.sessionStorage.removeItem(UPGRADE_PLAN_DETAIL_KEY)

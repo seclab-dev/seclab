@@ -5,6 +5,7 @@ import DesktopLayout from '../components/layout/DesktopLayout.vue'
 import DesktopView from '../views/DesktopView.vue'
 import http from '@/api'
 import type { AuthBody } from '@/api/interface'
+import { getLoginEntryPath, rememberLoginEntry } from '@/utils/login-entry'
 
 const router = createRouter({
   history: createWebHistory('/'),
@@ -12,6 +13,11 @@ const router = createRouter({
     {
       path: '/login',
       name: 'login',
+      component: LoginView,
+    },
+    {
+      path: '/:safeEntry([A-Za-z0-9]{8,32})',
+      name: 'safe-login',
       component: LoginView,
     },
     {
@@ -46,8 +52,15 @@ let hasChecked = false
  * @description 路由守卫：处理登录拦截逻辑
  */
 router.beforeEach(async (to, from) => {
-  // 只有当用户从登录页去往非登录页时（可能刚刚登录成功），才在下一次强制重新请求最新的 session
-  if (from.path === '/login' && to.path !== '/login') {
+  const fromLogin = from.path === '/login' || from.name === 'safe-login'
+  const toLogin = to.path === '/login' || to.name === 'safe-login'
+
+  if (to.name === 'safe-login') {
+    rememberLoginEntry(to.path)
+  }
+
+  // 从登录页去往非登录页时，只有在尚未明确标记登录成功的情况下才重新请求 session。
+  if (fromLogin && !toLogin && !isLoggedIn) {
     hasChecked = false
   }
 
@@ -59,12 +72,12 @@ router.beforeEach(async (to, from) => {
       hasChecked = true
     }
     if (!isLoggedIn) {
-      return '/login'
+      return getLoginEntryPath()
     }
   }
 
   // 2. 如果去往登录页
-  if (to.path === '/login') {
+  if (toLogin) {
     if (!hasChecked) {
       const res = await http.get<AuthBody>('/auth/me')
       isLoggedIn = res.success
@@ -79,6 +92,11 @@ router.beforeEach(async (to, from) => {
 export function resetAuthState() {
   isLoggedIn = false
   hasChecked = false
+}
+
+export function markAuthState(authenticated: boolean) {
+  isLoggedIn = authenticated
+  hasChecked = true
 }
 
 export default router

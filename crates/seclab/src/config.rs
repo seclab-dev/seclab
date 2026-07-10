@@ -244,6 +244,18 @@ fn config_path() -> PathBuf {
     }
 }
 
+/// 返回配置目录路径。
+pub fn config_dir() -> PathBuf {
+    if let Some(value) = env::var_os("SECLAB_CONFIG_DIR") {
+        return PathBuf::from(value);
+    }
+    if cfg!(debug_assertions) {
+        dev_base_dir().join("config")
+    } else {
+        production_home().join("config")
+    }
+}
+
 /// 返回数据库数据目录路径。
 pub fn data_dir() -> PathBuf {
     if let Some(value) = env::var_os("SECLAB_DB_DIR") {

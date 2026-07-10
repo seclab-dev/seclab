@@ -2,6 +2,7 @@
 import { computed, ref, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { resetAuthState } from '@/router'
+import { getLoginEntryPath } from '@/utils/login-entry'
 import { useWindowManagerStore, type WindowInstance } from '../../stores/window-manager'
 import type { AppId } from '@/apps/registry'
 import { useNotificationStore } from '../../stores/notification'
@@ -120,7 +121,7 @@ async function handleLogout() {
 
   const windowsToClose = [...store.openWindows]
   windowsToClose.forEach((w) => store.closeWindow(w.id))
-  window.location.replace('/login')
+  window.location.replace(getLoginEntryPath())
 }
 
 /**

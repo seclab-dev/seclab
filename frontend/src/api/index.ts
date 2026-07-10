@@ -8,6 +8,7 @@ import {
 } from 'axios'
 import type { ApiResponse } from '@/api/interface'
 import { handleAxiosError } from './error'
+import { getLoginEntryPath } from '@/utils/login-entry'
 
 const config = {
   baseURL: '/api/v1',
@@ -64,7 +65,7 @@ class HttpClient {
             if (!isAuthEndpoint) {
               this.handleUnauthorized()
             }
-            return response.data
+            return handleAxiosError(error)
           }
 
           if (response && response.status === 423) {
@@ -90,9 +91,10 @@ class HttpClient {
   }
 
   private handleUnauthorized() {
-    if (this.redirectingToLogin || window.location.pathname === '/login') return
+    const loginPath = getLoginEntryPath()
+    if (this.redirectingToLogin || window.location.pathname === loginPath) return
     this.redirectingToLogin = true
-    window.location.assign('/login')
+    window.location.assign(loginPath)
   }
 
   get<T>(url: string, params?: object, _object = {}): Promise<ApiResponse<T>> {

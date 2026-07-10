@@ -2,7 +2,7 @@
 
 use super::{
     apps, auth, desktop_apps, docker, nodes, notifications, platform, runtime, scripts, seclab,
-    suites, task_scheduler, upgrades,
+    security, suites, task_scheduler, upgrades,
 };
 use crate::api::node_proxy;
 use crate::db::init_db_pool;
@@ -16,6 +16,7 @@ use axum::{
     extract::DefaultBodyLimit,
     http::{Method, Request},
     middleware,
+    routing::get,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -44,6 +45,7 @@ pub fn state_api_router(app_state: Arc<AppState>) -> Router<Arc<AppState>> {
         .nest("/tasks", task_scheduler::task_scheduler_router())
         .nest("/upgrades", upgrades::upgrades_router())
         .nest("/scripts", scripts::scripts_router())
+        .nest("/security", security::security_router())
         .nest("/suites", suites::suites_router())
         .nest("/suite-instances", suites::suite_instances_router())
         .nest("/suite-install-tasks", suites::suite_install_tasks_router())
@@ -53,6 +55,7 @@ pub fn state_api_router(app_state: Arc<AppState>) -> Router<Arc<AppState>> {
         ));
 
     Router::new()
+        .route("/captcha", get(auth::captcha))
         .nest("/auth", auth::auth_router())
         .nest("/runtime", runtime::runtime_router())
         .merge(protected)
@@ -77,6 +80,8 @@ pub async fn create_router() -> Result<(Router, crate::state::DbPool)> {
     let app_state = Arc::new(AppState {
         server_name: "SecLab".to_string(),
         metadata_db: db,
+        captcha_service: crate::security::captcha::CaptchaService::default(),
+        login_tracker: crate::security::login_tracker::LoginTracker::default(),
         deploy_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         local_node_resource: Arc::new(tokio::sync::Mutex::new(None)),
     });
@@ -93,10 +98,17 @@ pub async fn create_router() -> Result<(Router, crate::state::DbPool)> {
 
     // 创建一个需要状态的路由实例，并立即为其提供状态
     let state_routes = state_api_router(Arc::clone(&app_state)).with_state(Arc::clone(&app_state));
-    let router = Router::new()
+    let routed_app = Router::new()
         .nest("/api/v1", public_api_router())
         .nest("/api/v1", state_routes)
+        .fallback(fallback_handler);
+
+    let router = routed_app
         .layer(cors)
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&app_state),
+            crate::security::safe_entry::safe_entry_layer,
+        ))
         .layer(middleware::from_fn(
             seclab_api::logging::http_log_middleware,
         ))
@@ -127,8 +139,7 @@ pub async fn create_router() -> Result<(Router, crate::state::DbPool)> {
         .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(
             10 * 1024 * 1024 * 1024, /* 10GB */
-        ))
-        .fallback(fallback_handler);
+        ));
 
     Ok((router, db_for_shutdown))
 }

@@ -46,6 +46,46 @@ command_exists() {
   command -v "$1" >/dev/null 2>&1
 }
 
+random_chars() {
+  local length="$1"
+  local charset="$2"
+  local output=""
+  local chunk=""
+  while (( ${#output} < length )); do
+    if command -v openssl >/dev/null 2>&1; then
+      chunk="$(openssl rand -base64 96)"
+    else
+      chunk="$(dd if=/dev/urandom bs=96 count=1 2>/dev/null | base64)"
+    fi
+    output="${output}$(printf '%s' "$chunk" | LC_ALL=C tr -dc "$charset")"
+  done
+  printf '%s' "${output:0:length}"
+}
+
+validate_safe_entry() {
+  local value="$1"
+  [[ "$value" =~ ^[A-Za-z0-9]{8,32}$ ]] || return 1
+  local lower
+  lower="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
+  local prefix
+  for prefix in api assets images favicon static public health metrics ws wss robots; do
+    [[ "$lower" != "$prefix"* ]] || return 1
+  done
+  return 0
+}
+
+validate_username() {
+  local value="$1"
+  [[ "$value" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$ ]]
+}
+
+json_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '%s' "$value"
+}
+
 prompt_yes_no() {
   local prompt="$1"
   local reply=""
@@ -366,6 +406,29 @@ SECLAB_LOG_DIR="${SECLAB_HOME}/logs"
 SECLAB_RUN_DIR="${SECLAB_HOME}/run"
 SECLAB_AGENT_SOCKET="${SECLAB_RUN_DIR}/seclab-agent.sock"
 
+DEFAULT_ADMIN_USERNAME="seclab"
+DEFAULT_ADMIN_PASSWORD="$(random_chars 16 'A-Za-z0-9!@#$%^&*')"
+DEFAULT_SAFE_ENTRY="$(random_chars 16 'A-Za-z0-9')"
+
+ADMIN_USERNAME="$(read_tty_input "Admin username [${DEFAULT_ADMIN_USERNAME}]: ")" || ADMIN_USERNAME=""
+if [[ -z "$ADMIN_USERNAME" ]]; then
+  ADMIN_USERNAME="$DEFAULT_ADMIN_USERNAME"
+fi
+validate_username "$ADMIN_USERNAME" || fail "Admin username must be 1-64 characters and contain only letters, digits, underscore, or hyphen"
+
+ADMIN_PASSWORD="$(read_tty_input "Admin password [generated]: ")" || ADMIN_PASSWORD=""
+if [[ -z "$ADMIN_PASSWORD" ]]; then
+  ADMIN_PASSWORD="$DEFAULT_ADMIN_PASSWORD"
+fi
+[[ -n "$ADMIN_PASSWORD" ]] || fail "Admin password must not be empty"
+((${#ADMIN_PASSWORD} >= 5)) || fail "Admin password must be at least 5 characters"
+
+SAFE_ENTRY="$(read_tty_input "Safe login entry [${DEFAULT_SAFE_ENTRY}]: ")" || SAFE_ENTRY=""
+if [[ -z "$SAFE_ENTRY" ]]; then
+  SAFE_ENTRY="$DEFAULT_SAFE_ENTRY"
+fi
+validate_safe_entry "$SAFE_ENTRY" || fail "Safe entry must be 8-32 ASCII letters or digits and must not use a reserved path prefix"
+
 if [[ "$installed" == "true" ]]; then
   log "Stopping existing SecLab services for overwrite..."
   $PREFIX systemctl stop seclab >/dev/null 2>&1 || true
@@ -486,6 +549,16 @@ run_seclab_init_runtime_config() {
 log "prepare directories under ${SECLAB_HOME}"
 $PREFIX mkdir -p "$SECLAB_CONFIG_DIR" "$SECLAB_DB_DIR" "$SECLAB_LOG_DIR" "$SECLAB_RUN_DIR"
 
+log "write bootstrap security file: ${SECLAB_CONFIG_DIR}/bootstrap-security.json"
+BOOTSTRAP_SECURITY_JSON="$(
+  printf '{"username":"%s","password":"%s","safe_entry":"%s","password_complexity":false}\n' \
+    "$(json_escape "$ADMIN_USERNAME")" \
+    "$(json_escape "$ADMIN_PASSWORD")" \
+    "$(json_escape "$SAFE_ENTRY")"
+)"
+printf '%s' "$BOOTSTRAP_SECURITY_JSON" | $PREFIX tee "$SECLAB_CONFIG_DIR/bootstrap-security.json" >/dev/null
+$PREFIX chmod 0600 "$SECLAB_CONFIG_DIR/bootstrap-security.json"
+
 log_section "== install agent"
 log "install binary: /usr/local/bin/seclab-agent"
 install_from_tarball "agent" "seclab-agent"
@@ -533,3 +606,10 @@ $PREFIX systemctl enable --now seclab >/dev/null 2>&1
 log "seclab service started"
 
 log_section "== install completed"
+echo "SecLab initial login information:"
+echo
+echo "  Username: ${ADMIN_USERNAME}"
+echo "  Password: ${ADMIN_PASSWORD}"
+echo "  URL     : https://${SECLAB_PUBLIC_HOST}:${SECLAB_PORT}/${SAFE_ENTRY}"
+echo
+echo "Please save the password now. slctl can reset the password but cannot display it later."

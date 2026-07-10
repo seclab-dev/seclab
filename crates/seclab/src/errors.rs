@@ -124,29 +124,37 @@ impl From<AuthError> for ApiError {
             AuthError::MissingCredentials => ApiError::bad_request(
                 ErrorCode::AuthMissingCredentials,
                 "missing username or password",
-            ),
+            )
+            .with_message_key("api.auth.missingCredentials"),
             AuthError::WrongCredentials => ApiError::unauthorized(
                 ErrorCode::AuthWrongCredentials,
                 "wrong username or password",
-            ),
+            )
+            .with_message_key("api.auth.wrongCredentials"),
             AuthError::InvalidToken => {
-                ApiError::unauthorized(ErrorCode::AuthInvalidToken, "invalid token")
+                ApiError::unauthorized(ErrorCode::AuthInvalidToken, "session expired or invalid")
+                    .with_message_key("api.auth.sessionExpired")
             }
             AuthError::TokenExpired => {
                 ApiError::unauthorized(ErrorCode::AuthTokenExpired, "token expired")
+                    .with_message_key("api.auth.sessionExpired")
             }
             AuthError::TokenCreation => ApiError::internal("token creation failed")
                 .with_detail(ErrorCode::AuthTokenCreationFailed.as_str()),
             AuthError::InvalidPassword => {
                 ApiError::unauthorized(ErrorCode::AuthInvalidPassword, "invalid password")
+                    .with_message_key("api.auth.invalidPassword")
             }
             AuthError::WrongOldPassword => {
                 ApiError::bad_request(ErrorCode::AuthWrongOldPassword, "wrong old password")
+                    .with_message_key("api.auth.wrongOldPassword")
             }
             AuthError::UsernameExists => {
                 ApiError::conflict(ErrorCode::AuthUsernameExists, "username already exists")
+                    .with_message_key("api.auth.usernameExists")
             }
-            AuthError::Forbidden => ApiError::forbidden(ErrorCode::AuthForbidden, "forbidden"),
+            AuthError::Forbidden => ApiError::forbidden(ErrorCode::AuthForbidden, "forbidden")
+                .with_message_key("api.auth.forbidden"),
         }
     }
 }

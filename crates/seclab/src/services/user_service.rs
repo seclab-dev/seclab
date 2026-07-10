@@ -1,12 +1,16 @@
 //! 用户服务：用户初始化、密码校验与业务规则封装。
 
+use crate::models::system_config;
+use crate::security::safe_entry_rules::validate_safe_entry_value;
 use crate::state::DbPool;
 use anyhow::Result;
 use bcrypt::{DEFAULT_COST, hash};
-use tracing::{debug, error};
-// 默认配置
-const DEFAULT_ADMIN_USERNAME: &str = "admin";
-const DEFAULT_ADMIN_PASSWORD: &str = "admin";
+use serde::Deserialize;
+use std::fs;
+use std::path::{Path, PathBuf};
+use tracing::{debug, error, info};
+
+const BOOTSTRAP_SECURITY_FILE: &str = "bootstrap-security.json";
 
 /// 使用 bcrypt 算法计算给定密码的哈希值。
 ///
@@ -23,74 +27,311 @@ pub fn hash_password(password: &str) -> Result<String, bcrypt::BcryptError> {
     hash(password, DEFAULT_COST)
 }
 
-/// 检查并创建内置的管理员用户（如果尚不存在）。
+/// 安装脚本写入的一次性安全初始化载荷。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct BootstrapSecurity {
+    username: String,
+    password: String,
+    safe_entry: String,
+    #[serde(default)]
+    password_complexity: bool,
+}
+
+/// 检查并初始化管理员用户（如果尚不存在）。
 ///
-/// 此函数是应用启动过程中的一个关键步骤，应在数据库连接建立和迁移完成后被调用。
-///
-/// # 功能流程
-/// 1. 查询数据库中是否存在用户名为 `DEFAULT_ADMIN_USERNAME` 的用户。
-/// 2. 如果用户已存在，则跳过创建，直接返回。
-/// 3. 如果用户不存在，则：
-///    a. 使用 `hash_password` 函数哈希 `DEFAULT_ADMIN_PASSWORD`。
-///    b. 将新的用户名和哈希后的密码插入到 `users` 表中。
-///    c. 记录相应的日志信息。
-///
-/// # 参数
-/// - `seclab_db`: 指向 `seclab` 数据库的连接池 (`DbPool`)。
-///
-/// # 返回
-/// - `Result<()>`: 如果操作成功或用户已存在，返回 `Ok(())`；如果哈希或数据库插入失败，
-///   返回一个包含错误信息的 `Err`。
+/// 生产新库必须由安装脚本生成的 bootstrap 文件初始化。开发模式允许
+/// 自动创建 `admin/admin`，并关闭安全入口，方便本地直接启动。
 pub async fn create_initial_admin_if_not_exists(seclab_db: &DbPool) -> Result<()> {
-    let exists = sqlx::query_scalar(r#"SELECT EXISTS(SELECT 1 FROM users WHERE username = ?)"#)
-        .bind(DEFAULT_ADMIN_USERNAME)
+    initialize_admin_if_not_exists(
+        seclab_db,
+        &bootstrap_security_path(),
+        cfg!(debug_assertions),
+    )
+    .await
+}
+
+async fn initialize_admin_if_not_exists(
+    seclab_db: &DbPool,
+    bootstrap_path: &Path,
+    allow_dev_default: bool,
+) -> Result<()> {
+    let user_count: i64 = sqlx::query_scalar("SELECT COUNT(1) FROM users")
         .fetch_one(seclab_db)
         .await?;
 
-    if exists {
-        debug!(
-            "Default admin user '{}' already exists. Skipping creation.",
-            DEFAULT_ADMIN_USERNAME
-        );
+    if user_count > 0 && !bootstrap_path.exists() {
+        debug!("Admin user already exists. Skipping bootstrap security initialization.");
         return Ok(());
     }
 
-    debug!(
-        "Default admin user '{}' not found. Creating it with default password: '{}'",
-        DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD
-    );
+    if !bootstrap_path.exists() {
+        if allow_dev_default {
+            initialize_admin_from_values(seclab_db, user_count, "admin", "admin", "", false)
+                .await?;
+            info!(
+                "Initialized development default admin user admin/admin with safe entry disabled."
+            );
+            return Ok(());
+        }
+        return Err(anyhow::anyhow!(
+            "missing bootstrap security file at {}: No such file or directory",
+            bootstrap_path.display()
+        ));
+    }
 
-    let password_hash = match hash_password(DEFAULT_ADMIN_PASSWORD) {
+    let raw = fs::read_to_string(bootstrap_path).map_err(|err| {
+        anyhow::anyhow!(
+            "missing bootstrap security file at {}: {}",
+            bootstrap_path.display(),
+            err
+        )
+    })?;
+    let bootstrap: BootstrapSecurity = serde_json::from_str(&raw)
+        .map_err(|err| anyhow::anyhow!("invalid bootstrap security file: {}", err))?;
+    validate_bootstrap(&bootstrap)?;
+
+    initialize_admin_from_values(
+        seclab_db,
+        user_count,
+        &bootstrap.username,
+        &bootstrap.password,
+        bootstrap.safe_entry.trim(),
+        bootstrap.password_complexity,
+    )
+    .await?;
+
+    match fs::remove_file(bootstrap_path) {
+        Ok(()) => info!(
+            "Bootstrap security file consumed and removed: {}",
+            bootstrap_path.display()
+        ),
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "admin initialized but failed to remove bootstrap security file {}: {}",
+                bootstrap_path.display(),
+                e
+            ));
+        }
+    }
+
+    info!("Successfully initialized bootstrap admin user.");
+    Ok(())
+}
+
+async fn initialize_admin_from_values(
+    seclab_db: &DbPool,
+    existing_user_count: i64,
+    username: &str,
+    password: &str,
+    safe_entry: &str,
+    password_complexity: bool,
+) -> Result<()> {
+    let password_hash = match hash_password(password) {
         Ok(hash) => hash,
         Err(e) => {
-            error!("Failed to hash default admin password: {}", e);
+            error!("Failed to hash admin password: {}", e);
             return Err(anyhow::anyhow!("Failed to hash admin password"));
         }
     };
 
-    // 插入默认管理员用户
+    if existing_user_count > 0 {
+        sqlx::query("DELETE FROM auth_sessions")
+            .execute(seclab_db)
+            .await?;
+        sqlx::query("DELETE FROM users").execute(seclab_db).await?;
+    }
+
     let result = sqlx::query(
         r#"
         INSERT INTO users (username, password_hash)
         VALUES (?, ?)
         "#,
     )
-    .bind(DEFAULT_ADMIN_USERNAME)
+    .bind(username)
     .bind(password_hash)
     .execute(seclab_db)
     .await;
 
-    match result {
-        Ok(_) => {
-            debug!(
-                "Successfully created default admin user: {}/{}",
-                DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD
-            );
-            Ok(())
+    if let Err(e) = result {
+        error!("Failed to insert bootstrap admin user into DB: {}", e);
+        return Err(anyhow::anyhow!("Failed to insert admin user: {}", e));
+    }
+
+    system_config::update_security_settings(seclab_db, safe_entry, password_complexity).await?;
+    Ok(())
+}
+
+/// 返回 bootstrap 文件路径。
+pub fn bootstrap_security_path() -> PathBuf {
+    crate::config::config_dir().join(BOOTSTRAP_SECURITY_FILE)
+}
+
+fn validate_bootstrap(bootstrap: &BootstrapSecurity) -> Result<()> {
+    let username = bootstrap.username.trim();
+    let valid_username = !username.is_empty()
+        && username.len() <= 64
+        && username
+            .chars()
+            .enumerate()
+            .all(|(idx, ch)| ch.is_ascii_alphanumeric() || ch == '_' || (idx > 0 && ch == '-'));
+    if !valid_username {
+        return Err(anyhow::anyhow!(
+            "bootstrap username must be 1-64 ASCII letters, digits, underscore, or hyphen"
+        ));
+    }
+    if bootstrap.password.is_empty() {
+        return Err(anyhow::anyhow!("bootstrap password must not be empty"));
+    }
+    if bootstrap.password.len() < 5 {
+        return Err(anyhow::anyhow!(
+            "bootstrap password must be at least 5 characters"
+        ));
+    }
+    let safe_entry = bootstrap.safe_entry.trim();
+    validate_safe_entry_value(safe_entry)
+        .map_err(|err| anyhow::anyhow!("bootstrap safe entry is invalid: {}", err))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BootstrapSecurity, initialize_admin_if_not_exists, validate_bootstrap};
+    use crate::models::system_config;
+    use crate::test_support::setup_test_db;
+    use bcrypt::verify;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn valid_bootstrap() -> BootstrapSecurity {
+        BootstrapSecurity {
+            username: "seclab".to_string(),
+            password: "12345".to_string(),
+            safe_entry: "Xm9Kp2Qs".to_string(),
+            password_complexity: false,
         }
-        Err(e) => {
-            error!("Failed to insert default admin user into DB: {}", e);
-            Err(anyhow::anyhow!("Failed to insert admin user: {}", e))
-        }
+    }
+
+    #[test]
+    fn accepts_valid_bootstrap_security_payload() {
+        assert!(validate_bootstrap(&valid_bootstrap()).is_ok());
+    }
+
+    #[test]
+    fn rejects_short_bootstrap_password() {
+        let mut bootstrap = valid_bootstrap();
+        bootstrap.password = "1234".to_string();
+        assert!(validate_bootstrap(&bootstrap).is_err());
+    }
+
+    #[test]
+    fn rejects_reserved_safe_entry_prefix_in_bootstrap() {
+        let mut bootstrap = valid_bootstrap();
+        bootstrap.safe_entry = "api123456".to_string();
+        assert!(validate_bootstrap(&bootstrap).is_err());
+    }
+
+    #[tokio::test]
+    async fn debug_default_initializes_admin_without_safe_entry() {
+        let pool = setup_test_db().await;
+        let missing_bootstrap = unique_bootstrap_path("missing");
+        initialize_admin_if_not_exists(&pool, &missing_bootstrap, true)
+            .await
+            .unwrap();
+
+        let (username, password_hash): (String, String) =
+            sqlx::query_as("SELECT username, password_hash FROM users ORDER BY id LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(username, "admin");
+        assert!(verify("admin", &password_hash).unwrap());
+        assert_eq!(
+            system_config::get_safe_entry_value(&pool).await.unwrap(),
+            ""
+        );
+        assert!(
+            !system_config::password_complexity_enabled(&pool)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn production_missing_bootstrap_is_rejected() {
+        let pool = setup_test_db().await;
+        let missing_bootstrap = unique_bootstrap_path("prod-missing");
+        let err = initialize_admin_if_not_exists(&pool, &missing_bootstrap, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("missing bootstrap security file"));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_file_overrides_development_default() {
+        let pool = setup_test_db().await;
+        let bootstrap_path = unique_bootstrap_path("bootstrap");
+        fs::create_dir_all(bootstrap_path.parent().unwrap()).unwrap();
+        fs::write(
+            &bootstrap_path,
+            r#"{"username":"seclab","password":"12345","safe_entry":"Xm9Kp2Qs","password_complexity":true}"#,
+        )
+        .unwrap();
+
+        initialize_admin_if_not_exists(&pool, &bootstrap_path, true)
+            .await
+            .unwrap();
+
+        let (username, password_hash): (String, String) =
+            sqlx::query_as("SELECT username, password_hash FROM users ORDER BY id LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(username, "seclab");
+        assert!(verify("12345", &password_hash).unwrap());
+        assert_eq!(
+            system_config::get_safe_entry_value(&pool).await.unwrap(),
+            "Xm9Kp2Qs"
+        );
+        assert!(
+            system_config::password_complexity_enabled(&pool)
+                .await
+                .unwrap()
+        );
+        assert!(!bootstrap_path.exists());
+    }
+
+    #[tokio::test]
+    async fn existing_user_is_not_reset_without_bootstrap() {
+        let pool = setup_test_db().await;
+        let missing_bootstrap = unique_bootstrap_path("existing");
+        initialize_admin_if_not_exists(&pool, &missing_bootstrap, true)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE users SET username = 'custom' WHERE id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        initialize_admin_if_not_exists(&pool, &missing_bootstrap, true)
+            .await
+            .unwrap();
+
+        let username: String = sqlx::query_scalar("SELECT username FROM users WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(username, "custom");
+    }
+
+    fn unique_bootstrap_path(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir()
+            .join("seclab-user-service-tests")
+            .join(format!("{label}-{}-{nanos}.json", std::process::id()))
     }
 }

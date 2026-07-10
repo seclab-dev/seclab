@@ -26,6 +26,8 @@ pub struct DeploySession {
 pub struct AppState {
     pub server_name: String,
     pub metadata_db: DbPool,
+    pub captcha_service: crate::security::captcha::CaptchaService,
+    pub login_tracker: crate::security::login_tracker::LoginTracker,
     pub deploy_sessions: Arc<std::sync::Mutex<HashMap<String, DeploySession>>>,
     pub local_node_resource: Arc<tokio::sync::Mutex<Option<serde_json::Value>>>,
 }

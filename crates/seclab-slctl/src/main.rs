@@ -3,7 +3,14 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use serde::Deserialize;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+
+const RESERVED_SAFE_ENTRY_PREFIXES: &[&str] = &[
+    "api", "assets", "images", "favicon", "static", "public", "health", "metrics", "ws", "wss",
+    "robots",
+];
 
 #[derive(Parser)]
 #[command(name = "slctl")]
@@ -24,13 +31,31 @@ enum Commands {
     Status,
     /// 显示节点和系统信息
     Info,
-    /// 重置指定用户的密码，常用于忘记用户名和密码时后台的处理
-    ResetPassword {
-        /// 要重置密码的用户名 (默认: admin)
-        #[arg(long, default_value = "admin")]
+    /// 修改管理员密码
+    Passwd {
+        /// 同时修改用户名
+        #[arg(long)]
+        username: Option<String>,
+        /// 新密码；不传则交互输入
+        password: Option<String>,
+    },
+    /// 修改管理员用户名
+    User {
+        /// 新用户名
+        #[arg(long)]
         username: String,
-        /// 新的密码
-        password: String,
+    },
+    /// 管理安全入口
+    Entry {
+        /// 重新生成安全入口
+        #[arg(long)]
+        regenerate: bool,
+        /// 设置自定义安全入口
+        #[arg(long)]
+        set: Option<String>,
+        /// 关闭安全入口
+        #[arg(long)]
+        disable: bool,
     },
     /// 卸载服务，支持 --purge 清理数据
     Uninstall {
@@ -66,32 +91,30 @@ struct Context {
     run_dir: PathBuf,
     /// Agent 的 Unix Socket 文件路径
     agent_socket: PathBuf,
-    /// 当前是否需要使用 sudo 运行特权指令
+    /// 当前是否需要提升权限运行特权指令。
     use_sudo: bool,
 }
 
-/// 检查当前运行的用户是否拥有 Root 权限或 Sudo 权限。
-/// 如果当前不是 Root 用户且无 Sudo，将打印错误并终止程序。
+/// seclab 运行时监听配置。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeListenConfig {
+    /// 实际监听地址。
+    host: String,
+    /// 实际监听端口。
+    port: u16,
+    /// 对外默认访问地址。
+    public_host: Option<String>,
+}
+
+/// 检查当前运行的用户是否拥有 Root 权限。
 fn check_privilege() -> Result<bool> {
     let uid = unsafe { libc::getuid() };
     if uid == 0 {
         return Ok(false);
     }
-
-    // 检查 sudo 命令是否存在于环境中
-    let sudo_exists = std::process::Command::new("which")
-        .arg("sudo")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-
-    if !sudo_exists {
-        eprintln!("slctl: must run as root or have sudo privilege");
-        std::process::exit(1);
-    }
-    Ok(true)
+    eprintln!("slctl: must run as root");
+    std::process::exit(1);
 }
 
 /// 动态检测当前可执行文件所在的路径，并推导出默认的 `SECLAB_HOME`。
@@ -155,11 +178,109 @@ fn parse_listen_addr(addr: &str) -> (String, String) {
     (addr.to_string(), "".to_string())
 }
 
+/// 将泛监听地址转换为可访问的本机地址。
+fn normalize_listen_host(host: &str) -> String {
+    match host.trim() {
+        "" | "*" | "0.0.0.0" | "::" | "[::]" => "127.0.0.1".to_string(),
+        value => value
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_string(),
+    }
+}
+
 /// 打印命令行工具用法。
 fn print_usage() {
     eprintln!(
-        "Usage:\n  slctl restart <seclab|agent>\n  slctl status\n  slctl info\n  slctl reset-password [--username <username>] <password>\n  slctl uninstall [--purge]\n  slctl self uninstall"
+        "Usage:\n  slctl restart <seclab|agent>\n  slctl status\n  slctl info\n  slctl passwd [--username <username>] [password]\n  slctl user --username <username>\n  slctl entry [--regenerate|--set <entry>|--disable]\n  slctl uninstall [--purge]\n  slctl self uninstall"
     );
+}
+
+/// 读取一行交互输入。
+fn prompt_line(prompt: &str) -> Result<String> {
+    print!("{}", prompt);
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim_end_matches(['\r', '\n']).to_string())
+}
+
+/// 校验用户名。
+fn validate_username_value(username: &str) -> Result<()> {
+    let valid = !username.trim().is_empty()
+        && username.len() <= 64
+        && username
+            .chars()
+            .enumerate()
+            .all(|(idx, ch)| ch.is_ascii_alphanumeric() || ch == '_' || (idx > 0 && ch == '-'));
+    if !valid {
+        return Err(anyhow::anyhow!(
+            "Username must be 1-64 ASCII letters, digits, underscore, or hyphen"
+        ));
+    }
+    Ok(())
+}
+
+/// 校验安全入口。
+fn validate_safe_entry_value(value: &str) -> Result<()> {
+    if !(8..=32).contains(&value.len()) || !value.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+        return Err(anyhow::anyhow!(
+            "Safe entry must be 8-32 ASCII letters or digits"
+        ));
+    }
+    let lower = value.to_ascii_lowercase();
+    if RESERVED_SAFE_ENTRY_PREFIXES
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+    {
+        return Err(anyhow::anyhow!(
+            "Safe entry must not use a reserved path prefix"
+        ));
+    }
+    Ok(())
+}
+
+/// 校验密码。
+fn validate_password(password: &str, enforce_complexity: bool) -> Result<()> {
+    if password.is_empty() {
+        return Err(anyhow::anyhow!("Password must not be empty"));
+    }
+    if !enforce_complexity {
+        if password.len() < 5 {
+            return Err(anyhow::anyhow!(
+                "Password length must be at least 5 characters"
+            ));
+        }
+        return Ok(());
+    }
+    if !(8..=30).contains(&password.len()) {
+        return Err(anyhow::anyhow!("Password length must be 8-30 characters"));
+    }
+    let has_letter = password.chars().any(|ch| ch.is_ascii_alphabetic());
+    let has_digit = password.chars().any(|ch| ch.is_ascii_digit());
+    let has_special = password.chars().any(|ch| !ch.is_ascii_alphanumeric());
+    let count = [has_letter, has_digit, has_special]
+        .into_iter()
+        .filter(|value| *value)
+        .count();
+    if count < 2 {
+        return Err(anyhow::anyhow!(
+            "Password must contain at least two character classes"
+        ));
+    }
+    Ok(())
+}
+
+/// 生成随机安全入口。
+fn generate_safe_entry() -> Result<String> {
+    let mut bytes = [0u8; 32];
+    std::fs::File::open("/dev/urandom")?
+        .read_exact(&mut bytes)
+        .map_err(|err| anyhow::anyhow!("Failed to read random bytes: {}", err))?;
+    let charset = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    Ok((0..16)
+        .map(|idx| charset[bytes[idx] as usize % charset.len()] as char)
+        .collect())
 }
 
 impl Context {
@@ -382,6 +503,7 @@ impl Context {
 
         let mut listen_ip = "unknown".to_string();
         let mut listen_port = "unknown".to_string();
+        let runtime_config = self.load_runtime_listen_config();
 
         if !pid_str.is_empty() && pid_str != "0" && command_exists("ss") {
             let ss_output = self
@@ -405,6 +527,14 @@ impl Context {
             }
         }
 
+        if let Some(config) = runtime_config {
+            listen_port = config.port.to_string();
+            listen_ip = config
+                .public_host
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| normalize_listen_host(&config.host));
+        }
+
         let database_path = self.db_dir.join("seclab.db");
         let db_exists = if self.use_sudo {
             let status = self.run_command_silent("test", &["-f", &database_path.to_string_lossy()]);
@@ -421,18 +551,42 @@ impl Context {
                 Err(e) => {
                     let err_msg = e.to_string();
                     if err_msg.contains("Permission denied") {
-                        "unknown (Permission denied, run as root/sudo)".to_string()
+                        "unknown (Permission denied, run as root)".to_string()
                     } else {
                         "unknown (Access failed)".to_string()
                     }
                 }
             }
         };
+        let safe_entry = self.get_safe_entry_from_db().unwrap_or_default();
 
         println!("slctl: seclab listen IP: {}", listen_ip);
         println!("slctl: seclab listen port: {}", listen_port);
         println!("slctl: admin username: {}", admin_username);
+        if safe_entry.trim().is_empty() {
+            println!("slctl: safe entry: disabled");
+        } else {
+            println!("slctl: safe entry: {}", safe_entry.trim());
+            println!(
+                "slctl: panel login URL: https://{}:{}/{}",
+                listen_ip,
+                listen_port,
+                safe_entry.trim()
+            );
+        }
         Ok(())
+    }
+
+    /// 读取运行时监听配置。
+    fn load_runtime_listen_config(&self) -> Option<RuntimeListenConfig> {
+        let path = self.config_dir.join("runtime-listen.json");
+        let raw = if self.use_sudo {
+            self.run_command_output("cat", &[&path.to_string_lossy()])
+                .ok()?
+        } else {
+            std::fs::read_to_string(path).ok()?
+        };
+        serde_json::from_str(&raw).ok()
     }
 
     /// 安全删除文件或目录（如果存在）。
@@ -528,68 +682,139 @@ impl Context {
         Ok(())
     }
 
-    /// 从数据库中获取管理员用户名。
-    /// 优先使用 rusqlite 直接打开文件，若遭遇权限问题且有 sudo 特权，则降级为使用 sudo sqlite3 命令行工具获取。
-    fn get_admin_username_from_db(&self) -> Result<String> {
+    /// 打开主控数据库。
+    fn open_database(&self) -> Result<rusqlite::Connection> {
         let database_path = self.db_dir.join("seclab.db");
-
-        match rusqlite::Connection::open(&database_path) {
-            Ok(conn) => {
-                let mut stmt = conn.prepare("SELECT username FROM users WHERE id = 1 LIMIT 1;")?;
-                let username: String = stmt.query_row([], |row| row.get(0))?;
-                Ok(username)
-            }
-            Err(e) => {
-                if self.use_sudo && command_exists("sqlite3") {
-                    let sqlite_query = "SELECT username FROM users WHERE id = 1 LIMIT 1;";
-                    let output = self.run_command_output(
-                        "sqlite3",
-                        &[&database_path.to_string_lossy(), sqlite_query],
-                    )?;
-                    let trimmed = output.trim();
-                    if !trimmed.is_empty() {
-                        return Ok(trimmed.to_string());
-                    }
-                }
-                Err(anyhow::anyhow!("Cannot access database: {}", e))
-            }
-        }
+        rusqlite::Connection::open(&database_path).map_err(|e| {
+            anyhow::anyhow!("Cannot access database {}: {}", database_path.display(), e)
+        })
     }
 
-    /// 重置指定用户的密码，常用于忘记用户名和密码时后台的处理。
-    fn reset_password(&self, username: &str, new_password: &str) -> Result<()> {
-        let database_path = self.db_dir.join("seclab.db");
+    /// 从数据库中获取管理员用户名。
+    fn get_admin_username_from_db(&self) -> Result<String> {
+        let conn = self.open_database()?;
+        let mut stmt = conn.prepare("SELECT username FROM users ORDER BY id LIMIT 1;")?;
+        let username: String = stmt.query_row([], |row| row.get(0))?;
+        Ok(username)
+    }
 
-        // 1. 计算 bcrypt 哈希
+    /// 确保系统配置单行存在。
+    fn ensure_system_config(&self, conn: &rusqlite::Connection) -> Result<()> {
+        conn.execute("INSERT OR IGNORE INTO system_config (id) VALUES (1);", [])?;
+        Ok(())
+    }
+
+    /// 从数据库中读取安全入口。
+    fn get_safe_entry_from_db(&self) -> Result<String> {
+        let conn = self.open_database()?;
+        self.ensure_system_config(&conn)?;
+        let value = conn.query_row(
+            "SELECT safe_entry FROM system_config WHERE id = 1;",
+            [],
+            |row| row.get::<_, String>(0),
+        )?;
+        Ok(value)
+    }
+
+    /// 写入安全入口。
+    fn set_safe_entry_in_db(&self, value: &str) -> Result<()> {
+        let conn = self.open_database()?;
+        self.ensure_system_config(&conn)?;
+        conn.execute(
+            "UPDATE system_config SET safe_entry = ?1 WHERE id = 1;",
+            rusqlite::params![value],
+        )?;
+        Ok(())
+    }
+
+    /// 修改管理员密码，可同时修改用户名。
+    fn passwd(&self, username: Option<&str>, new_password: &str) -> Result<()> {
+        validate_password(new_password, self.password_complexity_enabled()?)?;
         let password_hash = bcrypt::hash(new_password, bcrypt::DEFAULT_COST)
             .map_err(|e| anyhow::anyhow!("Failed to hash password: {}", e))?;
-
-        // 2. 尝试打开数据库连接
-        let conn = match rusqlite::Connection::open(&database_path) {
-            Ok(c) => c,
-            Err(e) => {
-                let err_msg = e.to_string();
-                if err_msg.contains("Permission denied") || self.use_sudo {
-                    return Err(anyhow::anyhow!(
-                        "Permission denied to write database. Please run this command with sudo, e.g.:\n  sudo slctl reset-password {}",
-                        new_password
-                    ));
-                }
-                return Err(anyhow::anyhow!("Failed to open database: {}", e));
-            }
+        let conn = self.open_database()?;
+        let affected = if let Some(username) = username {
+            validate_username_value(username)?;
+            conn.execute(
+                "UPDATE users SET username = ?1, password_hash = ?2 WHERE id = (SELECT id FROM users ORDER BY id LIMIT 1);",
+                rusqlite::params![username, password_hash],
+            )?
+        } else {
+            conn.execute(
+                "UPDATE users SET password_hash = ?1 WHERE id = (SELECT id FROM users ORDER BY id LIMIT 1);",
+                rusqlite::params![password_hash],
+            )?
         };
-
-        // 3. 执行修改逻辑
-        let mut stmt = conn.prepare("UPDATE users SET password_hash = ? WHERE username = ?;")?;
-        let affected = stmt.execute(rusqlite::params![password_hash, username])?;
         if affected == 0 {
+            return Err(anyhow::anyhow!("No admin user found in database."));
+        }
+        println!("slctl: password updated");
+        Ok(())
+    }
+
+    /// 修改管理员用户名。
+    fn update_username(&self, username: &str) -> Result<()> {
+        validate_username_value(username)?;
+        let conn = self.open_database()?;
+        let affected = conn.execute(
+            "UPDATE users SET username = ?1 WHERE id = (SELECT id FROM users ORDER BY id LIMIT 1);",
+            rusqlite::params![username],
+        )?;
+        if affected == 0 {
+            return Err(anyhow::anyhow!("No admin user found in database."));
+        }
+        println!("slctl: username updated to '{}'", username);
+        Ok(())
+    }
+
+    /// 当前密码复杂度开关。
+    fn password_complexity_enabled(&self) -> Result<bool> {
+        let conn = self.open_database()?;
+        self.ensure_system_config(&conn)?;
+        let value: i64 = conn.query_row(
+            "SELECT password_complexity FROM system_config WHERE id = 1;",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(value != 0)
+    }
+
+    /// 查看或修改安全入口。
+    fn entry(&self, regenerate: bool, set: Option<String>, disable: bool) -> Result<()> {
+        let action_count = [regenerate, set.is_some(), disable]
+            .into_iter()
+            .filter(|value| *value)
+            .count();
+        if action_count > 1 {
             return Err(anyhow::anyhow!(
-                "User '{}' not found in database.",
-                username
+                "Only one of --regenerate, --set, or --disable can be used"
             ));
         }
 
-        println!("slctl: successfully reset password for user '{}'", username);
+        if regenerate {
+            let value = generate_safe_entry()?;
+            self.set_safe_entry_in_db(&value)?;
+            println!("slctl: safe entry updated: {}", value);
+            return Ok(());
+        }
+        if let Some(value) = set {
+            validate_safe_entry_value(&value)?;
+            self.set_safe_entry_in_db(&value)?;
+            println!("slctl: safe entry updated: {}", value);
+            return Ok(());
+        }
+        if disable {
+            self.set_safe_entry_in_db("")?;
+            println!("slctl: safe entry disabled");
+            return Ok(());
+        }
+
+        let entry = self.get_safe_entry_from_db()?;
+        if entry.trim().is_empty() {
+            println!("slctl: safe entry: disabled");
+        } else {
+            println!("slctl: safe entry: {}", entry.trim());
+        }
         Ok(())
     }
 }
@@ -621,8 +846,29 @@ fn run_app(cli: Cli, context: Context) -> Result<()> {
         Commands::Info => {
             context.show_info()?;
         }
-        Commands::ResetPassword { username, password } => {
-            context.reset_password(&username, &password)?;
+        Commands::Passwd { username, password } => {
+            let password = match password {
+                Some(value) => value,
+                None => {
+                    let first = prompt_line("New password: ")?;
+                    let second = prompt_line("Confirm password: ")?;
+                    if first != second {
+                        return Err(anyhow::anyhow!("Password confirmation does not match"));
+                    }
+                    first
+                }
+            };
+            context.passwd(username.as_deref(), &password)?;
+        }
+        Commands::User { username } => {
+            context.update_username(&username)?;
+        }
+        Commands::Entry {
+            regenerate,
+            set,
+            disable,
+        } => {
+            context.entry(regenerate, set, disable)?;
         }
         Commands::Uninstall { purge } => {
             context.uninstall_service("agent", purge)?;
@@ -668,5 +914,33 @@ fn main() {
     if let Err(e) = run_app(cli, context) {
         eprintln!("slctl: {}", e);
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_password, validate_safe_entry_value};
+
+    #[test]
+    fn validates_safe_entry_format_and_reserved_prefixes() {
+        assert!(validate_safe_entry_value("Xm9Kp2Qs").is_ok());
+        assert!(validate_safe_entry_value("abc1234").is_err());
+        assert!(validate_safe_entry_value("abc1234!").is_err());
+        assert!(validate_safe_entry_value("api123456").is_err());
+        assert!(validate_safe_entry_value("AssetsLogin").is_err());
+    }
+
+    #[test]
+    fn validates_password_minimum_length_without_complexity() {
+        assert!(validate_password("", false).is_err());
+        assert!(validate_password("1234", false).is_err());
+        assert!(validate_password("12345", false).is_ok());
+    }
+
+    #[test]
+    fn validates_password_complexity_when_enabled() {
+        assert!(validate_password("abcdefg1", true).is_ok());
+        assert!(validate_password("abcdefgh", true).is_err());
+        assert!(validate_password("abc1", true).is_err());
     }
 }

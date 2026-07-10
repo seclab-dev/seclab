@@ -40,6 +40,6 @@ export function handleAxiosError(error: AxiosError): ApiResponse<null> {
     code: status,
     message,
     errorCode,
-    data: null,
+    data: (responseData?.data ?? null) as null,
   }
 }

@@ -8,25 +8,28 @@ use crate::models::logging::LogModule;
 use crate::models::user::User;
 use crate::services::logging::{self, PlatformLogEntry};
 use crate::state::AppState;
-use crate::types::{ApiError, ApiResponse, ApiResult};
+use crate::types::{ApiError, ApiResponse, ApiResult, AuthError};
 use axum::{
     Json, Router,
     extract::{FromRef, FromRequestParts, Request, State, connect_info::ConnectInfo},
-    http::{HeaderMap, header, request::Parts},
+    http::{HeaderMap, StatusCode, header, request::Parts},
     middleware::Next,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use axum_extra::extract::cookie::{Cookie as AxumCookie, SameSite};
 use bcrypt::verify;
+use seclab_contracts::api::ErrorCode;
 use seclab_contracts::auth::AuthBody;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 const SESSION_COOKIE: &str = "seclab_session";
 const SESSION_COOKIE_MAX_AGE_SECONDS: i64 = 12 * 60 * 60;
+const SESSION_COOKIE_PATH: &str = "/";
+const LEGACY_SESSION_COOKIE_PATHS: &[&str] = &["/api/v1", "/api/v1/auth"];
 
 /// 已通过服务端会话校验的管理员身份。
 #[derive(Debug, Clone)]
@@ -41,6 +44,26 @@ pub struct AuthenticatedAdmin {
 pub struct AuthPayload {
     pub username: String,
     pub password: String,
+    pub captcha_id: Option<String>,
+    pub captcha: Option<String>,
+}
+
+/// 登录失败扩展信息。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginFailurePayload {
+    pub captcha_required: bool,
+    pub locked: bool,
+    pub lockout_remaining: Option<u64>,
+}
+
+/// 当前客户端验证码状态。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptchaStatusPayload {
+    pub captcha_required: bool,
+    pub locked: bool,
+    pub lockout_remaining: Option<u64>,
 }
 
 /// 处理管理员登录请求，成功后创建可并存的服务端会话。
@@ -53,6 +76,17 @@ pub async fn login(
     let client_ip = conn.ip();
     let pool = &state.metadata_db;
     let trace_id = logging::resolve_trace_id(&headers);
+
+    if let Some(remaining) = state.login_tracker.lockout_remaining_secs(&client_ip).await {
+        return Ok(login_failure_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "登录尝试过于频繁，请稍后再试",
+            "api.auth.loginLocked",
+            true,
+            true,
+            Some(remaining),
+        ));
+    }
 
     if payload.username.is_empty() || payload.password.is_empty() {
         logging::platform_log_failure(&payload.username, "user_login", client_ip)
@@ -69,7 +103,34 @@ pub async fn login(
                 "message_key": "platformLog.auth.login.missingCredentials"
             }))
             .finish(pool);
-        return Err(ApiError::MissingCredentials);
+        return Err(ApiError::from(AuthError::MissingCredentials));
+    }
+
+    if state.login_tracker.needs_captcha(&client_ip).await {
+        match (&payload.captcha_id, &payload.captcha) {
+            (Some(captcha_id), Some(captcha)) => {
+                if !state.captcha_service.verify(captcha_id, captcha).await {
+                    state.login_tracker.record_failure(&client_ip).await;
+                    return Ok(login_failure_after_failure(
+                        &state,
+                        client_ip,
+                        "验证码错误，请重新输入",
+                        "api.auth.captchaInvalid",
+                    )
+                    .await);
+                }
+            }
+            _ => {
+                return Ok(login_failure_response(
+                    StatusCode::UNAUTHORIZED,
+                    "请输入验证码",
+                    "api.auth.captchaRequired",
+                    true,
+                    false,
+                    None,
+                ));
+            }
+        }
     }
 
     let user_record = sqlx::query_as::<_, User>(
@@ -104,10 +165,26 @@ pub async fn login(
             .finish(pool);
 
         match err {
-            sqlx::Error::RowNotFound => ApiError::WrongCredentials,
+            sqlx::Error::RowNotFound => ApiError::from(AuthError::WrongCredentials),
             _ => err.into(),
         }
-    })?;
+    });
+    let user_record = match user_record {
+        Ok(user) => user,
+        Err(err) => {
+            if err.code == ErrorCode::AuthWrongCredentials {
+                state.login_tracker.record_failure(&client_ip).await;
+                return Ok(login_failure_after_failure(
+                    &state,
+                    client_ip,
+                    "用户名或密码错误",
+                    "api.auth.wrongCredentials",
+                )
+                .await);
+            }
+            return Err(err);
+        }
+    };
 
     if !user_record.is_active() {
         logging::platform_log_failure(&payload.username, "user_login", client_ip)
@@ -125,7 +202,7 @@ pub async fn login(
                 "message_key": "platformLog.auth.login.userLookupFailed"
             }))
             .finish(pool);
-        return Err(ApiError::WrongCredentials);
+        return Err(ApiError::from(AuthError::WrongCredentials));
     }
 
     let valid_password = verify(&payload.password, &user_record.password_hash).map_err(|err| {
@@ -153,7 +230,7 @@ pub async fn login(
             user_record.username,
             err
         );
-        ApiError::WrongCredentials
+        ApiError::from(AuthError::WrongCredentials)
     })?;
 
     if !valid_password {
@@ -174,7 +251,14 @@ pub async fn login(
                 "message_key": "platformLog.auth.login.invalidPassword"
             }))
             .finish(pool);
-        return Err(ApiError::WrongCredentials);
+        state.login_tracker.record_failure(&client_ip).await;
+        return Ok(login_failure_after_failure(
+            &state,
+            client_ip,
+            "用户名或密码错误",
+            "api.auth.wrongCredentials",
+        )
+        .await);
     }
 
     let created = create_auth_session(
@@ -205,7 +289,9 @@ pub async fn login(
         }))
         .finish(pool);
 
-    let mut resp = ApiResponse::success_with_raw(
+    state.login_tracker.clear_failures(&client_ip).await;
+
+    let mut body = ApiResponse::success_with_raw(
         "Login succeeded",
         Some(AuthBody::new(
             user_record.id,
@@ -213,16 +299,41 @@ pub async fn login(
             created.record.id,
             created.record.expires_at,
         )),
-    )
-    .into_response();
+    );
+    body.message_key = Some("api.auth.loginSuccess".to_string());
+    let mut resp = body.into_response();
 
     set_auth_cookie(&mut resp, &created.token);
     Ok(resp)
 }
 
+/// 获取新的验证码。
+pub async fn captcha(State(state): State<Arc<AppState>>) -> ApiResult<impl IntoResponse> {
+    let payload = state.captcha_service.generate().await;
+    let mut body = ApiResponse::success_with_raw("Captcha generated", payload);
+    body.message_key = Some("api.auth.captchaGenerated".to_string());
+    Ok(body.into_response())
+}
+
+/// 查询当前 IP 是否需要验证码。
+pub async fn captcha_status(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(conn): ConnectInfo<SocketAddr>,
+) -> ApiResult<impl IntoResponse> {
+    let lockout_remaining = state.login_tracker.lockout_remaining_secs(&conn.ip()).await;
+    let payload = CaptchaStatusPayload {
+        captcha_required: state.login_tracker.needs_captcha(&conn.ip()).await,
+        locked: lockout_remaining.is_some(),
+        lockout_remaining,
+    };
+    let mut body = ApiResponse::success_with_raw("Captcha status loaded", payload);
+    body.message_key = Some("api.auth.captchaStatusLoaded".to_string());
+    Ok(body.into_response())
+}
+
 /// 返回当前有效管理员会话。
 pub async fn me(admin: AuthenticatedAdmin) -> ApiResult<impl IntoResponse> {
-    Ok(ApiResponse::success_with_raw(
+    let mut body = ApiResponse::success_with_raw(
         "Current session loaded",
         Some(AuthBody::new(
             admin.id,
@@ -230,8 +341,9 @@ pub async fn me(admin: AuthenticatedAdmin) -> ApiResult<impl IntoResponse> {
             admin.session.id,
             admin.session.expires_at,
         )),
-    )
-    .into_response())
+    );
+    body.message_key = Some("api.auth.currentSessionLoaded".to_string());
+    Ok(body.into_response())
 }
 
 /// 撤销当前认证会话并清理 Cookie。
@@ -280,7 +392,9 @@ pub async fn logout(
         log_logout_without_session(&state, conn.ip(), &trace_id);
     }
 
-    let mut resp = ApiResponse::success_with_raw("Logout succeeded", ()).into_response();
+    let mut body = ApiResponse::success_with_raw("Logout succeeded", ());
+    body.message_key = Some("api.auth.logoutSuccess".to_string());
+    let mut resp = body.into_response();
     clear_auth_cookie(&mut resp);
     Ok(resp)
 }
@@ -291,6 +405,51 @@ pub fn auth_router() -> Router<Arc<AppState>> {
         .route("/login", post(login))
         .route("/me", get(me))
         .route("/logout", post(logout))
+        .route("/captcha-status", get(captcha_status))
+}
+
+fn login_failure_response(
+    status: StatusCode,
+    message: &str,
+    message_key: &str,
+    captcha_required: bool,
+    locked: bool,
+    lockout_remaining: Option<u64>,
+) -> Response {
+    let payload = LoginFailurePayload {
+        captcha_required,
+        locked,
+        lockout_remaining,
+    };
+    let mut body = ApiResponse::error_with_raw(message, payload).set_code(status.as_u16());
+    body.message_key = Some(message_key.to_string());
+    (status, Json(body)).into_response()
+}
+
+async fn login_failure_after_failure(
+    state: &AppState,
+    client_ip: std::net::IpAddr,
+    message: &str,
+    message_key: &str,
+) -> Response {
+    if let Some(remaining) = state.login_tracker.lockout_remaining_secs(&client_ip).await {
+        return login_failure_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "登录尝试过于频繁，请稍后再试",
+            "api.auth.loginLocked",
+            true,
+            true,
+            Some(remaining),
+        );
+    }
+    login_failure_response(
+        StatusCode::UNAUTHORIZED,
+        message,
+        message_key,
+        true,
+        false,
+        None,
+    )
 }
 
 impl<S> FromRequestParts<S> for AuthenticatedAdmin
@@ -352,18 +511,37 @@ async fn authenticate_parts(
     parts: &mut Parts,
     state: &Arc<AppState>,
 ) -> Result<AuthenticatedAdmin, ApiError> {
-    let token = extract_cookie(parts, SESSION_COOKIE)?;
+    let token = extract_cookie(parts, SESSION_COOKIE).inspect_err(|_| {
+        tracing::warn!("Authentication failed: session cookie is missing");
+    })?;
     let token_hash = hash_session_token(&token);
-    let session = get_auth_session_by_hash(&state.metadata_db, &token_hash)
-        .await?
-        .ok_or(ApiError::InvalidToken)?;
+    let session = get_auth_session_by_hash(&state.metadata_db, &token_hash).await?;
+    let Some(session) = session else {
+        tracing::warn!(
+            token_hash_prefix = %short_token_hash(&token_hash),
+            "Authentication failed: session token was not found"
+        );
+        return Err(ApiError::from(AuthError::InvalidToken));
+    };
     if !is_session_active(&session) {
-        return Err(ApiError::InvalidToken);
+        tracing::warn!(
+            session_id = %session.id,
+            revoked = session.revoked_at.is_some(),
+            expires_at = %session.expires_at,
+            "Authentication failed: session is inactive"
+        );
+        return Err(ApiError::from(AuthError::InvalidToken));
     }
 
-    let user = get_active_admin_by_id(&state.metadata_db, session.user_id)
-        .await?
-        .ok_or(ApiError::InvalidToken)?;
+    let user = get_active_admin_by_id(&state.metadata_db, session.user_id).await?;
+    let Some(user) = user else {
+        tracing::warn!(
+            session_id = %session.id,
+            user_id = session.user_id,
+            "Authentication failed: session user is missing or inactive"
+        );
+        return Err(ApiError::from(AuthError::InvalidToken));
+    };
     touch_auth_session(&state.metadata_db, &session.id).await?;
 
     Ok(AuthenticatedAdmin {
@@ -371,6 +549,10 @@ async fn authenticate_parts(
         username: user.username,
         session,
     })
+}
+
+fn short_token_hash(value: &str) -> String {
+    value.chars().take(12).collect()
 }
 
 async fn get_active_admin_by_id(
@@ -418,30 +600,49 @@ fn build_cookie(name: &str, value: &str, max_age_seconds: i64, path: &str) -> Ax
 }
 
 fn set_auth_cookie(resp: &mut Response, token: &str) {
-    let cookie = build_cookie(SESSION_COOKIE, token, SESSION_COOKIE_MAX_AGE_SECONDS, "/");
+    clear_auth_cookie(resp);
+    let cookie = build_cookie(
+        SESSION_COOKIE,
+        token,
+        SESSION_COOKIE_MAX_AGE_SECONDS,
+        SESSION_COOKIE_PATH,
+    );
     resp.headers_mut()
         .append(header::SET_COOKIE, cookie.to_string().parse().unwrap());
 }
 
 fn clear_auth_cookie(resp: &mut Response) {
-    let cookie = build_cookie(SESSION_COOKIE, "", 0, "/");
+    for path in LEGACY_SESSION_COOKIE_PATHS {
+        clear_auth_cookie_path(resp, path);
+    }
+    clear_auth_cookie_path(resp, SESSION_COOKIE_PATH);
+}
+
+fn clear_auth_cookie_path(resp: &mut Response, path: &str) {
+    let cookie = build_cookie(SESSION_COOKIE, "", 0, path);
     resp.headers_mut()
         .append(header::SET_COOKIE, cookie.to_string().parse().unwrap());
 }
 
 fn extract_cookie(parts: &Parts, cookie_name: &str) -> Result<String, ApiError> {
-    extract_cookie_from_headers(&parts.headers, cookie_name).ok_or(ApiError::InvalidToken)
+    extract_cookie_from_headers(&parts.headers, cookie_name)
+        .ok_or_else(|| ApiError::from(AuthError::InvalidToken))
 }
 
 fn extract_cookie_from_headers(headers: &HeaderMap, cookie_name: &str) -> Option<String> {
-    let value = headers.get(header::COOKIE)?.to_str().ok()?;
-    for part in value.split(';') {
-        let trimmed = part.trim();
-        if let Some((name, val)) = trimmed.split_once('=')
-            && name == cookie_name
-        {
-            return Some(val.to_string());
+    let mut matched = None;
+    for value in headers.get_all(header::COOKIE) {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        for part in value.split(';') {
+            let trimmed = part.trim();
+            if let Some((name, val)) = trimmed.split_once('=')
+                && name == cookie_name
+            {
+                matched = Some(val.to_string());
+            }
         }
     }
-    None
+    matched
 }

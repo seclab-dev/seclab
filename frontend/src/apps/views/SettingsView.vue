@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { formatDateTime } from '@/utils/time'
 import { seclabApi } from '@/api/modules/seclab'
+import { securityApi } from '@/api/modules/security'
 import { systemApi } from '@/api/modules/system'
 import {
   upgradesApi,
@@ -16,6 +17,7 @@ import { useNotificationStore } from '@/stores/notification'
 import { useThemeStore } from '@/stores/theme'
 import { useWindowManagerStore } from '@/stores/window-manager'
 import { useConfirmationModalStore } from '@/stores/confirmation-modal'
+import { forgetLoginEntry, rememberLoginEntry } from '@/utils/login-entry'
 import {
   SecLabButton,
   SecLabCard,
@@ -56,6 +58,18 @@ const networkForm = ref({
   host: '',
   port: 0,
   publicHost: '',
+})
+const securityLoading = ref(false)
+const securitySaving = ref(false)
+const credentialSaving = ref(false)
+const securityForm = ref({
+  safeEntry: '',
+  passwordComplexity: false,
+})
+const usernameForm = ref('')
+const passwordForm = ref({
+  newPassword: '',
+  confirmPassword: '',
 })
 
 interface InterfaceOption {
@@ -143,6 +157,9 @@ const settingsBusy = computed(
   () =>
     networkLoading.value ||
     networkSaving.value ||
+    securityLoading.value ||
+    securitySaving.value ||
+    credentialSaving.value ||
     aboutLoading.value ||
     aboutCopying.value ||
     upgradeLoading.value ||
@@ -174,6 +191,7 @@ const menuItems = computed(() => [
     children: [
       { key: 'about', label: t('app.settings.menu.about') },
       { key: 'network', label: t('app.settings.menu.network') },
+      { key: 'security', label: t('app.settings.menu.security') },
       { key: 'upgrade', label: t('app.settings.menu.upgrade') },
     ],
   },
@@ -390,6 +408,146 @@ const saveNetworkConfig = async () => {
     notificationStore.error(t('app.settings.network.saveFailed'))
   } finally {
     networkSaving.value = false
+  }
+}
+
+const generateSafeEntryValue = () => {
+  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+  const cryptoApi = window.crypto
+  const bytes = new Uint8Array(16)
+  cryptoApi.getRandomValues(bytes)
+  return Array.from(bytes, (byte) => chars[byte % chars.length]).join('')
+}
+
+const reservedSafeEntryPrefixes = [
+  'api',
+  'assets',
+  'images',
+  'favicon',
+  'static',
+  'public',
+  'health',
+  'metrics',
+  'ws',
+  'wss',
+  'robots',
+]
+
+const isValidSafeEntry = (value: string) => {
+  if (!/^[A-Za-z0-9]{8,32}$/.test(value)) return false
+  const lower = value.toLowerCase()
+  return !reservedSafeEntryPrefixes.some((prefix) => lower.startsWith(prefix))
+}
+
+const loadSecuritySettings = async () => {
+  securityLoading.value = true
+  try {
+    const response = await securityApi.fetchSettings()
+    if (!response.success || !response.data) {
+      notificationStore.error(response.message || t('app.settings.security.loadFailed'))
+      return
+    }
+    securityForm.value.safeEntry = response.data.safeEntry
+    securityForm.value.passwordComplexity = response.data.passwordComplexity
+    usernameForm.value = ''
+  } catch (error) {
+    console.error('Failed to load security settings', error)
+    notificationStore.error(t('app.settings.security.loadFailed'))
+  } finally {
+    securityLoading.value = false
+  }
+}
+
+const saveSecuritySettings = async () => {
+  const safeEntry = securityForm.value.safeEntry.trim()
+  if (safeEntry && !isValidSafeEntry(safeEntry)) {
+    notificationStore.error(t('app.settings.security.safeEntryInvalid'))
+    return
+  }
+  securitySaving.value = true
+  try {
+    const response = await securityApi.updateSettings({
+      safeEntry,
+      passwordComplexity: securityForm.value.passwordComplexity,
+    })
+    if (!response.success) {
+      notificationStore.error(response.message || t('app.settings.security.saveFailed'))
+      return
+    }
+    securityForm.value.safeEntry = safeEntry
+    if (safeEntry) {
+      rememberLoginEntry(`/${safeEntry}`)
+    } else {
+      forgetLoginEntry()
+    }
+    notificationStore.success(t('app.settings.security.saveSuccess'))
+  } catch (error) {
+    console.error('Failed to save security settings', error)
+    notificationStore.error(t('app.settings.security.saveFailed'))
+  } finally {
+    securitySaving.value = false
+  }
+}
+
+const regenerateSafeEntry = () => {
+  securityForm.value.safeEntry = generateSafeEntryValue()
+}
+
+const clearSafeEntry = () => {
+  securityForm.value.safeEntry = ''
+}
+
+const saveUsername = async () => {
+  const username = usernameForm.value.trim()
+  if (!/^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$/.test(username)) {
+    notificationStore.error(t('app.settings.security.usernameInvalid'))
+    return
+  }
+  credentialSaving.value = true
+  try {
+    const response = await securityApi.updateUsername(username)
+    if (!response.success) {
+      notificationStore.error(response.message || t('app.settings.security.usernameFailed'))
+      return
+    }
+    usernameForm.value = ''
+    notificationStore.success(t('app.settings.security.usernameSuccess'))
+  } catch (error) {
+    console.error('Failed to update username', error)
+    notificationStore.error(t('app.settings.security.usernameFailed'))
+  } finally {
+    credentialSaving.value = false
+  }
+}
+
+const savePassword = async () => {
+  if (!passwordForm.value.newPassword) {
+    notificationStore.error(t('app.settings.security.passwordRequired'))
+    return
+  }
+  if (passwordForm.value.newPassword.length < 5) {
+    notificationStore.error(t('app.settings.security.passwordTooShort'))
+    return
+  }
+  if (passwordForm.value.newPassword !== passwordForm.value.confirmPassword) {
+    notificationStore.error(t('app.settings.security.passwordMismatch'))
+    return
+  }
+  credentialSaving.value = true
+  try {
+    const response = await securityApi.updatePassword(passwordForm.value.newPassword)
+    if (!response.success) {
+      notificationStore.error(response.message || t('app.settings.security.passwordFailed'))
+      return
+    }
+    passwordForm.value.newPassword = ''
+    passwordForm.value.confirmPassword = ''
+    notificationStore.success(t('app.settings.security.passwordSuccess'))
+  } catch (error) {
+    console.error('Failed to update password', error)
+    notificationStore.error(t('app.settings.security.passwordFailed'))
+  } finally {
+    credentialSaving.value = false
   }
 }
 
@@ -706,6 +864,7 @@ const deleteReleaseForVersion = async (version: string) => {
 
 onMounted(() => {
   void loadNetworkConfig()
+  void loadSecuritySettings()
   void loadAboutInfo()
   void loadUpgradeReleases()
   window.setInterval(() => {
@@ -766,6 +925,107 @@ onMounted(() => {
             <SecLabLoading
               :loading="networkLoading"
               :text="t('app.settings.network.loading')"
+              cover
+            />
+          </div>
+        </SecLabCard>
+      </div>
+
+      <div v-else-if="activeMenu === 'security'" class="section">
+        <SecLabCard class="card" shadow="never">
+          <template #header>
+            <h2 class="section-title">{{ t('app.settings.security.label') }}</h2>
+          </template>
+
+          <div class="form-wrapper">
+            <p class="description">{{ t('app.settings.security.description') }}</p>
+
+            <div
+              v-if="!securityLoading"
+              class="sl-form security-form"
+              data-page="settings-security"
+            >
+              <SecLabFormItem :label="t('app.settings.security.safeEntry')">
+                <div class="inline-row">
+                  <SecLabInput
+                    v-model="securityForm.safeEntry"
+                    :placeholder="t('app.settings.security.safeEntryPlaceholder')"
+                  />
+                  <SecLabButton @click="regenerateSafeEntry">
+                    {{ t('app.settings.security.regenerate') }}
+                  </SecLabButton>
+                  <SecLabButton @click="clearSafeEntry">
+                    {{ t('app.settings.security.disable') }}
+                  </SecLabButton>
+                </div>
+              </SecLabFormItem>
+
+              <SecLabFormItem :label="t('app.settings.security.passwordComplexity')">
+                <label class="checkbox-line">
+                  <input v-model="securityForm.passwordComplexity" type="checkbox" />
+                  <span>{{ t('app.settings.security.passwordComplexityHint') }}</span>
+                </label>
+              </SecLabFormItem>
+
+              <div class="form-actions">
+                <SecLabButton
+                  type="primary"
+                  :loading="securitySaving"
+                  @click="saveSecuritySettings"
+                >
+                  {{ t('app.settings.security.save') }}
+                </SecLabButton>
+              </div>
+
+              <div class="settings-divider" />
+
+              <SecLabFormItem :label="t('app.settings.security.newUsername')">
+                <div class="inline-row">
+                  <SecLabInput
+                    v-model="usernameForm"
+                    :placeholder="t('app.settings.security.usernamePlaceholder')"
+                  />
+                  <SecLabButton :loading="credentialSaving" @click="saveUsername">
+                    {{ t('app.settings.security.changeUsername') }}
+                  </SecLabButton>
+                </div>
+              </SecLabFormItem>
+
+              <form class="credential-password-form" @submit.prevent>
+                <input
+                  v-model="usernameForm"
+                  type="text"
+                  name="username"
+                  autocomplete="username"
+                  class="sr-only"
+                  tabindex="-1"
+                />
+                <SecLabFormItem :label="t('app.settings.security.newPassword')">
+                  <SecLabInput
+                    v-model="passwordForm.newPassword"
+                    type="password"
+                    autocomplete="new-password"
+                    :placeholder="t('app.settings.security.newPasswordPlaceholder')"
+                  />
+                </SecLabFormItem>
+                <SecLabFormItem :label="t('app.settings.security.confirmPassword')">
+                  <div class="inline-row">
+                    <SecLabInput
+                      v-model="passwordForm.confirmPassword"
+                      type="password"
+                      autocomplete="new-password"
+                      :placeholder="t('app.settings.security.confirmPasswordPlaceholder')"
+                    />
+                    <SecLabButton :loading="credentialSaving" @click="savePassword">
+                      {{ t('app.settings.security.changePassword') }}
+                    </SecLabButton>
+                  </div>
+                </SecLabFormItem>
+              </form>
+            </div>
+            <SecLabLoading
+              :loading="securityLoading"
+              :text="t('app.settings.security.loading')"
               cover
             />
           </div>
@@ -1148,12 +1408,38 @@ onMounted(() => {
   width: 240px;
 }
 
-.network-form {
+.network-form,
+.security-form {
   max-width: 520px;
 }
 
 .form-actions {
   margin-top: var(--sdl-space-4);
+}
+
+.inline-row {
+  display: flex;
+  gap: var(--sdl-space-2);
+  align-items: center;
+}
+
+.inline-row > :deep(.sl-input) {
+  flex: 1;
+  min-width: 0;
+}
+
+.checkbox-line {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sdl-space-2);
+  color: var(--sdl-text-secondary);
+  font-size: var(--sdl-font-body-sm);
+}
+
+.settings-divider {
+  height: 1px;
+  background: var(--sdl-border-subtle);
+  margin: var(--sdl-space-6) 0 var(--sdl-space-4);
 }
 
 .about-toolbar {
@@ -1394,6 +1680,18 @@ onMounted(() => {
 .error-text {
   color: var(--sdl-danger);
   word-break: break-word;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 @media (max-width: 1024px) {

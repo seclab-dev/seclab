@@ -15,6 +15,7 @@ pub mod node_tasks;
 pub mod nodes;
 pub mod scripts;
 pub mod suites;
+pub mod system_config;
 pub mod task_scheduler;
 pub mod upgrades;
 pub mod user;

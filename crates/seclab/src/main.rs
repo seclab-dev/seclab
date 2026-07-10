@@ -18,6 +18,7 @@ pub mod db;
 pub mod errors;
 pub mod models;
 pub mod runtime_config;
+pub mod security;
 pub mod services;
 pub mod state;
 #[cfg(test)]
