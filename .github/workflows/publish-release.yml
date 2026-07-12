@@ -120,7 +120,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ inputs.version }}
-          RELEASE_TAG: v${{ inputs.version }}
+          RELEASE_TAG: ${{ inputs.version }}
           RELEASE_ASSET: ${{ steps.asset.outputs.path }}
         shell: bash
         run: |
