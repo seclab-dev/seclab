@@ -26,7 +26,7 @@ use flate2::read::GzDecoder;
 use ring::digest;
 use seclab_contracts::types::DockerStatusSummary;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{Cursor, Read};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -706,6 +706,39 @@ async fn run_suite_install_task(
     }
     update_install_progress(&task_id, 5, "running", "prepare", None, false, None);
 
+    if let Err(err) = prewarm_suite_images(Arc::clone(&state), &task_id, &node_id, &request).await {
+        let detail = err.to_string();
+        let canceled = is_install_cancel_requested(&task_id);
+        let _ = delete_instance(&state.metadata_db, &instance_id).await;
+        update_install_progress(
+            &task_id,
+            if canceled { 100 } else { 40 },
+            if canceled { "canceled" } else { "failed" },
+            if canceled { "canceled" } else { "failed" },
+            None,
+            true,
+            (!canceled).then_some(detail.clone()),
+        );
+        finish_suite_install_task_log(
+            &state,
+            &audit_ctx,
+            SuiteInstallTaskLog {
+                event: if canceled {
+                    "suite_install_canceled"
+                } else {
+                    "suite_install_failed"
+                },
+                task_id: &task_id,
+                node_id: &node_id,
+                instance_id: &instance_id,
+                request: &request,
+                error: (!canceled).then_some(detail.as_str()),
+            },
+        );
+        return;
+    }
+    update_install_progress(&task_id, 40, "running", "start_services", None, false, None);
+
     let client = match NodeRuntimeClient::from_node_route(&state.metadata_db, Some(&node_id)).await
     {
         Ok(client) => client,
@@ -892,6 +925,99 @@ async fn run_suite_install_task(
     );
 }
 
+/// 提取套件声明的静态镜像并通过主控统一镜像任务预热目标节点。
+async fn prewarm_suite_images(
+    state: Arc<AppState>,
+    suite_task_id: &str,
+    node_id: &str,
+    request: &AgentSuiteInstallRequest,
+) -> anyhow::Result<()> {
+    let images = extract_suite_images(request)?;
+    let count = images.len().max(1);
+    for (index, image_ref) in images.iter().enumerate() {
+        if is_install_cancel_requested(suite_task_id) {
+            anyhow::bail!("suite install canceled");
+        }
+        let image_task = state.image_acquisition.start(
+            Arc::clone(&state),
+            node_id.to_string(),
+            image_ref.clone(),
+        );
+        loop {
+            if is_install_cancel_requested(suite_task_id) {
+                state.image_acquisition.cancel(&image_task.task_id);
+                anyhow::bail!("suite install canceled");
+            }
+            let progress = state
+                .image_acquisition
+                .get(&image_task.task_id)
+                .ok_or_else(|| anyhow::anyhow!("image task disappeared"))?;
+            let image_progress = 5
+                + (((index * 35) + usize::from(progress.progress_percent) * 35 / 100) / count)
+                    as u32;
+            let step = match progress.stage {
+                crate::services::image_acquisition::ImageStage::Checking => "check_image",
+                crate::services::image_acquisition::ImageStage::Exporting
+                | crate::services::image_acquisition::ImageStage::Uploading
+                | crate::services::image_acquisition::ImageStage::Loading => {
+                    "transfer_controller_image"
+                }
+                crate::services::image_acquisition::ImageStage::Pulling => "pull_registry_image",
+            };
+            update_install_progress(
+                suite_task_id,
+                image_progress.min(40),
+                "running",
+                step,
+                Some(image_ref.clone()),
+                false,
+                None,
+            );
+            match progress.status {
+                crate::services::image_acquisition::ImageTaskStatus::Success => break,
+                crate::services::image_acquisition::ImageTaskStatus::Failed => {
+                    anyhow::bail!(progress.status_text)
+                }
+                crate::services::image_acquisition::ImageTaskStatus::Cancelled => {
+                    anyhow::bail!("suite install canceled")
+                }
+                _ => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
+            }
+        }
+    }
+    Ok(())
+}
+
+fn extract_suite_images(request: &AgentSuiteInstallRequest) -> anyhow::Result<BTreeSet<String>> {
+    let mut images = request
+        .runtime_images
+        .iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && !value.contains("${"))
+        .collect::<BTreeSet<_>>();
+    let compose = request
+        .files
+        .iter()
+        .find(|file| file.path == request.compose_file)
+        .ok_or_else(|| anyhow::anyhow!("compose file is missing"))?;
+    let bytes = STANDARD.decode(&compose.content_base64)?;
+    let document: serde_yaml::Value = serde_yaml::from_slice(&bytes)?;
+    if let Some(services) = document
+        .get("services")
+        .and_then(serde_yaml::Value::as_mapping)
+    {
+        for service in services.values() {
+            if let Some(image) = service.get("image").and_then(serde_yaml::Value::as_str) {
+                let image = image.trim();
+                if !image.is_empty() && !image.contains("${") {
+                    images.insert(image.to_string());
+                }
+            }
+        }
+    }
+    Ok(images)
+}
+
 struct SuiteInstallTaskLog<'a> {
     event: &'a str,
     task_id: &'a str,
@@ -1021,13 +1147,13 @@ fn parse_agent_install_progress(
 ) -> Option<SuiteInstallProgress> {
     let data = response.get("data")?;
     let mut progress = base.clone();
-    progress.progress_percent = progress.progress_percent.max(
-        data.get("progressPercent")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
-            .unwrap_or(progress.progress_percent)
-            .min(100),
-    );
+    let agent_percent = data
+        .get("progressPercent")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(0)
+        .min(100);
+    progress.progress_percent = progress.progress_percent.max(40 + agent_percent * 60 / 100);
     progress.status = data
         .get("status")
         .and_then(serde_json::Value::as_str)
@@ -2062,6 +2188,41 @@ mod suite_asset_tests {
                 "".to_string(),
             ]),
             vec!["guowenju/seclab-protocol-simulation-engine:0.1.0-alpha.1".to_string()]
+        );
+    }
+
+    #[test]
+    fn suite_images_merge_compose_and_runtime_images() {
+        let compose = r#"services:
+  api:
+    image: example/api:1.0
+  dynamic:
+    image: ${DYNAMIC_IMAGE}
+"#;
+        let request = AgentSuiteInstallRequest {
+            instance_id: "instance".to_string(),
+            suite_id: "suite".to_string(),
+            version: "1.0.0".to_string(),
+            compose_project_name: "suite-project".to_string(),
+            compose_file: "compose.yaml".to_string(),
+            runtime_images: vec![
+                "example/engine:1.0".to_string(),
+                "example/api:1.0".to_string(),
+            ],
+            files: vec![SuitePackageFile {
+                path: "compose.yaml".to_string(),
+                content_base64: STANDARD.encode(compose),
+            }],
+            app_entries: Vec::new(),
+            operator: None,
+            trace_id: None,
+        };
+        assert_eq!(
+            extract_suite_images(&request).unwrap(),
+            BTreeSet::from([
+                "example/api:1.0".to_string(),
+                "example/engine:1.0".to_string()
+            ])
         );
     }
 }

@@ -1,5 +1,6 @@
 //! 服务层入口：聚合业务服务模块。
 
+pub mod image_acquisition;
 pub mod logging;
 pub mod node_check;
 pub mod node_deploy;

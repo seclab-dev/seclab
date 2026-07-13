@@ -1,44 +1,36 @@
 <script setup lang="ts">
 /**
  * @file DockerImageDistribute.vue
- * @description Docker 镜像分发组件，支持通过拉取/选择本地镜像或上传离线 Tar 镜像文件，分发到各集群节点，支持分发进度跟踪。
+ * @description 将主控已有镜像通过统一镜像任务分发到节点。
  */
 
 import { computed, ref, onMounted, onUnmounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { useDockerStore } from '@/stores/docker'
-import { useNodeStore } from '@/stores/node'
 import { useNotificationStore } from '@/stores/notification'
 import { nodesApi, type NodeSummaryResponse } from '@/api/modules/nodes'
-import { dockerApi, type DistributeNodeStatus } from '@/api/modules/docker'
-import { formatBytes } from '@/utils/docker-format'
+import { dockerApi, type ImagePullProgress } from '@/api/modules/docker'
+import type { ImageSummary } from '@/api/interface/docker'
 import { SecLabButton, SecLabCheckbox, SecLabTag, SecLabEmpty, SecLabSelect } from '@/components/ui'
 
 const { t } = useI18n()
-const store = useDockerStore()
-const nodeStore = useNodeStore()
 const notificationStore = useNotificationStore()
 
-// ─── 分发模式选择与当前节点镜像 ───
-const distMode = ref<'file' | 'local'>('local')
 const selectedLocalImage = ref<string | null>(null)
+const controllerImages = ref<ImageSummary[]>([])
 
 // ─── 节点选择与上传 ───
 const nodeList = ref<NodeSummaryResponse[]>([])
 const selectedNodeIds = ref<string[]>([])
-const uploadFile = ref<File | null>(null)
-const isDragging = ref(false)
 const isSubmitting = ref(false)
-const taskId = ref<string | null>(null)
-const distributeProgress = ref<Record<string, DistributeNodeStatus>>({})
+const taskIds = ref<Record<string, string>>({})
+const distributeProgress = ref<Record<string, ImagePullProgress>>({})
 
 let timer: number | null = null
-const sourceNodeId = computed(() => nodeStore.currentNodeId || 'local')
 
 // ─── 镜像选项 ───
 const localImageOptions = computed(() => {
   const options: { label: string; value: string }[] = []
-  store.imagesList.forEach((img) => {
+  controllerImages.value.forEach((img) => {
     if (img.RepoTags && img.RepoTags.length > 0) {
       img.RepoTags.forEach((tag: string) => {
         options.push({ label: tag, value: tag })
@@ -61,19 +53,14 @@ const fetchNodes = async () => {
   }
 }
 
+const fetchControllerImages = async () => {
+  const response = await dockerApi.fetchLocalImages()
+  controllerImages.value = response.data || []
+}
+
 // ─── 分发目标过滤 ───
 const filteredNodeList = computed(() => {
-  if (distMode.value === 'local') {
-    return nodeList.value.filter((n) => n.nodeId !== sourceNodeId.value)
-  }
-  return nodeList.value
-})
-
-watch(distMode, (newMode) => {
-  selectedNodeIds.value = []
-  if (newMode === 'local') {
-    void store.fetchImagesList()
-  }
+  return nodeList.value.filter((node) => node.nodeId !== 'local')
 })
 
 // ─── 节点全选逻辑 ───
@@ -102,102 +89,38 @@ const toggleNodeSelect = (nodeId: string) => {
   }
 }
 
-// ─── 文件拖拽与选择 ───
-const handleFileChange = (e: Event) => {
-  const target = e.target as HTMLInputElement
-  if (target.files && target.files.length > 0) {
-    uploadFile.value = target.files[0]
-  }
-}
-
-const handleDragOver = (e: DragEvent) => {
-  e.preventDefault()
-  isDragging.value = true
-}
-
-const handleDragLeave = () => {
-  isDragging.value = false
-}
-
-const handleDrop = (e: DragEvent) => {
-  e.preventDefault()
-  isDragging.value = false
-  if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
-    uploadFile.value = e.dataTransfer.files[0]
-  }
-}
-
-const triggerSelectFile = () => {
-  const input = document.createElement('input')
-  input.type = 'file'
-  input.accept = [
-    '.tar',
-    '.tar.gz',
-    '.tgz',
-    '.tar.bz2',
-    '.tbz',
-    '.tbz2',
-    '.tar.xz',
-    '.txz',
-    '.tar.zst',
-    '.tar.zstd',
-    'application/x-tar',
-    'application/gzip',
-    'application/x-bzip2',
-    'application/x-xz',
-    'application/zstd',
-  ].join(',')
-  input.onchange = handleFileChange
-  input.click()
-}
-
-const clearFile = () => {
-  uploadFile.value = null
-}
-
 // ─── 开始分发 ───
 const startDistribute = async () => {
-  if (distMode.value === 'file') {
-    if (!uploadFile.value) return
-  } else {
-    if (!selectedLocalImage.value) return
-  }
+  if (!selectedLocalImage.value) return
   if (selectedNodeIds.value.length === 0) return
 
   isSubmitting.value = true
-  taskId.value = null
+  taskIds.value = {}
   distributeProgress.value = {}
 
   selectedNodeIds.value.forEach((id) => {
     distributeProgress.value[id] = {
+      taskId: '',
+      nodeId: id,
+      imageRef: selectedLocalImage.value!,
       progressPercent: 0,
-      status: 'waiting',
+      status: 'pending',
+      stage: 'checking',
+      statusText: '',
     }
   })
 
   try {
-    let resData = ''
-    if (distMode.value === 'file') {
-      const formData = new FormData()
-      formData.append('file', uploadFile.value!)
-      formData.append('nodeIds', JSON.stringify(selectedNodeIds.value))
-      const res = await dockerApi.distributeImage(formData)
-      resData = res.data ?? ''
-    } else {
-      const res = await dockerApi.distributeLocalImage({
-        imageName: String(selectedLocalImage.value),
-        nodeIds: selectedNodeIds.value,
-        sourceNodeId: sourceNodeId.value,
+    for (const nodeId of selectedNodeIds.value) {
+      const response = await dockerApi.startImageTask({
+        nodeId,
+        imageRef: selectedLocalImage.value,
+        sourceMode: 'controller-first',
       })
-      resData = res.data ?? ''
+      if (!response.success || !response.data?.taskId) throw new Error(response.message)
+      taskIds.value[nodeId] = response.data.taskId
     }
-
-    if (resData) {
-      taskId.value = resData
-      startPolling()
-    } else {
-      throw new Error('未获取到任务ID')
-    }
+    startPolling()
   } catch (e) {
     console.error('Distribute error:', e)
     const errMsg = e instanceof Error ? e.message : String(e)
@@ -215,24 +138,18 @@ const startPolling = () => {
 }
 
 const fetchDistributeProgress = async () => {
-  if (!taskId.value) return
-
   try {
-    const res = await dockerApi.fetchDistributeStatus(taskId.value)
-    if (res && res.success && res.data && res.data.nodeStatuses) {
-      distributeProgress.value = res.data.nodeStatuses
-
-      const allFinished = Object.values(res.data.nodeStatuses).every(
-        (node) => node.status === 'success' || node.status === 'failed',
-      )
-
-      if (allFinished) {
-        if (timer) {
-          clearInterval(timer)
-          timer = null
-        }
-        isSubmitting.value = false
-      }
+    for (const [nodeId, currentTaskId] of Object.entries(taskIds.value)) {
+      const response = await dockerApi.fetchImageTaskProgress(currentTaskId)
+      if (response.success && response.data) distributeProgress.value[nodeId] = response.data
+    }
+    const allFinished = Object.values(distributeProgress.value).every((item) =>
+      ['success', 'failed', 'cancelled'].includes(item.status),
+    )
+    if (allFinished) {
+      if (timer) clearInterval(timer)
+      timer = null
+      isSubmitting.value = false
     }
   } catch (e) {
     console.error('Polling status failed:', e)
@@ -241,7 +158,7 @@ const fetchDistributeProgress = async () => {
 
 onMounted(() => {
   void fetchNodes()
-  void store.fetchImagesList()
+  void fetchControllerImages()
 })
 
 onUnmounted(() => {
@@ -252,7 +169,7 @@ onUnmounted(() => {
 
 // 监听本地镜像的列表变化，自动选择第一个
 watch(
-  () => store.imagesList,
+  controllerImages,
   (next) => {
     if (next.length > 0 && !selectedLocalImage.value) {
       const firstImg = next.find((img) => img.RepoTags && img.RepoTags.length > 0)
@@ -265,71 +182,13 @@ watch(
   },
   { immediate: true },
 )
-
-watch(sourceNodeId, () => {
-  selectedNodeIds.value = []
-  selectedLocalImage.value = null
-})
 </script>
 
 <template>
   <div class="distribute-container" data-ui="docker-image-distribute">
     <!-- 左侧：文件上传与配置 -->
     <div class="distribute-panel-left">
-      <!-- 分发模式选择 -->
-      <div class="distribute-mode-tabs" data-ui="distribute-mode-tabs">
-        <button
-          class="mode-tab-btn"
-          :class="{ 'is-active': distMode === 'local' }"
-          @click="distMode = 'local'"
-        >
-          {{ t('app.docker.images.distribute.modes.local') }}
-        </button>
-        <button
-          class="mode-tab-btn"
-          :class="{ 'is-active': distMode === 'file' }"
-          @click="distMode = 'file'"
-        >
-          {{ t('app.docker.images.distribute.modes.file') }}
-        </button>
-      </div>
-
-      <!-- 离线文件模式 -->
-      <div
-        v-if="distMode === 'file'"
-        class="upload-dropzone"
-        :class="{ 'is-dragging': isDragging, 'has-file': uploadFile }"
-        @dragover="handleDragOver"
-        @dragleave="handleDragLeave"
-        @drop="handleDrop"
-        @click="triggerSelectFile"
-        data-ui="distribute-upload-dropzone"
-      >
-        <div v-if="!uploadFile" class="upload-placeholder">
-          <div class="upload-icon">📤</div>
-          <div class="upload-title">
-            {{ t('app.docker.images.distribute.upload.placeholder') }}
-          </div>
-        </div>
-        <div v-else class="upload-file-info" @click.stop>
-          <div class="file-icon">📦</div>
-          <div class="file-details">
-            <div class="file-name" :title="uploadFile.name">{{ uploadFile.name }}</div>
-            <div class="file-size">{{ formatBytes(uploadFile.size) }}</div>
-          </div>
-          <SecLabButton
-            type="danger"
-            size="small"
-            @click="clearFile"
-            data-ui="distribute-clear-file"
-          >
-            {{ t('app.docker.images.distribute.upload.clear') }}
-          </SecLabButton>
-        </div>
-      </div>
-
-      <!-- 本地镜像分发模式 -->
-      <div v-else class="local-distribute-panel" data-ui="distribute-local-panel">
+      <div class="local-distribute-panel" data-ui="distribute-local-panel">
         <div class="panel-section">
           <label class="section-label">{{
             t('app.docker.images.distribute.selectLocal.title')
@@ -351,11 +210,7 @@ watch(sourceNodeId, () => {
       <div class="action-bar">
         <SecLabButton
           type="primary"
-          :disabled="
-            (distMode === 'file' ? !uploadFile : !selectedLocalImage) ||
-            selectedNodeIds.length === 0 ||
-            isSubmitting
-          "
+          :disabled="!selectedLocalImage || selectedNodeIds.length === 0 || isSubmitting"
           class="btn-start"
           @click="startDistribute"
           data-ui="distribute-submit-btn"
@@ -416,17 +271,17 @@ watch(sourceNodeId, () => {
           <!-- 进度跟踪部分 -->
           <div v-if="distributeProgress[node.nodeId]" class="node-status-area" @click.stop>
             <div class="status-tags-row">
-              <SecLabTag v-if="distributeProgress[node.nodeId].status === 'waiting'" type="default">
+              <SecLabTag v-if="distributeProgress[node.nodeId].status === 'pending'" type="default">
                 {{ t('app.docker.images.distribute.nodes.waiting') }}
               </SecLabTag>
               <SecLabTag
-                v-else-if="distributeProgress[node.nodeId].status === 'exporting'"
+                v-else-if="distributeProgress[node.nodeId].stage === 'exporting'"
                 type="warning"
               >
                 {{ t('app.docker.images.distribute.nodes.exporting') }}
               </SecLabTag>
               <SecLabTag
-                v-else-if="distributeProgress[node.nodeId].status === 'uploading'"
+                v-else-if="distributeProgress[node.nodeId].stage === 'uploading'"
                 type="primary"
               >
                 {{
@@ -436,10 +291,17 @@ watch(sourceNodeId, () => {
                 }}
               </SecLabTag>
               <SecLabTag
-                v-else-if="distributeProgress[node.nodeId].status === 'loading'"
+                v-else-if="distributeProgress[node.nodeId].stage === 'loading'"
                 type="warning"
               >
                 {{ t('app.docker.images.distribute.nodes.loading') }}
+              </SecLabTag>
+              <SecLabTag
+                v-else-if="distributeProgress[node.nodeId].status === 'running'"
+                type="primary"
+                :title="distributeProgress[node.nodeId].statusText"
+              >
+                {{ distributeProgress[node.nodeId].statusText }}
               </SecLabTag>
               <SecLabTag
                 v-else-if="distributeProgress[node.nodeId].status === 'success'"
@@ -450,7 +312,10 @@ watch(sourceNodeId, () => {
               <SecLabTag
                 v-else-if="distributeProgress[node.nodeId].status === 'failed'"
                 type="danger"
-                :title="distributeProgress[node.nodeId].error"
+                :title="
+                  distributeProgress[node.nodeId].registryError ||
+                  distributeProgress[node.nodeId].controllerError
+                "
               >
                 {{ t('app.docker.images.distribute.nodes.failed') }}
               </SecLabTag>
@@ -504,38 +369,6 @@ watch(sourceNodeId, () => {
   min-height: 0;
 }
 
-.distribute-mode-tabs {
-  display: flex;
-  background-color: rgba(255, 255, 255, 0.04);
-  border-radius: var(--sdl-radius-md);
-  padding: 4px;
-  border: 1px solid var(--sdl-border-default);
-}
-
-.mode-tab-btn {
-  flex: 1;
-  border: none;
-  background: transparent;
-  color: var(--sdl-text-secondary);
-  padding: var(--sdl-space-2) var(--sdl-space-3);
-  font-size: var(--sdl-font-body-sm);
-  font-weight: 500;
-  border-radius: var(--sdl-radius-sm);
-  cursor: pointer;
-  transition: all 0.2s;
-}
-
-.mode-tab-btn:hover {
-  color: var(--sdl-text-primary);
-  background-color: rgba(255, 255, 255, 0.02);
-}
-
-.mode-tab-btn.is-active {
-  color: var(--sdl-primary);
-  background-color: rgba(var(--sdl-primary-rgb), 0.08);
-  font-weight: 600;
-}
-
 .local-distribute-panel {
   flex: 1;
   min-height: 0;
@@ -570,97 +403,6 @@ watch(sourceNodeId, () => {
   background-color: rgba(255, 255, 255, 0.02);
   color: var(--sdl-text-muted);
   font-size: var(--sdl-font-body-sm);
-}
-
-.upload-dropzone {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border: 2px dashed var(--sdl-border-default);
-  border-radius: var(--sdl-radius-lg);
-  cursor: pointer;
-  background-color: rgba(255, 255, 255, 0.02);
-  transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
-  padding: var(--sdl-space-6);
-  text-align: center;
-}
-
-.upload-dropzone:hover {
-  border-color: var(--sdl-primary);
-  background-color: rgba(var(--sdl-primary-rgb), 0.04);
-}
-
-.upload-dropzone.is-dragging {
-  border-color: var(--sdl-primary);
-  background-color: rgba(var(--sdl-primary-rgb), 0.08);
-  transform: scale(0.995);
-}
-
-.upload-dropzone.has-file {
-  border-style: solid;
-  border-color: var(--sdl-border-default);
-  background-color: rgba(255, 255, 255, 0.04);
-  cursor: default;
-}
-
-.upload-placeholder {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: var(--sdl-space-3);
-}
-
-.upload-icon {
-  font-size: 40px;
-  filter: drop-shadow(0 2px 8px rgba(var(--sdl-primary-rgb), 0.2));
-}
-
-.upload-title {
-  font-size: var(--sdl-font-body-sm);
-  font-weight: 500;
-  color: var(--sdl-text-primary);
-}
-
-.upload-hint {
-  font-size: var(--sdl-font-body-xs);
-  color: var(--sdl-text-muted);
-}
-
-.upload-file-info {
-  display: flex;
-  align-items: center;
-  gap: var(--sdl-space-4);
-  width: 100%;
-  padding: var(--sdl-space-4);
-  border-radius: var(--sdl-radius-md);
-  background-color: rgba(0, 0, 0, 0.2);
-}
-
-.file-icon {
-  font-size: 36px;
-}
-
-.file-details {
-  flex: 1;
-  text-align: left;
-  min-width: 0;
-}
-
-.file-name {
-  font-size: var(--sdl-font-body-sm);
-  font-weight: 600;
-  color: var(--sdl-text-primary);
-  word-break: break-all;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.file-size {
-  font-size: var(--sdl-font-body-xs);
-  color: var(--sdl-text-muted);
-  margin-top: var(--sdl-space-1);
 }
 
 .action-bar {

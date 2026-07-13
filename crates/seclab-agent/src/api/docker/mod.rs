@@ -274,14 +274,15 @@ pub fn docker_router() -> Router<Arc<AppState>> {
         .route("/images/resolve", post(images::resolve_image))
         .route("/images/search", post(images::search_images))
         .route("/images/tags", post(images::image_tags))
-        .route("/images/pull", post(images::pull_image))
+        .route("/images/availability", post(images::image_availability))
+        .route("/image-pull-tasks", post(images::pull_image))
         .route(
-            "/images/pull/{task_id}/progress",
+            "/image-pull-tasks/{task_id}/progress",
             get(images::pull_image_progress),
         )
         .route(
-            "/images/pull/{task_id}/cancel",
-            post(images::cancel_pull_image),
+            "/image-pull-tasks/{task_id}",
+            delete(images::cancel_pull_image),
         )
         .route("/image/remove", delete(images::remove_image))
         .route(

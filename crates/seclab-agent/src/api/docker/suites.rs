@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use bollard::models::NetworkCreateRequest;
-use bollard::query_parameters::{self, CreateImageOptions};
+use bollard::query_parameters;
 use futures_util::StreamExt;
 use seclab_contracts::api::ErrorCode;
 use seclab_security::certs::{AGENT_CA_CERT_PEM, issue_client_cert};
@@ -1276,15 +1276,6 @@ async fn pull_image_with_progress(
     image_index: usize,
     image_count: usize,
 ) -> ApiResult<()> {
-    let docker = state.docker_client().await?;
-    let (from_image, tag) = split_image_name(image);
-    let options = CreateImageOptions {
-        from_image: Some(from_image),
-        tag: Some(tag),
-        ..Default::default()
-    };
-    let mut stream = docker.create_image(Some(options), None, None);
-
     update_install_progress(
         &payload.instance_id,
         image_progress(image_index, image_count, 5),
@@ -1295,17 +1286,11 @@ async fn pull_image_with_progress(
         None,
     );
 
-    let result = async {
-        while let Some(message) = stream.next().await {
-            ensure_install_not_canceled(&payload.instance_id)?;
-            let info = message.map_err(|err| {
-                ApiError::BadRequest(format!("suite image `{image}` pull failed: {err}"))
-            })?;
-            if let Some(error) = info.error {
-                return Err(ApiError::BadRequest(format!(
-                    "suite image `{image}` pull failed: {error}"
-                )));
-            }
+    let result = crate::api::docker::images::pull_registry_image(
+        state,
+        image,
+        || is_install_cancel_requested(&payload.instance_id),
+        |info| {
             if let Some(detail) = info.progress_detail
                 && let (Some(current), Some(total)) = (detail.current, detail.total)
                 && total > 0
@@ -1321,10 +1306,10 @@ async fn pull_image_with_progress(
                     None,
                 );
             }
-        }
-        Ok::<(), ApiError>(())
-    }
-    .await;
+        },
+    )
+    .await
+    .map_err(|err| ApiError::BadRequest(format!("suite image `{image}` pull failed: {err}")));
 
     let error = result.as_ref().err().map(ToString::to_string);
     let canceled = error
@@ -1375,23 +1360,6 @@ fn image_progress(image_index: usize, image_count: usize, image_percent: u32) ->
     let span = 75.0 / image_count as f64;
     let value = 15.0 + span * image_index as f64 + span * (image_percent.min(100) as f64 / 100.0);
     value.round().clamp(15.0, 90.0) as u32
-}
-
-/// 拆分 Docker 镜像名和标签，兼容包含 registry 端口的镜像地址。
-fn split_image_name(image: &str) -> (String, String) {
-    let Some((head, tail)) = image.rsplit_once('/') else {
-        return split_image_tag(image);
-    };
-    let (name, tag) = split_image_tag(tail);
-    (format!("{head}/{name}"), tag)
-}
-
-/// 拆分不含路径前缀的镜像名和标签，未声明标签时默认 latest。
-fn split_image_tag(image: &str) -> (String, String) {
-    if let Some((name, tag)) = image.rsplit_once(':') {
-        return (name.to_string(), tag.to_string());
-    }
-    (image.to_string(), "latest".to_string())
 }
 
 /// 提取 Docker 命令的有效错误文本。
@@ -1478,8 +1446,8 @@ mod tests {
         assert_eq!(
             images.into_iter().collect::<Vec<_>>(),
             vec![
-                "guowenju/seclab-protocol-simulation:0.1.0-alpha.1".to_string(),
                 "guowenju/seclab-protocol-simulation-engine:0.1.0-alpha.1".to_string(),
+                "guowenju/seclab-protocol-simulation:0.1.0-alpha.1".to_string(),
             ]
         );
     }

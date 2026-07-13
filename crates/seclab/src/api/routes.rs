@@ -84,6 +84,7 @@ pub async fn create_router() -> Result<(Router, crate::state::DbPool)> {
         login_tracker: crate::security::login_tracker::LoginTracker::default(),
         deploy_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         local_node_resource: Arc::new(tokio::sync::Mutex::new(None)),
+        image_acquisition: crate::services::image_acquisition::ImageAcquisitionService::new(),
     });
     crate::services::node_session_reaper::spawn_session_reaper(Arc::clone(&app_state));
     crate::services::upgrades::spawn_upgrade_scheduler(Arc::clone(&app_state));

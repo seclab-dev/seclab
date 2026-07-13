@@ -282,27 +282,6 @@ const createScopedDockerApi = (nodeId?: string) => ({
       payload,
     )
   },
-  pullImage: (imageName: string) => {
-    return http.post<ImagePullStartResponse>(buildDockerPath('/agent/docker/images/pull', nodeId), {
-      imageName,
-    })
-  },
-  startImagePull: (payload: { imageName: string; tag: string }) => {
-    return http.post<ImagePullStartResponse>(
-      buildDockerPath('/agent/docker/images/pull', nodeId),
-      payload,
-    )
-  },
-  fetchImagePullProgress: (taskId: string) => {
-    return http.get<ImagePullProgress>(
-      buildDockerPath(`/agent/docker/images/pull/${encodeURIComponent(taskId)}/progress`, nodeId),
-    )
-  },
-  cancelImagePull: (taskId: string) => {
-    return http.post<ImagePullProgress>(
-      buildDockerPath(`/agent/docker/images/pull/${encodeURIComponent(taskId)}/cancel`, nodeId),
-    )
-  },
 })
 
 export interface ImageTagInfo {
@@ -344,64 +323,30 @@ export interface ImageResolveResponse {
   tags: ImageTagInfo[]
 }
 
-export interface ImagePullStartResponse {
-  taskId: string
-}
-
-export type ImagePullStatus = 'pending' | 'pulling' | 'success' | 'failed' | 'cancelled'
-
-export interface ImagePullLayerProgress {
-  id: string
-  status?: string
-  progressPercent?: number
-}
+export type ImagePullStatus = 'pending' | 'running' | 'success' | 'failed' | 'cancelled'
 
 export interface ImagePullProgress {
   taskId: string
-  imageName: string
-  tag: string
+  nodeId: string
+  imageRef: string
   status: ImagePullStatus
+  source?: 'target' | 'controller' | 'registry'
+  stage: 'checking' | 'exporting' | 'uploading' | 'loading' | 'pulling'
   progressPercent: number
-  statusText?: string
-  error?: string
-  layers: ImagePullLayerProgress[]
-}
-
-export interface DistributeNodeStatus {
-  progressPercent: number
-  status: 'waiting' | 'exporting' | 'uploading' | 'loading' | 'success' | 'failed'
-  error?: string
-}
-
-export interface DistributeSession {
-  taskId: string
-  createdAt: number
-  nodeStatuses: Record<string, DistributeNodeStatus>
+  statusText: string
+  controllerError?: string
+  registryError?: string
 }
 
 export const dockerApi = Object.assign(createScopedDockerApi(), {
   forNode: createScopedDockerApi,
-  distributeImage: (formData: FormData) => {
-    return http.post<string>('/docker/images/distribute', formData, {
-      headers: {
-        'Content-Type': 'multipart/form-data',
-      },
-    })
-  },
-  fetchDistributeStatus: (taskId: string) => {
-    return http.get<DistributeSession>('/docker/images/distribute/status', { taskId })
-  },
+  startImageTask: (payload: { nodeId: string; imageRef: string; sourceMode: 'controller-first' }) =>
+    http.post<ImagePullProgress>('/docker/image-tasks', payload),
+  fetchImageTaskProgress: (taskId: string) =>
+    http.get<ImagePullProgress>(`/docker/image-tasks/${encodeURIComponent(taskId)}/progress`),
+  cancelImageTask: (taskId: string) =>
+    http.delete<ImagePullProgress>(`/docker/image-tasks/${encodeURIComponent(taskId)}`),
   fetchLocalImages: () => {
     return http.get<docker.ImageSummary[]>('/docker/local-images')
-  },
-  pullLocalImage: (imageName: string) => {
-    return http.post<string>('/docker/local-images/pull', { imageName })
-  },
-  distributeLocalImage: (payload: {
-    imageName: string
-    nodeIds: string[]
-    sourceNodeId?: string
-  }) => {
-    return http.post<string>('/docker/images/distribute/local', payload)
   },
 })

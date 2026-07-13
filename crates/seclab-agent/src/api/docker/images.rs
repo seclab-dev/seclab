@@ -48,6 +48,21 @@ pub struct PullRequest {
     pub tag: Option<String>,
 }
 
+/// 批量检查镜像是否存在的请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageAvailabilityRequest {
+    pub images: Vec<String>,
+}
+
+/// 单个镜像在当前节点的可用状态。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageAvailability {
+    pub image_ref: String,
+    pub available: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolveRequest {
@@ -166,6 +181,31 @@ struct ImagePullTask {
     error: Option<String>,
     layers: HashMap<String, ImagePullLayerProgress>,
     cancel: Arc<AtomicBool>,
+}
+
+/// 精确检查请求中的镜像引用是否存在于当前 Docker 守护进程。
+pub async fn image_availability(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ImageAvailabilityRequest>,
+) -> ApiResult<Response> {
+    if payload.images.is_empty() {
+        return Err(AgentError::BadRequest("images must not be empty".to_string()).into());
+    }
+    let docker = state.docker_client().await?;
+    let mut result = Vec::with_capacity(payload.images.len());
+    for image in payload.images {
+        let image_ref = image.trim().to_string();
+        if image_ref.is_empty() {
+            return Err(
+                AgentError::BadRequest("image reference must not be empty".to_string()).into(),
+            );
+        }
+        result.push(ImageAvailability {
+            available: docker.inspect_image(&image_ref).await.is_ok(),
+            image_ref,
+        });
+    }
+    Ok(ApiResponse::success_with_raw("Image availability loaded", Some(result)).into_response())
 }
 
 #[derive(Debug, Deserialize)]
@@ -553,37 +593,13 @@ async fn run_image_pull_task(
     });
 
     let result = async {
-        let docker = state
-            .docker_client()
-            .await
-            .map_err(|err| AgentError::DockerOperation(err.to_string()))?;
-        let options = CreateImageOptions {
-            from_image: Some(image_name.clone()),
-            tag: Some(tag.clone()),
-            ..Default::default()
-        };
-        let mut stream = docker.create_image(Some(options), None, None);
-
-        while let Some(msg) = stream.next().await {
-            if cancel.load(Ordering::Relaxed) {
-                return Err(AgentError::DockerOperation(
-                    "image pull cancelled".to_string(),
-                ));
-            }
-
-            let info = msg.map_err(|err| AgentError::DockerOperation(err.to_string()))?;
-            if let Some(error) = info
-                .error_detail
-                .as_ref()
-                .and_then(|detail| detail.message.clone())
-                .or_else(|| info.error.clone())
-            {
-                return Err(AgentError::DockerOperation(error));
-            }
-            update_pull_task_from_stream(&task_id, info);
-        }
-
-        Ok::<(), AgentError>(())
+        pull_registry_image(
+            &state,
+            &format!("{image_name}:{tag}"),
+            || cancel.load(Ordering::Relaxed),
+            |info| update_pull_task_from_stream(&task_id, info),
+        )
+        .await
     }
     .await;
 
@@ -606,6 +622,56 @@ async fn run_image_pull_task(
             task.error = Some(err.to_string());
         }
     });
+}
+
+/// 通过 Docker Registry 拉取镜像，并把原始进度事件交给调用方。
+pub async fn pull_registry_image(
+    state: &Arc<AppState>,
+    image_ref: &str,
+    is_cancelled: impl Fn() -> bool,
+    mut on_progress: impl FnMut(bollard::models::CreateImageInfo),
+) -> Result<(), AgentError> {
+    let docker = state
+        .docker_client()
+        .await
+        .map_err(|err| AgentError::DockerOperation(err.to_string()))?;
+    let (from_image, tag) = split_registry_image_ref(image_ref);
+    let options = CreateImageOptions {
+        from_image: Some(from_image),
+        tag: Some(tag),
+        ..Default::default()
+    };
+    let mut stream = docker.create_image(Some(options), None, None);
+    while let Some(message) = stream.next().await {
+        if is_cancelled() {
+            return Err(AgentError::DockerOperation(
+                "image pull cancelled".to_string(),
+            ));
+        }
+        let info = message.map_err(|err| AgentError::DockerOperation(err.to_string()))?;
+        if let Some(error) = info
+            .error_detail
+            .as_ref()
+            .and_then(|detail| detail.message.clone())
+            .or_else(|| info.error.clone())
+        {
+            return Err(AgentError::DockerOperation(error));
+        }
+        on_progress(info);
+    }
+    Ok(())
+}
+
+fn split_registry_image_ref(image_ref: &str) -> (String, String) {
+    let slash = image_ref.rfind('/').unwrap_or(0);
+    if let Some(colon) = image_ref.rfind(':').filter(|colon| *colon > slash) {
+        (
+            image_ref[..colon].to_string(),
+            image_ref[colon + 1..].to_string(),
+        )
+    } else {
+        (image_ref.to_string(), "latest".to_string())
+    }
 }
 
 fn update_pull_task_from_stream(task_id: &str, info: bollard::models::CreateImageInfo) {
@@ -893,6 +959,24 @@ pub async fn load_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splits_registry_port_and_tag() {
+        assert_eq!(
+            split_registry_image_ref("registry.local:5000/team/app:1.2.3"),
+            (
+                "registry.local:5000/team/app".to_string(),
+                "1.2.3".to_string()
+            )
+        );
+        assert_eq!(
+            split_registry_image_ref("registry.local:5000/team/app"),
+            (
+                "registry.local:5000/team/app".to_string(),
+                "latest".to_string()
+            )
+        );
+    }
 
     #[test]
     fn parses_official_docker_hub_image() {

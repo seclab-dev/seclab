@@ -61,7 +61,7 @@ const currentNodeName = computed(() => {
 
 const canSearch = computed(() => keyword.value.trim().length > 0 && !isSearching.value)
 const isPulling = computed(
-  () => pullProgress.value?.status === 'pending' || pullProgress.value?.status === 'pulling',
+  () => pullProgress.value?.status === 'pending' || pullProgress.value?.status === 'running',
 )
 const canPull = computed(
   () => Boolean(selectedImage.value) && !isPulling.value && !isStartingPull.value,
@@ -75,7 +75,7 @@ const pullStatusText = computed(() => {
   )
 })
 const visiblePullProgress = computed(() => {
-  if (!pullProgress.value || !['pending', 'pulling'].includes(pullProgress.value.status)) {
+  if (!pullProgress.value || !['pending', 'running'].includes(pullProgress.value.status)) {
     return null
   }
   return pullProgress.value
@@ -199,7 +199,7 @@ const loadTags = async (append = false) => {
 
 const fetchPullProgress = async (taskId: string) => {
   try {
-    const response = await dockerApi.forNode(nodeStore.currentNodeId).fetchImagePullProgress(taskId)
+    const response = await dockerApi.fetchImageTaskProgress(taskId)
     if (!response.success || !response.data) return
 
     pullProgress.value = response.data
@@ -212,7 +212,10 @@ const fetchPullProgress = async (taskId: string) => {
       } else if (response.data.status === 'failed') {
         notificationStore.error(
           t('app.docker.images.registry.failed', {
-            error: response.data.error || response.data.statusText || t('common.unknownError'),
+            error:
+              response.data.registryError ||
+              response.data.controllerError ||
+              response.data.statusText,
           }),
         )
       } else if (response.data.status === 'cancelled') {
@@ -225,13 +228,13 @@ const fetchPullProgress = async (taskId: string) => {
     const errMsg = error instanceof Error ? error.message : String(error)
     pullProgress.value = {
       taskId,
-      imageName: selectedImage.value?.repository || '',
-      tag: selectedTag.value,
+      nodeId: nodeStore.currentNodeId,
+      imageRef: `${selectedImage.value?.repository || ''}:${selectedTag.value}`,
       status: 'failed',
+      stage: 'pulling',
       progressPercent: pullProgress.value?.progressPercent ?? 0,
       statusText: t('app.docker.images.registry.progressFailed'),
-      error: errMsg,
-      layers: [],
+      registryError: errMsg,
     }
     isCanceling.value = false
     notificationStore.error(t('app.docker.images.registry.failed', { error: errMsg }))
@@ -252,9 +255,10 @@ const pullImage = async () => {
   isStartingPull.value = true
   pullProgress.value = null
   try {
-    const response = await dockerApi.forNode(nodeStore.currentNodeId).startImagePull({
-      imageName: selectedImage.value.repository,
-      tag: selectedTag.value || DEFAULT_TAG,
+    const response = await dockerApi.startImageTask({
+      nodeId: nodeStore.currentNodeId,
+      imageRef: `${selectedImage.value.repository}:${selectedTag.value || DEFAULT_TAG}`,
+      sourceMode: 'controller-first',
     })
     if (response.success && response.data?.taskId) {
       startPolling(response.data.taskId)
@@ -280,7 +284,7 @@ const cancelPull = async () => {
 
   isCanceling.value = true
   try {
-    const response = await dockerApi.forNode(nodeStore.currentNodeId).cancelImagePull(taskId)
+    const response = await dockerApi.cancelImageTask(taskId)
     if (response.success && response.data) {
       pullProgress.value = response.data
       if (['success', 'failed', 'cancelled'].includes(response.data.status)) {
