@@ -3,13 +3,12 @@ import { ref, watch, type ComputedRef } from 'vue'
 
 type ContainerStatsEntry = {
   data: {
-    cpuPercent: number
-    memoryUsageBytes: number
+    cpuCorePercent: number
+    memoryWorkingSetBytes: number
     memoryLimitBytes: number
     memoryPercent: number
     networkRxBytes: number
     networkTxBytes: number
-    containerCount: number
   }
   fetchedAt: number
 }

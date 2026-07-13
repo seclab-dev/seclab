@@ -14,6 +14,7 @@ use axum::{
 };
 use bollard::models::ContainerSummaryStateEnum;
 use bollard::query_parameters;
+use chrono::Utc;
 use seclab_contracts::types::{DockerServiceStatus, DockerStatusSummary};
 use std::sync::Arc;
 use tracing::info;
@@ -52,42 +53,22 @@ pub async fn overview_realtime(State(state): State<Arc<AppState>>) -> ApiResult<
         .list_images(Some(query_parameters::ListImagesOptions::default()))
         .await?;
 
-    let project_total_count = containers
-        .iter()
-        .filter(|container| {
-            container
-                .labels
-                .as_ref()
-                .is_some_and(|labels| labels.contains_key("com.docker.compose.project"))
-        })
-        .count();
-    let project_running_count = containers
-        .iter()
-        .filter(|container| {
-            container.labels.as_ref().is_some_and(|labels| {
-                labels.contains_key("com.docker.compose.project")
-                    && container.state == Some(ContainerSummaryStateEnum::RUNNING)
-            })
-        })
-        .count();
-
-    let overview = docker::OverviewStatus {
-        status: true,
-        total_container_count: containers.len(),
-        running_container_count: containers
+    let container_states = summarize_container_states(&containers);
+    let projects = compose::load_project_summaries(&state).await?;
+    let project_states = summarize_project_states(&projects);
+    let image_counts = docker::ImageCounts {
+        total: images.len(),
+        dangling: images
             .iter()
-            .filter(|c| c.state == Some(ContainerSummaryStateEnum::RUNNING))
+            .filter(|image| {
+                image.repo_tags.is_empty()
+                    || image.repo_tags.iter().all(|tag| tag == "<none>:<none>")
+            })
             .count(),
-        // TODO: 需要处理不同的非运行状态
-        // `stopped_container_count` 可由前端 `total - running` 计算，因此在后端此字段已移除。
-        total_image_count: images.len(),
-        project_total_count,
-        project_running_count,
     };
 
-    let overview_containers = containers
+    let trend_containers = containers
         .iter()
-        .filter(|container| container.state == Some(ContainerSummaryStateEnum::RUNNING))
         .filter_map(|container| {
             let id = container.id.as_ref()?.to_string();
             let name = container
@@ -97,33 +78,96 @@ pub async fn overview_realtime(State(state): State<Arc<AppState>>) -> ApiResult<
                 .map(|value| value.trim_start_matches('/').to_string())
                 .unwrap_or_else(|| id.clone());
             let created_at = container.created.unwrap_or_default();
-            Some(docker::OverviewContainerItem {
+            Some(docker::TrendContainerItem {
                 id,
                 name,
                 created_at,
+                state: container
+                    .state
+                    .map(|state| state.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
             })
         })
         .collect::<Vec<_>>();
 
-    let resource_usage = docker_stats::collect_realtime_summary(&state)
-        .await
-        .unwrap_or(docker::ResourceUsageSummary {
-            cpu_percent: 0.0,
-            memory_usage_bytes: 0,
+    let resource_usage = docker_stats::load_latest_summary(&state).await.unwrap_or(
+        docker::HostResourceUsageSummary {
+            status: docker::ResourceSampleStatus::Unavailable,
+            collected_at: None,
+            running_container_count: container_states.running,
+            sampled_container_count: 0,
+            cpu_host_percent: 0.0,
+            cpu_core_percent: 0.0,
+            memory_working_set_bytes: 0,
             memory_limit_bytes: 0,
             memory_percent: 0.0,
-            network_rx_bytes: 0,
-            network_tx_bytes: 0,
-            container_count: 0,
-        });
+        },
+    );
 
     let response = docker::OverviewRealtimeResponse {
-        overview,
+        collected_at: Utc::now().timestamp(),
+        container_states,
+        project_states,
+        images: image_counts,
         resource_usage,
-        overview_containers,
+        trend_containers,
     };
 
     Ok(ApiResponse::success_with_raw("Docker overview loaded", Some(response)).into_response())
+}
+
+/// 汇总 Docker 容器状态分布。
+fn summarize_container_states(
+    containers: &[bollard::secret::ContainerSummary],
+) -> docker::ContainerStateCounts {
+    let mut counts = docker::ContainerStateCounts {
+        total: containers.len(),
+        running: 0,
+        paused: 0,
+        restarting: 0,
+        exited: 0,
+        other: 0,
+    };
+    for container in containers {
+        match container.state {
+            Some(ContainerSummaryStateEnum::RUNNING) => counts.running += 1,
+            Some(ContainerSummaryStateEnum::PAUSED) => counts.paused += 1,
+            Some(ContainerSummaryStateEnum::RESTARTING) => counts.restarting += 1,
+            Some(ContainerSummaryStateEnum::EXITED) => counts.exited += 1,
+            _ => counts.other += 1,
+        }
+    }
+    counts
+}
+
+/// 汇总登记 Compose 项目的健康状态分布。
+fn summarize_project_states(
+    projects: &[docker::ComposeProjectSummary],
+) -> docker::ProjectStateCounts {
+    let mut counts = docker::ProjectStateCounts {
+        total: projects.len(),
+        healthy: 0,
+        partial: 0,
+        stopped: 0,
+        unknown: 0,
+    };
+    for project in projects {
+        if project.total_containers > 0 && project.running_containers == project.total_containers {
+            counts.healthy += 1;
+        } else if project.running_containers > 0
+            || project.paused_containers > 0
+            || project.restarting_containers > 0
+        {
+            counts.partial += 1;
+        } else if project.total_containers == 0
+            || project.exited_containers == project.total_containers
+        {
+            counts.stopped += 1;
+        } else {
+            counts.unknown += 1;
+        }
+    }
+    counts
 }
 
 /// 获取所有网络的详细信息。
@@ -333,4 +377,48 @@ pub fn docker_router() -> Router<Arc<AppState>> {
         .route("/system/df", get(system::system_df))
         .route("/system/prune", post(system::system_prune))
         .route("/logs", post(logs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::summarize_project_states;
+    use crate::models::docker::ComposeProjectSummary;
+
+    fn project(
+        total: usize,
+        running: usize,
+        paused: usize,
+        restarting: usize,
+        exited: usize,
+    ) -> ComposeProjectSummary {
+        ComposeProjectSummary {
+            name: "project".to_string(),
+            status: "unknown".to_string(),
+            total_containers: total,
+            running_containers: running,
+            exited_containers: exited,
+            paused_containers: paused,
+            restarting_containers: restarting,
+            has_compose_file: true,
+            compose_dir: None,
+            project_type: None,
+        }
+    }
+
+    #[test]
+    fn project_counts_are_distinct_and_stateful() {
+        let projects = vec![
+            project(3, 3, 0, 0, 0),
+            project(3, 1, 0, 0, 2),
+            project(1, 0, 1, 0, 0),
+            project(2, 0, 0, 0, 2),
+            project(0, 0, 0, 0, 0),
+        ];
+        let counts = summarize_project_states(&projects);
+        assert_eq!(counts.total, 5);
+        assert_eq!(counts.healthy, 1);
+        assert_eq!(counts.partial, 2);
+        assert_eq!(counts.stopped, 2);
+        assert_eq!(counts.unknown, 0);
+    }
 }

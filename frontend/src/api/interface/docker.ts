@@ -338,7 +338,7 @@ export interface ContainerStatsBatchRequest {
 }
 
 export interface ContainerStatsBatchResponse {
-  summaries: Record<string, ResourceUsageSummary>
+  summaries: Record<string, ContainerResourceUsageSummary>
 }
 
 /** 容器详情 (inspect) 的简化版本 */
@@ -567,64 +567,112 @@ export interface NetworkDisconnectRequest {
   force?: boolean
 }
 
-/** 资源监控统计 */
-export interface ResourceUsageSummary {
-  cpuPercent: number
-  memoryUsageBytes: number
+/** 容器资源统计快照。 */
+export interface ContainerResourceUsageSummary {
+  cpuCorePercent: number
+  memoryWorkingSetBytes: number
   memoryLimitBytes: number
   memoryPercent: number
   networkRxBytes: number
   networkTxBytes: number
-  containerCount: number
 }
 
-export interface ResourceUsagePoint {
+export type ResourceSampleStatus = 'fresh' | 'partial' | 'stale' | 'unavailable'
+
+/** 宿主机 Docker 资源汇总。 */
+export interface HostResourceUsageSummary {
+  status: ResourceSampleStatus
+  collectedAt: number | null
+  runningContainerCount: number
+  sampledContainerCount: number
+  cpuHostPercent: number
+  cpuCorePercent: number
+  memoryWorkingSetBytes: number
+  memoryLimitBytes: number
+  memoryPercent: number
+}
+
+/** 容器资源趋势点。 */
+export interface ContainerResourceUsagePoint {
   timestamp: number
-  cpuPercent: number
-  memoryUsageBytes: number
+  cpuCorePercent: number
+  memoryWorkingSetBytes: number
   memoryLimitBytes: number
   memoryPercent: number
-  networkRxBytes: number
-  networkTxBytes: number
-  containerCount?: number
+  networkRxBytesPerSecond: number | null
+  networkTxBytesPerSecond: number | null
 }
 
-export interface ResourceUsageHistory {
-  points: ResourceUsagePoint[]
+export interface ContainerResourceUsageHistory {
+  points: ContainerResourceUsagePoint[]
 }
 
 export interface ContainerStatsHistoryAllItem {
   id: string
   name: string
-  points: ResourceUsagePoint[]
+  points: ContainerResourceUsagePoint[]
 }
 
 export interface ContainerStatsHistoryAllResponse {
   containers: ContainerStatsHistoryAllItem[]
 }
 
-/**
- * 概览状态数据结构 (合并容器和镜像统计)
- */
-export interface OverviewStatus {
-  status: boolean
-  totalContainerCount: number
-  runningContainerCount: number
-  totalImageCount: number
-  projectTotalCount: number
-  projectRunningCount: number
+export interface ContainerStateCounts {
+  total: number
+  running: number
+  paused: number
+  restarting: number
+  exited: number
+  other: number
 }
 
-export interface OverviewContainerItem {
+export interface ProjectStateCounts {
+  total: number
+  healthy: number
+  partial: number
+  stopped: number
+  unknown: number
+}
+
+export interface ImageCounts {
+  total: number
+  dangling: number
+}
+
+export interface TrendContainerItem {
   id: string
   name: string
   createdAt: number
+  state: string
 }
 
 export interface OverviewRealtimeResponse {
-  overview: OverviewStatus
-  resourceUsage: ResourceUsageSummary
-  overviewContainers: OverviewContainerItem[]
+  collectedAt: number
+  containerStates: ContainerStateCounts
+  projectStates: ProjectStateCounts
+  images: ImageCounts
+  resourceUsage: HostResourceUsageSummary
+  trendContainers: TrendContainerItem[]
+}
+
+export interface ContainerStatsHistoryQuery {
+  ids: string[]
+  hours?: number
+}
+
+export interface DockerDiskUsageCategory {
+  totalCount: number
+  activeCount: number
+  sizeBytes: number
+  reclaimableBytes: number
+}
+
+export interface DockerDiskUsageSummary {
+  collectedAt: number
+  images: DockerDiskUsageCategory
+  containers: DockerDiskUsageCategory
+  volumes: DockerDiskUsageCategory
+  buildCache: DockerDiskUsageCategory
 }
 
 /** 容器引用 */

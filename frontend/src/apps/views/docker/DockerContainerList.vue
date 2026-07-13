@@ -278,7 +278,7 @@ const openContainerDetail = (containerId: string | undefined, state?: string) =>
         <template #resource="{ row: container }: { row: dockerType.ContainerSummary }">
           <template v-if="container.Id && getContainerStats(container.Id)">
             <div class="resource-line">
-              CPU {{ formatPercent(getContainerStats(container?.Id)?.cpuPercent) }}
+              CPU {{ formatPercent(getContainerStats(container?.Id)?.cpuCorePercent) }}
             </div>
             <div class="resource-line">
               MEM {{ formatPercent(getContainerStats(container?.Id)?.memoryPercent) }}

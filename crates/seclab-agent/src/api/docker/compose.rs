@@ -107,6 +107,14 @@ pub async fn create_project(
 
 /// 汇总登记在数据库中的 Compose 项目的运行状态与容器数量。
 pub async fn list_projects(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
+    let list = load_project_summaries(&state).await?;
+    Ok(ApiResponse::success_with_raw("Compose project list loaded", Some(list)).into_response())
+}
+
+/// 汇总登记项目及其容器状态，供项目列表与概览共用。
+pub(crate) async fn load_project_summaries(
+    state: &Arc<AppState>,
+) -> Result<Vec<docker::ComposeProjectSummary>, ApiError> {
     let docker = state.docker_client().await?;
     let options = query_parameters::ListContainersOptionsBuilder::new()
         .all(true)
@@ -187,7 +195,7 @@ pub async fn list_projects(State(state): State<Arc<AppState>>) -> ApiResult<Resp
     let mut list: Vec<docker::ComposeProjectSummary> = projects.into_values().collect();
     list.sort_by(|a, b| a.name.cmp(&b.name));
 
-    Ok(ApiResponse::success_with_raw("Compose project list loaded", Some(list)).into_response())
+    Ok(list)
 }
 
 /// 启动指定的 Compose 项目。

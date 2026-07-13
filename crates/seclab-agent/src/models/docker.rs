@@ -22,16 +22,35 @@ pub enum ContainerAction {
     Remove,
 }
 
-/// Docker 概览统计信息。
+/// Docker 容器状态分布。
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct OverviewStatus {
-    pub status: bool,
-    pub total_container_count: usize,
-    pub running_container_count: usize,
-    pub total_image_count: usize,
-    pub project_total_count: usize,
-    pub project_running_count: usize,
+pub struct ContainerStateCounts {
+    pub total: usize,
+    pub running: usize,
+    pub paused: usize,
+    pub restarting: usize,
+    pub exited: usize,
+    pub other: usize,
+}
+
+/// Docker Compose 项目健康状态分布。
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectStateCounts {
+    pub total: usize,
+    pub healthy: usize,
+    pub partial: usize,
+    pub stopped: usize,
+    pub unknown: usize,
+}
+
+/// Docker 镜像数量分布。
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageCounts {
+    pub total: usize,
+    pub dangling: usize,
 }
 
 /// 精简的容器引用信息。
@@ -154,38 +173,75 @@ pub struct NetworkDisconnectRequest {
     pub force: Option<bool>,
 }
 
-/// 资源使用的实时汇总数据。
+/// 资源采样数据的新鲜度与完整性状态。
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ResourceSampleStatus {
+    Fresh,
+    Partial,
+    Stale,
+    Unavailable,
+}
+
+/// Docker 容器资源统计快照。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ResourceUsageSummary {
-    pub cpu_percent: f64,
-    pub memory_usage_bytes: u64,
+pub struct ContainerResourceUsageSummary {
+    pub cpu_core_percent: f64,
+    pub memory_working_set_bytes: u64,
     pub memory_limit_bytes: u64,
     pub memory_percent: f64,
     pub network_rx_bytes: u64,
     pub network_tx_bytes: u64,
-    pub container_count: usize,
 }
 
-/// 单个时间点的资源使用数据。
+/// Docker 宿主机资源汇总。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ResourceUsagePoint {
+pub struct HostResourceUsageSummary {
+    pub status: ResourceSampleStatus,
+    pub collected_at: Option<i64>,
+    pub running_container_count: usize,
+    pub sampled_container_count: usize,
+    pub cpu_host_percent: f64,
+    pub cpu_core_percent: f64,
+    pub memory_working_set_bytes: u64,
+    pub memory_limit_bytes: u64,
+    pub memory_percent: f64,
+}
+
+/// Docker 宿主机单个时间点的资源使用数据。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostResourceUsagePoint {
     pub timestamp: i64,
-    pub cpu_percent: f64,
-    pub memory_usage_bytes: u64,
+    pub cpu_host_percent: f64,
+    pub cpu_core_percent: f64,
+    pub memory_working_set_bytes: u64,
     pub memory_limit_bytes: u64,
     pub memory_percent: f64,
-    pub network_rx_bytes: u64,
-    pub network_tx_bytes: u64,
-    pub container_count: Option<usize>,
+    pub running_container_count: usize,
+    pub sampled_container_count: usize,
 }
 
-/// 资源使用的历史序列数据。
+/// Docker 容器单个时间点的资源使用数据。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ResourceUsageHistory {
-    pub points: Vec<ResourceUsagePoint>,
+pub struct ContainerResourceUsagePoint {
+    pub timestamp: i64,
+    pub cpu_core_percent: f64,
+    pub memory_working_set_bytes: u64,
+    pub memory_limit_bytes: u64,
+    pub memory_percent: f64,
+    pub network_rx_bytes_per_second: Option<f64>,
+    pub network_tx_bytes_per_second: Option<f64>,
+}
+
+/// Docker 宿主机资源历史序列。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostResourceUsageHistory {
+    pub points: Vec<HostResourceUsagePoint>,
 }
 
 /// 批量查询容器统计的请求体。
@@ -199,25 +255,29 @@ pub struct ContainerStatsBatchRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContainerStatsBatchResponse {
-    pub summaries: HashMap<String, ResourceUsageSummary>,
+    pub summaries: HashMap<String, ContainerResourceUsageSummary>,
 }
 
-/// 概览中展示的容器简要信息。
+/// 概览趋势选择器中的容器简要信息。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct OverviewContainerItem {
+pub struct TrendContainerItem {
     pub id: String,
     pub name: String,
     pub created_at: i64,
+    pub state: String,
 }
 
 /// 概览页所需的实时数据汇总。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OverviewRealtimeResponse {
-    pub overview: OverviewStatus,
-    pub resource_usage: ResourceUsageSummary,
-    pub overview_containers: Vec<OverviewContainerItem>,
+    pub collected_at: i64,
+    pub container_states: ContainerStateCounts,
+    pub project_states: ProjectStateCounts,
+    pub images: ImageCounts,
+    pub resource_usage: HostResourceUsageSummary,
+    pub trend_containers: Vec<TrendContainerItem>,
 }
 
 /// 单个容器的历史趋势数据项。
@@ -226,7 +286,7 @@ pub struct OverviewRealtimeResponse {
 pub struct ContainerStatsHistoryAllItem {
     pub id: String,
     pub name: String,
-    pub points: Vec<ResourceUsagePoint>,
+    pub points: Vec<ContainerResourceUsagePoint>,
 }
 
 /// 多容器历史趋势的汇总响应。
@@ -234,6 +294,35 @@ pub struct ContainerStatsHistoryAllItem {
 #[serde(rename_all = "camelCase")]
 pub struct ContainerStatsHistoryAllResponse {
     pub containers: Vec<ContainerStatsHistoryAllItem>,
+}
+
+/// 批量查询容器资源趋势的请求体。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerStatsHistoryQuery {
+    pub ids: Vec<String>,
+    pub hours: Option<i64>,
+}
+
+/// Docker 磁盘使用分类统计。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerDiskUsageCategory {
+    pub total_count: usize,
+    pub active_count: usize,
+    pub size_bytes: u64,
+    pub reclaimable_bytes: u64,
+}
+
+/// Docker 系统磁盘使用汇总。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerDiskUsageSummary {
+    pub collected_at: i64,
+    pub images: DockerDiskUsageCategory,
+    pub containers: DockerDiskUsageCategory,
+    pub volumes: DockerDiskUsageCategory,
+    pub build_cache: DockerDiskUsageCategory,
 }
 
 /// Compose 项目服务伸缩请求体

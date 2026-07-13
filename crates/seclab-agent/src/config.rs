@@ -190,8 +190,8 @@ fn use_production_layout() -> bool {
 pub fn stats_sample_interval() -> std::time::Duration {
     let seconds = get()
         .stats_sample_interval_secs
-        .filter(|value| *value >= 600)
-        .unwrap_or(600);
+        .filter(|value| *value >= 60)
+        .unwrap_or(60);
     std::time::Duration::from_secs(seconds)
 }
 
@@ -258,7 +258,7 @@ mod tests {
 
     #[test]
     fn default_stats_values_are_stable() {
-        assert_eq!(stats_sample_interval(), Duration::from_secs(600));
+        assert_eq!(stats_sample_interval(), Duration::from_secs(60));
         assert_eq!(stats_retention_hours(), 12);
         assert_eq!(system_metrics_sample_interval(), Duration::from_secs(300));
         assert_eq!(system_metrics_retention_days(), 7);

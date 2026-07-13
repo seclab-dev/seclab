@@ -18,22 +18,38 @@ import { load as parseYaml } from 'js-yaml'
 
 /** 容器资源统计缓存条目 */
 export interface ContainerStatsEntry {
-  data: dockerType.ResourceUsageSummary
+  data: dockerType.ContainerResourceUsageSummary
   fetchedAt: number
 }
 
 /** 概览数据缓存 */
 interface OverviewCacheEntry {
   timestamp: number
-  overview: dockerType.OverviewStatus
 }
 
 /** 容器资源统计缓存 TTL (毫秒) */
-const CONTAINER_STATS_TTL = 10_000
+const CONTAINER_STATS_TTL = 60_000
 /** 概览缓存 TTL (毫秒) */
 const OVERVIEW_CACHE_TTL = 30_000
 /** 概览最大可选容器数 */
-const MAX_OVERVIEW_CONTAINERS = 7
+const MAX_OVERVIEW_CONTAINERS = 5
+
+const emptyContainerStates = (): dockerType.ContainerStateCounts => ({
+  total: 0,
+  running: 0,
+  paused: 0,
+  restarting: 0,
+  exited: 0,
+  other: 0,
+})
+
+const emptyProjectStates = (): dockerType.ProjectStateCounts => ({
+  total: 0,
+  healthy: 0,
+  partial: 0,
+  stopped: 0,
+  unknown: 0,
+})
 
 export const useDockerStore = defineStore('docker', () => {
   const { t } = useI18n()
@@ -52,18 +68,20 @@ export const useDockerStore = defineStore('docker', () => {
   const isLoading = ref<boolean>(true)
 
   // ─── 概览统计 ───
-  const totalContainerCount = ref<number>(0)
-  const runningContainerCount = ref<number>(0)
-  const totalImageCount = ref<number>(0)
-  const projectRunningCount = ref<number>(0)
-  const projectTotalCount = ref<number>(0)
-  const resourceUsage = ref<dockerType.ResourceUsageSummary | null>(null)
+  const overviewCollectedAt = ref<number | null>(null)
+  const overviewError = ref<string | null>(null)
+  const containerStates = ref<dockerType.ContainerStateCounts>(emptyContainerStates())
+  const projectStates = ref<dockerType.ProjectStateCounts>(emptyProjectStates())
+  const imageCounts = ref<dockerType.ImageCounts>({ total: 0, dangling: 0 })
+  const resourceUsage = ref<dockerType.HostResourceUsageSummary | null>(null)
 
   // ─── 概览图表数据 ───
-  const overviewContainers = ref<Array<{ id: string; name: string }>>([])
+  const overviewContainers = ref<dockerType.TrendContainerItem[]>([])
   const overviewSelectedContainerIds = ref<string[]>([])
-  const overviewHistoryMap = ref<Record<string, dockerType.ResourceUsageHistory>>({})
+  const overviewHistoryMap = ref<Record<string, dockerType.ContainerResourceUsageHistory>>({})
   const overviewHistoryLatestMap = ref<Record<string, number | null>>({})
+  const overviewHistoryHours = ref<1 | 6 | 12>(1)
+  const overviewHistoryError = ref<string | null>(null)
 
   // ─── 容器列表 ───
   const containers = ref<dockerType.ContainerSummary[]>([])
@@ -78,6 +96,13 @@ export const useDockerStore = defineStore('docker', () => {
   const networks = ref<dockerType.Network[]>([])
   const volumes = ref<dockerType.VolumeSummary[]>([])
   const systemInfo = ref<dockerType.DockerSystemInfo | null>(null)
+  const systemInfoLoading = ref(false)
+  const systemInfoError = ref<string | null>(null)
+  const systemInfoLoadedAt = ref<number | null>(null)
+  const diskUsage = ref<dockerType.DockerDiskUsageSummary | null>(null)
+  const diskUsageLoading = ref(false)
+  const diskUsageError = ref<string | null>(null)
+  const pruneLoading = ref(false)
   const composeContainers = ref<dockerType.ContainerSummary[]>([])
   const projectLogs = ref<string[]>([])
 
@@ -120,6 +145,8 @@ export const useDockerStore = defineStore('docker', () => {
   // ─── 缓存与防并发 ───
   const overviewCache = ref<OverviewCacheEntry | null>(null)
   const overviewRefreshInProgress = ref(false)
+  const historyRefreshInProgress = ref(false)
+  let historyRefreshQueued = false
 
   // ─── 轮询定时器 ───
   let resourceUsageTimer: number | null = null
@@ -144,23 +171,32 @@ export const useDockerStore = defineStore('docker', () => {
   /** 重置所有 Docker 数据到初始状态 */
   const resetAll = () => {
     dockerStatus.value = false
-    totalContainerCount.value = 0
-    runningContainerCount.value = 0
-    totalImageCount.value = 0
+    overviewCollectedAt.value = null
+    overviewError.value = null
+    containerStates.value = emptyContainerStates()
+    projectStates.value = emptyProjectStates()
+    imageCounts.value = { total: 0, dangling: 0 }
     resourceUsage.value = null
     overviewContainers.value = []
     overviewSelectedContainerIds.value = []
     overviewHistoryMap.value = {}
     overviewHistoryLatestMap.value = {}
+    overviewHistoryHours.value = 1
+    overviewHistoryError.value = null
     containers.value = []
     containerResourceStats.value = {}
     composeProjects.value = []
-    projectRunningCount.value = 0
-    projectTotalCount.value = 0
     imagesList.value = []
     networks.value = []
     volumes.value = []
     systemInfo.value = null
+    systemInfoLoading.value = false
+    systemInfoError.value = null
+    systemInfoLoadedAt.value = null
+    diskUsage.value = null
+    diskUsageLoading.value = false
+    diskUsageError.value = null
+    pruneLoading.value = false
     composeContainers.value = []
     projectLogs.value = []
     overviewCache.value = null
@@ -187,76 +223,96 @@ export const useDockerStore = defineStore('docker', () => {
   }
 
   /** 获取概览数据并更新状态 */
-  const fetchOverviewData = async (): Promise<dockerType.OverviewStatus | null> => {
+  const fetchOverviewData = async (): Promise<dockerType.OverviewRealtimeResponse | null> => {
     if (!dockerAvailable.value) return null
     const res = await dockerClient.value.fetchOverviewRealtime()
     if (!res.success || !res.data) {
-      notificationStore.error(
-        t('app.docker.messages.overviewFailed', {
-          message: res.message || t('common.unknownError'),
-        }),
-      )
-      dockerStatus.value = false
+      overviewError.value = t('app.docker.messages.overviewFailed', {
+        message: res.message || t('common.unknownError'),
+      })
+      resourceUsage.value = resourceUsage.value
+        ? { ...resourceUsage.value, status: 'unavailable' }
+        : null
       return null
     }
     const payload = res.data
-    dockerStatus.value = payload.overview.status
-    totalContainerCount.value = payload.overview.totalContainerCount
-    runningContainerCount.value = payload.overview.runningContainerCount
-    totalImageCount.value = payload.overview.totalImageCount
-    projectRunningCount.value = payload.overview.projectRunningCount
-    projectTotalCount.value = payload.overview.projectTotalCount
+    overviewError.value = null
+    overviewCollectedAt.value = payload.collectedAt
+    containerStates.value = payload.containerStates
+    projectStates.value = payload.projectStates
+    imageCounts.value = payload.images
     resourceUsage.value = payload.resourceUsage
-    const running = (payload.overviewContainers || []).map((item) => ({
-      id: item.id,
-      name: item.name,
-    }))
-    updateOverviewContainerState(running)
-    return payload.overview
+    updateOverviewContainerState(payload.trendContainers || [])
+    return payload
   }
 
-  /** 获取全部容器的历史资源数据 */
-  const fetchOverviewHistoryAll = async (hours = 12) => {
+  /** 获取当前选中容器的历史资源数据。 */
+  const fetchOverviewHistoryAll = async (hours = overviewHistoryHours.value) => {
     if (!dockerAvailable.value) return
-    const res = await dockerClient.value.fetchContainerResourceUsageHistoryAll(hours)
-    if (!res.success || !res.data) return
-    const nextItems: Record<string, dockerType.ResourceUsageHistory> = {}
-    const nextLatestMap: Record<string, number | null> = {}
-    for (const item of res.data.containers || []) {
-      nextItems[item.id] = { points: item.points }
-      const points = item.points || []
-      nextLatestMap[item.id] = points.length ? points[points.length - 1]!.timestamp : null
+    if (historyRefreshInProgress.value) {
+      historyRefreshQueued = true
+      return
     }
-    let changed = false
-    for (const id of overviewSelectedContainerIds.value) {
-      if (overviewHistoryLatestMap.value[id] !== nextLatestMap[id]) {
-        changed = true
-        break
+    const ids = overviewSelectedContainerIds.value.slice(0, MAX_OVERVIEW_CONTAINERS)
+    const requestKey = `${hours}:${ids.join(',')}`
+    if (ids.length === 0) {
+      overviewHistoryMap.value = {}
+      overviewHistoryLatestMap.value = {}
+      overviewHistoryError.value = null
+      return
+    }
+    historyRefreshInProgress.value = true
+    try {
+      const res = await dockerClient.value.fetchContainerResourceUsageHistoryAll({ ids, hours })
+      if (!res.success || !res.data) {
+        overviewHistoryError.value = res.message || t('common.unknownError')
+        return
       }
-    }
-    if (Object.keys(nextLatestMap).length !== Object.keys(overviewHistoryLatestMap.value).length) {
-      changed = true
-    }
-    if (changed) {
+      overviewHistoryError.value = null
+      const nextItems: Record<string, dockerType.ContainerResourceUsageHistory> = {}
+      const nextLatestMap: Record<string, number | null> = {}
+      for (const item of res.data.containers || []) {
+        nextItems[item.id] = { points: item.points }
+        const points = item.points || []
+        nextLatestMap[item.id] = points.length ? points[points.length - 1]!.timestamp : null
+      }
+      const currentKey = `${overviewHistoryHours.value}:${overviewSelectedContainerIds.value
+        .slice(0, MAX_OVERVIEW_CONTAINERS)
+        .join(',')}`
+      if (requestKey !== currentKey) {
+        historyRefreshQueued = true
+        return
+      }
       overviewHistoryLatestMap.value = nextLatestMap
       overviewHistoryMap.value = nextItems
+    } finally {
+      historyRefreshInProgress.value = false
+      if (historyRefreshQueued) {
+        historyRefreshQueued = false
+        void fetchOverviewHistoryAll()
+      }
     }
   }
 
-  /** 更新概览容器选择状态 */
-  const updateOverviewContainerState = (running: Array<{ id: string; name: string }>) => {
-    overviewContainers.value = running
-    const runningIds = new Set(running.map((item) => item.id))
-    const filteredSelected = overviewSelectedContainerIds.value.filter((id) => runningIds.has(id))
+  /** 更新概览趋势容器，并保留仍存在但已停止的选择。 */
+  const updateOverviewContainerState = (items: dockerType.TrendContainerItem[]) => {
+    overviewContainers.value = items
+    const availableIds = new Set(items.map((item) => item.id))
+    const retained = overviewSelectedContainerIds.value.filter((id) => availableIds.has(id))
+    const preferred = [
+      ...items.filter((item) => item.state.toLowerCase() === 'running'),
+      ...items.filter((item) => item.state.toLowerCase() !== 'running'),
+    ]
     const nextSelected =
-      filteredSelected.length > 0
-        ? filteredSelected.slice(0, MAX_OVERVIEW_CONTAINERS)
-        : running.slice(0, MAX_OVERVIEW_CONTAINERS).map((item) => item.id)
+      retained.length > 0
+        ? retained.slice(0, MAX_OVERVIEW_CONTAINERS)
+        : preferred.slice(0, MAX_OVERVIEW_CONTAINERS).map((item) => item.id)
+    const selectionChanged = nextSelected.join(',') !== overviewSelectedContainerIds.value.join(',')
     overviewSelectedContainerIds.value = nextSelected
-    void fetchOverviewHistoryAll()
+    if (selectionChanged) void fetchOverviewHistoryAll()
   }
 
-  /** 更新概览选中的容器列表 */
+  /** 更新概览选中的容器列表。 */
   const updateOverviewSelectedContainers = (ids: string[]) => {
     const unique = Array.from(new Set(ids))
     let nextIds = unique
@@ -270,9 +326,16 @@ export const useDockerStore = defineStore('docker', () => {
     void fetchOverviewHistoryAll()
   }
 
+  /** 更新资源趋势时间范围。 */
+  const setOverviewHistoryHours = (hours: 1 | 6 | 12) => {
+    if (overviewHistoryHours.value === hours) return
+    overviewHistoryHours.value = hours
+    void fetchOverviewHistoryAll(hours)
+  }
+
   /** 将概览数据写入缓存 */
-  const cacheOverviewState = (overview: dockerType.OverviewStatus) => {
-    overviewCache.value = { timestamp: Date.now(), overview }
+  const cacheOverviewState = () => {
+    overviewCache.value = { timestamp: Date.now() }
   }
 
   /** 统一加载概览数据 */
@@ -282,7 +345,7 @@ export const useDockerStore = defineStore('docker', () => {
     overviewRefreshInProgress.value = true
     try {
       const overviewResult = await fetchOverviewData()
-      if (overviewResult) cacheOverviewState(overviewResult)
+      if (overviewResult) cacheOverviewState()
     } finally {
       overviewRefreshInProgress.value = false
       if (showLoading) isLoading.value = false
@@ -383,11 +446,38 @@ export const useDockerStore = defineStore('docker', () => {
   /** 获取 Docker 系统信息 */
   const fetchDockerInfo = async () => {
     if (!dockerAvailable.value) return
-    const res = await dockerClient.value.fetchInfo()
-    if (res.success && res.data) {
-      systemInfo.value = res.data as dockerType.DockerSystemInfo
-    } else {
-      systemInfo.value = null
+    systemInfoLoading.value = true
+    systemInfoError.value = null
+    try {
+      const res = await dockerClient.value.fetchInfo()
+      if (res.success && res.data) {
+        systemInfo.value = res.data as dockerType.DockerSystemInfo
+        systemInfoLoadedAt.value = Math.floor(Date.now() / 1000)
+      } else {
+        systemInfo.value = null
+        systemInfoLoadedAt.value = null
+        systemInfoError.value = res.message || t('common.unknownError')
+      }
+    } finally {
+      systemInfoLoading.value = false
+    }
+  }
+
+  /** 获取 Docker 磁盘使用与可回收空间。 */
+  const fetchDockerDiskUsage = async () => {
+    if (!dockerAvailable.value) return
+    diskUsageLoading.value = true
+    diskUsageError.value = null
+    try {
+      const res = await dockerClient.value.dfSystem()
+      if (res.success && res.data) {
+        diskUsage.value = res.data
+      } else {
+        diskUsage.value = null
+        diskUsageError.value = res.message || t('common.unknownError')
+      }
+    } finally {
+      diskUsageLoading.value = false
     }
   }
 
@@ -451,7 +541,9 @@ export const useDockerStore = defineStore('docker', () => {
   /** 启动概览数据轮询 */
   const startOverviewPolling = () => {
     if (!dockerAvailable.value || resourceUsageTimer !== null) return
-    resourceUsageTimer = window.setInterval(fetchOverviewData, 10_000)
+    resourceUsageTimer = window.setInterval(() => {
+      void loadOverviewData({ showLoading: false })
+    }, 30_000)
   }
 
   /** 停止概览数据轮询 */
@@ -1126,6 +1218,7 @@ export const useDockerStore = defineStore('docker', () => {
 
   /** 清理 Docker 系统垃圾 */
   const handlePruneSystem = async () => {
+    if (pruneLoading.value) return
     const confirmed = await modalStore.showConfirmation(
       t('app.docker.messages.pruneConfirm'),
       t('app.docker.messages.pruneConfirmTitle'),
@@ -1133,24 +1226,35 @@ export const useDockerStore = defineStore('docker', () => {
       t('confirmation.cancel'),
     )
     if (!confirmed) return
-    isLoading.value = true
-    const res = await dockerClient.value.pruneSystem()
-    isLoading.value = false
-    if (res.success) {
-      notificationStore.success(t('app.docker.messages.pruneSuccess'))
-      await Promise.all([
-        fetchContainers(),
-        fetchImagesList(),
-        fetchNetworks(),
-        fetchVolumes(),
-        fetchOverviewData(),
-      ])
-    } else {
+    pruneLoading.value = true
+    notificationStore.info(t('app.docker.messages.pruneStarted'))
+    try {
+      const res = await dockerClient.value.pruneSystem()
+      if (res.success) {
+        notificationStore.success(t('app.docker.messages.pruneSuccess'))
+        await Promise.all([
+          fetchContainers(),
+          fetchImagesList(),
+          fetchNetworks(),
+          fetchVolumes(),
+          fetchOverviewData(),
+          fetchDockerDiskUsage(),
+        ])
+      } else {
+        notificationStore.error(
+          t('app.docker.messages.pruneFailed', {
+            message: res.message || t('common.unknownError'),
+          }),
+        )
+      }
+    } catch (error) {
       notificationStore.error(
         t('app.docker.messages.pruneFailed', {
-          message: res.message || t('common.unknownError'),
+          message: error instanceof Error ? error.message : t('common.unknownError'),
         }),
       )
+    } finally {
+      pruneLoading.value = false
     }
   }
 
@@ -1166,17 +1270,19 @@ export const useDockerStore = defineStore('docker', () => {
     isLoading,
 
     // 概览统计
-    totalContainerCount,
-    runningContainerCount,
-    totalImageCount,
-    projectRunningCount,
-    projectTotalCount,
+    overviewCollectedAt,
+    overviewError,
+    containerStates,
+    projectStates,
+    imageCounts,
     resourceUsage,
 
     // 概览图表
     overviewContainers,
     overviewSelectedContainerIds,
     overviewHistoryMap,
+    overviewHistoryHours,
+    overviewHistoryError,
 
     // 容器
     containers,
@@ -1191,6 +1297,13 @@ export const useDockerStore = defineStore('docker', () => {
     networks,
     volumes,
     systemInfo,
+    systemInfoLoading,
+    systemInfoError,
+    systemInfoLoadedAt,
+    diskUsage,
+    diskUsageLoading,
+    diskUsageError,
+    pruneLoading,
     composeContainers,
     projectLogs,
 
@@ -1224,12 +1337,14 @@ export const useDockerStore = defineStore('docker', () => {
     fetchNetworks,
     fetchVolumes,
     fetchDockerInfo,
+    fetchDockerDiskUsage,
     fetchComposeContainers,
     fetchProjectLogs,
     fetchContainerResourceStats,
     loadOverviewData,
     refreshOverviewDataIfNeeded,
     updateOverviewSelectedContainers,
+    setOverviewHistoryHours,
     initialLoad,
 
     // 轮询

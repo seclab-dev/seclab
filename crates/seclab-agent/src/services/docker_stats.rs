@@ -1,15 +1,30 @@
 //! Docker 统计采样服务：定时采样并写入缓存。
 
 use crate::config;
-use crate::models::docker::ResourceUsageSummary;
+use crate::models::docker::{
+    ContainerResourceUsageSummary, HostResourceUsageSummary, ResourceSampleStatus,
+};
 use crate::state::AppState;
 use bollard::models::ContainerSummaryStateEnum;
 use bollard::query_parameters;
 use chrono::Utc;
 use futures_util::stream::{self, StreamExt};
+use sqlx::FromRow;
 use std::sync::Arc;
 use tokio::time::{Duration, timeout};
 use tracing::{debug, warn};
+
+#[derive(Debug, FromRow)]
+struct LatestSummaryRow {
+    created_at: i64,
+    cpu_core_percent: f64,
+    cpu_host_percent: f64,
+    memory_working_set_bytes: i64,
+    memory_limit_bytes: i64,
+    memory_percent: f64,
+    running_container_count: i64,
+    sampled_container_count: i64,
+}
 
 /// 启动后台采样任务，定期收集并清理 Docker 统计数据。
 pub fn spawn_stats_collector(state: Arc<AppState>) {
@@ -43,24 +58,75 @@ pub fn spawn_stats_collector(state: Arc<AppState>) {
     });
 }
 
-pub async fn collect_realtime_summary(state: &AppState) -> anyhow::Result<ResourceUsageSummary> {
-    let docker = match state.docker_client().await {
-        Ok(client) => client,
-        Err(_) => {
-            return Ok(ResourceUsageSummary {
-                cpu_percent: 0.0,
-                memory_usage_bytes: 0,
-                memory_limit_bytes: 0,
-                memory_percent: 0.0,
-                network_rx_bytes: 0,
-                network_tx_bytes: 0,
-                container_count: 0,
-            });
-        }
+/// 从缓存读取最近一次宿主机 Docker 资源汇总，并标注新鲜度。
+pub async fn load_latest_summary(state: &AppState) -> anyhow::Result<HostResourceUsageSummary> {
+    let row = sqlx::query_as::<_, LatestSummaryRow>(
+        r#"
+        SELECT
+            created_at,
+            cpu_core_percent,
+            cpu_host_percent,
+            memory_working_set_bytes,
+            memory_limit_bytes,
+            memory_percent,
+            running_container_count,
+            sampled_container_count
+        FROM docker_metrics_summary
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(&state.metadata_db)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(HostResourceUsageSummary {
+            status: ResourceSampleStatus::Unavailable,
+            collected_at: None,
+            running_container_count: 0,
+            sampled_container_count: 0,
+            cpu_host_percent: 0.0,
+            cpu_core_percent: 0.0,
+            memory_working_set_bytes: 0,
+            memory_limit_bytes: 0,
+            memory_percent: 0.0,
+        });
     };
 
-    let (summary, _) = collect_samples_and_summary(&docker, false).await?;
-    Ok(summary)
+    let status = resolve_sample_status(
+        Utc::now().timestamp(),
+        row.created_at,
+        row.running_container_count,
+        row.sampled_container_count,
+    );
+    Ok(HostResourceUsageSummary {
+        status,
+        collected_at: Some(row.created_at),
+        running_container_count: row.running_container_count.max(0) as usize,
+        sampled_container_count: row.sampled_container_count.max(0) as usize,
+        cpu_host_percent: row.cpu_host_percent,
+        cpu_core_percent: row.cpu_core_percent,
+        memory_working_set_bytes: row.memory_working_set_bytes.max(0) as u64,
+        memory_limit_bytes: row.memory_limit_bytes.max(0) as u64,
+        memory_percent: row.memory_percent,
+    })
+}
+
+/// 根据采样时间与覆盖率判定资源数据状态。
+fn resolve_sample_status(
+    now: i64,
+    collected_at: i64,
+    running_container_count: i64,
+    sampled_container_count: i64,
+) -> ResourceSampleStatus {
+    let stale_after = config::stats_sample_interval().as_secs() as i64 * 2;
+    if now - collected_at > stale_after {
+        ResourceSampleStatus::Stale
+    } else if sampled_container_count < running_container_count {
+        ResourceSampleStatus::Partial
+    } else {
+        ResourceSampleStatus::Fresh
+    }
 }
 
 async fn collect_and_store_stats(state: &AppState) -> anyhow::Result<()> {
@@ -69,7 +135,7 @@ async fn collect_and_store_stats(state: &AppState) -> anyhow::Result<()> {
         Err(_) => return Ok(()),
     };
 
-    let (summary, samples) = collect_samples_and_summary(&docker, true).await?;
+    let (summary, samples) = collect_samples_and_summary(&docker).await?;
     let timestamp = Utc::now().timestamp();
     let mut tx = state.metadata_db.begin().await?;
 
@@ -77,24 +143,24 @@ async fn collect_and_store_stats(state: &AppState) -> anyhow::Result<()> {
         r#"
         INSERT INTO docker_metrics_summary (
             created_at,
-            cpu_percent,
-            memory_usage_bytes,
+            cpu_core_percent,
+            cpu_host_percent,
+            memory_working_set_bytes,
             memory_limit_bytes,
             memory_percent,
-            network_rx_bytes,
-            network_tx_bytes,
-            container_count
+            running_container_count,
+            sampled_container_count
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(timestamp)
-    .bind(summary.cpu_percent)
-    .bind(summary.memory_usage_bytes as i64)
+    .bind(summary.cpu_core_percent)
+    .bind(summary.cpu_host_percent)
+    .bind(summary.memory_working_set_bytes as i64)
     .bind(summary.memory_limit_bytes as i64)
     .bind(summary.memory_percent)
-    .bind(summary.network_rx_bytes as i64)
-    .bind(summary.network_tx_bytes as i64)
-    .bind(summary.container_count as i64)
+    .bind(summary.running_container_count as i64)
+    .bind(summary.sampled_container_count as i64)
     .execute(&mut *tx)
     .await?;
 
@@ -105,8 +171,8 @@ async fn collect_and_store_stats(state: &AppState) -> anyhow::Result<()> {
                 INSERT INTO docker_metrics_container (
                     container_id,
                     created_at,
-                    cpu_percent,
-                    memory_usage_bytes,
+                    cpu_core_percent,
+                    memory_working_set_bytes,
                     memory_limit_bytes,
                     memory_percent,
                     network_rx_bytes,
@@ -116,8 +182,8 @@ async fn collect_and_store_stats(state: &AppState) -> anyhow::Result<()> {
             )
             .bind(id)
             .bind(timestamp)
-            .bind(sample.cpu_percent)
-            .bind(sample.memory_usage_bytes as i64)
+            .bind(sample.cpu_core_percent)
+            .bind(sample.memory_working_set_bytes as i64)
             .bind(sample.memory_limit_bytes as i64)
             .bind(sample.memory_percent)
             .bind(sample.network_rx_bytes as i64)
@@ -130,15 +196,17 @@ async fn collect_and_store_stats(state: &AppState) -> anyhow::Result<()> {
     tx.commit().await?;
     debug!(
         "Docker stats sampled: containers={}, timestamp={}",
-        summary.container_count, timestamp
+        summary.sampled_container_count, timestamp
     );
     Ok(())
 }
 
 async fn collect_samples_and_summary(
     docker: &bollard::Docker,
-    include_network: bool,
-) -> anyhow::Result<(ResourceUsageSummary, Vec<(String, ResourceUsageSummary)>)> {
+) -> anyhow::Result<(
+    HostResourceUsageSummary,
+    Vec<(String, ContainerResourceUsageSummary)>,
+)> {
     let options = query_parameters::ListContainersOptionsBuilder::new()
         .all(true)
         .build();
@@ -149,9 +217,10 @@ async fn collect_samples_and_summary(
         .filter_map(|container| container.id)
         .collect();
 
-    let samples: Vec<(String, ResourceUsageSummary)> = stream::iter(running_ids)
+    let running_container_count = running_ids.len();
+    let samples: Vec<(String, ContainerResourceUsageSummary)> = stream::iter(running_ids)
         .map(|id| async {
-            let summary = fetch_container_stats_snapshot(docker, &id, include_network).await;
+            let summary = fetch_container_stats_snapshot(docker, &id).await;
             summary.map(|value| (id, value))
         })
         .buffer_unordered(6)
@@ -159,47 +228,53 @@ async fn collect_samples_and_summary(
         .collect()
         .await;
 
-    let mut cpu_percent_total = 0.0_f64;
-    let mut memory_usage_bytes = 0_u64;
+    let sampled_container_count = samples.len();
+    let mut cpu_core_percent = 0.0_f64;
+    let mut memory_working_set_bytes = 0_u64;
     let mut memory_limit_bytes = 0_u64;
-    let mut network_rx_bytes = 0_u64;
-    let mut network_tx_bytes = 0_u64;
-    let mut running_count = 0_usize;
 
     for (_, sample) in &samples {
-        running_count += 1;
-        cpu_percent_total += sample.cpu_percent;
-        memory_usage_bytes += sample.memory_usage_bytes;
+        cpu_core_percent += sample.cpu_core_percent;
+        memory_working_set_bytes += sample.memory_working_set_bytes;
         memory_limit_bytes = memory_limit_bytes.max(sample.memory_limit_bytes);
-        network_rx_bytes += sample.network_rx_bytes;
-        network_tx_bytes += sample.network_tx_bytes;
     }
 
-    if let Ok(info) = docker.info().await
-        && let Some(mem_total) = info.mem_total
-        && mem_total > 0
-    {
-        memory_limit_bytes = mem_total as u64;
-    }
-
-    if memory_limit_bytes > 0 {
-        memory_usage_bytes = memory_usage_bytes.min(memory_limit_bytes);
+    let mut online_cpus = 1_u64;
+    if let Ok(info) = docker.info().await {
+        if let Some(mem_total) = info.mem_total
+            && mem_total > 0
+        {
+            memory_limit_bytes = mem_total as u64;
+        }
+        if let Some(ncpu) = info.ncpu
+            && ncpu > 0
+        {
+            online_cpus = ncpu as u64;
+        }
     }
 
     let memory_percent = if memory_limit_bytes > 0 {
-        (memory_usage_bytes as f64 / memory_limit_bytes as f64) * 100.0
+        ((memory_working_set_bytes as f64 / memory_limit_bytes as f64) * 100.0).clamp(0.0, 100.0)
     } else {
         0.0
     };
+    let cpu_host_percent = normalize_cpu_host_percent(cpu_core_percent, online_cpus);
+    let status = if sampled_container_count < running_container_count {
+        ResourceSampleStatus::Partial
+    } else {
+        ResourceSampleStatus::Fresh
+    };
 
-    let summary = ResourceUsageSummary {
-        cpu_percent: cpu_percent_total,
-        memory_usage_bytes,
+    let summary = HostResourceUsageSummary {
+        status,
+        collected_at: Some(Utc::now().timestamp()),
+        running_container_count,
+        sampled_container_count,
+        cpu_host_percent,
+        cpu_core_percent,
+        memory_working_set_bytes,
         memory_limit_bytes,
         memory_percent,
-        network_rx_bytes,
-        network_tx_bytes,
-        container_count: running_count,
     };
 
     Ok((summary, samples))
@@ -225,8 +300,7 @@ async fn cleanup_old_stats(state: &AppState) -> anyhow::Result<()> {
 async fn fetch_container_stats_snapshot(
     docker: &bollard::Docker,
     id: &str,
-    include_network: bool,
-) -> Option<ResourceUsageSummary> {
+) -> Option<ContainerResourceUsageSummary> {
     let stats_options = query_parameters::StatsOptionsBuilder::new()
         .stream(false)
         .one_shot(true)
@@ -237,12 +311,23 @@ async fn fetch_container_stats_snapshot(
         .ok()??
         .ok()?;
 
-    let cpu_percent = calculate_cpu_percent(&sample);
+    let cpu_core_percent = calculate_cpu_percent(&sample);
 
-    let (mut memory_usage_bytes, mut memory_limit_bytes) = (0_u64, 0_u64);
+    let (mut memory_working_set_bytes, mut memory_limit_bytes) = (0_u64, 0_u64);
     if let Some(memory_stats) = &sample.memory_stats {
         if let Some(usage) = memory_stats.usage {
-            memory_usage_bytes = usage;
+            let reclaimable_cache = memory_stats
+                .stats
+                .as_ref()
+                .and_then(|stats| {
+                    stats
+                        .get("total_inactive_file")
+                        .or_else(|| stats.get("inactive_file"))
+                        .or_else(|| stats.get("cache"))
+                })
+                .copied()
+                .unwrap_or(0);
+            memory_working_set_bytes = usage.saturating_sub(reclaimable_cache);
         }
         if let Some(limit) = memory_stats.limit {
             memory_limit_bytes = limit;
@@ -251,7 +336,7 @@ async fn fetch_container_stats_snapshot(
 
     let mut network_rx_bytes = 0_u64;
     let mut network_tx_bytes = 0_u64;
-    if include_network && let Some(networks) = sample.networks {
+    if let Some(networks) = sample.networks {
         for network in networks.values() {
             if let Some(rx) = network.rx_bytes {
                 network_rx_bytes += rx;
@@ -263,20 +348,24 @@ async fn fetch_container_stats_snapshot(
     }
 
     let memory_percent = if memory_limit_bytes > 0 {
-        (memory_usage_bytes as f64 / memory_limit_bytes as f64) * 100.0
+        ((memory_working_set_bytes as f64 / memory_limit_bytes as f64) * 100.0).clamp(0.0, 100.0)
     } else {
         0.0
     };
 
-    Some(ResourceUsageSummary {
-        cpu_percent,
-        memory_usage_bytes,
+    Some(ContainerResourceUsageSummary {
+        cpu_core_percent,
+        memory_working_set_bytes,
         memory_limit_bytes,
         memory_percent,
         network_rx_bytes,
         network_tx_bytes,
-        container_count: 1,
     })
+}
+
+/// 将 Docker 多核 CPU 百分比归一化为宿主机总容量占比。
+fn normalize_cpu_host_percent(cpu_core_percent: f64, online_cpus: u64) -> f64 {
+    (cpu_core_percent / online_cpus.max(1) as f64).clamp(0.0, 100.0)
 }
 
 fn calculate_cpu_percent(stats: &bollard::models::ContainerStatsResponse) -> f64 {
@@ -313,8 +402,11 @@ fn calculate_cpu_percent(stats: &bollard::models::ContainerStatsResponse) -> f64
 
 #[cfg(test)]
 mod tests {
-    use super::{calculate_cpu_percent, cleanup_old_stats};
+    use super::{
+        calculate_cpu_percent, cleanup_old_stats, normalize_cpu_host_percent, resolve_sample_status,
+    };
     use crate::config;
+    use crate::models::docker::ResourceSampleStatus;
     use crate::test_support::setup_test_state;
     use bollard::models::{ContainerCpuStats, ContainerCpuUsage, ContainerStatsResponse};
     use chrono::Utc;
@@ -374,6 +466,28 @@ mod tests {
         assert!((percent - 100.0).abs() < 0.0001);
     }
 
+    #[test]
+    fn normalize_cpu_percent_uses_host_capacity() {
+        assert_eq!(normalize_cpu_host_percent(400.0, 8), 50.0);
+        assert_eq!(normalize_cpu_host_percent(900.0, 8), 100.0);
+    }
+
+    #[test]
+    fn sample_status_distinguishes_partial_stale_and_idle() {
+        assert_eq!(
+            resolve_sample_status(100, 90, 2, 1),
+            ResourceSampleStatus::Partial
+        );
+        assert_eq!(
+            resolve_sample_status(1000, 0, 2, 2),
+            ResourceSampleStatus::Stale
+        );
+        assert_eq!(
+            resolve_sample_status(100, 90, 0, 0),
+            ResourceSampleStatus::Fresh
+        );
+    }
+
     #[tokio::test]
     async fn cleanup_old_stats_removes_expired_rows() {
         let state = setup_test_state().await;
@@ -385,18 +499,18 @@ mod tests {
         sqlx::query(
             r#"
             INSERT INTO docker_metrics_summary (
-                created_at, cpu_percent, memory_usage_bytes, memory_limit_bytes, memory_percent,
-                network_rx_bytes, network_tx_bytes, container_count
+                created_at, cpu_core_percent, cpu_host_percent, memory_working_set_bytes,
+                memory_limit_bytes, memory_percent, running_container_count, sampled_container_count
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(old)
         .bind(1.0)
+        .bind(1.0)
         .bind(10_i64)
         .bind(20_i64)
         .bind(50.0)
-        .bind(5_i64)
-        .bind(6_i64)
+        .bind(1_i64)
         .bind(1_i64)
         .execute(&state.metadata_db)
         .await
@@ -405,18 +519,18 @@ mod tests {
         sqlx::query(
             r#"
             INSERT INTO docker_metrics_summary (
-                created_at, cpu_percent, memory_usage_bytes, memory_limit_bytes, memory_percent,
-                network_rx_bytes, network_tx_bytes, container_count
+                created_at, cpu_core_percent, cpu_host_percent, memory_working_set_bytes,
+                memory_limit_bytes, memory_percent, running_container_count, sampled_container_count
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(recent)
         .bind(2.0)
+        .bind(2.0)
         .bind(11_i64)
         .bind(21_i64)
         .bind(52.0)
-        .bind(7_i64)
-        .bind(8_i64)
+        .bind(2_i64)
         .bind(2_i64)
         .execute(&state.metadata_db)
         .await
@@ -425,7 +539,7 @@ mod tests {
         sqlx::query(
             r#"
             INSERT INTO docker_metrics_container (
-                container_id, created_at, cpu_percent, memory_usage_bytes, memory_limit_bytes,
+                container_id, created_at, cpu_core_percent, memory_working_set_bytes, memory_limit_bytes,
                 memory_percent, network_rx_bytes, network_tx_bytes
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             "#,
@@ -445,7 +559,7 @@ mod tests {
         sqlx::query(
             r#"
             INSERT INTO docker_metrics_container (
-                container_id, created_at, cpu_percent, memory_usage_bytes, memory_limit_bytes,
+                container_id, created_at, cpu_core_percent, memory_working_set_bytes, memory_limit_bytes,
                 memory_percent, network_rx_bytes, network_tx_bytes
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             "#,

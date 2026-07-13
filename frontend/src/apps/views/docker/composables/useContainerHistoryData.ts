@@ -19,7 +19,7 @@ export const useContainerHistoryData = ({
 }: UseContainerHistoryDataOptions) => {
   const historyStatus = ref<HistoryStatus>('idle')
   const historyError = ref<string | null>(null)
-  const containerHistory = ref<dockerType.ResourceUsageHistory | null>(null)
+  const containerHistory = ref<dockerType.ContainerResourceUsageHistory | null>(null)
   const dockerClient = computed(() => dockerApi.forNode(nodeId.value))
 
   let requestVersion = 0
@@ -46,7 +46,9 @@ export const useContainerHistoryData = ({
     if (selectedContainerId.value !== id) return
 
     if (res.success && res.data) {
-      containerHistory.value = res.data
+      containerHistory.value = res.data.containers[0]
+        ? { points: res.data.containers[0].points }
+        : { points: [] }
       historyStatus.value = 'ready'
       return
     }

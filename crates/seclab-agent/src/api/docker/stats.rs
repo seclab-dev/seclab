@@ -3,7 +3,7 @@
 use crate::config;
 use crate::models::docker;
 use crate::state::AppState;
-use crate::types::{ApiResponse, ApiResult};
+use crate::types::{ApiError, ApiResponse, ApiResult};
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
@@ -24,20 +24,20 @@ pub struct StatsHistoryQuery {
 #[derive(Debug, FromRow)]
 struct SummaryRow {
     created_at: i64,
-    cpu_percent: f64,
-    memory_usage_bytes: i64,
+    cpu_core_percent: f64,
+    cpu_host_percent: f64,
+    memory_working_set_bytes: i64,
     memory_limit_bytes: i64,
     memory_percent: f64,
-    network_rx_bytes: i64,
-    network_tx_bytes: i64,
-    container_count: i64,
+    running_container_count: i64,
+    sampled_container_count: i64,
 }
 
 #[derive(Debug, FromRow)]
 struct ContainerRow {
     created_at: i64,
-    cpu_percent: f64,
-    memory_usage_bytes: i64,
+    cpu_core_percent: f64,
+    memory_working_set_bytes: i64,
     memory_limit_bytes: i64,
     memory_percent: f64,
     network_rx_bytes: i64,
@@ -56,13 +56,13 @@ pub async fn history(
         r#"
         SELECT
             created_at,
-            cpu_percent,
-            memory_usage_bytes,
+            cpu_core_percent,
+            cpu_host_percent,
+            memory_working_set_bytes,
             memory_limit_bytes,
             memory_percent,
-            network_rx_bytes,
-            network_tx_bytes,
-            container_count
+            running_container_count,
+            sampled_container_count
         FROM docker_metrics_summary
         WHERE created_at >= ?
         ORDER BY created_at ASC
@@ -73,7 +73,7 @@ pub async fn history(
     .await?;
 
     let points = rows.into_iter().map(row_to_summary_point).collect();
-    let response = docker::ResourceUsageHistory { points };
+    let response = docker::HostResourceUsageHistory { points };
     Ok(
         ApiResponse::success_with_raw("Resource usage history loaded", Some(response))
             .into_response(),
@@ -93,8 +93,8 @@ pub async fn container_summary(
         r#"
         SELECT
             created_at,
-            cpu_percent,
-            memory_usage_bytes,
+            cpu_core_percent,
+            memory_working_set_bytes,
             memory_limit_bytes,
             memory_percent,
             network_rx_bytes,
@@ -109,13 +109,14 @@ pub async fn container_summary(
     .fetch_optional(&state.metadata_db)
     .await?;
 
-    let summary = row
-        .map(row_to_container_summary)
-        .unwrap_or_else(empty_container_summary);
-    Ok(
-        ApiResponse::success_with_raw("Container resource summary loaded", Some(summary))
-            .into_response(),
-    )
+    match row {
+        Some(row) => Ok(ApiResponse::success_with_raw(
+            "Container resource summary loaded",
+            Some(row_to_container_summary(row)),
+        )
+        .into_response()),
+        None => Err(ApiError::NotFound),
+    }
 }
 
 /// 返回单个容器在时间窗口内的资源趋势。
@@ -131,8 +132,8 @@ pub async fn container_history(
         r#"
         SELECT
             created_at,
-            cpu_percent,
-            memory_usage_bytes,
+            cpu_core_percent,
+            memory_working_set_bytes,
             memory_limit_bytes,
             memory_percent,
             network_rx_bytes,
@@ -148,8 +149,14 @@ pub async fn container_history(
     .fetch_all(&state.metadata_db)
     .await?;
 
-    let points = rows.into_iter().map(row_to_container_point).collect();
-    let response = docker::ResourceUsageHistory { points };
+    let points = rows_to_container_points(rows);
+    let response = docker::ContainerStatsHistoryAllResponse {
+        containers: vec![docker::ContainerStatsHistoryAllItem {
+            id: id.clone(),
+            name: id,
+            points,
+        }],
+    };
     Ok(
         ApiResponse::success_with_raw("Container resource history loaded", Some(response))
             .into_response(),
@@ -159,45 +166,19 @@ pub async fn container_history(
 /// 批量返回多个容器的历史趋势，并补齐容器名称。
 pub async fn container_histories(
     State(state): State<Arc<AppState>>,
-    payload: Option<Json<StatsHistoryQuery>>,
+    Json(payload): Json<docker::ContainerStatsHistoryQuery>,
 ) -> ApiResult<Response> {
     info!("Requesting batch container resource usage history (cache)");
-    let hours = clamp_hours(payload.as_ref().and_then(|value| value.hours));
-    let cutoff = Utc::now().timestamp() - hours * 3600;
-
-    let rows = sqlx::query_as::<_, ContainerHistoryRow>(
-        r#"
-        SELECT
-            container_id,
-            created_at,
-            cpu_percent,
-            memory_usage_bytes,
-            memory_limit_bytes,
-            memory_percent,
-            network_rx_bytes,
-            network_tx_bytes
-        FROM docker_metrics_container
-        WHERE created_at >= ?
-        ORDER BY container_id ASC, created_at ASC
-        "#,
-    )
-    .bind(cutoff)
-    .fetch_all(&state.metadata_db)
-    .await?;
-
-    let mut points_map: HashMap<String, Vec<docker::ResourceUsagePoint>> = HashMap::new();
-    for row in rows {
-        let points = points_map.entry(row.container_id.clone()).or_default();
-        points.push(row_to_container_point(ContainerRow {
-            created_at: row.created_at,
-            cpu_percent: row.cpu_percent,
-            memory_usage_bytes: row.memory_usage_bytes,
-            memory_limit_bytes: row.memory_limit_bytes,
-            memory_percent: row.memory_percent,
-            network_rx_bytes: row.network_rx_bytes,
-            network_tx_bytes: row.network_tx_bytes,
-        }));
+    let mut ids = payload.ids;
+    ids.sort();
+    ids.dedup();
+    if ids.len() > 5 {
+        return Err(ApiError::BadRequest(
+            "At most 5 containers can be queried at once".to_string(),
+        ));
     }
+    let hours = clamp_hours(payload.hours);
+    let cutoff = Utc::now().timestamp() - hours * 3600;
 
     let docker = state.docker_client().await?;
     let options = query_parameters::ListContainersOptionsBuilder::new()
@@ -217,14 +198,33 @@ pub async fn container_histories(
         }
     }
 
-    let mut containers: Vec<docker::ContainerStatsHistoryAllItem> = points_map
-        .into_iter()
-        .map(|(id, points)| docker::ContainerStatsHistoryAllItem {
+    let mut containers = Vec::with_capacity(ids.len());
+    for id in ids {
+        let rows = sqlx::query_as::<_, ContainerRow>(
+            r#"
+            SELECT
+                created_at,
+                cpu_core_percent,
+                memory_working_set_bytes,
+                memory_limit_bytes,
+                memory_percent,
+                network_rx_bytes,
+                network_tx_bytes
+            FROM docker_metrics_container
+            WHERE container_id = ? AND created_at >= ?
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(&id)
+        .bind(cutoff)
+        .fetch_all(&state.metadata_db)
+        .await?;
+        containers.push(docker::ContainerStatsHistoryAllItem {
             name: name_map.get(&id).cloned().unwrap_or_else(|| id.clone()),
             id,
-            points,
-        })
-        .collect();
+            points: rows_to_container_points(rows),
+        });
+    }
     containers.sort_by(|a, b| a.name.cmp(&b.name));
 
     let response = docker::ContainerStatsHistoryAllResponse { containers };
@@ -232,18 +232,6 @@ pub async fn container_histories(
         ApiResponse::success_with_raw("Container resource history loaded", Some(response))
             .into_response(),
     )
-}
-
-#[derive(Debug, FromRow)]
-struct ContainerHistoryRow {
-    container_id: String,
-    created_at: i64,
-    cpu_percent: f64,
-    memory_usage_bytes: i64,
-    memory_limit_bytes: i64,
-    memory_percent: f64,
-    network_rx_bytes: i64,
-    network_tx_bytes: i64,
 }
 
 /// 批量返回多个容器的最新资源统计快照。
@@ -255,15 +243,15 @@ pub async fn container_summaries(
         "Requesting batch container resource usage summary (cache): {} ids",
         payload.ids.len()
     );
-    let mut summaries: HashMap<String, docker::ResourceUsageSummary> = HashMap::new();
+    let mut summaries: HashMap<String, docker::ContainerResourceUsageSummary> = HashMap::new();
 
     for id in payload.ids {
         let row = sqlx::query_as::<_, ContainerRow>(
             r#"
             SELECT
                 created_at,
-                cpu_percent,
-                memory_usage_bytes,
+                cpu_core_percent,
+                memory_working_set_bytes,
                 memory_limit_bytes,
                 memory_percent,
                 network_rx_bytes,
@@ -296,52 +284,97 @@ fn clamp_hours(value: Option<i64>) -> i64 {
     hours.min(max_hours)
 }
 
-fn empty_container_summary() -> docker::ResourceUsageSummary {
-    docker::ResourceUsageSummary {
-        cpu_percent: 0.0,
-        memory_usage_bytes: 0,
-        memory_limit_bytes: 0,
-        memory_percent: 0.0,
-        network_rx_bytes: 0,
-        network_tx_bytes: 0,
-        container_count: 0,
-    }
-}
-
-fn row_to_container_summary(row: ContainerRow) -> docker::ResourceUsageSummary {
-    docker::ResourceUsageSummary {
-        cpu_percent: row.cpu_percent,
-        memory_usage_bytes: row.memory_usage_bytes as u64,
+fn row_to_container_summary(row: ContainerRow) -> docker::ContainerResourceUsageSummary {
+    docker::ContainerResourceUsageSummary {
+        cpu_core_percent: row.cpu_core_percent,
+        memory_working_set_bytes: row.memory_working_set_bytes as u64,
         memory_limit_bytes: row.memory_limit_bytes as u64,
         memory_percent: row.memory_percent,
         network_rx_bytes: row.network_rx_bytes as u64,
         network_tx_bytes: row.network_tx_bytes as u64,
-        container_count: 1,
     }
 }
 
-fn row_to_summary_point(row: SummaryRow) -> docker::ResourceUsagePoint {
-    docker::ResourceUsagePoint {
+fn row_to_summary_point(row: SummaryRow) -> docker::HostResourceUsagePoint {
+    docker::HostResourceUsagePoint {
         timestamp: row.created_at,
-        cpu_percent: row.cpu_percent,
-        memory_usage_bytes: row.memory_usage_bytes as u64,
+        cpu_host_percent: row.cpu_host_percent,
+        cpu_core_percent: row.cpu_core_percent,
+        memory_working_set_bytes: row.memory_working_set_bytes as u64,
         memory_limit_bytes: row.memory_limit_bytes as u64,
         memory_percent: row.memory_percent,
-        network_rx_bytes: row.network_rx_bytes as u64,
-        network_tx_bytes: row.network_tx_bytes as u64,
-        container_count: Some(row.container_count as usize),
+        running_container_count: row.running_container_count as usize,
+        sampled_container_count: row.sampled_container_count as usize,
     }
 }
 
-fn row_to_container_point(row: ContainerRow) -> docker::ResourceUsagePoint {
-    docker::ResourceUsagePoint {
-        timestamp: row.created_at,
-        cpu_percent: row.cpu_percent,
-        memory_usage_bytes: row.memory_usage_bytes as u64,
-        memory_limit_bytes: row.memory_limit_bytes as u64,
-        memory_percent: row.memory_percent,
-        network_rx_bytes: row.network_rx_bytes as u64,
-        network_tx_bytes: row.network_tx_bytes as u64,
-        container_count: None,
+fn rows_to_container_points(rows: Vec<ContainerRow>) -> Vec<docker::ContainerResourceUsagePoint> {
+    let max_gap_seconds = (config::stats_sample_interval().as_secs() as i64 * 5) / 2;
+    let mut previous: Option<&ContainerRow> = None;
+    let mut points = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let (network_rx_bytes_per_second, network_tx_bytes_per_second) = previous
+            .filter(|previous| {
+                let gap = row.created_at - previous.created_at;
+                gap > 0
+                    && gap <= max_gap_seconds
+                    && row.network_rx_bytes >= previous.network_rx_bytes
+                    && row.network_tx_bytes >= previous.network_tx_bytes
+            })
+            .map(|previous| {
+                let elapsed = (row.created_at - previous.created_at) as f64;
+                (
+                    Some((row.network_rx_bytes - previous.network_rx_bytes) as f64 / elapsed),
+                    Some((row.network_tx_bytes - previous.network_tx_bytes) as f64 / elapsed),
+                )
+            })
+            .unwrap_or((None, None));
+        points.push(docker::ContainerResourceUsagePoint {
+            timestamp: row.created_at,
+            cpu_core_percent: row.cpu_core_percent,
+            memory_working_set_bytes: row.memory_working_set_bytes as u64,
+            memory_limit_bytes: row.memory_limit_bytes as u64,
+            memory_percent: row.memory_percent,
+            network_rx_bytes_per_second,
+            network_tx_bytes_per_second,
+        });
+        previous = Some(row);
+    }
+    points
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ContainerRow, rows_to_container_points};
+
+    fn row(created_at: i64, rx: i64, tx: i64) -> ContainerRow {
+        ContainerRow {
+            created_at,
+            cpu_core_percent: 120.0,
+            memory_working_set_bytes: 1024,
+            memory_limit_bytes: 4096,
+            memory_percent: 25.0,
+            network_rx_bytes: rx,
+            network_tx_bytes: tx,
+        }
+    }
+
+    #[test]
+    fn network_rate_handles_normal_counter_growth() {
+        let points = rows_to_container_points(vec![row(100, 100, 200), row(160, 700, 500)]);
+        assert_eq!(points[0].network_rx_bytes_per_second, None);
+        assert_eq!(points[1].network_rx_bytes_per_second, Some(10.0));
+        assert_eq!(points[1].network_tx_bytes_per_second, Some(5.0));
+    }
+
+    #[test]
+    fn network_rate_ignores_counter_reset_and_long_gap() {
+        let points = rows_to_container_points(vec![
+            row(100, 1000, 1000),
+            row(160, 100, 100),
+            row(400, 500, 500),
+        ]);
+        assert_eq!(points[1].network_rx_bytes_per_second, None);
+        assert_eq!(points[2].network_rx_bytes_per_second, None);
     }
 }

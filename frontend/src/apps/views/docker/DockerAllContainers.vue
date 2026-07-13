@@ -31,13 +31,12 @@ defineProps<{
     string,
     {
       data: {
-        cpuPercent: number
-        memoryUsageBytes: number
+        cpuCorePercent: number
+        memoryWorkingSetBytes: number
         memoryLimitBytes: number
         memoryPercent: number
         networkRxBytes: number
         networkTxBytes: number
-        containerCount: number
       }
       fetchedAt: number
     }

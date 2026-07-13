@@ -161,10 +161,14 @@ const createScopedDockerApi = (nodeId?: string) => ({
     return http.get(buildDockerPath(`/agent/docker/volumes/${encodeURIComponent(name)}`, nodeId))
   },
   dfSystem: () => {
-    return http.get(buildDockerPath('/agent/docker/system/df', nodeId))
+    return http.get<docker.DockerDiskUsageSummary>(
+      buildDockerPath('/agent/docker/system/df', nodeId),
+    )
   },
   pruneSystem: () => {
-    return http.post(buildDockerPath('/agent/docker/system/prune', nodeId))
+    return http.post(buildDockerPath('/agent/docker/system/prune', nodeId), undefined, {
+      timeout: 600000,
+    })
   },
   /** 获取所有网络的详细信息。 */
   listNetworks: () => {
@@ -203,26 +207,26 @@ const createScopedDockerApi = (nodeId?: string) => ({
     )
   },
   fetchResourceUsageHistory: (hours?: number) => {
-    return http.post<docker.ResourceUsageHistory>(
+    return http.post(
       buildDockerPath('/agent/docker/stats/history', nodeId),
       hours ? { hours } : undefined,
     )
   },
   fetchContainerResourceUsageSummary: (id: string) => {
-    return http.get<docker.ResourceUsageSummary>(
+    return http.get<docker.ContainerResourceUsageSummary>(
       buildDockerPath(`/agent/docker/containers/${encodeURIComponent(id)}/stats/summary`, nodeId),
     )
   },
   fetchContainerResourceUsageHistory: (id: string, hours?: number) => {
-    return http.post<docker.ResourceUsageHistory>(
+    return http.post<docker.ContainerStatsHistoryAllResponse>(
       buildDockerPath(`/agent/docker/containers/${encodeURIComponent(id)}/stats/history`, nodeId),
       hours ? { hours } : undefined,
     )
   },
-  fetchContainerResourceUsageHistoryAll: (hours?: number) => {
+  fetchContainerResourceUsageHistoryAll: (payload: docker.ContainerStatsHistoryQuery) => {
     return http.post<docker.ContainerStatsHistoryAllResponse>(
       buildDockerPath('/agent/docker/containers/stats/history', nodeId),
-      hours ? { hours } : undefined,
+      payload,
     )
   },
   fetchContainerResourceUsageSummaries: (payload: docker.ContainerStatsBatchRequest) => {

@@ -297,21 +297,11 @@ onUnmounted(() => {
       <component
         v-else
         :is="activeComponent"
-        :docker-status="store.dockerStatus"
-        :running-container-count="store.runningContainerCount"
-        :total-image-count="store.totalImageCount"
-        :total-container-count="store.totalContainerCount"
-        :project-running-count="store.projectRunningCount"
-        :project-total-count="store.projectTotalCount"
         :containers="store.containers"
         :projects="store.composeProjects"
         :images-list="store.imagesList"
         :volumes="store.volumes"
         :networks="store.networks"
-        :resource-usage="store.resourceUsage"
-        :running-containers="store.overviewContainers"
-        :selected-container-ids="store.overviewSelectedContainerIds"
-        :resource-usage-history-map="store.overviewHistoryMap"
         :container-resource-stats="store.containerResourceStats"
         :is-create-active="
           activeMenu === 'containers'
@@ -347,7 +337,6 @@ onUnmounted(() => {
         @update:container-form="(v: typeof store.containerForm) => (store.containerForm = v)"
         @cancel-project-create="store.cancelProjectCreate"
         @submit-project-create="store.submitProjectForm"
-        @update:selected-container-ids="store.updateOverviewSelectedContainers"
         @update:project-form-name="(v: string) => (store.projectFormName = v)"
         @update:project-form-compose="
           (v: string) => {

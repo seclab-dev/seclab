@@ -35,7 +35,7 @@ export const useContainerHistoryCharts = ({ t }: UseContainerHistoryChartsOption
 
   const formatPercent = (value?: number) => {
     if (value === undefined) return '0.0%'
-    return `${Math.min(Math.max(value, 0), 100).toFixed(1)}%`
+    return `${Math.max(value, 0).toFixed(1)}%`
   }
 
   const formatBytes = (bytes?: number) => {
@@ -111,7 +111,7 @@ export const useContainerHistoryCharts = ({ t }: UseContainerHistoryChartsOption
     },
     yAxis: {
       type: 'value',
-      max: 100,
+      min: 0,
       axisLabel: {
         formatter: (val: number) => `${val.toFixed(0)}%`,
         fontSize: 10,
@@ -123,7 +123,8 @@ export const useContainerHistoryCharts = ({ t }: UseContainerHistoryChartsOption
       {
         type: 'line',
         data: values,
-        smooth: true,
+        smooth: false,
+        connectNulls: false,
         showSymbol: false,
         lineStyle: { color },
         areaStyle: { color: `${color}22` },
@@ -182,7 +183,8 @@ export const useContainerHistoryCharts = ({ t }: UseContainerHistoryChartsOption
       {
         type: 'line',
         data: percents,
-        smooth: true,
+        smooth: false,
+        connectNulls: false,
         showSymbol: false,
         lineStyle: { color: '#2f9e44' },
         areaStyle: { color: 'rgba(47,158,68,0.12)' },
@@ -190,7 +192,11 @@ export const useContainerHistoryCharts = ({ t }: UseContainerHistoryChartsOption
     ],
   })
 
-  const buildNetworkLineOption = (labels: string[], rxSeries: number[], txSeries: number[]) => ({
+  const buildNetworkLineOption = (
+    labels: string[],
+    rxSeries: Array<number | null>,
+    txSeries: Array<number | null>,
+  ) => ({
     title: {
       text: t('app.docker.containers.networkTrend'),
       left: 12,
@@ -199,11 +205,16 @@ export const useContainerHistoryCharts = ({ t }: UseContainerHistoryChartsOption
     },
     tooltip: {
       trigger: 'axis',
-      formatter: (params: Array<{ seriesName: string; data: number; dataIndex: number }>) => {
+      formatter: (
+        params: Array<{ seriesName: string; data: number | null; dataIndex: number }>,
+      ) => {
         const first = params[0]
         if (!first) return ''
         const label = labels[first.dataIndex] || ''
-        const lines = params.map((item) => `${item.seriesName}: ${formatBytesPerSecond(item.data)}`)
+        const lines = params.map(
+          (item) =>
+            `${item.seriesName}: ${item.data === null ? '-' : formatBytesPerSecond(item.data)}`,
+        )
         return [label, ...lines].join('<br/>')
       },
     },
@@ -234,7 +245,8 @@ export const useContainerHistoryCharts = ({ t }: UseContainerHistoryChartsOption
         type: 'line',
         name: t('app.docker.containers.download'),
         data: rxSeries,
-        smooth: true,
+        smooth: false,
+        connectNulls: false,
         showSymbol: false,
         lineStyle: { color: '#1d63ed' },
         areaStyle: { color: 'rgba(29,99,237,0.12)' },
@@ -243,7 +255,8 @@ export const useContainerHistoryCharts = ({ t }: UseContainerHistoryChartsOption
         type: 'line',
         name: t('app.docker.containers.upload'),
         data: txSeries,
-        smooth: true,
+        smooth: false,
+        connectNulls: false,
         showSymbol: false,
         lineStyle: { color: '#f39c12' },
         areaStyle: { color: 'rgba(243,156,18,0.12)' },
@@ -278,7 +291,7 @@ export const useContainerHistoryCharts = ({ t }: UseContainerHistoryChartsOption
     networkHistoryChart?.clear()
   }
 
-  const renderHistory = async (history: dockerType.ResourceUsageHistory | null) => {
+  const renderHistory = async (history: dockerType.ContainerResourceUsageHistory | null) => {
     await initCharts()
 
     const points = history?.points || []
@@ -288,26 +301,13 @@ export const useContainerHistoryCharts = ({ t }: UseContainerHistoryChartsOption
     }
 
     const labels = points.map((point) => formatTimeLabel(point.timestamp))
-    const cpuSeries = points.map((point) => point.cpuPercent)
+    const cpuSeries = points.map((point) => point.cpuCorePercent)
     const memSeries = points.map((point) => point.memoryPercent)
-    const memUsage = points.map((point) => point.memoryUsageBytes)
+    const memUsage = points.map((point) => point.memoryWorkingSetBytes)
     const memLimit = points.map((point) => point.memoryLimitBytes)
 
-    const rxSeries: number[] = [0]
-    const txSeries: number[] = [0]
-
-    for (let i = 1; i < points.length; i += 1) {
-      const prev = points[i - 1]
-      const current = points[i]
-      if (!prev || !current) {
-        rxSeries.push(0)
-        txSeries.push(0)
-        continue
-      }
-      const deltaSeconds = Math.max(current.timestamp - prev.timestamp, 1)
-      rxSeries.push((current.networkRxBytes - prev.networkRxBytes) / deltaSeconds)
-      txSeries.push((current.networkTxBytes - prev.networkTxBytes) / deltaSeconds)
-    }
+    const rxSeries = points.map((point) => point.networkRxBytesPerSecond)
+    const txSeries = points.map((point) => point.networkTxBytesPerSecond)
 
     cpuHistoryChart?.setOption(
       buildPercentLineOption(t('app.docker.containers.cpuTrend'), labels, cpuSeries, '#1d63ed'),

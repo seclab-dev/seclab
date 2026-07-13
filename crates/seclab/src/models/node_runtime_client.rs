@@ -205,6 +205,7 @@ fn is_long_running_request(path: &str) -> bool {
         || path.contains("/agent/docker/install")
         || path.contains("/agent/docker/suites/install")
         || path.contains("/agent/docker/daemon/settings")
+        || path.contains("/agent/docker/system/prune")
         || is_suite_progress_stream(path)
 }
 
@@ -407,6 +408,11 @@ mod tests {
         assert!(!is_long_running_request(
             "/api/v1/agent/docker/suite/seclab-host-scanner/proxy/main/api/tasks/task_1"
         ));
+    }
+
+    #[test]
+    fn docker_system_prune_uses_long_timeout() {
+        assert!(is_long_running_request("/api/v1/agent/docker/system/prune"));
     }
 
     #[tokio::test]
