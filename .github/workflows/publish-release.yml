@@ -33,6 +33,35 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Validate release input
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid SemVer version: $RELEASE_VERSION"
+            exit 1
+          fi
+
+      - name: Resolve release source
+        id: source
+        env:
+          RELEASE_TAG: ${{ inputs.version }}
+        shell: bash
+        run: |
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            git checkout --detach "refs/tags/$RELEASE_TAG"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Reusing existing release tag: $RELEASE_TAG"
+          else
+            git fetch origin main
+            if [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]]; then
+              echo "New release tags must be created from the latest main commit"
+              exit 1
+            fi
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
         with:
@@ -45,17 +74,12 @@ jobs:
           cache: pnpm
           cache-dependency-path: frontend/pnpm-lock.yaml
 
-      - name: Validate release version
+      - name: Verify source versions
         env:
           RELEASE_VERSION: ${{ inputs.version }}
         shell: bash
         run: |
           set -euo pipefail
-
-          if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "Invalid SemVer version: $RELEASE_VERSION"
-            exit 1
-          fi
 
           CARGO_VERSION="$(grep -E '^version[[:space:]]*=' Cargo.toml | head -n 1 | awk -F '"' '{print $2}')"
           FRONTEND_VERSION="$(node --input-type=module -e "import pkg from './frontend/package.json' with { type: 'json' }; console.log(pkg.version)")"
@@ -116,6 +140,25 @@ jobs:
           fi
           echo "path=$ASSET" >> "$GITHUB_OUTPUT"
 
+      - name: Ensure release tag
+        if: steps.source.outputs.exists != 'true'
+        env:
+          RELEASE_TAG: ${{ inputs.version }}
+        shell: bash
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            git fetch origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+            if [[ "$(git rev-list -n 1 "$RELEASE_TAG")" != "$(git rev-parse HEAD)" ]]; then
+              echo "Release tag already points to a different commit: $RELEASE_TAG"
+              exit 1
+            fi
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag --annotate "$RELEASE_TAG" --message "Release $RELEASE_TAG"
+          git push origin "refs/tags/$RELEASE_TAG"
+
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -130,6 +173,7 @@ jobs:
           fi
 
           gh release create "$RELEASE_TAG" "$RELEASE_ASSET" \
+            --verify-tag \
             --title "SecLab $RELEASE_VERSION" \
             --notes "SecLab $RELEASE_VERSION" \
             "${RELEASE_FLAGS[@]}"
