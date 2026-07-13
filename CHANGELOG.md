@@ -2,6 +2,13 @@
 
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，并遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### Fixed
+
+- 套件工作负载创建前检查目标节点宿主机端口，端口冲突时不再创建容器。
+- 套件工作负载容器启动失败时自动清理已创建容器，避免遗留停止状态的容器。
+
 ## [0.1.0-alpha.2] - 2026-07-11
 
 ### 不兼容变更

@@ -13,9 +13,12 @@ use axum::{
 use base64::Engine;
 use bollard::models::{ContainerCreateBody, HostConfig, PortBinding, RestartPolicy};
 use bollard::query_parameters;
+use seclab_contracts::api::ErrorCode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
+use tokio::net::{TcpListener, UdpSocket};
 use uuid::Uuid;
 
 const SUITE_NETWORK_NAME: &str = "seclab-suite-network";
@@ -144,6 +147,7 @@ async fn start_workload(
 ) -> ApiResult<impl IntoResponse> {
     validate_suite_request(&payload.suite_id, &payload.suite_instance_id).await?;
     validate_workload_request(&payload)?;
+    ensure_workload_ports_available(&payload.ports).await?;
 
     let docker = state.docker_client().await?;
     let workload_id = format!("workload-{}", Uuid::now_v7());
@@ -193,12 +197,33 @@ async fn start_workload(
         .name(&container_name)
         .build();
     let created = docker.create_container(Some(options), config).await?;
-    docker
+    if let Err(start_error) = docker
         .start_container(
             &container_name,
             None::<query_parameters::StartContainerOptions>,
         )
-        .await?;
+        .await
+    {
+        if let Err(cleanup_error) = docker
+            .remove_container(
+                &created.id,
+                Some(query_parameters::RemoveContainerOptions {
+                    force: true,
+                    v: false,
+                    link: false,
+                }),
+            )
+            .await
+        {
+            tracing::error!(
+                container_id = %created.id,
+                container_name,
+                error = %cleanup_error,
+                "failed to remove suite workload container after start failure"
+            );
+        }
+        return Err(ApiError::from(start_error));
+    }
 
     Ok(Json(StartWorkloadResponse {
         workload_id,
@@ -490,6 +515,28 @@ fn validate_workload_request(payload: &StartWorkloadRequest) -> ApiResult<()> {
     Ok(())
 }
 
+async fn ensure_workload_ports_available(ports: &[WorkloadPort]) -> ApiResult<()> {
+    for port in ports {
+        let address = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port.host_port);
+        let result = match port.protocol.as_str() {
+            "tcp" => TcpListener::bind(address).await.map(drop),
+            "udp" => UdpSocket::bind(address).await.map(drop),
+            _ => continue,
+        };
+        if let Err(err) = result {
+            return Err(ApiError::conflict(
+                ErrorCode::SuiteWorkloadPortUnavailable,
+                "suite workload host port is unavailable",
+            )
+            .with_detail(format!(
+                "protocol={} hostPort={} error={err}",
+                port.protocol, port.host_port
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn workload_container_name(workload_name: &str, workload_id: &str) -> String {
     let suffix = compact_container_id(workload_id);
     let max_readable_len = MAX_WORKLOAD_CONTAINER_NAME_LEN
@@ -699,9 +746,12 @@ fn validate_id(label: &str, value: &str) -> ApiResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_WORKLOAD_CONTAINER_NAME_LEN, sanitize_container_segment,
-        suite_workload_cleanup_filters, workload_container_name,
+        MAX_WORKLOAD_CONTAINER_NAME_LEN, WorkloadPort, ensure_workload_ports_available,
+        sanitize_container_segment, suite_workload_cleanup_filters, workload_container_name,
     };
+    use seclab_contracts::api::ErrorCode;
+    use std::net::{Ipv4Addr, SocketAddrV4};
+    use tokio::net::{TcpListener, UdpSocket};
 
     #[test]
     fn workload_container_name_uses_rule_id_and_short_workload_id() {
@@ -755,5 +805,41 @@ mod tests {
                 "seclab.suite_instance_id=suite-instance-1".to_string()
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn workload_port_check_rejects_bound_tcp_port() {
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let err = ensure_workload_ports_available(&[WorkloadPort {
+            host_port: port,
+            container_port: port,
+            protocol: "tcp".to_string(),
+        }])
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(err.code, ErrorCode::SuiteWorkloadPortUnavailable);
+    }
+
+    #[tokio::test]
+    async fn workload_port_check_rejects_bound_udp_port() {
+        let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let err = ensure_workload_ports_available(&[WorkloadPort {
+            host_port: port,
+            container_port: port,
+            protocol: "udp".to_string(),
+        }])
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(err.code, ErrorCode::SuiteWorkloadPortUnavailable);
     }
 }
