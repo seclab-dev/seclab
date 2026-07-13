@@ -875,6 +875,11 @@ const zh: typeof en = {
         suite_network_create: '创建套件网络',
         suite_image_pull: '拉取套件镜像',
         suite_image_pull_canceled: '取消拉取套件镜像',
+        docker_image_reused_on_target: '复用节点已有镜像',
+        docker_image_transferred_from_controller: '从主控分发镜像',
+        docker_image_pulled_from_registry: '从镜像仓库拉取镜像',
+        docker_image_acquisition_cancelled: '取消获取节点镜像',
+        docker_image_acquisition_failed: '获取节点镜像失败',
       },
       tabs: {
         events: '事件日志',

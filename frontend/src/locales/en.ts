@@ -891,6 +891,11 @@ const en = {
         suite_network_create: 'Create Suite Network',
         suite_image_pull: 'Pull Suite Image',
         suite_image_pull_canceled: 'Suite Image Pull Canceled',
+        docker_image_reused_on_target: 'Reuse Existing Node Image',
+        docker_image_transferred_from_controller: 'Transfer Image from Controller',
+        docker_image_pulled_from_registry: 'Pull Image from Registry',
+        docker_image_acquisition_cancelled: 'Cancel Node Image Acquisition',
+        docker_image_acquisition_failed: 'Node Image Acquisition Failed',
       },
       tabs: {
         events: 'Event Logs',

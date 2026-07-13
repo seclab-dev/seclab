@@ -175,31 +175,9 @@ impl ImageAcquisitionService {
             task.status = ImageTaskStatus::Running;
             task.progress_percent = 2;
         });
-        if let Some(task) = self.get(task_id) {
-            let mut log = PlatformLogEntry::new(
-                "system",
-                "docker_image_acquisition",
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
-            )
-            .module(LogModule::Docker)
-            .target_type("docker_image")
-            .target_id(&task.image_ref)
-            .metadata(serde_json::json!({
-                "node_id": task.node_id,
-                "image_ref": task.image_ref,
-                "source": task.source,
-                "stage": task.stage,
-                "controller_error": task.controller_error,
-                "registry_error": task.registry_error,
-            }));
-            if task.status == ImageTaskStatus::Success {
-                log = log.set_success();
-            }
-            log.finish(&state.metadata_db);
-        }
         let result = self
             .acquire_inner(
-                state,
+                Arc::clone(&state),
                 &task.node_id,
                 &task.image_ref,
                 Arc::clone(&task.cancel),
@@ -226,6 +204,26 @@ impl ImageAcquisitionService {
                 }
             }
         });
+        if let Some(task) = self.get(task_id) {
+            let (event, message_key) = image_log_descriptor(&task.status, task.source.as_ref());
+            let mut log = PlatformLogEntry::new("system", event, IpAddr::V4(Ipv4Addr::LOCALHOST))
+                .module(LogModule::Docker)
+                .target_type("docker_image")
+                .target_id(&task.image_ref)
+                .metadata(serde_json::json!({
+                    "message_key": message_key,
+                    "node_id": task.node_id,
+                    "image_ref": task.image_ref,
+                    "source": task.source,
+                    "stage": task.stage,
+                    "controller_error": task.controller_error,
+                    "registry_error": task.registry_error,
+                }));
+            if task.status == ImageTaskStatus::Success {
+                log = log.set_success();
+            }
+            log.finish(&state.metadata_db);
+        }
     }
 
     async fn acquire_inner(
@@ -393,6 +391,34 @@ impl ImageAcquisitionService {
     }
 }
 
+fn image_log_descriptor(
+    status: &ImageTaskStatus,
+    source: Option<&ImageSource>,
+) -> (&'static str, &'static str) {
+    match (status, source) {
+        (ImageTaskStatus::Success, Some(ImageSource::Target)) => (
+            "docker_image_reused_on_target",
+            "platformLog.docker.imageAcquisition.targetReused",
+        ),
+        (ImageTaskStatus::Success, Some(ImageSource::Controller)) => (
+            "docker_image_transferred_from_controller",
+            "platformLog.docker.imageAcquisition.controllerTransferred",
+        ),
+        (ImageTaskStatus::Success, Some(ImageSource::Registry)) => (
+            "docker_image_pulled_from_registry",
+            "platformLog.docker.imageAcquisition.registryPulled",
+        ),
+        (ImageTaskStatus::Cancelled, _) => (
+            "docker_image_acquisition_cancelled",
+            "platformLog.docker.imageAcquisition.cancelled",
+        ),
+        _ => (
+            "docker_image_acquisition_failed",
+            "platformLog.docker.imageAcquisition.failed",
+        ),
+    }
+}
+
 fn local_docker() -> anyhow::Result<Docker> {
     Docker::connect_with_local_defaults().context("controller Docker is unavailable")
 }
@@ -508,5 +534,21 @@ async fn pull_from_registry(
             Some("cancelled") => return Err(anyhow!("Agent registry pull cancelled")),
             _ => tokio::time::sleep(Duration::from_millis(300)).await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn controller_source_uses_explicit_transfer_event() {
+        assert_eq!(
+            image_log_descriptor(&ImageTaskStatus::Success, Some(&ImageSource::Controller)),
+            (
+                "docker_image_transferred_from_controller",
+                "platformLog.docker.imageAcquisition.controllerTransferred"
+            )
+        );
     }
 }
