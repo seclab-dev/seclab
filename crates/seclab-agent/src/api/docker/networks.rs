@@ -81,7 +81,7 @@ pub async fn connect_network(
     );
     let docker = state.docker_client().await?;
     let request = NetworkConnectRequest {
-        container: Some(payload.container),
+        container: payload.container,
         endpoint_config: None,
     };
     docker.connect_network(&id, request).await?;
@@ -100,7 +100,7 @@ pub async fn disconnect_network(
     );
     let docker = state.docker_client().await?;
     let request = NetworkDisconnectRequest {
-        container: Some(payload.container),
+        container: payload.container,
         force: Some(payload.force.unwrap_or(false)),
     };
     docker.disconnect_network(&id, request).await?;

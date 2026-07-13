@@ -25,7 +25,7 @@ const SUITE_NETWORK_NAME: &str = "seclab-suite-network";
 const WORKLOAD_LABEL: &str = "seclab.workload_type";
 const WORKLOAD_LABEL_VALUE: &str = "suite-workload";
 const MAX_WORKLOAD_CONTAINER_NAME_LEN: usize = 96;
-type ExposedPorts = HashMap<String, HashMap<(), ()>>;
+type ExposedPorts = Vec<String>;
 type PortBindings = HashMap<String, Option<Vec<PortBinding>>>;
 
 #[derive(Debug, Deserialize)]
@@ -635,11 +635,11 @@ fn workload_labels(payload: &StartWorkloadRequest, workload_id: &str) -> HashMap
 }
 
 fn port_maps(ports: &[WorkloadPort]) -> (ExposedPorts, PortBindings) {
-    let mut exposed = HashMap::new();
+    let mut exposed = Vec::new();
     let mut bindings = HashMap::new();
     for port in ports {
         let key = format!("{}/{}", port.container_port, port.protocol);
-        exposed.insert(key.clone(), HashMap::new());
+        exposed.push(key.clone());
         bindings.insert(
             key,
             Some(vec![PortBinding {

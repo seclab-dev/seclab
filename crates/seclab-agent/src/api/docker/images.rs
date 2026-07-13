@@ -12,6 +12,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
+use bollard::models::ImageSummary;
 use bollard::query_parameters;
 use bollard::query_parameters::{CreateImageOptions, ImportImageOptions};
 use futures_util::{StreamExt, TryStreamExt};
@@ -252,7 +253,7 @@ pub struct ExportQuery {
 pub async fn list_images(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
     info!("Requesting docker images");
     let docker = state.docker_client().await?;
-    let images: Vec<bollard::secret::ImageSummary> = docker
+    let images: Vec<ImageSummary> = docker
         .list_images(Some(query_parameters::ListImagesOptions::default()))
         .await?;
     Ok(ApiResponse::success_with_raw("Image list loaded", Some(images)).into_response())
@@ -653,7 +654,6 @@ pub async fn pull_registry_image(
             .error_detail
             .as_ref()
             .and_then(|detail| detail.message.clone())
-            .or_else(|| info.error.clone())
         {
             return Err(AgentError::DockerOperation(error));
         }
@@ -901,7 +901,7 @@ pub async fn load_image(
     let read_file = File::open(&temp_file_path)
         .await
         .map_err(AgentError::FileOperation)?;
-    let byte_stream = FramedRead::new(read_file, BytesCodec::new()).map(|r| r.unwrap().freeze());
+    let byte_stream = FramedRead::new(read_file, BytesCodec::new()).map_ok(|bytes| bytes.freeze());
 
     let docker = state.docker_client().await?;
     let options = ImportImageOptions {
@@ -921,7 +921,7 @@ pub async fn load_image(
             if let Some(stream_msg) = msg.stream {
                 logs.push(stream_msg);
             }
-            if let Some(error_msg) = msg.error {
+            if let Some(error_msg) = msg.error_detail.and_then(|detail| detail.message) {
                 return Err(AgentError::DockerOperation(error_msg));
             }
         }

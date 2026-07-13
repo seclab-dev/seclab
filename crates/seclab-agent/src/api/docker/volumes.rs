@@ -8,7 +8,7 @@ use crate::types::{ApiResponse, ApiResult};
 
 use axum::extract::{Json, Path, State};
 use axum::response::{IntoResponse, Response};
-use bollard::volume::CreateVolumeOptions;
+use bollard::models::VolumeCreateRequest;
 use std::sync::Arc;
 use tracing::info;
 
@@ -19,11 +19,12 @@ pub async fn create_volume(
 ) -> ApiResult<Response> {
     info!("Requesting docker volume create: {}", payload.name);
     let docker = state.docker_client().await?;
-    let options = CreateVolumeOptions {
-        name: payload.name,
-        driver: payload.driver.unwrap_or_else(|| "local".to_string()),
-        driver_opts: payload.driver_opts.unwrap_or_default(),
-        labels: payload.labels.unwrap_or_default(),
+    let options = VolumeCreateRequest {
+        name: Some(payload.name),
+        driver: Some(payload.driver.unwrap_or_else(|| "local".to_string())),
+        driver_opts: payload.driver_opts,
+        labels: payload.labels,
+        ..Default::default()
     };
     let volume = docker.create_volume(options).await?;
     Ok(ApiResponse::success_with_raw("Docker volume created", Some(volume)).into_response())

@@ -12,7 +12,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
-use bollard::models::ContainerSummaryStateEnum;
+use bollard::models::{ContainerSummary, ContainerSummaryStateEnum, ImageSummary, SystemInfo};
 use bollard::query_parameters;
 use chrono::Utc;
 use seclab_contracts::types::{DockerServiceStatus, DockerStatusSummary};
@@ -34,7 +34,7 @@ pub mod volumes;
 pub async fn info(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
     info!("Requesting docker info");
     let docker = state.docker_client().await?;
-    let info: bollard::secret::SystemInfo = docker.info().await?;
+    let info: SystemInfo = docker.info().await?;
     Ok(ApiResponse::success_with_raw("Docker info loaded", Some(info)).into_response())
 }
 
@@ -46,10 +46,9 @@ pub async fn overview_realtime(State(state): State<Arc<AppState>>) -> ApiResult<
     let options = query_parameters::ListContainersOptionsBuilder::new()
         .all(true)
         .build();
-    let containers: Vec<bollard::secret::ContainerSummary> =
-        docker.list_containers(Some(options)).await?;
+    let containers: Vec<ContainerSummary> = docker.list_containers(Some(options)).await?;
 
-    let images: Vec<bollard::secret::ImageSummary> = docker
+    let images: Vec<ImageSummary> = docker
         .list_images(Some(query_parameters::ListImagesOptions::default()))
         .await?;
 
@@ -117,9 +116,7 @@ pub async fn overview_realtime(State(state): State<Arc<AppState>>) -> ApiResult<
 }
 
 /// 汇总 Docker 容器状态分布。
-fn summarize_container_states(
-    containers: &[bollard::secret::ContainerSummary],
-) -> docker::ContainerStateCounts {
+fn summarize_container_states(containers: &[ContainerSummary]) -> docker::ContainerStateCounts {
     let mut counts = docker::ContainerStateCounts {
         total: containers.len(),
         running: 0,

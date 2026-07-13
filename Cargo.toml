@@ -29,7 +29,7 @@ tokio-util = { version = "0.7.16" }
 tokio-stream = { version = "0.1.17" }
 jsonwebtoken = { version = "9.3" }
 bcrypt = { version = "0.17.1" }
-bollard = { version = "0.19.4" }
+bollard = { version = "0.21.0" }
 tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3" }
 tracing-appender = { version = "0.2" }

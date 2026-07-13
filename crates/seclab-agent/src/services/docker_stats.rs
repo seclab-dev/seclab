@@ -418,6 +418,7 @@ mod tests {
         presystem_total: u64,
     ) -> ContainerStatsResponse {
         ContainerStatsResponse {
+            os_type: None,
             name: None,
             id: None,
             read: None,

@@ -47,12 +47,21 @@ impl AppState {
                 },
             );
         }
+        // Bollard 0.21 默认使用 API 1.53。必须先协商版本，否则 Docker 28.x
+        // 和最高仅支持 API 1.52 的 Docker 29.0/29.1 会在初始化阶段被误判为不可用。
         match Docker::connect_with_socket_defaults() {
-            Ok(client) => match client.info().await {
-                Ok(_) => (Some(Arc::new(client)), DockerServiceStatus::Available),
+            Ok(client) => match client.negotiate_version().await {
+                Ok(client) => match client.info().await {
+                    Ok(_) => (Some(Arc::new(client)), DockerServiceStatus::Available),
+                    Err(err) => {
+                        let status = map_docker_error(&err.to_string());
+                        tracing::warn!(error = %err, "Docker is not ready");
+                        (None, status)
+                    }
+                },
                 Err(err) => {
                     let status = map_docker_error(&err.to_string());
-                    tracing::warn!(error = %err, "Docker is not ready");
+                    tracing::warn!(error = %err, "Docker API version negotiation failed");
                     (None, status)
                 }
             },

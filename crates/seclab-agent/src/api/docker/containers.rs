@@ -12,8 +12,8 @@ use axum::{
 use bollard::container::LogOutput;
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::models::{
-    ContainerCreateBody, ContainerTopResponse, HostConfig, PortBinding, RestartPolicy,
-    RestartPolicyNameEnum,
+    ContainerCreateBody, ContainerSummary, ContainerTopResponse, HostConfig, PortBinding,
+    RestartPolicy, RestartPolicyNameEnum,
 };
 use bollard::query_parameters::{self, LogsOptions};
 use chrono::{DateTime, Local};
@@ -35,8 +35,7 @@ pub async fn list_containers(State(state): State<Arc<AppState>>) -> ApiResult<Re
     let options = query_parameters::ListContainersOptionsBuilder::new()
         .all(true)
         .build();
-    let containers: Vec<bollard::secret::ContainerSummary> =
-        docker.list_containers(Some(options)).await?;
+    let containers: Vec<ContainerSummary> = docker.list_containers(Some(options)).await?;
 
     Ok(ApiResponse::success_with_raw("Container list loaded", Some(containers)).into_response())
 }
@@ -548,7 +547,7 @@ fn split_nonempty_lines(input: Option<&str>) -> Vec<String> {
 }
 
 fn parse_port_bindings(input: Option<&str>) -> PortBindingsResult {
-    let mut exposed_ports: HashMap<String, HashMap<(), ()>> = HashMap::new();
+    let mut exposed_ports = Vec::new();
     let mut bindings: bollard::models::PortMap = HashMap::new();
 
     for raw in split_nonempty_lines(input).into_iter() {
@@ -577,7 +576,7 @@ fn parse_port_bindings(input: Option<&str>) -> PortBindingsResult {
         }
 
         let key = format!("{}/{}", container_port.trim(), proto.trim());
-        exposed_ports.entry(key.clone()).or_default();
+        exposed_ports.push(key.clone());
         bindings
             .entry(key)
             .or_insert_with(|| Some(Vec::new()))
@@ -592,8 +591,7 @@ fn parse_port_bindings(input: Option<&str>) -> PortBindingsResult {
     Ok((exposed_ports, bindings))
 }
 
-type PortBindingsResult =
-    Result<(HashMap<String, HashMap<(), ()>>, bollard::models::PortMap), ApiError>;
+type PortBindingsResult = Result<(Vec<String>, bollard::models::PortMap), ApiError>;
 
 fn parse_restart_policy(policy: &str) -> Option<RestartPolicyNameEnum> {
     match policy.trim().to_ascii_lowercase().as_str() {
