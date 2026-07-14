@@ -1,5 +1,6 @@
 //! Docker 容器 API：容器列表、操作与状态查询。
 
+use crate::api::docker::context::DockerOperationContext;
 use crate::models::docker;
 use crate::state::AppState;
 use crate::types::{ApiError, ApiResponse, ApiResult};
@@ -21,11 +22,8 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use tracing::{error, info};
-
-use crate::services::logging::{AgentLogModule, LoggerEntry};
 
 /// 获取所有 Docker 容器（包括已停止的）的摘要信息列表。
 pub async fn list_containers(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
@@ -69,69 +67,85 @@ pub async fn list_project_containers(State(state): State<Arc<AppState>>) -> ApiR
 /// 创建容器并按需启动。
 pub async fn create_container(
     State(state): State<Arc<AppState>>,
+    context: DockerOperationContext,
     Json(payload): Json<docker::ContainerCreateRequest>,
 ) -> ApiResult<Response> {
     info!("Requesting container create: {}", payload.name);
-    let docker = state.docker_client().await?;
+    let container_name = payload.name.clone();
+    let image_name = payload.image.clone();
+    let result: ApiResult<Response> = async {
+        let docker = state.docker_client().await?;
 
-    let env = split_nonempty_lines(payload.env.as_deref());
-    let binds = split_nonempty_lines(payload.volumes.as_deref());
-    let (exposed_ports, port_bindings) = parse_port_bindings(payload.ports.as_deref())?;
+        let env = split_nonempty_lines(payload.env.as_deref());
+        let binds = split_nonempty_lines(payload.volumes.as_deref());
+        let (exposed_ports, port_bindings) = parse_port_bindings(payload.ports.as_deref())?;
 
-    let host_config = HostConfig {
-        port_bindings: if port_bindings.is_empty() {
-            None
-        } else {
-            Some(port_bindings)
-        },
-        binds: if binds.is_empty() { None } else { Some(binds) },
-        restart_policy: payload
-            .restart_policy
+        let host_config = HostConfig {
+            port_bindings: if port_bindings.is_empty() {
+                None
+            } else {
+                Some(port_bindings)
+            },
+            binds: if binds.is_empty() { None } else { Some(binds) },
+            restart_policy: payload
+                .restart_policy
+                .as_deref()
+                .and_then(parse_restart_policy)
+                .map(|policy| RestartPolicy {
+                    name: Some(policy),
+                    maximum_retry_count: None,
+                }),
+            auto_remove: payload.auto_remove,
+            network_mode: payload.network.clone(),
+            ..Default::default()
+        };
+
+        let cmd = payload
+            .command
             .as_deref()
-            .and_then(parse_restart_policy)
-            .map(|policy| RestartPolicy {
-                name: Some(policy),
-                maximum_retry_count: None,
-            }),
-        auto_remove: payload.auto_remove,
-        network_mode: payload.network.clone(),
-        ..Default::default()
-    };
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| vec!["/bin/sh".to_string(), "-c".to_string(), value.to_string()]);
 
-    let cmd = payload
-        .command
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| vec!["/bin/sh".to_string(), "-c".to_string(), value.to_string()]);
+        let config = ContainerCreateBody {
+            image: Some(payload.image.clone()),
+            env: if env.is_empty() { None } else { Some(env) },
+            cmd,
+            exposed_ports: if exposed_ports.is_empty() {
+                None
+            } else {
+                Some(exposed_ports)
+            },
+            host_config: Some(host_config),
+            ..Default::default()
+        };
 
-    let config = ContainerCreateBody {
-        image: Some(payload.image.clone()),
-        env: if env.is_empty() { None } else { Some(env) },
-        cmd,
-        exposed_ports: if exposed_ports.is_empty() {
-            None
-        } else {
-            Some(exposed_ports)
-        },
-        host_config: Some(host_config),
-        ..Default::default()
-    };
+        let options = query_parameters::CreateContainerOptionsBuilder::new()
+            .name(&payload.name)
+            .build();
+        let created = docker.create_container(Some(options), config).await?;
 
-    let options = query_parameters::CreateContainerOptionsBuilder::new()
-        .name(&payload.name)
-        .build();
-    let created = docker.create_container(Some(options), config).await?;
+        if payload.auto_start.unwrap_or(true) {
+            docker
+                .start_container(
+                    &payload.name,
+                    None::<query_parameters::StartContainerOptions>,
+                )
+                .await?;
+        }
 
-    if payload.auto_start.unwrap_or(true) {
-        docker
-            .start_container(
-                &payload.name,
-                None::<query_parameters::StartContainerOptions>,
-            )
-            .await?;
+        Ok(ApiResponse::success_with_raw("Container created", Some(created)).into_response())
     }
-
-    Ok(ApiResponse::success_with_raw("Container created", Some(created)).into_response())
+    .await;
+    context
+        .finish(
+            &state.metadata_db,
+            "container.create",
+            Some(("container", &container_name)),
+            json!({ "name": container_name, "image": image_name }),
+            false,
+            result,
+        )
+        .await
 }
 
 /// 获取容器详情（inspect）。
@@ -167,125 +181,210 @@ pub async fn top_container(
 /// 重命名容器。
 pub async fn rename_container(
     State(state): State<Arc<AppState>>,
+    context: DockerOperationContext,
     Path(id): Path<String>,
     Json(payload): Json<docker::ContainerRenameRequest>,
 ) -> ApiResult<Response> {
     info!("Requesting container rename: {} -> {}", id, payload.name);
-    let docker = state.docker_client().await?;
-    let options = query_parameters::RenameContainerOptionsBuilder::new()
-        .name(&payload.name)
-        .build();
-    docker.rename_container(&id, options).await?;
-    Ok(ApiResponse::ok("Container renamed").into_response())
+    let new_name = payload.name.clone();
+    let result: ApiResult<Response> = async {
+        let docker = state.docker_client().await?;
+        let options = query_parameters::RenameContainerOptionsBuilder::new()
+            .name(&payload.name)
+            .build();
+        docker.rename_container(&id, options).await?;
+        Ok(ApiResponse::ok("Container renamed").into_response())
+    }
+    .await;
+    context
+        .finish(
+            &state.metadata_db,
+            "container.rename",
+            Some(("container", &id)),
+            json!({ "name": id, "newName": new_name }),
+            false,
+            result,
+        )
+        .await
 }
 
 /// 暂停容器。
 pub async fn pause_container(
     State(state): State<Arc<AppState>>,
+    context: DockerOperationContext,
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
     info!("Requesting container pause: {}", id);
-    let docker = state.docker_client().await?;
-    docker.pause_container(&id).await?;
-    Ok(ApiResponse::ok("Container paused").into_response())
+    let result: ApiResult<Response> = async {
+        let docker = state.docker_client().await?;
+        docker.pause_container(&id).await?;
+        Ok(ApiResponse::ok("Container paused").into_response())
+    }
+    .await;
+    context
+        .finish(
+            &state.metadata_db,
+            "container.pause",
+            Some(("container", &id)),
+            json!({ "name": id }),
+            false,
+            result,
+        )
+        .await
 }
 
 /// 恢复容器。
 pub async fn unpause_container(
     State(state): State<Arc<AppState>>,
+    context: DockerOperationContext,
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
     info!("Requesting container unpause: {}", id);
-    let docker = state.docker_client().await?;
-    docker.unpause_container(&id).await?;
-    Ok(ApiResponse::ok("Container unpaused").into_response())
+    let result: ApiResult<Response> = async {
+        let docker = state.docker_client().await?;
+        docker.unpause_container(&id).await?;
+        Ok(ApiResponse::ok("Container unpaused").into_response())
+    }
+    .await;
+    context
+        .finish(
+            &state.metadata_db,
+            "container.unpause",
+            Some(("container", &id)),
+            json!({ "name": id }),
+            false,
+            result,
+        )
+        .await
 }
 
 /// 强制停止容器。
 pub async fn kill_container(
     State(state): State<Arc<AppState>>,
+    context: DockerOperationContext,
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
     info!("Requesting container kill: {}", id);
-    let docker = state.docker_client().await?;
-    docker
-        .kill_container(&id, None::<query_parameters::KillContainerOptions>)
-        .await?;
-    Ok(ApiResponse::ok("Container killed").into_response())
+    let result: ApiResult<Response> = async {
+        let docker = state.docker_client().await?;
+        docker
+            .kill_container(&id, None::<query_parameters::KillContainerOptions>)
+            .await?;
+        Ok(ApiResponse::ok("Container killed").into_response())
+    }
+    .await;
+    context
+        .finish(
+            &state.metadata_db,
+            "container.kill",
+            Some(("container", &id)),
+            json!({ "name": id }),
+            true,
+            result,
+        )
+        .await
 }
 
 /// 删除容器（含参数）
 pub async fn remove_container(
     State(state): State<Arc<AppState>>,
+    context: DockerOperationContext,
     Path(id): Path<String>,
     Query(query): Query<docker::ContainerRemoveQuery>,
 ) -> ApiResult<Response> {
     info!("Requesting container remove: {}", id);
-    let docker = state.docker_client().await?;
+    let result: ApiResult<Response> = async {
+        let docker = state.docker_client().await?;
 
-    // 不能删除运行中的容器
-    let container_info = docker
-        .inspect_container(&id, None::<query_parameters::InspectContainerOptions>)
-        .await?;
-    if let Some(true) = container_info.state.and_then(|s| s.running) {
-        return Err(ApiError::BadRequest(
-            "Cannot delete a running container. Please stop it first.".to_string(),
-        ));
+        // 不能删除运行中的容器
+        let container_info = docker
+            .inspect_container(&id, None::<query_parameters::InspectContainerOptions>)
+            .await?;
+        if let Some(true) = container_info.state.and_then(|s| s.running) {
+            return Err(ApiError::BadRequest(
+                "Cannot delete a running container. Please stop it first.".to_string(),
+            ));
+        }
+
+        let options = query_parameters::RemoveContainerOptionsBuilder::new()
+            .force(query.force.unwrap_or(false))
+            .v(query.volumes.unwrap_or(false))
+            .link(query.link.unwrap_or(false))
+            .build();
+        docker.remove_container(&id, Some(options)).await?;
+        Ok(ApiResponse::ok("Container removed").into_response())
     }
-
-    let options = query_parameters::RemoveContainerOptionsBuilder::new()
-        .force(query.force.unwrap_or(false))
-        .v(query.volumes.unwrap_or(false))
-        .link(query.link.unwrap_or(false))
-        .build();
-    docker.remove_container(&id, Some(options)).await?;
-    Ok(ApiResponse::ok("Container removed").into_response())
+    .await;
+    context
+        .finish(
+            &state.metadata_db,
+            "container.remove",
+            Some(("container", &id)),
+            json!({ "name": id }),
+            true,
+            result,
+        )
+        .await
 }
 
 /// 容器 exec 执行命令。
 pub async fn exec_container(
     State(state): State<Arc<AppState>>,
+    context: DockerOperationContext,
     Path(id): Path<String>,
     Json(payload): Json<docker::ContainerExecRequest>,
 ) -> ApiResult<Response> {
     info!("Requesting container exec: {}", id);
-    let docker = state.docker_client().await?;
-    let exec = docker
-        .create_exec(
-            &id,
-            CreateExecOptions {
-                attach_stdout: Some(true),
-                attach_stderr: Some(true),
-                cmd: Some(vec![
-                    "/bin/sh".to_string(),
-                    "-c".to_string(),
-                    payload.command,
-                ]),
-                ..Default::default()
-            },
-        )
-        .await?;
+    let result: ApiResult<Response> = async {
+        let docker = state.docker_client().await?;
+        let exec = docker
+            .create_exec(
+                &id,
+                CreateExecOptions {
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    cmd: Some(vec![
+                        "/bin/sh".to_string(),
+                        "-c".to_string(),
+                        payload.command,
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .await?;
 
-    let mut output = String::new();
-    if let StartExecResults::Attached {
-        output: mut stream, ..
-    } = docker.start_exec(&exec.id, None).await?
-    {
-        while let Some(Ok(log)) = stream.next().await {
-            if let Some(line) = format_log_output(log) {
-                output.push_str(&line);
-                output.push('\n');
+        let mut output = String::new();
+        if let StartExecResults::Attached {
+            output: mut stream, ..
+        } = docker.start_exec(&exec.id, None).await?
+        {
+            while let Some(Ok(log)) = stream.next().await {
+                if let Some(line) = format_log_output(log) {
+                    output.push_str(&line);
+                    output.push('\n');
+                }
             }
         }
+
+        let inspect = docker.inspect_exec(&exec.id).await?;
+        let result = docker::ContainerExecResult {
+            exit_code: inspect.exit_code,
+            output,
+        };
+
+        Ok(ApiResponse::success_with_raw("Command executed", Some(result)).into_response())
     }
-
-    let inspect = docker.inspect_exec(&exec.id).await?;
-    let result = docker::ContainerExecResult {
-        exit_code: inspect.exit_code,
-        output,
-    };
-
-    Ok(ApiResponse::success_with_raw("Command executed", Some(result)).into_response())
+    .await;
+    context
+        .finish(
+            &state.metadata_db,
+            "container.exec",
+            Some(("container", &id)),
+            json!({ "name": id }),
+            false,
+            result,
+        )
+        .await
 }
 
 /// 对指定容器执行操作，如启动、停止、重启或删除。
@@ -296,128 +395,85 @@ pub async fn exec_container(
 ///
 /// # 处理流程
 /// 1. 根据 `payload.action` 的值，调用相应的 `bollard` 函数（如 `start_container`）。
-/// 2. 在操作成功后，创建并记录一条平台日志 (`LoggerEntry`)。
+/// 2. 记录操作成功或失败的 Docker 操作日志。
 /// 3. 返回一个表示操作结果的 `ApiResponse`。
 /// 4. 如果 Docker API 调用失败，将错误转换为 `ApiError::DockerApi` 并返回。
 pub async fn handle_action(
     State(state): State<Arc<AppState>>,
+    context: DockerOperationContext,
     Json(payload): Json<docker::ActionRequest>,
 ) -> ApiResult<Response> {
     let container_name = &payload.name;
-    let docker = state.docker_client().await?;
+    let event_code = match payload.action {
+        docker::ContainerAction::Start => "container.start",
+        docker::ContainerAction::Stop => "container.stop",
+        docker::ContainerAction::Restart => "container.restart",
+        docker::ContainerAction::Remove => "container.remove",
+    };
+    let high_impact = matches!(payload.action, docker::ContainerAction::Remove);
 
     info!(
         "Request to perform action '{:?}' on container '{}'",
         payload.action, container_name
     );
 
-    match payload.action {
-        docker::ContainerAction::Start => {
-            docker
-                .start_container(
-                    container_name,
-                    None::<query_parameters::StartContainerOptions>,
-                )
-                .await
-                .map_err(|e| {
-                    error!("Failed to start container '{}': {}", container_name, e);
-                    ApiError::DockerApi(e)
-                })?;
-            LoggerEntry::new(
-                "docker",
-                "docker_container_started",
-                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-            )
-            .set_success()
-            .module(AgentLogModule::Docker)
-            .metadata(json!({
-                "message_key": "platformLog.docker.container.started",
-                "container_name": container_name
-            }))
-            .finish(&state.metadata_db);
-            info!("Successfully started container '{}'", container_name);
-            Ok(ApiResponse::ok("Container started").into_response())
-        }
+    let result: ApiResult<Response> = async {
+        let docker = state.docker_client().await?;
+        match payload.action {
+            docker::ContainerAction::Start => {
+                docker
+                    .start_container(
+                        container_name,
+                        None::<query_parameters::StartContainerOptions>,
+                    )
+                    .await?;
+                info!("Successfully started container '{}'", container_name);
+                Ok(ApiResponse::ok("Container started").into_response())
+            }
 
-        docker::ContainerAction::Stop => {
-            docker
-                .stop_container(
-                    container_name,
-                    None::<query_parameters::StopContainerOptions>,
-                )
-                .await
-                .map_err(|e| {
-                    error!("Failed to stop container '{}': {}", container_name, e);
-                    ApiError::DockerApi(e)
-                })?;
-            LoggerEntry::new(
-                "docker",
-                "docker_container_stopped",
-                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-            )
-            .set_success()
-            .module(AgentLogModule::Docker)
-            .metadata(json!({
-                "message_key": "platformLog.docker.container.stopped",
-                "container_name": container_name
-            }))
-            .finish(&state.metadata_db);
-            info!("Successfully stopped container '{}'", container_name);
-            Ok(ApiResponse::ok("Container stopped").into_response())
-        }
-        docker::ContainerAction::Restart => {
-            docker
-                .restart_container(
-                    container_name,
-                    None::<query_parameters::RestartContainerOptions>,
-                )
-                .await
-                .map_err(|e| {
-                    error!("Failed to restart container '{}': {}", container_name, e);
-                    ApiError::DockerApi(e)
-                })?;
-            LoggerEntry::new(
-                "docker",
-                "docker_container_restarted",
-                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-            )
-            .set_success()
-            .module(AgentLogModule::Docker)
-            .metadata(json!({
-                "message_key": "platformLog.docker.container.restarted",
-                "container_name": container_name
-            }))
-            .finish(&state.metadata_db);
-            info!("Successfully restarted container '{}'", container_name);
-            Ok(ApiResponse::ok("Container restarted").into_response())
-        }
-        docker::ContainerAction::Remove => {
-            docker
-                .remove_container(
-                    container_name,
-                    None::<query_parameters::RemoveContainerOptions>,
-                )
-                .await
-                .map_err(|e| {
-                    error!("Failed to remove container '{}': {}", container_name, e);
-                    ApiError::DockerApi(e)
-                })?;
-            LoggerEntry::new(
-                "docker",
-                "docker_container_removed",
-                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-            )
-            .set_success()
-            .module(AgentLogModule::Docker)
-            .metadata(json!({
-                "message_key": "platformLog.docker.container.removed",
-                "container_name": container_name
-            }))
-            .finish(&state.metadata_db);
-            info!("Successfully removed container '{}'", container_name);
-            Ok(ApiResponse::ok("Container removed").into_response())
+            docker::ContainerAction::Stop => {
+                docker
+                    .stop_container(
+                        container_name,
+                        None::<query_parameters::StopContainerOptions>,
+                    )
+                    .await?;
+                info!("Successfully stopped container '{}'", container_name);
+                Ok(ApiResponse::ok("Container stopped").into_response())
+            }
+            docker::ContainerAction::Restart => {
+                docker
+                    .restart_container(
+                        container_name,
+                        None::<query_parameters::RestartContainerOptions>,
+                    )
+                    .await?;
+                info!("Successfully restarted container '{}'", container_name);
+                Ok(ApiResponse::ok("Container restarted").into_response())
+            }
+            docker::ContainerAction::Remove => {
+                docker
+                    .remove_container(
+                        container_name,
+                        None::<query_parameters::RemoveContainerOptions>,
+                    )
+                    .await?;
+                info!("Successfully removed container '{}'", container_name);
+                Ok(ApiResponse::ok("Container removed").into_response())
+            }
         }
     }
+    .await;
+    context
+        .finish(
+            &state.metadata_db,
+            event_code,
+            Some(("container", container_name)),
+            json!({ "name": container_name }),
+            high_impact,
+            result,
+        )
+        .await
 }
 
 /// 查询参数，用于获取容器日志。

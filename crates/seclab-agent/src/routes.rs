@@ -6,7 +6,9 @@ use super::api::{
 use crate::db;
 use crate::state::DbPool;
 
-use crate::services::{docker_stats, system_metrics, task_scheduler, websocket::create_channel};
+use crate::services::{
+    docker_activity, docker_stats, system_metrics, task_scheduler, websocket::create_channel,
+};
 use crate::state::AppState;
 use anyhow::Result;
 use axum::extract::connect_info::ConnectInfo;
@@ -66,6 +68,7 @@ pub async fn create_router() -> Result<(Router, DbPool)> {
     });
 
     docker_stats::spawn_stats_collector(Arc::clone(&app_state));
+    docker_activity::spawn_retention_worker(app_state.metadata_db.clone());
     system_metrics::spawn_collector(Arc::clone(&app_state));
     task_scheduler::spawn_scheduler(Arc::clone(&app_state));
 

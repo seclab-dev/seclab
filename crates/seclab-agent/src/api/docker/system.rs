@@ -1,5 +1,6 @@
 //! Docker 系统清理与磁盘使用统计 API。
 
+use crate::api::docker::context::DockerOperationContext;
 use crate::models::docker::{DockerDiskUsageCategory, DockerDiskUsageSummary};
 use crate::state::AppState;
 use crate::types::{ApiError, ApiResponse, ApiResult};
@@ -9,6 +10,7 @@ use axum::response::{IntoResponse, Response};
 use bollard::Docker;
 use chrono::Utc;
 use serde::Deserialize;
+use serde_json::json;
 use std::sync::Arc;
 use tokio::process::Command;
 use tracing::info;
@@ -226,26 +228,42 @@ fn positive_bytes(value: i64) -> u64 {
 }
 
 /// 执行一键清理（清理停止的容器、未使用的网络和挂起镜像）。
-pub async fn system_prune() -> ApiResult<Response> {
+pub async fn system_prune(
+    State(state): State<Arc<AppState>>,
+    context: DockerOperationContext,
+) -> ApiResult<Response> {
     info!("Requesting docker system prune");
-    let output = Command::new("docker")
-        .args(["system", "prune", "-f"])
-        .output()
-        .await?;
+    let result: ApiResult<Response> = async {
+        let output = Command::new("docker")
+            .args(["system", "prune", "-f"])
+            .output()
+            .await?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(ApiError::Internal(format!(
-            "Docker system prune failed: {}",
-            stderr.trim()
-        )));
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(ApiError::Internal(format!(
+                "Docker system prune failed: {}",
+                stderr.trim()
+            )));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        Ok(
+            ApiResponse::success_with_raw("Docker system prune completed", Some(stdout))
+                .into_response(),
+        )
     }
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    Ok(
-        ApiResponse::success_with_raw("Docker system prune completed", Some(stdout))
-            .into_response(),
-    )
+    .await;
+    context
+        .finish(
+            &state.metadata_db,
+            "system.prune",
+            Some(("system", "docker")),
+            json!({}),
+            true,
+            result,
+        )
+        .await
 }
 
 #[cfg(test)]

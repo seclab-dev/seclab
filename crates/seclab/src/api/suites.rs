@@ -4,6 +4,7 @@ use crate::api::auth::AuthenticatedAdmin;
 use crate::models::NodeRuntimeClient;
 use crate::models::desktop_apps::{delete_desktop_apps, hide_suite_desktop_apps};
 use crate::models::logging::LogModule;
+use crate::models::node_runtime_client::AgentOperationContext;
 use crate::models::suites::{
     SuiteAppEntryManifest, SuiteAppEntryRecord, SuiteInstanceSummary, SuiteManifest,
     SuitePackageFile, SuitePackageSnapshot, delete_catalog_item, delete_instance,
@@ -134,8 +135,6 @@ struct AgentSuiteInstallRequest {
     runtime_images: Vec<String>,
     files: Vec<SuitePackageFile>,
     app_entries: Vec<SuiteAppEntryManifest>,
-    operator: Option<String>,
-    trace_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -146,8 +145,6 @@ struct AgentSuiteActionRequest {
     compose_project_name: String,
     #[serde(default)]
     remove_data: bool,
-    operator: Option<String>,
-    trace_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -187,6 +184,14 @@ impl SuiteAuditContext {
             username: admin.username.clone(),
             client_ip: extract_client_ip(headers, conn),
             trace_id: logging::resolve_trace_id(headers),
+        }
+    }
+
+    fn agent_operation_context(&self) -> AgentOperationContext {
+        AgentOperationContext {
+            actor_name: self.username.clone(),
+            client_ip: self.client_ip.to_string(),
+            trace_id: self.trace_id.clone(),
         }
     }
 }
@@ -494,8 +499,6 @@ pub async fn install_suite(
         runtime_images: normalize_runtime_images(&manifest.runtime.images),
         files: package.files,
         app_entries: manifest.app_entries,
-        operator: Some(ctx.username.clone()),
-        trace_id: Some(ctx.trace_id.clone()),
     };
 
     upsert_install_progress(SuiteInstallProgress {
@@ -771,13 +774,17 @@ async fn run_suite_install_task(
     };
 
     let agent_response = match client
-        .post_json::<serde_json::Value, _>("/api/v1/agent/docker/suites/install", &request)
+        .post_json_with_operation_context::<serde_json::Value, _>(
+            "/api/v1/agent/docker/suites/install",
+            &request,
+            &audit_ctx.agent_operation_context(),
+        )
         .await
     {
         Ok(value) => value,
         Err(err) => {
             let detail = err.to_string();
-            compensate_failed_install(&client, &request, &instance_id).await;
+            compensate_failed_install(&client, &request, &instance_id, &audit_ctx).await;
             let _ = delete_instance(&state.metadata_db, &instance_id).await;
             if is_install_cancel_requested(&task_id) || is_install_canceled_error(&detail) {
                 update_install_progress(&task_id, 100, "canceled", "canceled", None, true, None);
@@ -1060,21 +1067,24 @@ async fn compensate_failed_install(
     client: &NodeRuntimeClient,
     request: &AgentSuiteInstallRequest,
     instance_id: &str,
+    context: &SuiteAuditContext,
 ) {
     let action = AgentSuiteActionRequest {
         suite_id: request.suite_id.clone(),
         suite_instance_id: instance_id.to_string(),
         compose_project_name: request.compose_project_name.clone(),
         remove_data: false,
-        operator: request.operator.clone(),
-        trace_id: request.trace_id.clone(),
     };
     let path = format!(
         "/api/v1/agent/docker/suite/{}/uninstall",
         request.compose_project_name
     );
     if let Err(err) = client
-        .post_json::<serde_json::Value, _>(&path, &action)
+        .post_json_with_operation_context::<serde_json::Value, _>(
+            &path,
+            &action,
+            &context.agent_operation_context(),
+        )
         .await
     {
         tracing::warn!(
@@ -1205,17 +1215,16 @@ pub async fn enable_instance(
         suite_instance_id: instance.instance_id.clone(),
         compose_project_name: instance.compose_project_name.clone(),
         remove_data: false,
-        operator: Some(ctx.username.clone()),
-        trace_id: Some(ctx.trace_id.clone()),
     };
     let result = async {
         let agent_response = match client
-            .post_json::<serde_json::Value, _>(
+            .post_json_with_operation_context::<serde_json::Value, _>(
                 &format!(
                     "/api/v1/agent/docker/suite/{}/enable",
                     instance.compose_project_name
                 ),
                 &request,
+                &ctx.agent_operation_context(),
             )
             .await
         {
@@ -1290,17 +1299,16 @@ pub async fn disable_instance(
         suite_instance_id: instance.instance_id.clone(),
         compose_project_name: instance.compose_project_name.clone(),
         remove_data: false,
-        operator: Some(ctx.username.clone()),
-        trace_id: Some(ctx.trace_id.clone()),
     };
     let result = async {
         let agent_response = match client
-            .post_json::<serde_json::Value, _>(
+            .post_json_with_operation_context::<serde_json::Value, _>(
                 &format!(
                     "/api/v1/agent/docker/suite/{}/disable",
                     instance.compose_project_name
                 ),
                 &request,
+                &ctx.agent_operation_context(),
             )
             .await
         {
@@ -1369,27 +1377,27 @@ pub async fn uninstall_instance(
         suite_instance_id: instance.instance_id.clone(),
         compose_project_name: instance.compose_project_name.clone(),
         remove_data: payload.remove_data,
-        operator: Some(ctx.username.clone()),
-        trace_id: Some(ctx.trace_id.clone()),
     };
     let result = async {
         client
-            .post_json::<serde_json::Value, _>(
+            .post_json_with_operation_context::<serde_json::Value, _>(
                 &format!(
                     "/api/v1/agent/docker/suite/{}/disable",
                     instance.compose_project_name
                 ),
                 &request,
+                &ctx.agent_operation_context(),
             )
             .await
             .ok();
         let agent_response = match client
-            .post_json::<serde_json::Value, _>(
+            .post_json_with_operation_context::<serde_json::Value, _>(
                 &format!(
                     "/api/v1/agent/docker/suite/{}/uninstall",
                     instance.compose_project_name
                 ),
                 &request,
+                &ctx.agent_operation_context(),
             )
             .await
         {
@@ -2214,8 +2222,6 @@ mod suite_asset_tests {
                 content_base64: STANDARD.encode(compose),
             }],
             app_entries: Vec::new(),
-            operator: None,
-            trace_id: None,
         };
         assert_eq!(
             extract_suite_images(&request).unwrap(),

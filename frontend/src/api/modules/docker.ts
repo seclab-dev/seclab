@@ -1,6 +1,5 @@
 import http from '@/api'
 import * as docker from '../interface/docker'
-import * as logging from '../interface/logging'
 
 const buildDockerPath = (path: string, nodeId?: string) => {
   if (!nodeId || nodeId === 'local') {
@@ -200,9 +199,9 @@ const createScopedDockerApi = (nodeId?: string) => ({
   performAction: (data: docker.ActionRequest) => {
     return http.post<null>(buildDockerPath('/agent/docker/action', nodeId), data)
   },
-  fetchDockerLogs: (payload: logging.PlatformLogQuery) => {
-    return http.post<logging.PlatformLogList>(
-      buildDockerPath('/agent/docker/logs', nodeId),
+  fetchDockerActivityLogs: (payload: docker.DockerActivityLogQuery) => {
+    return http.post<docker.DockerActivityLogPage>(
+      buildDockerPath('/agent/docker/activity-logs/query', nodeId),
       payload,
     )
   },

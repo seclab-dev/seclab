@@ -1,6 +1,8 @@
 //! 节点运行时代理 API：将前端请求转发至节点执行面。
 
+use crate::api::auth::AuthenticatedAdmin;
 use crate::models::node_runtime_client::NodeRuntimeClient;
+use crate::services::logging;
 use crate::services::node_inventory::get_node_display_name;
 use crate::services::runtime_metrics;
 use crate::state::AppState;
@@ -12,7 +14,7 @@ use axum::{
         OriginalUri, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::Request,
+    http::{HeaderMap, HeaderValue, Request, header::HeaderName},
     response::{IntoResponse, Response},
     routing::{any, get},
 };
@@ -21,6 +23,69 @@ use futures_util::stream::StreamExt;
 use reqwest_websocket::{CloseCode, RequestBuilderExt};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
+
+const ACTOR_KIND_HEADER: HeaderName = HeaderName::from_static("x-seclab-actor-kind");
+const ACTOR_NAME_HEADER: HeaderName = HeaderName::from_static("x-seclab-actor-name");
+const CLIENT_IP_HEADER: HeaderName = HeaderName::from_static("x-seclab-client-ip");
+const TRACE_ID_HEADER: HeaderName = HeaderName::from_static("x-seclab-trace-id");
+
+fn inject_trusted_operation_context(
+    headers: &mut HeaderMap,
+    actor_name: &str,
+    client_ip: &str,
+    trace_id: &str,
+) {
+    for name in [
+        &ACTOR_KIND_HEADER,
+        &ACTOR_NAME_HEADER,
+        &CLIENT_IP_HEADER,
+        &TRACE_ID_HEADER,
+    ] {
+        headers.remove(name);
+    }
+    headers.insert(&ACTOR_KIND_HEADER, HeaderValue::from_static("user"));
+    if let Ok(value) = HeaderValue::from_str(actor_name) {
+        headers.insert(&ACTOR_NAME_HEADER, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(client_ip) {
+        headers.insert(&CLIENT_IP_HEADER, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(trace_id) {
+        headers.insert(&TRACE_ID_HEADER, value);
+    }
+}
+
+fn prepare_proxy_headers(parts: &axum::http::request::Parts) -> HeaderMap {
+    let mut headers = parts.headers.clone();
+    let Some(admin) = parts.extensions.get::<AuthenticatedAdmin>() else {
+        for name in [
+            &ACTOR_KIND_HEADER,
+            &ACTOR_NAME_HEADER,
+            &CLIENT_IP_HEADER,
+            &TRACE_ID_HEADER,
+        ] {
+            headers.remove(name);
+        }
+        return headers;
+    };
+    let client_ip = headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            parts
+                .extensions
+                .get::<axum::extract::connect_info::ConnectInfo<std::net::SocketAddr>>()
+                .map(|axum::extract::connect_info::ConnectInfo(address)| address.ip().to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    let trace_id = logging::resolve_trace_id(&headers);
+    inject_trusted_operation_context(&mut headers, &admin.username, &client_ip, &trace_id);
+    headers
+}
 
 fn rebuild_scoped_proxy_path(path_with_query: &str, node_id: &str) -> String {
     let prefix = format!("/api/v1/node/{node_id}");
@@ -290,8 +355,8 @@ pub async fn proxy_handler(
     req: Request<Body>,
 ) -> ApiResult<Response> {
     let (parts, body) = req.into_parts();
+    let headers = prepare_proxy_headers(&parts);
     let method = parts.method;
-    let headers = parts.headers;
 
     let path_with_query = ori
         .path_and_query()
@@ -336,8 +401,8 @@ pub async fn proxy_handler_for_node(
     req: Request<Body>,
 ) -> ApiResult<Response> {
     let (parts, body) = req.into_parts();
+    let headers = prepare_proxy_headers(&parts);
     let method = parts.method;
-    let headers = parts.headers;
 
     let raw_path = ori
         .path_and_query()
@@ -394,7 +459,25 @@ pub fn agent_router() -> Router<Arc<AppState>> {
 
 #[cfg(test)]
 mod tests {
-    use super::rebuild_scoped_proxy_path;
+    use super::{
+        ACTOR_KIND_HEADER, ACTOR_NAME_HEADER, CLIENT_IP_HEADER, TRACE_ID_HEADER,
+        inject_trusted_operation_context, rebuild_scoped_proxy_path,
+    };
+    use axum::http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn trusted_context_overwrites_spoofed_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(&ACTOR_KIND_HEADER, HeaderValue::from_static("system"));
+        headers.insert(&ACTOR_NAME_HEADER, HeaderValue::from_static("spoofed"));
+
+        inject_trusted_operation_context(&mut headers, "admin", "192.0.2.10", "trace-1");
+
+        assert_eq!(headers[&ACTOR_KIND_HEADER], "user");
+        assert_eq!(headers[&ACTOR_NAME_HEADER], "admin");
+        assert_eq!(headers[&CLIENT_IP_HEADER], "192.0.2.10");
+        assert_eq!(headers[&TRACE_ID_HEADER], "trace-1");
+    }
 
     #[test]
     fn rebuild_scoped_proxy_path_rewrites_node_scoped_prefix() {

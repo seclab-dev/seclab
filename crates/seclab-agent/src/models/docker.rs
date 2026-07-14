@@ -1,6 +1,7 @@
 //! Docker 客户端模型：与 Docker daemon 通信封装。
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 
 /// 容器动作请求，包含目标与操作类型。
@@ -13,7 +14,7 @@ pub struct ActionRequest {
 }
 
 /// 区分操作类型
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ContainerAction {
     Start,
@@ -356,4 +357,126 @@ pub struct VolumeCreateRequest {
     pub driver: Option<String>,
     pub driver_opts: Option<HashMap<String, String>>,
     pub labels: Option<HashMap<String, String>>,
+}
+
+/// Docker 操作日志的发起者类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DockerActivityActorKind {
+    User,
+    System,
+}
+
+impl DockerActivityActorKind {
+    /// 返回数据库使用的稳定字符串。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::System => "system",
+        }
+    }
+}
+
+/// Docker 操作日志级别。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DockerActivityLevel {
+    Info,
+    Warning,
+    Error,
+}
+
+impl DockerActivityLevel {
+    /// 返回数据库使用的稳定字符串。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// Docker 操作执行结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DockerActivityOutcome {
+    Success,
+    Failure,
+}
+
+impl DockerActivityOutcome {
+    /// 返回数据库使用的稳定字符串。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+        }
+    }
+}
+
+/// Docker 操作日志发起者。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerActivityActor {
+    pub kind: DockerActivityActorKind,
+    pub name: String,
+    pub client_ip: Option<String>,
+}
+
+/// Docker 操作的目标对象。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerActivityTarget {
+    pub kind: String,
+    pub id: String,
+}
+
+/// Docker 操作日志列表项。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerActivityLogItem {
+    pub id: i64,
+    pub occurred_at: i64,
+    pub actor: DockerActivityActor,
+    pub level: DockerActivityLevel,
+    pub outcome: DockerActivityOutcome,
+    pub event_code: String,
+    pub target: Option<DockerActivityTarget>,
+    pub message_params: Value,
+    pub error_message: Option<String>,
+    pub trace_id: Option<String>,
+}
+
+/// Docker 操作日志查询参数。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerActivityLogQuery {
+    #[serde(default = "default_activity_log_page")]
+    pub page: u32,
+    #[serde(default = "default_activity_log_page_size")]
+    pub page_size: u32,
+    pub levels: Option<Vec<DockerActivityLevel>>,
+    pub actor_kinds: Option<Vec<DockerActivityActorKind>>,
+    pub start_at: Option<i64>,
+    pub end_at: Option<i64>,
+    pub keyword: Option<String>,
+}
+
+/// Docker 操作日志分页响应。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerActivityLogPage {
+    pub total: i64,
+    pub page: u32,
+    pub page_size: u32,
+    pub items: Vec<DockerActivityLogItem>,
+}
+
+const fn default_activity_log_page() -> u32 {
+    1
+}
+
+const fn default_activity_log_page_size() -> u32 {
+    20
 }

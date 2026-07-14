@@ -37,6 +37,14 @@ pub struct NodeRuntimeClient {
     ws_base_url: String,
 }
 
+/// Master 向 Agent 发起变更请求时注入的可信操作者上下文。
+#[derive(Debug, Clone)]
+pub struct AgentOperationContext {
+    pub actor_name: String,
+    pub client_ip: String,
+    pub trace_id: String,
+}
+
 impl NodeRuntimeClient {
     /// 根据目标节点标识选择 UDS 或 TLS 连接。
     pub async fn from_node_route(pool: &DbPool, node_id: Option<&str>) -> ApiResult<Self> {
@@ -128,6 +136,29 @@ impl NodeRuntimeClient {
         }
         let resp = request.send().await?;
         decode_json_response("POST", path, resp).await
+    }
+
+    /// 携带可信操作者上下文发起 POST 请求。
+    pub async fn post_json_with_operation_context<T: DeserializeOwned, B: Serialize>(
+        &self,
+        path: &str,
+        payload: &B,
+        context: &AgentOperationContext,
+    ) -> anyhow::Result<T> {
+        let url = self.build_uri(path);
+        let mut request = self
+            .client
+            .post(url)
+            .header("x-seclab-actor-kind", "user")
+            .header("x-seclab-actor-name", &context.actor_name)
+            .header("x-seclab-client-ip", &context.client_ip)
+            .header("x-seclab-trace-id", &context.trace_id)
+            .json(payload);
+        if is_long_running_request(path) {
+            request = request.timeout(Duration::from_secs(PROXY_LONG_RUNNING_REQUEST_TIMEOUT_SECS));
+        }
+        let response = request.send().await?;
+        decode_json_response("POST", path, response).await
     }
 
     /// 发起 PUT 请求并解析 JSON 响应。

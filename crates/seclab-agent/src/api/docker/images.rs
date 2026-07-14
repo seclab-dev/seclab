@@ -1,5 +1,6 @@
 //! Docker 镜像 API：镜像列表与管理操作。
 
+use crate::api::docker::context::DockerOperationContext;
 use crate::models::docker;
 use crate::state::AppState;
 use crate::types::{AgentError, ApiResponse, ApiResult};
@@ -19,10 +20,8 @@ use futures_util::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::services::logging::{AgentLogModule, LoggerEntry};
 use std::collections::HashMap;
 use std::default::Default;
-use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{
     Arc, LazyLock, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -267,37 +266,38 @@ pub async fn list_images(State(state): State<Arc<AppState>>) -> ApiResult<Respon
 ///
 /// # 处理流程
 /// 1. 调用 `bollard` 的 `remove_image` 方法执行删除操作。
-/// 2. 如果删除成功，记录一条平台日志 (`LoggerEntry`)。
+/// 2. 记录删除成功或失败的 Docker 操作日志。
 /// 3. 将 Docker API 的返回结果封装在 `ApiResponse` 中返回给客户端。
 pub async fn remove_image(
     State(state): State<Arc<AppState>>,
+    context: DockerOperationContext,
     Query(query): Query<docker::ImageRef>,
 ) -> ApiResult<Response> {
     info!("Requesting Remove {} image", query.name);
-
-    let docker = state.docker_client().await?;
-    let images = docker
-        .remove_image(
-            &query.id,
-            Some(query_parameters::RemoveImageOptions::default()),
-            None,
-        )
-        .await?;
-    LoggerEntry::new(
-        "docker",
-        "docker_image_removed",
-        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-    )
-    .set_success()
-    .module(AgentLogModule::Docker)
-    .metadata(json!({
-        "message_key": "platformLog.docker.image.removed",
-        "image_name": query.name
-    }))
-    .finish(&state.metadata_db);
+    let image_name = query.name.clone();
+    let result: ApiResult<Response> = async {
+        let docker = state.docker_client().await?;
+        let images = docker
+            .remove_image(
+                &query.id,
+                Some(query_parameters::RemoveImageOptions::default()),
+                None,
+            )
+            .await?;
+        Ok(ApiResponse::success_with_raw("Image removed", Some(images)).into_response())
+    }
+    .await;
     info!("{} image removed", query.name);
-
-    Ok(ApiResponse::success_with_raw("Image removed", Some(images)).into_response())
+    context
+        .finish(
+            &state.metadata_db,
+            "image.remove",
+            Some(("image", &query.id)),
+            json!({ "name": image_name }),
+            true,
+            result,
+        )
+        .await
 }
 
 /// 搜索 Docker Hub 镜像仓库。
@@ -491,6 +491,7 @@ fn normalize_search_repository(repo_name: &str, is_official: bool) -> String {
 /// 启动镜像拉取任务，并返回可轮询的任务 ID。
 pub async fn pull_image(
     State(state): State<Arc<AppState>>,
+    context: DockerOperationContext,
     Json(payload): Json<PullRequest>,
 ) -> ApiResult<Response> {
     let image_ref = parse_docker_hub_image_ref(&payload.image_name)?;
@@ -525,8 +526,26 @@ pub async fn pull_image(
     }
 
     let task_id_for_worker = task_id.clone();
+    let worker_context = context.clone();
+    context
+        .record_success(
+            &state.metadata_db,
+            "image.pull.submitted",
+            Some(("image", &image_name)),
+            json!({ "name": image_name.clone(), "tag": tag.clone() }),
+            false,
+        )
+        .await;
     tokio::spawn(async move {
-        run_image_pull_task(state, task_id_for_worker, image_name, tag, cancel).await;
+        run_image_pull_task(
+            state,
+            worker_context,
+            task_id_for_worker,
+            image_name,
+            tag,
+            cancel,
+        )
+        .await;
     });
 
     Ok(ApiResponse::success_with_raw(
@@ -554,7 +573,11 @@ pub async fn pull_image_progress(Path(task_id): Path<String>) -> ApiResult<Respo
 }
 
 /// 取消镜像拉取任务。
-pub async fn cancel_pull_image(Path(task_id): Path<String>) -> ApiResult<Response> {
+pub async fn cancel_pull_image(
+    State(state): State<Arc<AppState>>,
+    context: DockerOperationContext,
+    Path(task_id): Path<String>,
+) -> ApiResult<Response> {
     let progress = {
         let mut tasks = IMAGE_PULL_TASKS
             .lock()
@@ -574,14 +597,24 @@ pub async fn cancel_pull_image(Path(task_id): Path<String>) -> ApiResult<Respons
         task.to_response(task_id.clone())
     };
 
-    Ok(
+    let response =
         ApiResponse::success_with_raw("Image pull cancellation requested", Some(progress))
-            .into_response(),
-    )
+            .into_response();
+    context
+        .record_success(
+            &state.metadata_db,
+            "image.pull.cancel",
+            Some(("imagePullTask", &task_id)),
+            json!({ "taskId": task_id }),
+            true,
+        )
+        .await;
+    Ok(response)
 }
 
 async fn run_image_pull_task(
     state: Arc<AppState>,
+    context: DockerOperationContext,
     task_id: String,
     image_name: String,
     tag: String,
@@ -604,7 +637,7 @@ async fn run_image_pull_task(
     }
     .await;
 
-    update_pull_task(&task_id, |task| match result {
+    update_pull_task(&task_id, |task| match &result {
         Ok(()) => {
             task.status = ImagePullStatus::Success;
             task.progress_percent = 100;
@@ -623,6 +656,43 @@ async fn run_image_pull_task(
             task.error = Some(err.to_string());
         }
     });
+
+    let target = format!("{image_name}:{tag}");
+    match result {
+        Ok(()) => {
+            context
+                .record_success(
+                    &state.metadata_db,
+                    "image.pull",
+                    Some(("image", &target)),
+                    json!({ "name": image_name, "tag": tag }),
+                    false,
+                )
+                .await;
+        }
+        Err(_) if cancel.load(Ordering::Relaxed) => {
+            context
+                .record_success(
+                    &state.metadata_db,
+                    "image.pull.cancelled",
+                    Some(("image", &target)),
+                    json!({ "name": image_name, "tag": tag }),
+                    true,
+                )
+                .await;
+        }
+        Err(error) => {
+            context
+                .record_failure(
+                    &state.metadata_db,
+                    "image.pull",
+                    Some(("image", &target)),
+                    json!({ "name": image_name, "tag": tag }),
+                    error.to_string(),
+                )
+                .await;
+        }
+    }
 }
 
 /// 通过 Docker Registry 拉取镜像，并把原始进度事件交给调用方。
@@ -863,8 +933,23 @@ pub async fn export_image(
 /// 接收流式上传的镜像 tar 包，并导入到本地 Docker 中。
 pub async fn load_image(
     State(state): State<Arc<AppState>>,
-    mut multipart: Multipart,
+    context: DockerOperationContext,
+    multipart: Multipart,
 ) -> ApiResult<Response> {
+    let result = load_image_inner(Arc::clone(&state), multipart).await;
+    context
+        .finish(
+            &state.metadata_db,
+            "image.load",
+            None,
+            json!({}),
+            false,
+            result,
+        )
+        .await
+}
+
+async fn load_image_inner(state: Arc<AppState>, mut multipart: Multipart) -> ApiResult<Response> {
     info!("Starting docker image load");
     let mut temp_file_path = std::env::temp_dir();
     let file_name = format!("docker-image-{}.tar", Uuid::new_v4());
@@ -937,18 +1022,6 @@ pub async fn load_image(
     load_result?;
 
     let log_output = logs.join("");
-
-    LoggerEntry::new(
-        "docker",
-        "docker_image_loaded",
-        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-    )
-    .set_success()
-    .module(AgentLogModule::Docker)
-    .metadata(json!({
-        "message_key": "platformLog.docker.image.loaded",
-    }))
-    .finish(&state.metadata_db);
 
     Ok(
         ApiResponse::success_with_raw("Docker image loaded successfully", Some(log_output))

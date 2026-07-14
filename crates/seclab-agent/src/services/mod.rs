@@ -1,7 +1,7 @@
 //! 服务层入口：聚合业务服务模块。
 
+pub mod docker_activity;
 pub mod docker_stats;
-pub mod logging;
 pub mod pcap;
 pub mod process_manager;
 pub mod runtime_logs;

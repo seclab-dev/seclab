@@ -2,5 +2,4 @@
 
 pub mod docker;
 pub mod identity;
-pub mod logging;
 pub mod scheduled_tasks;

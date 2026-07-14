@@ -1,5 +1,6 @@
 //! Docker daemon 设置接口：管理镜像加速与出站代理配置。
 
+use crate::api::docker::context::DockerOperationContext;
 use crate::services::settings as settings_service;
 use crate::state::AppState;
 use crate::types::{ApiError, ApiResponse, ApiResult};
@@ -8,7 +9,7 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use std::io::ErrorKind;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -56,7 +57,25 @@ pub async fn get_settings(State(state): State<Arc<AppState>>) -> ApiResult<Respo
 /// 校验、写入并应用当前节点的 Docker daemon 设置。
 pub async fn update_settings(
     State(state): State<Arc<AppState>>,
-    Json(mut settings): Json<DockerDaemonSettings>,
+    context: DockerOperationContext,
+    Json(settings): Json<DockerDaemonSettings>,
+) -> ApiResult<Response> {
+    let result = update_settings_inner(Arc::clone(&state), settings).await;
+    context
+        .finish(
+            &state.metadata_db,
+            "daemon.settings.update",
+            Some(("dockerDaemon", "settings")),
+            json!({}),
+            true,
+            result,
+        )
+        .await
+}
+
+async fn update_settings_inner(
+    state: Arc<AppState>,
+    mut settings: DockerDaemonSettings,
 ) -> ApiResult<Response> {
     let _guard = DAEMON_SETTINGS_LOCK.lock().await;
     normalize_and_validate_settings(&mut settings)?;

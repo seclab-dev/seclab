@@ -1,5 +1,6 @@
 //! Docker 安装 API：按官方软件仓库安装 Docker Engine。
 
+use crate::api::docker::context::DockerOperationContext;
 use crate::types::{ApiError, ApiResponse, ApiResult};
 use axum::{
     Json,
@@ -7,6 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::{collections::HashMap, fs, sync::Arc};
 use tokio::process::Command;
 
@@ -48,53 +50,83 @@ impl OsRelease {
 ///
 /// 此接口不接受前端传入的 shell 脚本；agent 端只执行内置安装流程。
 pub async fn install(
-    State(_state): State<Arc<crate::state::AppState>>,
+    State(state): State<Arc<crate::state::AppState>>,
+    context: DockerOperationContext,
     Json(payload): Json<DockerInstallPayload>,
 ) -> ApiResult<Response> {
-    if payload.mirror.as_deref().unwrap_or("official") != "official" {
-        return Err(ApiError::BadRequest(
-            "only official Docker repository is supported".to_string(),
-        ));
-    }
+    context
+        .record_success(
+            &state.metadata_db,
+            "docker.install.submitted",
+            Some(("dockerEngine", "docker")),
+            json!({}),
+            false,
+        )
+        .await;
+    let result: ApiResult<Response> = async {
+        if payload.mirror.as_deref().unwrap_or("official") != "official" {
+            return Err(ApiError::BadRequest(
+                "only official Docker repository is supported".to_string(),
+            ));
+        }
 
-    let os = read_os_release()?;
-    let repo = match os.id.as_str() {
-        "ubuntu" => "ubuntu",
-        "debian" => "debian",
-        other => {
-            return Err(ApiError::BadRequest(format!(
-                "unsupported distro for Docker installation: {other}"
+        let os = read_os_release()?;
+        let repo = match os.id.as_str() {
+            "ubuntu" => "ubuntu",
+            "debian" => "debian",
+            other => {
+                return Err(ApiError::BadRequest(format!(
+                    "unsupported distro for Docker installation: {other}"
+                )));
+            }
+        };
+        let suite = os.suite().ok_or_else(|| {
+            ApiError::BadRequest("os-release does not contain VERSION_CODENAME".to_string())
+        })?;
+        let arch = docker_arch()?;
+        let timeout_secs = payload.timeout_secs.unwrap_or(600).clamp(60, 1_800) as u64;
+        let started_at = chrono::Utc::now().timestamp();
+        let script = build_install_script(repo, suite, &arch);
+
+        let output = Command::new("/usr/bin/timeout")
+            .arg(format!("{}s", timeout_secs))
+            .arg("/bin/bash")
+            .arg("-lc")
+            .arg(script)
+            .output()
+            .await
+            .map_err(|err| ApiError::Internal(format!("failed to install Docker: {err}")))?;
+
+        let exit_code = output.status.code().unwrap_or(-1) as i64;
+        let result = DockerInstallResult {
+            exit_code,
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            timed_out: exit_code == 124,
+            started_at,
+            finished_at: chrono::Utc::now().timestamp(),
+        };
+
+        if result.exit_code != 0 {
+            return Err(ApiError::Internal(format!(
+                "Docker install exited with code {}: {}",
+                result.exit_code,
+                result.stderr.trim()
             )));
         }
-    };
-    let suite = os.suite().ok_or_else(|| {
-        ApiError::BadRequest("os-release does not contain VERSION_CODENAME".to_string())
-    })?;
-    let arch = docker_arch()?;
-    let timeout_secs = payload.timeout_secs.unwrap_or(600).clamp(60, 1_800) as u64;
-    let started_at = chrono::Utc::now().timestamp();
-    let script = build_install_script(repo, suite, &arch);
-
-    let output = Command::new("/usr/bin/timeout")
-        .arg(format!("{}s", timeout_secs))
-        .arg("/bin/bash")
-        .arg("-lc")
-        .arg(script)
-        .output()
+        Ok(ApiResponse::success_with_raw("Docker install finished", Some(result)).into_response())
+    }
+    .await;
+    context
+        .finish(
+            &state.metadata_db,
+            "docker.install",
+            Some(("dockerEngine", "docker")),
+            json!({}),
+            false,
+            result,
+        )
         .await
-        .map_err(|err| ApiError::Internal(format!("failed to install Docker: {err}")))?;
-
-    let exit_code = output.status.code().unwrap_or(-1) as i64;
-    let result = DockerInstallResult {
-        exit_code,
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        timed_out: exit_code == 124,
-        started_at,
-        finished_at: chrono::Utc::now().timestamp(),
-    };
-
-    Ok(ApiResponse::success_with_raw("Docker install finished", Some(result)).into_response())
 }
 
 fn read_os_release() -> ApiResult<OsRelease> {

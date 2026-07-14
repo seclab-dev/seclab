@@ -2,6 +2,7 @@
 //! 基于数据库 docker_compose_projects 进行干净的项目登记与路径维护。
 
 use crate::api::docker::containers::format_log_output;
+use crate::api::docker::context::DockerOperationContext;
 use crate::config;
 use crate::models::docker;
 use crate::state::AppState;
@@ -14,6 +15,7 @@ use bollard::query_parameters::{self, LogsOptions};
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use serde::Deserialize;
+use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
@@ -65,8 +67,11 @@ async fn ensure_compose_file(state: &Arc<AppState>, project: &str) -> Result<Pat
 /// 写入 compose 文件并启动项目。
 pub async fn create_project(
     State(state): State<Arc<AppState>>,
+    context: DockerOperationContext,
     Json(payload): Json<docker::ComposeProjectCreateRequest>,
 ) -> ApiResult<Response> {
+    let requested_name = payload.name.clone();
+    let result: ApiResult<Response> = async {
     let project = normalize_project_name(&payload.name)?;
     let ptype = payload
         .project_type
@@ -102,7 +107,19 @@ pub async fn create_project(
     run_compose_command(&project, &compose_file, &["up", "-d"]).await?;
 
     info!("Compose project created: {} in dir {}", project, dir_str);
-    Ok(ApiResponse::ok("Compose project created").into_response())
+        Ok(ApiResponse::ok("Compose project created").into_response())
+    }
+    .await;
+    context
+        .finish(
+            &state.metadata_db,
+            "compose.create",
+            Some(("composeProject", &requested_name)),
+            json!({ "name": requested_name }),
+            false,
+            result,
+        )
+        .await
 }
 
 /// 汇总登记在数据库中的 Compose 项目的运行状态与容器数量。
@@ -201,34 +218,28 @@ pub(crate) async fn load_project_summaries(
 /// 启动指定的 Compose 项目。
 pub async fn start_project(
     State(state): State<Arc<AppState>>,
+    context: DockerOperationContext,
     Path(name): Path<String>,
 ) -> ApiResult<Response> {
-    let project = normalize_project_name(&name)?;
-    let compose_file = ensure_compose_file(&state, &project).await?;
-    run_compose_command(&project, &compose_file, &["start"]).await?;
-    Ok(ApiResponse::ok("Compose project started").into_response())
+    project_command(&state, &context, &name, "compose.start", &["start"]).await
 }
 
 /// 停止指定的 Compose 项目。
 pub async fn stop_project(
     State(state): State<Arc<AppState>>,
+    context: DockerOperationContext,
     Path(name): Path<String>,
 ) -> ApiResult<Response> {
-    let project = normalize_project_name(&name)?;
-    let compose_file = ensure_compose_file(&state, &project).await?;
-    run_compose_command(&project, &compose_file, &["stop"]).await?;
-    Ok(ApiResponse::ok("Compose project stopped").into_response())
+    project_command(&state, &context, &name, "compose.stop", &["stop"]).await
 }
 
 /// 重启指定的 Compose 项目。
 pub async fn restart_project(
     State(state): State<Arc<AppState>>,
+    context: DockerOperationContext,
     Path(name): Path<String>,
 ) -> ApiResult<Response> {
-    let project = normalize_project_name(&name)?;
-    let compose_file = ensure_compose_file(&state, &project).await?;
-    run_compose_command(&project, &compose_file, &["restart"]).await?;
-    Ok(ApiResponse::ok("Compose project restarted").into_response())
+    project_command(&state, &context, &name, "compose.restart", &["restart"]).await
 }
 
 /// 删除项目时的可选参数（干净重构下已不再强依赖此参数）。
@@ -241,69 +252,97 @@ pub struct DeleteProjectQuery {
 /// 停止并删除 Compose 项目，依据形态类型自动决定是否保留文件。
 pub async fn delete_project(
     State(state): State<Arc<AppState>>,
+    context: DockerOperationContext,
     Path(name): Path<String>,
     Query(_query): Query<DeleteProjectQuery>,
 ) -> ApiResult<Response> {
-    let project = normalize_project_name(&name)?;
+    let result: ApiResult<Response> = async {
+        let project = normalize_project_name(&name)?;
 
-    // 不能删除运行中的 Compose 项目
-    let docker = state.docker_client().await?;
-    let mut filters = HashMap::new();
-    filters.insert(
-        "label".to_string(),
-        vec![format!("com.docker.compose.project={}", project)],
-    );
-    filters.insert("status".to_string(), vec!["running".to_string()]);
-    let options = query_parameters::ListContainersOptionsBuilder::new()
-        .all(true)
-        .filters(&filters)
-        .build();
-    let running_containers = docker.list_containers(Some(options)).await?;
-    if !running_containers.is_empty() {
-        return Err(ApiError::BadRequest(
-            "Cannot delete a running compose project. Please stop it first.".to_string(),
-        ));
-    }
-
-    let (dir, ptype) = resolve_project_meta(&state, &project).await?;
-    let compose_file = dir.join(COMPOSE_FILE_NAME);
-    if tokio::fs::metadata(&compose_file).await.is_ok() {
-        run_compose_command(&project, &compose_file, &["down"]).await?;
-    } else {
-        remove_project_containers(&state, &project).await?;
-    }
-
-    // 从数据库中移除登记
-    sqlx::query("DELETE FROM docker_compose_projects WHERE name = ?1")
-        .bind(&project)
-        .execute(&state.metadata_db)
-        .await?;
-
-    // 形态控制删除：
-    // - "docker" 形态：坚决不清除本地文件目录以防止挂载或关键数据丢失
-    // - 其他一键部署形态：彻底清理该项目的整个目录
-    if ptype != "docker" {
-        if !is_safe_project_name(&project) {
-            return Err(ApiError::BadRequest("unsafe project name".to_string()));
+        // 不能删除运行中的 Compose 项目
+        let docker = state.docker_client().await?;
+        let mut filters = HashMap::new();
+        filters.insert(
+            "label".to_string(),
+            vec![format!("com.docker.compose.project={}", project)],
+        );
+        filters.insert("status".to_string(), vec!["running".to_string()]);
+        let options = query_parameters::ListContainersOptionsBuilder::new()
+            .all(true)
+            .filters(&filters)
+            .build();
+        let running_containers = docker.list_containers(Some(options)).await?;
+        if !running_containers.is_empty() {
+            return Err(ApiError::BadRequest(
+                "Cannot delete a running compose project. Please stop it first.".to_string(),
+            ));
         }
-        if tokio::fs::metadata(&dir).await.is_ok() {
-            tokio::fs::remove_dir_all(&dir).await?;
-        }
-    }
 
-    Ok(ApiResponse::ok("Compose project deleted").into_response())
+        let (dir, ptype) = resolve_project_meta(&state, &project).await?;
+        let compose_file = dir.join(COMPOSE_FILE_NAME);
+        if tokio::fs::metadata(&compose_file).await.is_ok() {
+            run_compose_command(&project, &compose_file, &["down"]).await?;
+        } else {
+            remove_project_containers(&state, &project).await?;
+        }
+
+        // 从数据库中移除登记
+        sqlx::query("DELETE FROM docker_compose_projects WHERE name = ?1")
+            .bind(&project)
+            .execute(&state.metadata_db)
+            .await?;
+
+        // 形态控制删除：
+        // - "docker" 形态：坚决不清除本地文件目录以防止挂载或关键数据丢失
+        // - 其他一键部署形态：彻底清理该项目的整个目录
+        if ptype != "docker" {
+            if !is_safe_project_name(&project) {
+                return Err(ApiError::BadRequest("unsafe project name".to_string()));
+            }
+            if tokio::fs::metadata(&dir).await.is_ok() {
+                tokio::fs::remove_dir_all(&dir).await?;
+            }
+        }
+
+        Ok(ApiResponse::ok("Compose project deleted").into_response())
+    }
+    .await;
+    context
+        .finish(
+            &state.metadata_db,
+            "compose.delete",
+            Some(("composeProject", &name)),
+            json!({ "name": name }),
+            true,
+            result,
+        )
+        .await
 }
 
 /// 拉取最新镜像并重建 Compose 项目。
 pub async fn update_project(
     State(state): State<Arc<AppState>>,
+    context: DockerOperationContext,
     Path(name): Path<String>,
 ) -> ApiResult<Response> {
-    let project = normalize_project_name(&name)?;
-    let compose_file = ensure_compose_file(&state, &project).await?;
-    run_compose_command(&project, &compose_file, &["pull"]).await?;
-    run_compose_command(&project, &compose_file, &["up", "-d", "--force-recreate"]).await?;
-    Ok(ApiResponse::ok("Compose project updated").into_response())
+    let result: ApiResult<Response> = async {
+        let project = normalize_project_name(&name)?;
+        let compose_file = ensure_compose_file(&state, &project).await?;
+        run_compose_command(&project, &compose_file, &["pull"]).await?;
+        run_compose_command(&project, &compose_file, &["up", "-d", "--force-recreate"]).await?;
+        Ok(ApiResponse::ok("Compose project updated").into_response())
+    }
+    .await;
+    context
+        .finish(
+            &state.metadata_db,
+            "compose.update",
+            Some(("composeProject", &name)),
+            json!({ "name": name }),
+            false,
+            result,
+        )
+        .await
 }
 
 /// 返回 Compose 项目根目录路径。
@@ -517,22 +556,64 @@ fn clamp_i64_to_i32(value: i64) -> i32 {
 /// 伸缩 Compose 项目中指定服务的容器副本数量。
 pub async fn scale_project(
     State(state): State<Arc<AppState>>,
+    context: DockerOperationContext,
     Path(name): Path<String>,
     Json(payload): Json<docker::ComposeProjectScaleRequest>,
 ) -> ApiResult<Response> {
-    let project = normalize_project_name(&name)?;
-    let compose_file = ensure_compose_file(&state, &project).await?;
-    let scale_arg = format!("{}={}", payload.service, payload.replicas);
+    let service = payload.service.clone();
+    let replicas = payload.replicas;
+    let result: ApiResult<Response> = async {
+        let project = normalize_project_name(&name)?;
+        let compose_file = ensure_compose_file(&state, &project).await?;
+        let scale_arg = format!("{}={}", payload.service, payload.replicas);
 
-    run_compose_command(
-        &project,
-        &compose_file,
-        &["up", "-d", "--scale", &scale_arg],
-    )
-    .await?;
+        run_compose_command(
+            &project,
+            &compose_file,
+            &["up", "-d", "--scale", &scale_arg],
+        )
+        .await?;
 
-    info!("Compose project scaled: {}/{}", project, scale_arg);
-    Ok(ApiResponse::ok("Compose project scaled").into_response())
+        info!("Compose project scaled: {}/{}", project, scale_arg);
+        Ok(ApiResponse::ok("Compose project scaled").into_response())
+    }
+    .await;
+    context
+        .finish(
+            &state.metadata_db,
+            "compose.scale",
+            Some(("composeProject", &name)),
+            json!({ "name": name, "service": service, "replicas": replicas }),
+            false,
+            result,
+        )
+        .await
+}
+
+async fn project_command(
+    state: &Arc<AppState>,
+    context: &DockerOperationContext,
+    name: &str,
+    event_code: &str,
+    args: &[&str],
+) -> ApiResult<Response> {
+    let result: ApiResult<Response> = async {
+        let project = normalize_project_name(name)?;
+        let compose_file = ensure_compose_file(state, &project).await?;
+        run_compose_command(&project, &compose_file, args).await?;
+        Ok(ApiResponse::ok("Compose project operation completed").into_response())
+    }
+    .await;
+    context
+        .finish(
+            &state.metadata_db,
+            event_code,
+            Some(("composeProject", name)),
+            json!({ "name": name }),
+            false,
+            result,
+        )
+        .await
 }
 
 /// 校验 Compose YAML 配置的合法性。

@@ -1,11 +1,10 @@
 //! Docker API 聚合：容器、镜像、网络与统计子路由。
 
 use crate::models::docker;
-use crate::services::docker_stats;
+use crate::services::{docker_activity, docker_stats};
 use crate::state::AppState;
 use crate::types::{ApiResponse, ApiResult};
 
-use crate::services::logging::{self, AgentLogModule, LogPayload};
 use axum::{
     Router,
     extract::{Json, State},
@@ -21,6 +20,7 @@ use tracing::info;
 
 pub mod compose;
 pub mod containers;
+pub mod context;
 pub mod daemon_settings;
 pub mod images;
 pub mod install;
@@ -213,24 +213,13 @@ pub async fn status(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
     Ok(ApiResponse::success_with_raw("Docker status loaded", Some(summary)).into_response())
 }
 
-/// 获取 Docker 模块的日志
-pub async fn logs(
+/// 查询 Docker 操作日志。
+pub async fn activity_logs(
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<LogPayload>,
+    Json(payload): Json<docker::DockerActivityLogQuery>,
 ) -> ApiResult<Response> {
-    info!(
-        "Requesting Docker module platform logs: page={}, page_size={}",
-        payload.page, payload.page_size
-    );
-
-    let dev_ops_query = LogPayload {
-        modules: Some(vec![AgentLogModule::Docker]),
-        ..payload
-    };
-
-    let logs = logging::fetch_agent_logs(&state.metadata_db, dev_ops_query).await?;
-
-    Ok(ApiResponse::success_with_raw("Platform logs loaded", Some(logs)).into_response())
+    let page = docker_activity::query(&state.metadata_db, payload).await?;
+    Ok(ApiResponse::success_with_raw("Docker activity logs loaded", Some(page)).into_response())
 }
 
 /// 构建 Docker 子模块的路由集合。
@@ -373,7 +362,8 @@ pub fn docker_router() -> Router<Arc<AppState>> {
         )
         .route("/system/df", get(system::system_df))
         .route("/system/prune", post(system::system_prune))
-        .route("/logs", post(logs))
+        .route("/activity-logs/query", post(activity_logs))
+        .layer(axum::middleware::from_fn(context::operation_context_layer))
 }
 
 #[cfg(test)]
