@@ -1432,6 +1432,7 @@ const en = {
       guardOpen: 'Disk Manager is still open. Please close this window first.',
       labels: {
         systemDisk: 'System',
+        readOnly: 'Read only',
       },
       fields: {
         size: 'Size',
@@ -1488,7 +1489,11 @@ const en = {
         empty: 'No disk data',
         loadFailed: 'Failed to fetch disk data',
         systemDiskBlocked: 'Operation forbidden on system disk',
+        wslReadOnly:
+          'This node is running in WSL. Disk information is read-only and all disk operations are disabled.',
         unformattedDisk: 'This disk is unused. Start partitioning to mount and use it.',
+        unformattedDiskReadOnly:
+          'No traditional partition layout was detected. WSL virtual disks are read-only here.',
         partitionFailed: 'Failed to init partition',
         partitionSuccess: 'Disk {disk} init partition success',
         operationFailed: 'Partition operation failed',

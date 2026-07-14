@@ -60,6 +60,7 @@ pub struct DiskInfo {
     pub serial: String,
     pub partition_table: String,
     pub is_system_disk: bool,
+    pub read_only: bool,
     pub partitions: Vec<DiskPartitionInfo>,
 }
 
@@ -1144,10 +1145,11 @@ fn collect_disks() -> anyhow::Result<Vec<DiskInfo>> {
     let mut by_name = HashMap::<String, LsblkDevice>::new();
     flatten_devices(&parsed.blockdevices, &mut by_name);
     let system_disk_names = resolve_system_disk_names(&by_name);
+    let read_only = is_wsl_runtime();
 
     let mut rows = Vec::new();
     for device in &parsed.blockdevices {
-        collect_disk_rows(device, &system_disk_names, &mut rows);
+        collect_disk_rows(device, &system_disk_names, read_only, &mut rows);
     }
     Ok(rows)
 }
@@ -1161,7 +1163,12 @@ fn flatten_devices(devices: &[LsblkDevice], by_name: &mut HashMap<String, LsblkD
     }
 }
 
-fn collect_disk_rows(device: &LsblkDevice, system_disk_names: &[String], rows: &mut Vec<DiskInfo>) {
+fn collect_disk_rows(
+    device: &LsblkDevice,
+    system_disk_names: &[String],
+    read_only: bool,
+    rows: &mut Vec<DiskInfo>,
+) {
     if device.device_type == "disk" {
         let transport = device
             .tran
@@ -1190,12 +1197,41 @@ fn collect_disk_rows(device: &LsblkDevice, system_disk_names: &[String], rows: &
             serial: normalize_optional_field(device.serial.as_deref()),
             partition_table: normalize_optional_field(device.pttype.as_deref()),
             is_system_disk: system_disk_names.iter().any(|item| item == &device.name),
+            read_only,
             partitions: collect_partitions(device),
         });
     }
     for child in &device.children {
-        collect_disk_rows(child, system_disk_names, rows);
+        collect_disk_rows(child, system_disk_names, read_only, rows);
     }
+}
+
+/// 判断当前进程是否运行在 Windows Subsystem for Linux 环境中。
+fn is_wsl_runtime() -> bool {
+    if std::env::var_os("WSL_INTEROP").is_some() || std::env::var_os("WSL_DISTRO_NAME").is_some() {
+        return true;
+    }
+
+    ["/proc/sys/kernel/osrelease", "/proc/version"]
+        .iter()
+        .filter_map(|path| fs::read_to_string(path).ok())
+        .any(|value| is_wsl_kernel_text(&value))
+}
+
+/// 根据内核版本文本识别 WSL 特征。
+fn is_wsl_kernel_text(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    normalized.contains("microsoft") || normalized.contains("-wsl")
+}
+
+/// 阻止 WSL 环境执行会改变块设备状态的操作。
+fn guard_disk_management_runtime() -> anyhow::Result<()> {
+    if is_wsl_runtime() {
+        return Err(anyhow::anyhow!(
+            "disk management is read-only in WSL environments"
+        ));
+    }
+    Ok(())
 }
 
 fn resolve_system_disk_names(by_name: &HashMap<String, LsblkDevice>) -> Vec<String> {
@@ -1441,6 +1477,7 @@ fn do_mount_partition(
     partition_name: &str,
     mountpoint: Option<String>,
 ) -> anyhow::Result<()> {
+    guard_disk_management_runtime()?;
     let context = resolve_partition_context(disk_name, partition_name)?;
     guard_partition_context(&context)?;
     if has_active_mountpoint(&context.partition) {
@@ -1464,6 +1501,7 @@ fn do_mount_partition(
 }
 
 fn do_unmount_partition(disk_name: &str, partition_name: &str) -> anyhow::Result<()> {
+    guard_disk_management_runtime()?;
     let context = resolve_partition_context(disk_name, partition_name)?;
     guard_partition_context(&context)?;
     let mounts = active_mountpoints(&context.partition);
@@ -1491,6 +1529,7 @@ fn do_format_partition(
     partition_name: &str,
     filesystem: &str,
 ) -> anyhow::Result<()> {
+    guard_disk_management_runtime()?;
     let context = resolve_partition_context(disk_name, partition_name)?;
     guard_partition_context(&context)?;
     if has_active_mountpoint(&context.partition) {
@@ -1724,6 +1763,7 @@ fn do_initialize_disk(
     filesystem: &str,
     mountpoint: Option<String>,
 ) -> anyhow::Result<()> {
+    guard_disk_management_runtime()?;
     if filesystem != "ext4" {
         return Err(anyhow::anyhow!("only ext4 initialization is supported"));
     }
@@ -2043,6 +2083,13 @@ mod disk_safety_tests {
 
         let system_disks = resolve_system_disk_names(&by_name);
         assert_eq!(system_disks, vec!["sda".to_string()]);
+    }
+
+    #[test]
+    fn detects_wsl_kernel_signatures() {
+        assert!(is_wsl_kernel_text("5.15.167.4-microsoft-standard-WSL2"));
+        assert!(is_wsl_kernel_text("6.6.87.2-microsoft-standard-WSL2"));
+        assert!(!is_wsl_kernel_text("6.8.0-60-generic"));
     }
 
     #[test]

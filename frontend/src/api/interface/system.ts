@@ -65,6 +65,7 @@ export interface DiskInfo {
   serial: string
   partitionTable: string
   isSystemDisk: boolean
+  readOnly: boolean
   partitions: DiskPartitionInfo[]
 }
 

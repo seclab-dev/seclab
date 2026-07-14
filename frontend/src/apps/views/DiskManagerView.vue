@@ -46,6 +46,7 @@ const pendingMountTarget = ref<
   | null
 >(null)
 const diskBusy = computed(() => loading.value || actionLoading.value)
+const diskManagementReadOnly = computed(() => diskRows.value.some((disk) => disk.readOnly))
 
 watch(
   diskBusy,
@@ -122,11 +123,12 @@ const reloadDisks = async () => {
 }
 
 const handleInitPartition = async (disk: DiskInfo) => {
-  if (!canInitializeDisk(disk) || actionLoading.value) return
+  if (diskManagementReadOnly.value || !canInitializeDisk(disk) || actionLoading.value) return
   openMountDialog('initialize', disk)
 }
 
 const confirmInitPartition = async (disk: DiskInfo, mountpoint: string) => {
+  if (diskManagementReadOnly.value) return
   const confirmed = await confirmationModal.showConfirmation(
     t('app.diskManager.confirm.initMessage', { disk: disk.name, mountpoint }),
     t('app.diskManager.confirm.title'),
@@ -211,26 +213,34 @@ const hasExternalMountpoint = (partition: DiskPartitionInfo) => {
 }
 
 const canInitializeDisk = (disk: DiskInfo) => {
-  if (disk.isSystemDisk) return false
+  if (diskManagementReadOnly.value || disk.isSystemDisk) return false
   return !disk.partitions.some(isMountedPartition)
 }
 
 const canRepartitionDisk = (disk: DiskInfo) => {
   return (
-    !disk.isSystemDisk && disk.partitions.length > 0 && !disk.partitions.some(isMountedPartition)
+    !diskManagementReadOnly.value &&
+    !disk.isSystemDisk &&
+    disk.partitions.length > 0 &&
+    !disk.partitions.some(isMountedPartition)
   )
 }
 
 const canMountPartition = (disk: DiskInfo, partition: DiskPartitionInfo) => {
-  return !disk.isSystemDisk && !isMountedPartition(partition) && hasFilesystem(partition)
+  return (
+    !diskManagementReadOnly.value &&
+    !disk.isSystemDisk &&
+    !isMountedPartition(partition) &&
+    hasFilesystem(partition)
+  )
 }
 
 const canUnmountPartition = (disk: DiskInfo, partition: DiskPartitionInfo) => {
-  return !disk.isSystemDisk && isManagedMountedPartition(partition)
+  return !diskManagementReadOnly.value && !disk.isSystemDisk && isManagedMountedPartition(partition)
 }
 
 const canFormatPartition = (disk: DiskInfo, partition: DiskPartitionInfo) => {
-  return !disk.isSystemDisk && !isMountedPartition(partition)
+  return !diskManagementReadOnly.value && !disk.isSystemDisk && !isMountedPartition(partition)
 }
 
 const partitionActions = (disk: DiskInfo, partition: DiskPartitionInfo) => {
@@ -322,6 +332,7 @@ const closeMountDialog = () => {
 }
 
 const confirmMountDialog = async () => {
+  if (diskManagementReadOnly.value) return
   const target = pendingMountTarget.value
   if (!target) return
   const mountpoint = normalizeMountpointInput(mountpointInput.value)
@@ -343,7 +354,7 @@ const runPartitionAction = async (
   partition: DiskPartitionInfo,
   mountpoint?: string,
 ) => {
-  if (disk.isSystemDisk || actionLoading.value) return
+  if (diskManagementReadOnly.value || disk.isSystemDisk || actionLoading.value) return
 
   const isMounted = isMountedPartition(partition)
   if (action === 'mount' && !canMountPartition(disk, partition)) return
@@ -432,7 +443,14 @@ onMounted(async () => {
 </script>
 
 <template>
-  <div class="disk-manager" data-seclab-app="disk-manager">
+  <div class="disk-manager" data-page="disk-manager" data-seclab-app="disk-manager">
+    <div v-if="diskManagementReadOnly" class="read-only-notice" data-ui="disk-read-only-notice">
+      <SecLabIcon class="hint-icon" name="lock" :size="16" />
+      <div class="read-only-content">
+        <SecLabTag type="warning">{{ t('app.diskManager.labels.readOnly') }}</SecLabTag>
+        <span>{{ t('app.diskManager.messages.wslReadOnly') }}</span>
+      </div>
+    </div>
     <div v-if="sortedDiskRows.length === 0 && !loading" class="empty-state">
       <div class="empty-content">
         <SecLabIcon class="empty-icon" name="disk" :size="48" />
@@ -493,7 +511,13 @@ onMounted(async () => {
           <div v-if="isUnformattedDisk(disk)" class="unformatted-section">
             <div class="unformatted-hint">
               <SecLabIcon class="hint-icon" name="info" :size="14" />
-              <p>{{ t('app.diskManager.messages.unformattedDisk') }}</p>
+              <p>
+                {{
+                  diskManagementReadOnly
+                    ? t('app.diskManager.messages.unformattedDiskReadOnly')
+                    : t('app.diskManager.messages.unformattedDisk')
+                }}
+              </p>
             </div>
             <div class="unformatted-actions">
               <SecLabButton
@@ -626,6 +650,26 @@ onMounted(async () => {
   display: flex;
   flex-direction: column;
   gap: var(--sdl-space-3);
+}
+
+.read-only-notice {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--sdl-space-3);
+  padding: var(--sdl-space-3) var(--sdl-space-4);
+  color: var(--sdl-text-secondary);
+  background: var(--sdl-warning-soft);
+  border: 1px solid var(--sdl-warning);
+  border-radius: var(--sdl-radius-md);
+  font-size: var(--sdl-font-body-sm);
+}
+
+.read-only-content {
+  display: flex;
+  align-items: center;
+  gap: var(--sdl-space-2);
+  min-width: 0;
 }
 
 .card.is-system-disk {

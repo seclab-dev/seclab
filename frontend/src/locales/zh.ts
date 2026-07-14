@@ -1409,6 +1409,7 @@ const zh: typeof en = {
       guardOpen: '磁盘管理仍在打开，请先关闭该窗口。',
       labels: {
         systemDisk: '系统盘',
+        readOnly: '只读',
       },
       fields: {
         size: '大小',
@@ -1462,7 +1463,9 @@ const zh: typeof en = {
         empty: '暂无磁盘数据',
         loadFailed: '获取磁盘数据失败',
         systemDiskBlocked: '系统盘禁止操作',
+        wslReadOnly: '当前节点运行在 WSL 环境中，磁盘信息仅供查看，所有磁盘操作均已禁用。',
         unformattedDisk: '该硬盘尚未使用，可开始分区后挂载使用。',
+        unformattedDiskReadOnly: '未检测到传统分区结构；WSL 虚拟磁盘仅供查看。',
         partitionFailed: '磁盘分区初始化失败',
         partitionSuccess: '磁盘 {disk} 分区初始化成功',
         operationFailed: '磁盘分区操作失败',
