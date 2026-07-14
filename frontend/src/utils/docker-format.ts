@@ -104,31 +104,6 @@ export const formatImageTags = (tags: dockerType.ImageSummary['RepoTags'] | unde
 }
 
 /**
- * 格式化 IPAM 配置信息 (子网与网关)。
- * @param ipam IPAM 配置对象
- */
-export const formatIpamConfig = (ipam: dockerType.Ipam | null | undefined): string => {
-  if (!ipam || !ipam.Config || ipam.Config.length === 0) return '-'
-  return ipam.Config.map((config) => {
-    let result = ''
-    if (config.Subnet) result += `Subnet: ${config.Subnet}`
-    if (config.Gateway) result += (result ? ' / ' : '') + `Gateway: ${config.Gateway}`
-    return result
-  }).join('; ')
-}
-
-/**
- * 计算网络中已连接的容器数量。
- * @param containers 容器映射
- */
-export const getConnectedContainerCount = (
-  containers: Record<string, dockerType.NetworkContainer> | null | undefined,
-): number => {
-  if (!containers) return 0
-  return Object.keys(containers).length
-}
-
-/**
  * 格式化 key-value 记录为逗号分隔的字符串。
  * @param input key-value 记录
  */
@@ -144,19 +119,25 @@ export const formatKeyValue = (input: Record<string, string> | null | undefined)
  * 每行一个 key=value 对，解析失败返回 null。
  * @param input 多行文本输入
  */
-export const parseLabels = (input: string): Record<string, string> | null => {
-  const labels: Record<string, string> = {}
+export const parseKeyValueLines = (input: string): Record<string, string> | null => {
+  const values: Record<string, string> = {}
   const lines = input
     .split('\n')
     .map((line) => line.trim())
     .filter((line) => line.length > 0)
   for (const line of lines) {
-    const [key, value] = line.split('=')
-    if (!key || value === undefined) return null
-    labels[key.trim()] = value.trim()
+    const separator = line.indexOf('=')
+    if (separator <= 0) return null
+    const key = line.slice(0, separator).trim()
+    const value = line.slice(separator + 1).trim()
+    if (!key || Object.hasOwn(values, key)) return null
+    values[key] = value
   }
-  return Object.keys(labels).length > 0 ? labels : {}
+  return values
 }
+
+/** 解析 Docker 标签文本，保留既有调用名称。 */
+export const parseLabels = parseKeyValueLines
 
 /**
  * 获取 CSS 自定义属性值（用于 ECharts 主题色同步）。

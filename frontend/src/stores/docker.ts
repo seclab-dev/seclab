@@ -93,7 +93,17 @@ export const useDockerStore = defineStore('docker', () => {
 
   // ─── 镜像 / 网络 / 卷 / 系统 ───
   const imagesList = ref<dockerType.ImageSummary[]>([])
-  const networks = ref<dockerType.Network[]>([])
+  const networks = ref<dockerType.DockerNetworkSummary[]>([])
+  const networkListLoading = ref(false)
+  const networkListError = ref<string | null>(null)
+  const networkListLoadedAt = ref<number | null>(null)
+  const networkDetail = ref<dockerType.DockerNetworkDetail | null>(null)
+  const networkDetailLoading = ref(false)
+  const networkDetailError = ref<string | null>(null)
+  const networkCreateLoading = ref(false)
+  const networkDeleteLoadingId = ref<string | null>(null)
+  const networkConnectLoading = ref(false)
+  const networkDisconnectLoading = ref<Record<string, boolean>>({})
   const volumes = ref<dockerType.VolumeSummary[]>([])
   const systemInfo = ref<dockerType.DockerSystemInfo | null>(null)
   const systemInfoLoading = ref(false)
@@ -130,23 +140,14 @@ export const useDockerStore = defineStore('docker', () => {
   )
   const composeYamlError = ref('')
 
-  // ─── 网络创建/查看 ───
-  const isNetworkCreateActive = ref(false)
-  const networkForm = ref({
-    name: '',
-    driver: 'bridge',
-    subnet: '',
-    gateway: '',
-    labels: '',
-  })
-  const selectedNetworkDetail = ref<dockerType.Network | null>(null)
-  const isNetworkModalVisible = ref(false)
-
   // ─── 缓存与防并发 ───
   const overviewCache = ref<OverviewCacheEntry | null>(null)
   const overviewRefreshInProgress = ref(false)
   const historyRefreshInProgress = ref(false)
   let historyRefreshQueued = false
+  let networkListRequestSequence = 0
+  let networkDetailRequestSequence = 0
+  let networkNodeId: string | null = null
 
   // ─── 轮询定时器 ───
   let resourceUsageTimer: number | null = null
@@ -188,6 +189,19 @@ export const useDockerStore = defineStore('docker', () => {
     composeProjects.value = []
     imagesList.value = []
     networks.value = []
+    networkListLoading.value = false
+    networkListError.value = null
+    networkListLoadedAt.value = null
+    networkDetail.value = null
+    networkDetailLoading.value = false
+    networkDetailError.value = null
+    networkCreateLoading.value = false
+    networkDeleteLoadingId.value = null
+    networkConnectLoading.value = false
+    networkDisconnectLoading.value = {}
+    networkNodeId = null
+    networkListRequestSequence += 1
+    networkDetailRequestSequence += 1
     volumes.value = []
     systemInfo.value = null
     systemInfoLoading.value = false
@@ -416,20 +430,39 @@ export const useDockerStore = defineStore('docker', () => {
     }
   }
 
-  /** 获取网络列表 */
-  const fetchNetworks = async () => {
-    if (!dockerAvailable.value) return
-    const res = await dockerClient.value.listNetworks()
-    if (res.success) {
-      networks.value = res.data || []
-    } else {
-      notificationStore.error(
-        t('app.docker.messages.listNetworksFailed', {
-          message: res.message || t('common.unknownError'),
-        }),
-      )
+  /** 获取网络摘要列表，并阻止旧节点响应覆盖当前状态。 */
+  const fetchNetworks = async (): Promise<boolean> => {
+    if (!dockerAvailable.value) return false
+    const nodeId = nodeStore.currentNodeId || 'local'
+    if (networkNodeId !== nodeId) {
       networks.value = []
+      networkListLoadedAt.value = null
+      networkDetail.value = null
+      networkDetailLoading.value = false
+      networkDetailError.value = null
+      networkDetailRequestSequence += 1
+      networkNodeId = nodeId
     }
+    const sequence = ++networkListRequestSequence
+    networkListLoading.value = true
+    networkListError.value = null
+    const res = await dockerClient.value.listNetworks()
+    if (
+      sequence !== networkListRequestSequence ||
+      nodeId !== (nodeStore.currentNodeId || 'local')
+    ) {
+      return false
+    }
+    networkListLoading.value = false
+    if (res.success && res.data) {
+      networks.value = res.data
+      networkListLoadedAt.value = Date.now()
+      return true
+    }
+    networkListError.value = t('app.docker.messages.listNetworksFailed', {
+      message: res.message || t('common.unknownError'),
+    })
+    return false
   }
 
   /** 获取卷列表 */
@@ -858,94 +891,139 @@ export const useDockerStore = defineStore('docker', () => {
     }
   }
 
-  /** 删除网络 */
-  const handleDeleteNetwork = async (id: string) => {
-    const confirmed = await modalStore.showConfirmation(
-      t('app.docker.messages.deleteNetworkConfirm', { id: id.substring(0, 12) }),
-      t('app.docker.messages.deleteConfirmTitle'),
-      t('app.docker.messages.deleteAction'),
-      t('confirmation.cancel'),
-    )
-    if (!confirmed) return
-    const res = await dockerClient.value.removeNetwork(id)
-    if (res.success) {
-      notificationStore.success(t('app.docker.messages.deleteNetworkSuccess'))
-      await fetchNetworks()
-    } else {
-      notificationStore.error(
-        t('app.docker.messages.deleteNetworkFailed', {
-          message: res.message || t('common.unknownError'),
-        }),
-      )
-    }
-  }
-
-  /** 查看网络详情 (调用 inspectNetwork 获取详细数据) */
-  const handleViewNetwork = async (id: string) => {
+  /** 按需获取网络详情，并阻止过期详情覆盖当前选择。 */
+  const fetchNetworkDetail = async (id: string): Promise<dockerType.DockerNetworkDetail | null> => {
+    if (!id) return null
+    const nodeId = nodeStore.currentNodeId || 'local'
+    const sequence = ++networkDetailRequestSequence
+    if (networkDetail.value?.summary.id !== id) networkDetail.value = null
+    networkDetailLoading.value = true
+    networkDetailError.value = null
     const res = await dockerClient.value.inspectNetwork(id)
+    if (
+      sequence !== networkDetailRequestSequence ||
+      nodeId !== (nodeStore.currentNodeId || 'local')
+    ) {
+      return null
+    }
+    networkDetailLoading.value = false
     if (res.success && res.data) {
-      selectedNetworkDetail.value = res.data
-      isNetworkModalVisible.value = true
-    } else {
-      notificationStore.error(
-        t('app.docker.messages.inspectNetworkFailed', {
-          message: res.message || t('common.unknownError'),
-        }),
-      )
+      networkDetail.value = res.data
+      return res.data
     }
-  }
-
-  /** 连接容器到网络 */
-  const handleConnectNetwork = async (networkId: string, containerId: string) => {
-    if (!networkId || !containerId) return
-    const res = await dockerClient.value.connectNetwork(networkId, { container: containerId })
-    if (res.success) {
-      notificationStore.success(t('app.docker.messages.connectNetworkSuccess'))
-      // 刷新网络详情
-      const inspectRes = await dockerClient.value.inspectNetwork(networkId)
-      if (inspectRes.success && inspectRes.data) {
-        selectedNetworkDetail.value = inspectRes.data
-      }
-      // 刷新网络列表
-      void fetchNetworks()
-    } else {
-      notificationStore.error(
-        t('app.docker.messages.connectNetworkFailed', {
-          message: res.message || t('common.unknownError'),
-        }),
-      )
-    }
-  }
-
-  /** 从网络断开容器 */
-  const handleDisconnectNetwork = async (networkId: string, containerId: string) => {
-    if (!networkId || !containerId) return
-    const res = await dockerClient.value.disconnectNetwork(networkId, {
-      container: containerId,
-      force: true,
+    networkDetailError.value = t('app.docker.messages.inspectNetworkFailed', {
+      message: res.message || t('common.unknownError'),
     })
-    if (res.success) {
-      notificationStore.success(t('app.docker.messages.disconnectNetworkSuccess'))
-      // 刷新网络详情
-      const inspectRes = await dockerClient.value.inspectNetwork(networkId)
-      if (inspectRes.success && inspectRes.data) {
-        selectedNetworkDetail.value = inspectRes.data
+    return null
+  }
+
+  /** 清理当前网络详情并使在途请求失效。 */
+  const clearNetworkDetail = () => {
+    networkDetailRequestSequence += 1
+    networkDetail.value = null
+    networkDetailLoading.value = false
+    networkDetailError.value = null
+  }
+
+  /** 创建 Bridge 网络。 */
+  const createNetwork = async (
+    payload: dockerType.DockerNetworkCreateRequest,
+  ): Promise<boolean> => {
+    if (networkCreateLoading.value) return false
+    networkCreateLoading.value = true
+    try {
+      const res = await dockerClient.value.createNetwork(payload)
+      if (!res.success) {
+        notificationStore.error(
+          t('app.docker.messages.createNetworkFailed', {
+            message: res.message || t('common.unknownError'),
+          }),
+        )
+        return false
       }
-      // 刷新网络列表
-      void fetchNetworks()
-    } else {
-      notificationStore.error(
-        t('app.docker.messages.disconnectNetworkFailed', {
-          message: res.message || t('common.unknownError'),
-        }),
+      notificationStore.success(
+        t('app.docker.messages.createNetworkSuccess', { name: payload.name }),
       )
+      if (res.data?.warning) notificationStore.info(res.data.warning)
+      await fetchNetworks()
+      return true
+    } finally {
+      networkCreateLoading.value = false
     }
   }
 
-  /** 关闭网络详情弹窗 */
-  const closeNetworkModal = () => {
-    isNetworkModalVisible.value = false
-    selectedNetworkDetail.value = null
+  /** 删除自定义网络。 */
+  const removeNetwork = async (network: dockerType.DockerNetworkSummary): Promise<boolean> => {
+    if (networkDeleteLoadingId.value) return false
+    networkDeleteLoadingId.value = network.id
+    try {
+      const res = await dockerClient.value.removeNetwork(network.id)
+      if (!res.success) {
+        notificationStore.error(
+          t('app.docker.messages.deleteNetworkFailed', {
+            message: res.message || t('common.unknownError'),
+          }),
+        )
+        return false
+      }
+      notificationStore.success(t('app.docker.messages.deleteNetworkSuccess'))
+      if (networkDetail.value?.summary.id === network.id) clearNetworkDetail()
+      await fetchNetworks()
+      return true
+    } finally {
+      networkDeleteLoadingId.value = null
+    }
+  }
+
+  /** 将运行中的容器连接到自定义网络。 */
+  const connectNetwork = async (networkId: string, containerId: string): Promise<boolean> => {
+    if (!networkId || !containerId || networkConnectLoading.value) return false
+    networkConnectLoading.value = true
+    try {
+      const res = await dockerClient.value.connectNetwork(networkId, { container: containerId })
+      if (!res.success) {
+        notificationStore.error(
+          t('app.docker.messages.connectNetworkFailed', {
+            message: res.message || t('common.unknownError'),
+          }),
+        )
+        return false
+      }
+      notificationStore.success(t('app.docker.messages.connectNetworkSuccess'))
+      await fetchNetworkDetail(networkId)
+      return true
+    } finally {
+      networkConnectLoading.value = false
+    }
+  }
+
+  /** 从自定义网络断开容器。 */
+  const disconnectNetwork = async (
+    networkId: string,
+    containerId: string,
+    force: boolean,
+  ): Promise<boolean> => {
+    if (!networkId || !containerId || networkDisconnectLoading.value[containerId]) return false
+    networkDisconnectLoading.value[containerId] = true
+    try {
+      const res = await dockerClient.value.disconnectNetwork(networkId, {
+        container: containerId,
+        force,
+      })
+      if (!res.success) {
+        notificationStore.error(
+          t('app.docker.messages.disconnectNetworkFailed', {
+            message: res.message || t('common.unknownError'),
+          }),
+        )
+        return false
+      }
+      notificationStore.success(t('app.docker.messages.disconnectNetworkSuccess'))
+      await fetchNetworkDetail(networkId)
+      return true
+    } finally {
+      networkDisconnectLoading.value[containerId] = false
+    }
   }
 
   // ─── 容器创建流程 ───
@@ -1089,59 +1167,6 @@ export const useDockerStore = defineStore('docker', () => {
         composeYamlError.value =
           error instanceof Error ? error.message : t('app.docker.messages.yamlParseFailed')
       }
-    }
-  }
-
-  // ─── 网络创建流程 ───
-
-  /** 开始创建网络 */
-  const handleCreateNetwork = () => {
-    isNetworkCreateActive.value = true
-  }
-
-  /** 取消网络创建 */
-  const cancelNetworkCreate = () => {
-    isNetworkCreateActive.value = false
-    networkForm.value = {
-      name: '',
-      driver: 'bridge',
-      subnet: '',
-      gateway: '',
-      labels: '',
-    }
-  }
-
-  /** 提交网络创建 */
-  const submitNetworkForm = async () => {
-    if (!networkForm.value.name.trim()) {
-      notificationStore.error(t('app.docker.messages.networkNameRequired'))
-      return
-    }
-    const { parseLabels } = await import('@/utils/docker-format')
-    const labels = parseLabels(networkForm.value.labels)
-    if (labels === null) {
-      notificationStore.error(t('app.docker.messages.invalidLabels'))
-      return
-    }
-    const res = await dockerClient.value.createNetwork({
-      name: networkForm.value.name.trim(),
-      driver: networkForm.value.driver || undefined,
-      subnet: networkForm.value.subnet || undefined,
-      gateway: networkForm.value.gateway || undefined,
-      labels: labels || undefined,
-    })
-    if (res.success) {
-      notificationStore.success(
-        t('app.docker.messages.createNetworkSuccess', { name: networkForm.value.name }),
-      )
-      cancelNetworkCreate()
-      await fetchNetworks()
-    } else {
-      notificationStore.error(
-        t('app.docker.messages.createNetworkFailed', {
-          message: res.message || t('common.unknownError'),
-        }),
-      )
     }
   }
 
@@ -1295,6 +1320,16 @@ export const useDockerStore = defineStore('docker', () => {
     // 镜像 / 网络 / 卷 / 系统
     imagesList,
     networks,
+    networkListLoading,
+    networkListError,
+    networkListLoadedAt,
+    networkDetail,
+    networkDetailLoading,
+    networkDetailError,
+    networkCreateLoading,
+    networkDeleteLoadingId,
+    networkConnectLoading,
+    networkDisconnectLoading,
     volumes,
     systemInfo,
     systemInfoLoading,
@@ -1320,12 +1355,6 @@ export const useDockerStore = defineStore('docker', () => {
     projectFormDir,
     projectFormCompose,
     composeYamlError,
-
-    // 网络创建/查看
-    isNetworkCreateActive,
-    networkForm,
-    selectedNetworkDetail,
-    isNetworkModalVisible,
 
     // 数据获取
     fetchDockerAvailability,
@@ -1361,12 +1390,12 @@ export const useDockerStore = defineStore('docker', () => {
     handleComposeProjectAction,
     handleEditComposeConfig,
     handleDeleteImage,
-    handleDeleteNetwork,
-    handleViewNetwork,
-    handleConnectNetwork,
-    handleDisconnectNetwork,
-    closeNetworkModal,
-    handleCreateNetwork,
+    fetchNetworkDetail,
+    clearNetworkDetail,
+    createNetwork,
+    removeNetwork,
+    connectNetwork,
+    disconnectNetwork,
 
     // 容器创建
     startContainerCreateFlow,
@@ -1378,10 +1407,6 @@ export const useDockerStore = defineStore('docker', () => {
     cancelProjectCreate,
     submitProjectForm,
     validateComposeYaml,
-
-    // 网络创建
-    cancelNetworkCreate,
-    submitNetworkForm,
 
     // 编排与系统操作
     handleScaleComposeProject,

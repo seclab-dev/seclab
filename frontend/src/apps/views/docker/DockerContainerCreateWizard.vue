@@ -45,8 +45,8 @@ const restartPolicyOptions = [
 const networkOptions = computed(() => [
   { label: t('app.docker.containers.default'), value: '' },
   ...(store.networks || []).map((net) => ({
-    label: net.Name || net.Id || '',
-    value: net.Name || net.Id || '',
+    label: net.name || net.id,
+    value: net.name || net.id,
   })),
 ])
 

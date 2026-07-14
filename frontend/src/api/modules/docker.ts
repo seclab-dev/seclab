@@ -169,15 +169,20 @@ const createScopedDockerApi = (nodeId?: string) => ({
       timeout: 600000,
     })
   },
-  /** 获取所有网络的详细信息。 */
+  /** 获取 Docker 网络摘要列表。 */
   listNetworks: () => {
-    return http.get<docker.Network[]>(buildDockerPath('/agent/docker/networks', nodeId))
+    return http.get<docker.DockerNetworkSummary[]>(
+      buildDockerPath('/agent/docker/networks', nodeId),
+    )
   },
-  createNetwork: (payload: docker.NetworkCreateRequest) => {
-    return http.post(buildDockerPath('/agent/docker/networks', nodeId), payload)
+  createNetwork: (payload: docker.DockerNetworkCreateRequest) => {
+    return http.post<docker.DockerNetworkCreateResult>(
+      buildDockerPath('/agent/docker/networks', nodeId),
+      payload,
+    )
   },
   inspectNetwork: (id: string) => {
-    return http.get<docker.Network>(
+    return http.get<docker.DockerNetworkDetail>(
       buildDockerPath(`/agent/docker/networks/${encodeURIComponent(id)}`, nodeId),
     )
   },

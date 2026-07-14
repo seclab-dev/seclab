@@ -149,14 +149,114 @@ pub struct ComposeProjectLogsQuery {
 }
 
 /// 创建网络的请求参数。
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct NetworkCreateRequest {
-    pub name: String,
-    pub driver: Option<String>,
+pub struct DockerNetworkIpamConfig {
     pub subnet: Option<String>,
     pub gateway: Option<String>,
+    pub ip_range: Option<String>,
+}
+
+/// 创建 Bridge 网络的请求参数。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerNetworkCreateRequest {
+    pub name: String,
+    #[serde(default)]
+    pub internal: bool,
+    #[serde(default)]
+    pub enable_ipv6: bool,
+    pub ipv4: Option<DockerNetworkIpamConfig>,
+    pub ipv6: Option<DockerNetworkIpamConfig>,
+    pub options: Option<HashMap<String, String>>,
     pub labels: Option<HashMap<String, String>>,
+}
+
+/// Docker 网络的管理归属。
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DockerNetworkManagementKind {
+    System,
+    Compose,
+    Suite,
+    Custom,
+}
+
+/// Docker 网络的管理信息。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerNetworkManagement {
+    pub kind: DockerNetworkManagementKind,
+    pub owner_name: Option<String>,
+    pub read_only: bool,
+}
+
+/// Docker 网络允许执行的操作。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerNetworkCapabilities {
+    pub can_remove: bool,
+    pub can_manage_connections: bool,
+}
+
+/// Docker 网络列表项。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerNetworkSummary {
+    pub id: String,
+    pub name: String,
+    pub created_at: Option<i64>,
+    pub driver: String,
+    pub scope: String,
+    pub enable_ipv4: bool,
+    pub enable_ipv6: bool,
+    pub internal: bool,
+    pub attachable: bool,
+    pub ingress: bool,
+    pub config_only: bool,
+    pub subnets: Vec<String>,
+    pub management: DockerNetworkManagement,
+    pub capabilities: DockerNetworkCapabilities,
+}
+
+/// Docker 网络中连接的容器端点。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerNetworkContainer {
+    pub id: String,
+    pub name: String,
+    pub endpoint_id: Option<String>,
+    pub mac_address: Option<String>,
+    pub ipv4_address: Option<String>,
+    pub ipv6_address: Option<String>,
+}
+
+/// Docker Overlay 网络的对等节点。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerNetworkPeer {
+    pub name: Option<String>,
+    pub ip: Option<String>,
+}
+
+/// Docker 网络详情。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerNetworkDetail {
+    pub summary: DockerNetworkSummary,
+    pub ipam_configs: Vec<DockerNetworkIpamConfig>,
+    pub options: HashMap<String, String>,
+    pub labels: HashMap<String, String>,
+    pub containers: Vec<DockerNetworkContainer>,
+    pub peers: Vec<DockerNetworkPeer>,
+}
+
+/// Docker 网络创建结果。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerNetworkCreateResult {
+    pub id: String,
+    pub warning: Option<String>,
 }
 
 /// 将容器连接到网络的请求参数。
@@ -171,7 +271,8 @@ pub struct NetworkConnectRequest {
 #[serde(rename_all = "camelCase")]
 pub struct NetworkDisconnectRequest {
     pub container: String,
-    pub force: Option<bool>,
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// 资源采样数据的新鲜度与完整性状态。

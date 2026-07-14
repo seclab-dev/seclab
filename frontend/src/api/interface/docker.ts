@@ -435,125 +435,87 @@ export interface DockerDaemonSettings {
 /** Compose 项目日志响应 */
 export type ComposeProjectLogs = string[]
 
-export interface IpamConfig {
-  /** Subnet in CIDR format. */
-  Subnet?: string | null
-
-  /** IP range in CIDR format. */
-  IPRange?: string | null
-
-  /** Gateway IP. */
-  Gateway?: string | null
-
-  /** Auxiliary addresses map. */
-  AuxiliaryAddresses?: Record<string, string> | null
-}
-
-export interface Ipam {
-  /** IPAM driver name. */
-  Driver?: string | null
-
-  /** List of IPAM configuration objects. */
-  Config?: IpamConfig[] | null
-
-  /** Driver-specific options. */
-  Options?: Record<string, string> | null
-}
-
-export interface NetworkContainer {
-  /** Container name. */
-  Name?: string | null
-
-  /** Endpoint ID. */
-  EndpointID?: string | null
-
-  /** MAC address of the endpoint. */
-  MacAddress?: string | null
-
-  /** IPv4 address with CIDR (e.g. "172.18.0.2/16"). */
-  IPv4Address?: string | null
-
-  /** IPv6 address with CIDR. */
-  IPv6Address?: string | null
-}
-
-export interface ConfigReference {
-  /** Name of the config-only network providing configuration. */
-  Network?: string | null
-}
-
-export interface PeerInfo {
-  /** Peer node ID. */
-  Name?: string | null
-
-  /** Peer node IP address. */
-  IP?: string | null
-}
-
-export interface Network {
-  /** Name of the network. */
-  Name?: string | null
-
-  /** Unique ID of the network. */
-  Id?: string | null
-
-  /**
-   * Creation timestamp in RFC3339 nano-second format.
-   * In Rust this is `Option<BollardDate>`.
-   * 具体类型可根据你的前端需求调整，例如 string。
-   */
-  Created?: string | null
-
-  /** Scope of the network (e.g. "swarm", "local"). */
-  Scope?: string | null
-
-  /** Network driver (e.g. "bridge", "overlay"). */
-  Driver?: string | null
-
-  /** Whether IPv4 is enabled. */
-  EnableIPv4?: boolean | null
-
-  /** Whether IPv6 is enabled. */
-  EnableIPv6?: boolean | null
-
-  /** IPAM configuration. */
-  IPAM?: Ipam | null
-
-  /** Whether the network is internal. */
-  Internal?: boolean | null
-
-  /** Whether the network is attachable. */
-  Attachable?: boolean | null
-
-  /** Whether this network is the ingress network. */
-  Ingress?: boolean | null
-
-  /** ConfigFrom reference. */
-  ConfigFrom?: ConfigReference | null
-
-  /** Whether the network is config-only. */
-  ConfigOnly?: boolean | null
-
-  /** Containers attached to this network. */
-  Containers?: Record<string, NetworkContainer> | null
-
-  /** Network options. */
-  Options?: Record<string, string> | null
-
-  /** User-defined metadata. */
-  Labels?: Record<string, string> | null
-
-  /** Peer nodes (for overlay networks only). */
-  Peers?: PeerInfo[] | null
-}
-
-/** 网络创建请求 */
-export interface NetworkCreateRequest {
-  name: string
-  driver?: string
+/** Docker 网络 IPAM 配置。 */
+export interface DockerNetworkIpamConfig {
   subnet?: string
   gateway?: string
+  ipRange?: string
+}
+
+export type DockerNetworkManagementKind = 'system' | 'compose' | 'suite' | 'custom'
+
+/** Docker 网络的管理归属。 */
+export interface DockerNetworkManagement {
+  kind: DockerNetworkManagementKind
+  ownerName?: string
+  readOnly: boolean
+}
+
+/** Docker 网络允许执行的操作。 */
+export interface DockerNetworkCapabilities {
+  canRemove: boolean
+  canManageConnections: boolean
+}
+
+/** Docker 网络列表项。 */
+export interface DockerNetworkSummary {
+  id: string
+  name: string
+  createdAt?: number
+  driver: string
+  scope: string
+  enableIpv4: boolean
+  enableIpv6: boolean
+  internal: boolean
+  attachable: boolean
+  ingress: boolean
+  configOnly: boolean
+  subnets: string[]
+  management: DockerNetworkManagement
+  capabilities: DockerNetworkCapabilities
+}
+
+/** Docker 网络中的容器端点。 */
+export interface DockerNetworkContainer {
+  id: string
+  name: string
+  endpointId?: string
+  macAddress?: string
+  ipv4Address?: string
+  ipv6Address?: string
+}
+
+/** Docker Overlay 网络的对等节点。 */
+export interface DockerNetworkPeer {
+  name?: string
+  ip?: string
+}
+
+/** Docker 网络详情。 */
+export interface DockerNetworkDetail {
+  summary: DockerNetworkSummary
+  ipamConfigs: DockerNetworkIpamConfig[]
+  options: Record<string, string>
+  labels: Record<string, string>
+  containers: DockerNetworkContainer[]
+  peers: DockerNetworkPeer[]
+}
+
+/** Bridge 网络创建请求。 */
+export interface DockerNetworkCreateRequest {
+  name: string
+  internal: boolean
+  enableIpv6: boolean
+  ipv4?: DockerNetworkIpamConfig
+  ipv6?: DockerNetworkIpamConfig
+  options?: Record<string, string>
   labels?: Record<string, string>
+}
+
+/** Docker 网络创建结果。 */
+export interface DockerNetworkCreateResult {
+  id: string
+  warning?: string
 }
 
 /** 网络连接请求 */
@@ -564,7 +526,7 @@ export interface NetworkConnectRequest {
 /** 网络断开请求 */
 export interface NetworkDisconnectRequest {
   container: string
-  force?: boolean
+  force: boolean
 }
 
 /** 容器资源统计快照。 */

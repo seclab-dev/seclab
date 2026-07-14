@@ -12,7 +12,7 @@ import type * as dockerType from '@/api/interface/docker'
 defineProps<{
   containers: dockerType.ContainerSummary[]
   imagesList?: dockerType.ImageSummary[]
-  networks?: dockerType.Network[]
+  networks?: dockerType.DockerNetworkSummary[]
   isCreateActive?: boolean
   containerStep?: 'selectImage' | 'config'
   selectedImageId?: string | null

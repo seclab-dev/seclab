@@ -24,6 +24,7 @@ import type {
 } from '@/api/interface/docker'
 import { useI18n } from 'vue-i18n'
 import { formatDateTime } from '@/utils/time'
+import type { SecLabTableColumn } from '@/components/ui/SecLabTable.vue'
 
 /** Docker 操作日志查询、四列表格与审计详情。 */
 const { t, te, locale } = useI18n()
@@ -51,7 +52,7 @@ const filters = ref<{
 })
 
 const totalPages = computed(() => Math.max(1, Math.ceil(totalLogs.value / pageSize.value)))
-const columns = computed(() => [
+const columns = computed<SecLabTableColumn[]>(() => [
   { label: t('app.docker.activity.columns.time'), width: 180, slot: 'time', align: 'center' },
   { label: t('app.docker.activity.columns.actor'), width: 150, slot: 'actor', align: 'center' },
   { label: t('app.docker.activity.columns.level'), width: 100, slot: 'level', align: 'center' },
@@ -107,12 +108,35 @@ const formatMessage = (log: DockerActivityLogItem): string => {
   const action = te(actionKey) ? t(actionKey) : log.eventCode
   const paramTarget = log.messageParams?.name
   const target = (typeof paramTarget === 'string' && paramTarget.trim()) || log.target?.id || '-'
+  const paramContainer = log.messageParams?.container
+  const container =
+    log.eventCode.startsWith('network.') &&
+    typeof paramContainer === 'string' &&
+    paramContainer.trim()
+      ? paramContainer
+      : undefined
   if (log.outcome === 'failure' && log.errorMessage) {
-    return t('app.docker.activity.messages.failureWithReason', {
-      action,
-      target,
-      reason: log.errorMessage,
-    })
+    return t(
+      container
+        ? 'app.docker.activity.messages.networkFailureWithReason'
+        : 'app.docker.activity.messages.failureWithReason',
+      {
+        action,
+        target,
+        container,
+        reason: log.errorMessage,
+      },
+    )
+  }
+  if (container) {
+    return t(
+      `app.docker.activity.messages.network${log.outcome === 'success' ? 'Success' : 'Failure'}`,
+      {
+        action,
+        target,
+        container,
+      },
+    )
   }
   return t(`app.docker.activity.messages.${log.outcome}`, { action, target })
 }

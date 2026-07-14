@@ -1,654 +1,771 @@
 <script setup lang="ts">
-import SecLabTable, { type SecLabTableColumn } from '@/components/ui/SecLabTable.vue'
+import { computed, ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
+import type { SecLabTableColumn } from '@/components/ui/SecLabTable.vue'
 import {
+  SecLabActionMenu,
+  SecLabAlert,
   SecLabButton,
-  SecLabTag,
-  SecLabSelect,
-  SecLabInput,
+  SecLabDescriptions,
+  SecLabDialog,
+  SecLabDrawer,
   SecLabEmpty,
   SecLabFormItem,
-  SecLabActionMenu,
+  SecLabInput,
+  SecLabLoading,
+  SecLabSelect,
+  SecLabSwitch,
+  SecLabTable,
+  SecLabTag,
 } from '@/components/ui'
-import { computed, ref, onMounted } from 'vue'
-import { useI18n } from 'vue-i18n'
-import { useDockerStore } from '@/stores/docker'
+import type {
+  DockerNetworkContainer,
+  DockerNetworkCreateRequest,
+  DockerNetworkManagementKind,
+  DockerNetworkSummary,
+} from '@/api/interface/docker'
 import { useConfirmationModalStore } from '@/stores/confirmation-modal'
-import { formatIpamConfig, getConnectedContainerCount, formatKeyValue } from '@/utils/docker-format'
-import { isSuiteManagedResource } from './docker-suite-labels'
+import { useDockerStore } from '@/stores/docker'
+import { useNodeStore } from '@/stores/node'
+import { formatKeyValue, parseKeyValueLines } from '@/utils/docker-format'
+import { formatDateTime } from '@/utils/time'
 
-/**
- * @file DockerNetworks.vue
- * @description Docker 网络列表与详情管理组件，严格遵循 SDL 设计规范，直接消费 Pinia Store。
- */
+defineOptions({ inheritAttrs: false })
 
+/** Docker 网络列表、Bridge 创建和按需详情管理页。 */
 const { t } = useI18n()
 const store = useDockerStore()
+const nodeStore = useNodeStore()
 const modalStore = useConfirmationModalStore()
 
-const networkRows = computed(() => store.networks ?? [])
-
-/** 网络表格列定义 */
-const columns = computed<SecLabTableColumn[]>(() => [
-  { label: t('app.docker.networks.columns.name'), minWidth: 220, slot: 'name' },
-  { label: t('app.docker.networks.columns.driver'), width: 120, slot: 'driver' },
-  { label: t('app.docker.networks.columns.ipam'), minWidth: 260, slot: 'ipam' },
-  {
-    label: t('app.docker.networks.columns.connected'),
-    width: 120,
-    align: 'center',
-    slot: 'connected',
-  },
-  { label: t('app.docker.networks.columns.actions'), width: 120, align: 'center', slot: 'actions' },
-])
-
-/** 驱动选项列表 */
-const driverOptions = [
-  { label: 'bridge', value: 'bridge' },
-  { label: 'host', value: 'host' },
-  { label: 'overlay', value: 'overlay' },
-  { label: 'macvlan', value: 'macvlan' },
-  { label: 'none', value: 'none' },
-]
-
-// ─── 网络连接管理 ───
+const search = ref('')
+const managementFilter = ref<'' | DockerNetworkManagementKind>('')
+const driverFilter = ref('')
+const createVisible = ref(false)
+const advancedVisible = ref(false)
+const createError = ref('')
+const detailVisible = ref(false)
+const selectedSummary = ref<DockerNetworkSummary | null>(null)
 const selectedContainerToConnect = ref('')
-const isConnecting = ref(false)
-const isDisconnecting = ref<Record<string, boolean>>({})
 
-/** 可连接到当前网络（即目前尚未连接）的容器列表 */
-const connectableContainers = computed(() => {
-  const connectedIds = new Set(Object.keys(store.selectedNetworkDetail?.Containers || {}))
-  return store.containers
-    .filter((c) => c.Id && !connectedIds.has(c.Id))
-    .map((c) => {
-      const rawName = c.Names?.[0] || ''
-      const name = rawName.replace(/^\//, '') || c.Id?.substring(0, 12) || ''
-      return {
-        label: name,
-        value: c.Id!,
-      }
-    })
+const emptyForm = () => ({
+  name: '',
+  ipv4Subnet: '',
+  ipv4Gateway: '',
+  ipv4Range: '',
+  enableIpv6: false,
+  ipv6Subnet: '',
+  ipv6Gateway: '',
+  ipv6Range: '',
+  internal: false,
+  options: '',
+  labels: '',
 })
+const form = ref(emptyForm())
 
-/** 已连接容器列表列定义 */
-const containerColumns = computed<SecLabTableColumn[]>(() => [
-  { label: t('app.docker.networks.detail.name'), slot: 'name' },
-  { label: t('app.docker.networks.detail.ip'), width: 160, slot: 'ip' },
-  { label: t('app.docker.networks.detail.actions'), width: 120, align: 'center', slot: 'actions' },
+const columns = computed<SecLabTableColumn[]>(() => [
+  { label: t('app.docker.networks.columns.name'), minWidth: 210, slot: 'name' },
+  { label: t('app.docker.networks.columns.management'), width: 130, slot: 'management' },
+  { label: t('app.docker.networks.columns.driver'), width: 110, slot: 'driver', align: 'center' },
+  { label: t('app.docker.networks.columns.subnets'), minWidth: 210, slot: 'subnets' },
+  { label: t('app.docker.networks.columns.actions'), width: 110, align: 'center', slot: 'actions' },
 ])
 
-/** 已连接的容器列表格式化 */
-const connectedContainersList = computed(() => {
-  const containersMap = store.selectedNetworkDetail?.Containers
-  if (!containersMap) return []
-  return Object.entries(containersMap).map(([id, info]) => {
-    const ip = info.IPv4Address || info.IPv6Address || '-'
-    const rawName = info.Name || ''
-    return {
-      id,
-      name: rawName.replace(/^\//, '') || id.substring(0, 12),
-      ip,
-    }
+const managementOptions = computed(() => [
+  { label: t('app.docker.networks.filters.allManagement'), value: '' },
+  ...(['system', 'compose', 'suite', 'custom'] as const).map((value) => ({
+    label: t(`app.docker.networks.management.${value}`),
+    value,
+  })),
+])
+const driverOptions = computed(() => [
+  { label: t('app.docker.networks.filters.allDrivers'), value: '' },
+  ...Array.from(new Set(store.networks.map((network) => network.driver)))
+    .sort()
+    .map((driver) => ({ label: driver, value: driver })),
+])
+
+const filteredNetworks = computed(() => {
+  const keyword = search.value.trim().toLowerCase()
+  return store.networks.filter((network) => {
+    if (keyword && !network.name.toLowerCase().includes(keyword)) return false
+    if (managementFilter.value && network.management.kind !== managementFilter.value) return false
+    if (driverFilter.value && network.driver !== driverFilter.value) return false
+    return true
   })
 })
 
-/** 接入容器到网络 */
-const handleConnect = async () => {
-  if (!selectedContainerToConnect.value || !store.selectedNetworkDetail?.Id) return
-  isConnecting.value = true
-  try {
-    await store.handleConnectNetwork(
-      store.selectedNetworkDetail.Id,
-      selectedContainerToConnect.value,
+const currentDetail = computed(() => store.networkDetail)
+const currentSummary = computed(() => currentDetail.value?.summary ?? selectedSummary.value)
+const isReadOnlyDetail = computed(() => currentSummary.value?.management.readOnly ?? true)
+const canManageConnections = computed(
+  () => currentSummary.value?.capabilities.canManageConnections ?? false,
+)
+
+const containerColumns = computed<SecLabTableColumn[]>(() => {
+  const columns: SecLabTableColumn[] = [
+    { label: t('app.docker.networks.detail.name'), minWidth: 150, slot: 'name' },
+    { label: t('app.docker.networks.detail.ipv4'), minWidth: 150, slot: 'ipv4' },
+    { label: t('app.docker.networks.detail.ipv6'), minWidth: 180, slot: 'ipv6' },
+    { label: t('app.docker.networks.detail.macAddress'), minWidth: 150, slot: 'mac' },
+  ]
+  if (canManageConnections.value) {
+    columns.push({
+      label: t('app.docker.networks.detail.actions'),
+      width: 110,
+      align: 'center',
+      slot: 'actions',
+    })
+  }
+  return columns
+})
+
+const connectableContainers = computed(() => {
+  const connectedIds = new Set(
+    currentDetail.value?.containers.map((container) => container.id) ?? [],
+  )
+  return store.containers
+    .filter(
+      (container) =>
+        container.State === 'running' && container.Id && !connectedIds.has(container.Id),
     )
-    selectedContainerToConnect.value = ''
-  } finally {
-    isConnecting.value = false
+    .map((container) => {
+      const id = container.Id!
+      const name = container.Names?.[0]?.replace(/^\//, '') || id.substring(0, 12)
+      return { label: name, value: id }
+    })
+})
+
+const detailItems = computed(() => {
+  const summary = currentSummary.value
+  if (!summary) return []
+  return [
+    { label: t('app.docker.networks.detail.name'), value: summary.name },
+    { label: t('app.docker.networks.detail.id'), value: summary.id },
+    { label: t('app.docker.networks.detail.management'), value: managementLabel(summary) },
+    { label: t('app.docker.networks.detail.driver'), value: summary.driver },
+    { label: t('app.docker.networks.detail.scope'), value: summary.scope },
+    { label: t('app.docker.networks.detail.createdAt'), value: formatDateTime(summary.createdAt) },
+    {
+      label: t('app.docker.networks.detail.ipam'),
+      value: formatIpam(currentDetail.value?.ipamConfigs ?? []),
+      span: 2,
+    },
+    { label: t('app.docker.networks.detail.features'), value: featureLabel(summary) },
+    {
+      label: t('app.docker.networks.detail.options'),
+      value: formatKeyValue(currentDetail.value?.options),
+    },
+    {
+      label: t('app.docker.networks.detail.labels'),
+      value: formatKeyValue(currentDetail.value?.labels),
+      span: 2,
+    },
+  ]
+})
+
+function managementLabel(network: DockerNetworkSummary): string {
+  const label = t(`app.docker.networks.management.${network.management.kind}`)
+  return network.management.ownerName ? `${label} · ${network.management.ownerName}` : label
+}
+
+/** 将网络的特殊能力转换为面向用户的本地化说明。 */
+function featureLabel(network: DockerNetworkSummary): string {
+  const features = [
+    network.internal ? t('app.docker.networks.features.internal') : '',
+    network.enableIpv6 ? t('app.docker.networks.features.ipv6') : '',
+    network.attachable ? t('app.docker.networks.features.attachable') : '',
+    network.ingress ? t('app.docker.networks.features.ingress') : '',
+    network.configOnly ? t('app.docker.networks.features.configOnly') : '',
+  ].filter(Boolean)
+  return features.join(' · ') || '-'
+}
+
+function managementTagType(
+  kind: DockerNetworkManagementKind,
+): 'default' | 'primary' | 'warning' | 'info' {
+  if (kind === 'custom') return 'primary'
+  if (kind === 'compose') return 'info'
+  if (kind === 'suite') return 'warning'
+  return 'default'
+}
+
+function readOnlyReason(network: DockerNetworkSummary): string {
+  return t(`app.docker.networks.readOnly.${network.management.kind}`)
+}
+
+function formatIpam(
+  configs: Array<{ subnet?: string; gateway?: string; ipRange?: string }>,
+): string {
+  if (!configs.length) return '-'
+  return configs
+    .map((config) => [config.subnet, config.gateway, config.ipRange].filter(Boolean).join(' · '))
+    .filter(Boolean)
+    .join('; ')
+}
+
+function openCreate(): void {
+  form.value = emptyForm()
+  advancedVisible.value = false
+  createError.value = ''
+  createVisible.value = true
+}
+
+function closeCreate(): void {
+  if (store.networkCreateLoading) return
+  createVisible.value = false
+  createError.value = ''
+}
+
+function optionalIpam(subnet: string, gateway: string, ipRange: string) {
+  const values = {
+    subnet: subnet.trim() || undefined,
+    gateway: gateway.trim() || undefined,
+    ipRange: ipRange.trim() || undefined,
+  }
+  return Object.values(values).some(Boolean) ? values : undefined
+}
+
+function parseFormMap(value: string, label: string): Record<string, string> | undefined {
+  const parsed = parseKeyValueLines(value)
+  if (parsed === null) throw new Error(t('app.docker.networks.create.invalidKeyValue', { label }))
+  return Object.keys(parsed).length ? parsed : undefined
+}
+
+async function submitCreate(): Promise<void> {
+  createError.value = ''
+  const name = form.value.name.trim()
+  if (!name) {
+    createError.value = t('app.docker.messages.networkNameRequired')
+    return
+  }
+  try {
+    const options = parseFormMap(form.value.options, t('app.docker.networks.create.options'))
+    const labels = parseFormMap(form.value.labels, t('app.docker.networks.create.labels'))
+    const reserved = Object.keys(labels ?? {}).find(
+      (key) => key.startsWith('seclab.') || key.startsWith('com.docker.compose.'),
+    )
+    if (reserved) {
+      createError.value = t('app.docker.networks.create.reservedLabel', { key: reserved })
+      return
+    }
+    const payload: DockerNetworkCreateRequest = {
+      name,
+      internal: form.value.internal,
+      enableIpv6: form.value.enableIpv6,
+      ipv4: optionalIpam(form.value.ipv4Subnet, form.value.ipv4Gateway, form.value.ipv4Range),
+      ipv6: form.value.enableIpv6
+        ? optionalIpam(form.value.ipv6Subnet, form.value.ipv6Gateway, form.value.ipv6Range)
+        : undefined,
+      options,
+      labels,
+    }
+    if (await store.createNetwork(payload)) createVisible.value = false
+  } catch (error) {
+    createError.value = error instanceof Error ? error.message : t('common.unknownError')
   }
 }
 
-/** 从网络断开容器 */
-const handleDisconnect = async (containerId: string, containerName: string) => {
-  if (!store.selectedNetworkDetail?.Id) return
+async function openDetail(network: DockerNetworkSummary): Promise<void> {
+  selectedSummary.value = network
+  selectedContainerToConnect.value = ''
+  detailVisible.value = true
+  await Promise.all([store.fetchNetworkDetail(network.id), store.fetchContainers()])
+}
+
+function closeDetail(): void {
+  detailVisible.value = false
+  selectedSummary.value = null
+  selectedContainerToConnect.value = ''
+  store.clearNetworkDetail()
+}
+
+async function deleteNetwork(network: DockerNetworkSummary): Promise<void> {
+  if (!network.capabilities.canRemove) return
   const confirmed = await modalStore.showConfirmation(
-    t('app.docker.networks.detail.disconnectConfirm', {
-      containerName,
-      networkName:
-        store.selectedNetworkDetail.Name || store.selectedNetworkDetail.Id.substring(0, 12),
-    }),
+    t('app.docker.networks.actions.deleteConfirm', { name: network.name }),
     t('app.docker.messages.deleteConfirmTitle'),
-    t('app.docker.networks.detail.disconnectContainer'),
+    t('app.docker.messages.deleteAction'),
     t('confirmation.cancel'),
   )
   if (!confirmed) return
-  isDisconnecting.value[containerId] = true
-  try {
-    await store.handleDisconnectNetwork(store.selectedNetworkDetail.Id, containerId)
-  } finally {
-    isDisconnecting.value[containerId] = false
+  const deleted = await store.removeNetwork(network)
+  if (deleted && selectedSummary.value?.id === network.id) closeDetail()
+}
+
+async function connectContainer(): Promise<void> {
+  const networkId = currentSummary.value?.id
+  if (!networkId || !selectedContainerToConnect.value) return
+  if (await store.connectNetwork(networkId, selectedContainerToConnect.value)) {
+    selectedContainerToConnect.value = ''
   }
 }
 
-/** 挂载时如果容器列表为空，预先加载容器，保证接入容器下拉框有数据 */
-onMounted(() => {
-  if (store.containers.length === 0) {
-    void store.fetchContainers()
-  }
-})
+async function disconnectContainer(
+  container: DockerNetworkContainer,
+  force: boolean,
+): Promise<void> {
+  const summary = currentSummary.value
+  if (!summary || !summary.capabilities.canManageConnections) return
+  const confirmed = await modalStore.showConfirmation(
+    t(
+      force
+        ? 'app.docker.networks.detail.forceDisconnectConfirm'
+        : 'app.docker.networks.detail.disconnectConfirm',
+      { containerName: container.name, networkName: summary.name },
+    ),
+    t(
+      force
+        ? 'app.docker.networks.detail.forceDisconnectTitle'
+        : 'app.docker.networks.detail.disconnectTitle',
+    ),
+    t(
+      force
+        ? 'app.docker.networks.detail.forceDisconnectAction'
+        : 'app.docker.networks.detail.disconnectContainer',
+    ),
+    t('confirmation.cancel'),
+  )
+  if (confirmed) await store.disconnectNetwork(summary.id, container.id, force)
+}
+
+function rowActions(network: DockerNetworkSummary) {
+  return [
+    {
+      label: t('app.docker.networks.actions.view'),
+      handler: () => void openDetail(network),
+    },
+    {
+      label: t('app.docker.networks.actions.delete'),
+      handler: () => void deleteNetwork(network),
+      class: 'app-btn-delete',
+      disabled: !network.capabilities.canRemove,
+      tooltip: network.capabilities.canRemove ? undefined : readOnlyReason(network),
+    },
+  ]
+}
+
+function containerActions(container: DockerNetworkContainer) {
+  return [
+    {
+      label: t('app.docker.networks.detail.disconnectContainer'),
+      handler: () => void disconnectContainer(container, false),
+    },
+    {
+      label: t('app.docker.networks.detail.forceDisconnectAction'),
+      handler: () => void disconnectContainer(container, true),
+      class: 'app-btn-delete',
+    },
+  ]
+}
+
+watch(
+  () => nodeStore.currentNodeId,
+  () => void store.fetchNetworks(),
+  { immediate: true },
+)
 </script>
 
 <template>
-  <div class="docker-networks" data-page="docker-networks">
-    <div class="docker-card">
-      <div v-if="!store.isNetworkCreateActive" class="network-actions">
-        <SecLabButton type="primary" @click="store.handleCreateNetwork">
+  <div class="network-page" data-page="docker-networks">
+    <div class="network-toolbar" data-ui="toolbar">
+      <div class="toolbar-filters" data-slot="filters">
+        <SecLabInput
+          v-model="search"
+          class="search-input"
+          :placeholder="t('app.docker.networks.filters.searchPlaceholder')"
+        />
+        <SecLabSelect
+          v-model="managementFilter"
+          class="filter-select"
+          :options="managementOptions"
+        />
+        <SecLabSelect v-model="driverFilter" class="filter-select" :options="driverOptions" />
+      </div>
+      <div class="toolbar-actions" data-slot="actions">
+        <SecLabButton :loading="store.networkListLoading" @click="store.fetchNetworks">
+          {{ t('common.refresh') }}
+        </SecLabButton>
+        <SecLabButton type="primary" @click="openCreate">
           {{ t('app.docker.networks.actions.create') }}
         </SecLabButton>
       </div>
+    </div>
 
-      <!-- 网络创建面板 -->
-      <div v-if="store.isNetworkCreateActive" class="network-create-panel">
-        <div class="create-panel-header">
-          <h3>{{ t('app.docker.networks.create.title') }}</h3>
-        </div>
+    <SecLabAlert
+      v-if="store.networkListError"
+      type="warning"
+      :title="t('app.docker.networks.refreshFailed')"
+      :description="store.networkListError"
+      show-icon
+      data-ui="network-list-error"
+    />
 
-        <div class="create-panel-body sl-form">
+    <div class="network-table-shell" data-ui="table">
+      <SecLabTable
+        v-if="filteredNetworks.length"
+        :data="filteredNetworks"
+        :columns="columns"
+        border
+      >
+        <template #name="{ row }: { row: DockerNetworkSummary }">
+          <button class="network-name" type="button" @click="openDetail(row)">
+            {{ row.name }}
+          </button>
+        </template>
+        <template #management="{ row }: { row: DockerNetworkSummary }">
+          <SecLabTag :type="managementTagType(row.management.kind)" size="small">
+            {{ managementLabel(row) }}
+          </SecLabTag>
+        </template>
+        <template #driver="{ row }: { row: DockerNetworkSummary }">
+          <span class="mono-text">{{ row.driver }}</span>
+        </template>
+        <template #subnets="{ row }: { row: DockerNetworkSummary }">
+          <span class="mono-text subnet-cell">{{ row.subnets.join(', ') || '-' }}</span>
+        </template>
+        <template #actions="{ row }: { row: DockerNetworkSummary }">
+          <SecLabActionMenu
+            :label="t('app.docker.networks.actions.menu')"
+            :actions="rowActions(row)"
+          />
+        </template>
+      </SecLabTable>
+      <SecLabEmpty
+        v-else-if="!store.networkListLoading"
+        :description="
+          search || managementFilter || driverFilter
+            ? t('app.docker.networks.filteredEmpty')
+            : t('app.docker.networks.empty')
+        "
+      />
+      <SecLabLoading :loading="store.networkListLoading && !store.networks.length" cover />
+    </div>
+
+    <SecLabDialog
+      :visible="createVisible"
+      :title="t('app.docker.networks.create.title')"
+      width="680px"
+      :close-on-click-overlay="!store.networkCreateLoading"
+      data-ui="network-create-dialog"
+      @close="closeCreate"
+    >
+      <div class="create-form" data-slot="body">
+        <SecLabAlert v-if="createError" type="error" :title="createError" show-icon />
+        <div class="form-grid">
           <SecLabFormItem :label="t('app.docker.networks.create.name')" required>
             <SecLabInput
-              v-model="store.networkForm.name"
+              v-model="form.name"
               :placeholder="t('app.docker.networks.create.namePlaceholder')"
             />
           </SecLabFormItem>
-
           <SecLabFormItem :label="t('app.docker.networks.create.driver')">
-            <SecLabSelect v-model="store.networkForm.driver" :options="driverOptions" />
+            <SecLabInput model-value="bridge" readonly />
           </SecLabFormItem>
-
-          <div class="form-row">
-            <SecLabFormItem :label="t('app.docker.networks.create.subnet')" class="form-row-item">
+        </div>
+        <SecLabButton type="secondary" size="small" @click="advancedVisible = !advancedVisible">
+          {{
+            advancedVisible
+              ? t('app.docker.networks.create.hideAdvanced')
+              : t('app.docker.networks.create.showAdvanced')
+          }}
+        </SecLabButton>
+        <div v-if="advancedVisible" class="advanced-fields" data-slot="advanced">
+          <div class="form-group-title">{{ t('app.docker.networks.create.ipv4Title') }}</div>
+          <div class="form-grid three-columns">
+            <SecLabFormItem :label="t('app.docker.networks.create.subnet')">
               <SecLabInput
-                v-model="store.networkForm.subnet"
-                :placeholder="t('app.docker.networks.create.subnetPlaceholder')"
+                v-model="form.ipv4Subnet"
+                :placeholder="t('app.docker.networks.create.ipv4SubnetPlaceholder')"
               />
             </SecLabFormItem>
-            <SecLabFormItem :label="t('app.docker.networks.create.gateway')" class="form-row-item">
+            <SecLabFormItem :label="t('app.docker.networks.create.gateway')">
               <SecLabInput
-                v-model="store.networkForm.gateway"
-                :placeholder="t('app.docker.networks.create.gatewayPlaceholder')"
+                v-model="form.ipv4Gateway"
+                :placeholder="t('app.docker.networks.create.ipv4GatewayPlaceholder')"
+              />
+            </SecLabFormItem>
+            <SecLabFormItem :label="t('app.docker.networks.create.ipRange')">
+              <SecLabInput
+                v-model="form.ipv4Range"
+                :placeholder="t('app.docker.networks.create.ipv4RangePlaceholder')"
               />
             </SecLabFormItem>
           </div>
-
-          <SecLabFormItem :label="t('app.docker.networks.create.labels')">
-            <SecLabInput
-              v-model="store.networkForm.labels"
-              type="textarea"
-              :rows="4"
-              placeholder="e.g. key=value"
+          <div class="switch-row">
+            <SecLabSwitch
+              v-model="form.enableIpv6"
+              :active-text="t('app.docker.networks.create.enableIpv6')"
             />
+            <SecLabSwitch
+              v-model="form.internal"
+              :active-text="t('app.docker.networks.create.internal')"
+            />
+          </div>
+          <template v-if="form.enableIpv6">
+            <div class="form-group-title">{{ t('app.docker.networks.create.ipv6Title') }}</div>
+            <div class="form-grid three-columns">
+              <SecLabFormItem :label="t('app.docker.networks.create.subnet')">
+                <SecLabInput
+                  v-model="form.ipv6Subnet"
+                  :placeholder="t('app.docker.networks.create.ipv6SubnetPlaceholder')"
+                />
+              </SecLabFormItem>
+              <SecLabFormItem :label="t('app.docker.networks.create.gateway')">
+                <SecLabInput
+                  v-model="form.ipv6Gateway"
+                  :placeholder="t('app.docker.networks.create.ipv6GatewayPlaceholder')"
+                />
+              </SecLabFormItem>
+              <SecLabFormItem :label="t('app.docker.networks.create.ipRange')">
+                <SecLabInput
+                  v-model="form.ipv6Range"
+                  :placeholder="t('app.docker.networks.create.ipv6RangePlaceholder')"
+                />
+              </SecLabFormItem>
+            </div>
+          </template>
+          <SecLabFormItem
+            :label="t('app.docker.networks.create.options')"
+            :hint="t('app.docker.networks.create.keyValueHint')"
+          >
+            <SecLabInput v-model="form.options" type="textarea" :rows="3" />
+          </SecLabFormItem>
+          <SecLabFormItem
+            :label="t('app.docker.networks.create.labels')"
+            :hint="t('app.docker.networks.create.labelHint')"
+          >
+            <SecLabInput v-model="form.labels" type="textarea" :rows="3" />
           </SecLabFormItem>
         </div>
-
-        <div class="create-panel-footer">
-          <SecLabButton @click="store.cancelNetworkCreate">
-            {{ t('app.docker.networks.actions.cancel') }}
-          </SecLabButton>
-          <SecLabButton type="primary" @click="store.submitNetworkForm">
-            {{ t('app.docker.networks.actions.submit') }}
-          </SecLabButton>
-        </div>
       </div>
+      <template #footer>
+        <SecLabButton :disabled="store.networkCreateLoading" @click="closeCreate">{{
+          t('common.cancel')
+        }}</SecLabButton>
+        <SecLabButton type="primary" :loading="store.networkCreateLoading" @click="submitCreate">{{
+          t('app.docker.networks.actions.submit')
+        }}</SecLabButton>
+      </template>
+    </SecLabDialog>
 
-      <!-- 网络列表 -->
-      <div v-if="!store.isNetworkCreateActive" class="card-scroll-wrapper">
-        <SecLabTable v-if="networkRows.length > 0" :data="networkRows" :columns="columns" border>
-          <template #name="{ row }: { row: any }">
-            <div class="resource-name-cell">
-              <span class="network-name-cell" @click="store.handleViewNetwork(row?.Id)">{{
-                row?.Name || '-'
-              }}</span>
-              <SecLabTag v-if="isSuiteManagedResource(row?.Labels)" type="primary" size="small">
-                {{ t('app.docker.suiteManaged') }}
-              </SecLabTag>
-            </div>
-          </template>
+    <SecLabDrawer
+      v-model="detailVisible"
+      :title="t('app.docker.networks.detail.title')"
+      width="780px"
+      data-ui="network-detail-drawer"
+      @close="closeDetail"
+    >
+      <div class="detail-content" data-slot="detail">
+        <SecLabAlert
+          v-if="isReadOnlyDetail && currentSummary"
+          type="info"
+          :title="t('app.docker.networks.detail.readOnlyTitle')"
+          :description="readOnlyReason(currentSummary)"
+          show-icon
+        />
+        <SecLabAlert
+          v-if="store.networkDetailError"
+          type="warning"
+          :title="t('app.docker.networks.detail.refreshFailed')"
+          :description="store.networkDetailError"
+          show-icon
+        />
+        <SecLabDescriptions v-if="currentSummary" :items="detailItems" :column="2" border />
 
-          <template #driver="{ row }: { row: any }">
-            <SecLabTag type="info">{{ row?.Driver || '-' }}</SecLabTag>
-          </template>
-
-          <template #ipam="{ row }: { row: any }">
-            <span class="ipam-text">{{ formatIpamConfig(row?.IPAM) }}</span>
-          </template>
-
-          <template #connected="{ row }: { row: any }">
-            <SecLabTag type="info">
-              {{ getConnectedContainerCount(row?.Containers) }}
-            </SecLabTag>
-          </template>
-
-          <template #actions="{ row }: { row: any }">
-            <SecLabActionMenu
-              :label="t('app.docker.networks.actions.menu')"
-              :actions="[
-                {
-                  label: t('app.docker.networks.actions.view'),
-                  handler: () => store.handleViewNetwork(row?.Id),
-                },
-                {
-                  label: t('app.docker.networks.actions.delete'),
-                  handler: () => store.handleDeleteNetwork(row?.Id),
-                  class: 'btn-delete',
-                },
-              ]"
-            />
-          </template>
-
-          <template #empty>
-            <SecLabEmpty :description="t('app.docker.networks.empty')" />
-          </template>
-        </SecLabTable>
-
-        <SecLabEmpty v-else :description="t('app.docker.networks.empty')" />
-      </div>
-    </div>
-
-    <!-- 网络详情 Modal -->
-    <div v-if="store.isNetworkModalVisible && store.selectedNetworkDetail" class="modal-overlay">
-      <div class="modal">
-        <div class="modal-header">
-          <h3>{{ t('app.docker.networks.detail.title') }}</h3>
-          <button class="modal-close" @click="store.closeNetworkModal">×</button>
-        </div>
-        <div class="modal-body">
-          <div class="detail-grid">
-            <div class="detail-item">
-              <span class="detail-label">{{ t('app.docker.networks.detail.name') }}</span>
-              <span class="detail-value highlight-value">{{
-                store.selectedNetworkDetail.Name || '-'
-              }}</span>
-            </div>
-            <div class="detail-item">
-              <span class="detail-label">{{ t('app.docker.networks.detail.id') }}</span>
-              <span class="detail-value mono-text">{{
-                store.selectedNetworkDetail.Id || '-'
-              }}</span>
-            </div>
-            <div class="detail-item">
-              <span class="detail-label">{{ t('app.docker.networks.detail.scope') }}</span>
-              <span class="detail-value">{{ store.selectedNetworkDetail.Scope || '-' }}</span>
-            </div>
-            <div class="detail-item">
-              <span class="detail-label">{{ t('app.docker.networks.detail.driver') }}</span>
-              <span class="detail-value">{{ store.selectedNetworkDetail.Driver || '-' }}</span>
-            </div>
-            <div class="detail-item">
-              <span class="detail-label">{{ t('app.docker.networks.detail.internal') }}</span>
-              <span class="detail-value">{{
-                store.selectedNetworkDetail.Internal
-                  ? t('app.docker.networks.detail.yes')
-                  : t('app.docker.networks.detail.no')
-              }}</span>
-            </div>
-            <div class="detail-item">
-              <span class="detail-label">{{ t('app.docker.networks.detail.attachable') }}</span>
-              <span class="detail-value">{{
-                store.selectedNetworkDetail.Attachable
-                  ? t('app.docker.networks.detail.yes')
-                  : t('app.docker.networks.detail.no')
-              }}</span>
-            </div>
-            <div class="detail-item">
-              <span class="detail-label">{{ t('app.docker.networks.detail.ingress') }}</span>
-              <span class="detail-value">{{
-                store.selectedNetworkDetail.Ingress
-                  ? t('app.docker.networks.detail.yes')
-                  : t('app.docker.networks.detail.no')
-              }}</span>
-            </div>
-            <div class="detail-item">
-              <span class="detail-label">{{ t('app.docker.networks.detail.createdAt') }}</span>
-              <span class="detail-value">{{ store.selectedNetworkDetail.Created || '-' }}</span>
-            </div>
-            <div class="detail-item detail-full">
-              <span class="detail-label">{{ t('app.docker.networks.detail.ipam') }}</span>
-              <span class="detail-value mono-text">
-                {{ formatIpamConfig(store.selectedNetworkDetail.IPAM) }}
-              </span>
-            </div>
-            <div class="detail-item detail-full">
-              <span class="detail-label">{{ t('app.docker.networks.detail.options') }}</span>
-              <span class="detail-value">{{
-                formatKeyValue(store.selectedNetworkDetail.Options)
-              }}</span>
-            </div>
-            <div class="detail-item detail-full">
-              <span class="detail-label">{{ t('app.docker.networks.detail.labels') }}</span>
-              <span class="detail-value">{{
-                formatKeyValue(store.selectedNetworkDetail.Labels)
-              }}</span>
-            </div>
-          </div>
-
-          <!-- 已连接容器列表 -->
-          <div class="containers-section">
-            <h4 class="section-title">{{ t('app.docker.networks.detail.containers') }}</h4>
-            <SecLabTable
-              v-if="connectedContainersList.length > 0"
-              :data="connectedContainersList"
-              :columns="containerColumns"
-              border
-              size="small"
-              class="connected-table"
+        <div class="detail-block">
+          <div class="block-title">{{ t('app.docker.networks.detail.containers') }}</div>
+          <SecLabTable
+            v-if="currentDetail?.containers.length"
+            :data="currentDetail.containers"
+            :columns="containerColumns"
+            border
+          >
+            <template #name="{ row }: { row: DockerNetworkContainer }"
+              ><span class="container-name">{{ row.name }}</span></template
             >
-              <template #name="{ row }">
-                <span class="container-name-text">{{ row.name }}</span>
-              </template>
-              <template #ip="{ row }">
-                <span class="mono-text">{{ row.ip }}</span>
-              </template>
-              <template #actions="{ row }">
-                <SecLabButton
-                  type="danger"
-                  size="small"
-                  :loading="isDisconnecting[row.id]"
-                  @click="handleDisconnect(row.id, row.name)"
-                >
-                  {{ t('app.docker.networks.detail.disconnectContainer') }}
-                </SecLabButton>
-              </template>
-            </SecLabTable>
-            <SecLabEmpty v-else :description="t('app.docker.networks.detail.noContainers')" />
-          </div>
-
-          <!-- 接入容器操作区 -->
-          <div class="connect-section">
-            <h4 class="section-title">{{ t('app.docker.networks.detail.connectContainer') }}</h4>
-            <div class="connect-form-row">
-              <SecLabSelect
-                v-model="selectedContainerToConnect"
-                :options="connectableContainers"
-                :placeholder="t('app.docker.networks.detail.selectContainerPlaceholder')"
-                class="container-select"
+            <template #ipv4="{ row }: { row: DockerNetworkContainer }"
+              ><span class="mono-text">{{ row.ipv4Address || '-' }}</span></template
+            >
+            <template #ipv6="{ row }: { row: DockerNetworkContainer }"
+              ><span class="mono-text">{{ row.ipv6Address || '-' }}</span></template
+            >
+            <template #mac="{ row }: { row: DockerNetworkContainer }"
+              ><span class="mono-text">{{ row.macAddress || '-' }}</span></template
+            >
+            <template #actions="{ row }: { row: DockerNetworkContainer }">
+              <SecLabActionMenu
+                v-if="canManageConnections"
+                :label="t('app.docker.networks.actions.menu')"
+                :disabled="store.networkDisconnectLoading[row.id]"
+                :actions="containerActions(row)"
               />
-              <SecLabButton
-                type="primary"
-                :disabled="!selectedContainerToConnect"
-                :loading="isConnecting"
-                @click="handleConnect"
-              >
-                {{ t('app.docker.networks.detail.connectAction') }}
-              </SecLabButton>
-            </div>
+            </template>
+          </SecLabTable>
+          <SecLabEmpty
+            v-else-if="!store.networkDetailLoading"
+            :description="t('app.docker.networks.detail.noContainers')"
+          />
+        </div>
+
+        <div
+          v-if="canManageConnections"
+          class="detail-block connect-block"
+          data-slot="connect-container"
+        >
+          <div class="block-title">{{ t('app.docker.networks.detail.connectContainer') }}</div>
+          <div class="connect-row">
+            <SecLabSelect
+              v-model="selectedContainerToConnect"
+              :options="connectableContainers"
+              :placeholder="t('app.docker.networks.detail.selectContainerPlaceholder')"
+            />
+            <SecLabButton
+              type="primary"
+              :disabled="!selectedContainerToConnect"
+              :loading="store.networkConnectLoading"
+              @click="connectContainer"
+            >
+              {{ t('app.docker.networks.detail.connectAction') }}
+            </SecLabButton>
           </div>
+          <SecLabEmpty
+            v-if="!connectableContainers.length"
+            :description="t('app.docker.networks.detail.noConnectableContainers')"
+          />
         </div>
-        <div class="modal-footer">
-          <SecLabButton @click="store.closeNetworkModal">
-            {{ t('common.close') }}
-          </SecLabButton>
-        </div>
+        <SecLabLoading :loading="store.networkDetailLoading && !currentDetail" cover />
       </div>
-    </div>
+    </SecLabDrawer>
   </div>
 </template>
 
 <style scoped>
-.docker-networks {
-  flex-grow: 1;
+.network-page {
+  height: 100%;
+  min-height: 0;
   display: flex;
   flex-direction: column;
-  min-height: 0;
-}
-
-.docker-card {
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  margin-top: var(--sdl-space-3);
-  background-color: var(--sdl-bg-panel);
-  padding: var(--sdl-space-5);
-  border: 1px solid var(--sdl-border-default);
-  border-radius: var(--sdl-radius-lg);
-  box-sizing: border-box;
-  flex-grow: 1;
-}
-
-.network-actions {
-  display: flex;
-  justify-content: flex-start;
-  margin-bottom: var(--sdl-space-4);
-}
-
-.network-create-panel {
-  border: 1px solid var(--sdl-border-default);
-  border-radius: var(--sdl-radius-lg);
-  padding: var(--sdl-space-5);
-  margin-bottom: var(--sdl-space-4);
-  background: var(--sdl-bg-card);
-  display: flex;
-  flex-direction: column;
-  gap: var(--sdl-space-4);
-  flex: 1;
-  min-height: 0;
-}
-
-.create-panel-header h3 {
-  margin: 0;
-  color: var(--sdl-primary);
-  font-size: var(--sdl-font-title);
-}
-
-.create-panel-body {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sdl-space-2);
-  flex: 1;
-  min-height: 0;
-  overflow: auto;
-}
-
-.form-row {
-  display: flex;
-  gap: var(--sdl-space-4);
-}
-
-.form-row-item {
-  flex: 1;
-  min-width: 0;
-}
-
-.create-panel-footer {
-  display: flex;
   gap: var(--sdl-space-3);
-  justify-content: flex-end;
+  padding-top: var(--sdl-space-3);
 }
-
-.card-scroll-wrapper {
-  flex: 1;
-  min-height: 0;
-  overflow: auto;
-}
-
-.resource-name-cell {
-  min-width: 0;
-  display: inline-flex;
+.network-toolbar {
+  display: flex;
   align-items: center;
-  gap: 6px;
+  justify-content: space-between;
+  gap: var(--sdl-space-4);
+  padding: var(--sdl-space-3) var(--sdl-space-4);
+  border: 1px solid var(--sdl-border-default);
+  border-radius: var(--sdl-radius-md);
+  background: var(--sdl-bg-panel);
 }
-
-.network-name-cell {
+.toolbar-filters,
+.toolbar-actions,
+.switch-row,
+.connect-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sdl-space-2);
+}
+.search-input {
+  width: 240px;
+}
+.filter-select {
+  width: 150px;
+}
+.network-table-shell {
+  position: relative;
+  flex: 1;
+  min-height: 260px;
+  overflow: auto;
+  border: 1px solid var(--sdl-border-default);
+  border-radius: var(--sdl-radius-md);
+  background: var(--sdl-bg-panel);
+}
+.network-name {
+  padding: 0;
+  border: 0;
+  background: transparent;
   color: var(--sdl-primary);
+  font: inherit;
+  font-weight: 600;
   cursor: pointer;
-  font-weight: 500;
 }
-
-.network-name-cell:hover {
+.network-name:hover {
   text-decoration: underline;
 }
-
-.ipam-text {
-  display: inline-block;
-  white-space: pre-wrap;
-  word-break: break-word;
-  font-family: var(--sdl-font-mono);
-  font-size: var(--sdl-font-caption);
-  color: var(--sdl-text-secondary);
-}
-
-/* ─── 弹窗通用 ─── */
-.modal-overlay {
-  position: fixed;
-  inset: 0;
-  background-color: var(--sdl-bg-backdrop);
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  z-index: var(--sdl-z-index-modal);
-  backdrop-filter: blur(4px);
-}
-
-.modal {
-  background: var(--sdl-bg-panel);
-  border: 1px solid var(--sdl-border-strong);
-  border-radius: var(--sdl-radius-lg);
-  box-shadow: var(--sdl-shadow-window);
-  width: 550px;
-  max-width: 90%;
-  max-height: 85%;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  animation: sl-modal-pop 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
-}
-
-.modal-header {
-  padding: var(--sdl-space-4) var(--sdl-space-5);
-  border-bottom: 1px solid var(--sdl-border-subtle);
-  background: var(--sdl-bg-muted);
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-
-.modal-header h3 {
-  margin: 0;
-  font-size: var(--sdl-font-subtitle);
-  color: var(--sdl-text-primary);
-  font-weight: 600;
-}
-
-.modal-close {
-  background: none;
-  border: none;
-  font-size: 20px;
-  cursor: pointer;
-  color: var(--sdl-text-muted);
-  transition: color 0.2s;
-}
-
-.modal-close:hover {
-  color: var(--sdl-text-primary);
-}
-
-.modal-body {
-  padding: var(--sdl-space-5);
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: var(--sdl-space-5);
-}
-
-.modal-footer {
-  padding: var(--sdl-space-3) var(--sdl-space-5);
-  border-top: 1px solid var(--sdl-border-subtle);
-  display: flex;
-  justify-content: flex-end;
-}
-
-/* ─── 网络详情 ─── */
-.detail-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: var(--sdl-space-3);
-  border-bottom: 1px solid var(--sdl-border-subtle);
-  padding-bottom: var(--sdl-space-4);
-}
-
-.detail-item {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sdl-space-1);
-}
-
-.detail-full {
-  grid-column: span 2;
-}
-
-.detail-label {
-  font-weight: 600;
-  color: var(--sdl-text-secondary);
-  font-size: var(--sdl-font-caption);
-}
-
-.detail-value {
-  color: var(--sdl-text-primary);
-  word-break: break-all;
-  font-size: var(--sdl-font-body-sm);
-}
-
-.highlight-value {
-  color: var(--sdl-primary);
-  font-weight: 600;
-}
-
 .mono-text {
   font-family: var(--sdl-font-mono);
 }
-
-/* ─── 容器列表与连接 ─── */
-.containers-section,
-.connect-section {
+.subnet-cell {
+  white-space: normal;
+  word-break: break-word;
+}
+.create-form,
+.advanced-fields,
+.detail-content,
+.detail-block {
   display: flex;
   flex-direction: column;
   gap: var(--sdl-space-3);
 }
-
-.section-title {
-  margin: 0;
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 var(--sdl-space-4);
+}
+.three-columns {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.advanced-fields {
+  margin-top: var(--sdl-space-2);
+  padding-top: var(--sdl-space-3);
+  border-top: 1px solid var(--sdl-border-subtle);
+}
+.form-group-title,
+.block-title {
+  color: var(--sdl-text-primary);
   font-size: var(--sdl-font-body);
-  color: var(--sdl-text-primary);
-  border-left: 3px solid var(--sdl-primary);
-  padding-left: var(--sdl-space-2);
+  font-weight: 600;
 }
-
-.connected-table {
-  max-height: 180px;
-  overflow-y: auto;
+.detail-content {
+  position: relative;
+  min-height: 240px;
 }
-
-.container-name-text {
-  color: var(--sdl-text-primary);
-  font-weight: 500;
+.detail-block {
+  padding-top: var(--sdl-space-3);
+  border-top: 1px solid var(--sdl-border-subtle);
 }
-
-.connect-form-row {
-  display: flex;
-  gap: var(--sdl-space-3);
-  align-items: center;
+.container-name {
+  font-weight: 600;
 }
-
-.container-select {
+.connect-row > :first-child {
   flex: 1;
 }
-
-@keyframes sl-modal-pop {
-  from {
-    transform: scale(0.95);
-    opacity: 0;
+@media (max-width: 980px) {
+  .network-toolbar {
+    align-items: stretch;
+    flex-direction: column;
   }
-  to {
-    transform: scale(1);
-    opacity: 1;
+  .toolbar-filters,
+  .toolbar-actions {
+    flex-wrap: wrap;
+  }
+}
+@media (max-width: 680px) {
+  .search-input,
+  .filter-select {
+    width: 100%;
+  }
+  .toolbar-filters,
+  .toolbar-actions,
+  .connect-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .form-grid,
+  .three-columns {
+    grid-template-columns: 1fr;
   }
 }
 </style>

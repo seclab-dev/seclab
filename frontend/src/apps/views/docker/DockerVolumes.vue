@@ -76,7 +76,7 @@ const formatCreatedAt = (createdAt: string | undefined): string => {
 }
 
 /** 处理搜索输入 */
-const handleSearchInput = (value: string | number | boolean | undefined) => {
+const handleSearchInput = (value: string | number | null) => {
   searchQuery.value = typeof value === 'string' ? value : value == null ? '' : String(value)
 }
 

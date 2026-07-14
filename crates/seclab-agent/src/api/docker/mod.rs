@@ -167,30 +167,6 @@ fn summarize_project_states(
     counts
 }
 
-/// 获取所有网络的详细信息。
-///
-/// 底层行为等同于对每个已存在的网络执行 `docker network inspect <name>`。
-pub async fn inspect_networks(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
-    info!("Requesting docker network");
-    let docker = state.docker_client().await?;
-
-    let options = query_parameters::InspectNetworkOptions::default();
-
-    let mut networks = vec![];
-    for network in docker
-        .list_networks(Some(query_parameters::ListNetworksOptions::default()))
-        .await?
-        .iter()
-    {
-        networks.push(
-            docker
-                .inspect_network(network.name.as_ref().unwrap(), Some(options.clone()))
-                .await?,
-        );
-    }
-    Ok(ApiResponse::success_with_raw("Docker networks loaded", Some(networks)).into_response())
-}
-
 /// 返回当前宿主机的 Docker 卷列表。
 pub async fn volumes(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
     info!("Requesting docker node");
@@ -317,7 +293,7 @@ pub fn docker_router() -> Router<Arc<AppState>> {
         .route("/image/remove", delete(images::remove_image))
         .route(
             "/networks",
-            get(inspect_networks).post(networks::create_network),
+            get(networks::list_networks).post(networks::create_network),
         )
         .route(
             "/networks/{id}",

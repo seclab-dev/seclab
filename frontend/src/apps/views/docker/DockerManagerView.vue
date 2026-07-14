@@ -201,7 +201,6 @@ watch(
         store.stopContainerStatsPolling()
         break
       case 'networks':
-        fetchAction = store.fetchNetworks()
         store.stopContainerStatsPolling()
         break
       default:
@@ -218,7 +217,6 @@ watch(
 
     store.isContainerCreateActive = false
     store.isProjectCreateActive = false
-    store.isNetworkCreateActive = false
     store.containerStep = 'selectImage'
     store.selectedImageId = null
   },
@@ -301,16 +299,13 @@ onUnmounted(() => {
         :projects="store.composeProjects"
         :images-list="store.imagesList"
         :volumes="store.volumes"
-        :networks="store.networks"
         :container-resource-stats="store.containerResourceStats"
         :is-create-active="
           activeMenu === 'containers'
             ? store.isContainerCreateActive
             : activeMenu === 'projects'
               ? store.isProjectCreateActive
-              : activeMenu === 'networks'
-                ? store.isNetworkCreateActive
-                : false
+              : false
         "
         :container-step="store.containerStep"
         :selected-image-id="store.selectedImageId"
@@ -319,16 +314,12 @@ onUnmounted(() => {
         :project-form-name="store.projectFormName"
         :project-form-compose="store.projectFormCompose"
         :compose-yaml-error="store.composeYamlError"
-        :network-form="store.networkForm"
         :node-id="targetNodeId"
         @action="store.handleContainerAction"
         @project-action="store.handleComposeProjectAction"
         @edit-compose="store.handleEditComposeConfig"
         @create="handleCreateClick"
         @delete-image="store.handleDeleteImage"
-        @delete-network="store.handleDeleteNetwork"
-        @create-network="store.handleCreateNetwork"
-        @view-network="store.handleViewNetwork"
         @cancel-create="store.cancelContainerCreate"
         @submit-create="store.submitContainerConfig"
         @fetch-container-stats="store.fetchContainerResourceStats"
@@ -344,9 +335,6 @@ onUnmounted(() => {
             store.validateComposeYaml(v)
           }
         "
-        @cancel-network-create="store.cancelNetworkCreate"
-        @submit-network-create="store.submitNetworkForm"
-        @update:network-form="(v: typeof store.networkForm) => (store.networkForm = v)"
         @update:detail-active="(v: boolean) => (store.isContainerDetailActive = v)"
         @logs-active-change="updateRealtimeLogsActive"
         @terminal-active-change="updateContainerTerminalActive"
