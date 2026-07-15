@@ -293,50 +293,55 @@ function rowActions(container: DockerContainerSummary) {
 <template>
   <div class="container-list" data-page="docker-container-list">
     <div class="container-toolbar" data-ui="toolbar">
-      <SecLabInput
-        id="docker-container-search"
-        v-model="search"
-        name="docker-container-search"
-        :placeholder="t('app.docker.containers.containerNamePlaceholder')"
-        clearable
-        class="search-input"
-        data-slot="search"
-      />
-      <SecLabSelect
-        v-model="stateFilter"
-        :options="stateOptions"
-        class="filter-select"
-        data-slot="state-filter"
-      />
-      <SecLabSelect
-        v-model="managementFilter"
-        :options="managementOptions"
-        class="filter-select"
-        data-slot="management-filter"
-      />
-      <div class="toolbar-spacer" />
-      <div v-if="selectedIds.size > 0" class="batch-control" data-slot="batch-actions">
-        <span>{{ t('app.docker.containers.selectedCount', { count: selectedIds.size }) }}</span>
-        <SecLabActionMenu
-          :label="t('app.docker.containers.batchActions')"
-          :actions="batchActions"
+      <div class="toolbar-filters" data-slot="filters">
+        <SecLabInput
+          id="docker-container-search"
+          v-model="search"
+          name="docker-container-search"
+          :placeholder="t('app.docker.containers.containerNamePlaceholder')"
+          clearable
+          class="search-input"
+          data-slot="search"
+        />
+        <SecLabSelect
+          v-model="stateFilter"
+          :options="stateOptions"
+          class="filter-select"
+          data-slot="state-filter"
+        />
+        <SecLabSelect
+          v-model="managementFilter"
+          :options="managementOptions"
+          class="filter-select"
+          data-slot="management-filter"
         />
       </div>
-      <SecLabButton
-        type="secondary"
-        :loading="store.containerListLoading && store.containers.length > 0"
-        data-ui="refresh-containers"
-        @click="store.fetchContainers"
-      >
-        {{ t('common.refresh') }}
-      </SecLabButton>
-      <SecLabButton
-        type="primary"
-        data-ui="create-container"
-        @click="store.startContainerCreateFlow"
-      >
-        {{ t('app.docker.containers.create') }}
-      </SecLabButton>
+      <div class="toolbar-actions" data-slot="actions">
+        <div v-if="selectedIds.size > 0" class="batch-control" data-slot="batch-actions">
+          <span>{{ t('app.docker.containers.selectedCount', { count: selectedIds.size }) }}</span>
+          <SecLabActionMenu
+            :label="t('app.docker.containers.batchActions')"
+            :actions="batchActions"
+          />
+        </div>
+        <div class="primary-actions" data-slot="primary-actions">
+          <SecLabButton
+            type="secondary"
+            :loading="store.containerListLoading && store.containers.length > 0"
+            data-ui="refresh-containers"
+            @click="store.fetchContainers"
+          >
+            {{ t('common.refresh') }}
+          </SecLabButton>
+          <SecLabButton
+            type="primary"
+            data-ui="create-container"
+            @click="store.startContainerCreateFlow"
+          >
+            {{ t('app.docker.containers.create') }}
+          </SecLabButton>
+        </div>
+      </div>
     </div>
 
     <SecLabAlert
@@ -453,6 +458,8 @@ function rowActions(container: DockerContainerSummary) {
   display: flex;
   flex-direction: column;
   background: var(--sdl-bg-panel);
+  container-name: docker-container-list;
+  container-type: inline-size;
 }
 
 .container-toolbar {
@@ -464,16 +471,37 @@ function rowActions(container: DockerContainerSummary) {
   border-bottom: 1px solid var(--sdl-border-subtle);
 }
 
+.toolbar-filters,
+.toolbar-actions,
+.primary-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sdl-space-3);
+}
+
+.toolbar-filters {
+  flex: 1;
+  min-width: 0;
+}
+
+.toolbar-actions {
+  flex-shrink: 0;
+}
+
+.primary-actions {
+  flex-shrink: 0;
+}
+
 .search-input {
-  width: min(300px, 28vw);
+  flex: 1 1 300px;
+  width: auto;
+  min-width: 180px;
+  max-width: 300px;
 }
 
 .filter-select {
+  flex: 0 0 150px;
   width: 150px;
-}
-
-.toolbar-spacer {
-  flex: 1;
 }
 
 .batch-control {
@@ -482,6 +510,7 @@ function rowActions(container: DockerContainerSummary) {
   gap: var(--sdl-space-2);
   color: var(--sdl-text-secondary);
   font-size: var(--sdl-font-caption);
+  white-space: nowrap;
 }
 
 .container-table-wrapper {
@@ -544,17 +573,59 @@ function rowActions(container: DockerContainerSummary) {
   -webkit-line-clamp: 2;
 }
 
-@media (max-width: 900px) {
+@container docker-container-list (max-width: 900px) {
   .container-toolbar {
-    flex-wrap: wrap;
+    align-items: stretch;
+    flex-direction: column;
   }
 
-  .search-input {
+  .toolbar-filters,
+  .toolbar-actions {
     width: 100%;
   }
 
-  .toolbar-spacer {
-    display: none;
+  .toolbar-actions {
+    justify-content: flex-end;
+  }
+
+  .search-input {
+    max-width: none;
+  }
+}
+
+@container docker-container-list (max-width: 640px) {
+  .toolbar-filters {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .search-input {
+    grid-column: 1 / -1;
+    width: 100%;
+    min-width: 0;
+  }
+
+  .filter-select {
+    width: 100%;
+  }
+
+  .batch-control {
+    margin-right: auto;
+  }
+}
+
+@container docker-container-list (max-width: 460px) {
+  .toolbar-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .batch-control {
+    margin-right: 0;
+  }
+
+  .primary-actions {
+    justify-content: flex-end;
   }
 }
 </style>

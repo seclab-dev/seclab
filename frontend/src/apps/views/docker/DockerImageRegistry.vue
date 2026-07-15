@@ -631,7 +631,7 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: var(--sdl-space-3);
-  max-width: 760px;
+  width: 100%;
 }
 
 .registry-mode {
@@ -640,10 +640,6 @@ onBeforeUnmount(() => {
   min-height: 0;
   flex-direction: column;
   gap: var(--sdl-space-3);
-}
-
-.reference-mode {
-  max-width: 860px;
 }
 
 .reference-cancel-button {
