@@ -218,7 +218,7 @@ const statusLabel = (status: string | undefined) => {
                       : row?.projectType === 'docker'
                         ? t('app.docker.projects.actions.deleteDockerHint')
                         : t('app.docker.projects.actions.deleteSystemHint'),
-                  class: 'btn-delete',
+                  className: 'btn-delete',
                 },
               ]"
             />
