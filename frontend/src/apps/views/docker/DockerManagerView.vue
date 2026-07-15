@@ -185,7 +185,7 @@ watch(
         store.stopContainerStatsPolling()
         break
       case 'containers':
-        fetchAction = store.fetchContainers()
+        void store.fetchContainers()
         store.startContainerStatsPolling(() => activeMenu.value)
         break
       case 'projects':
@@ -245,6 +245,7 @@ watch(
       store.startHistoryPolling()
     }
     if (store.dockerAvailable && activeMenu.value === 'containers') {
+      await store.fetchContainers()
       store.startContainerStatsPolling(() => activeMenu.value)
     }
   },
@@ -276,7 +277,7 @@ onUnmounted(() => {
 
     <div class="content-area">
       <!-- 加载中 -->
-      <div v-if="store.isLoading" class="wip-placeholder">
+      <div v-if="store.isLoading && activeMenu !== 'containers'" class="wip-placeholder">
         <p>{{ t('app.docker.loading') }}</p>
       </div>
 

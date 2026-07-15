@@ -10,7 +10,7 @@ import type * as dockerType from '@/api/interface/docker'
 
 // 声明原有属性以确保与主视图组件通信时的 TypeScript 类型兼容性
 defineProps<{
-  containers: dockerType.ContainerSummary[]
+  containers: dockerType.DockerContainerSummary[]
   networks?: dockerType.DockerNetworkSummary[]
   isCreateActive?: boolean
   containerStep?: 'selectImage' | 'config'
@@ -19,34 +19,21 @@ defineProps<{
   containerForm?: {
     name: string
     command: string
-    env: string
-    ports: string
-    volumes: string
-    restartPolicy: string
-    network: string
+    environment: Array<{ name: string; value: string }>
+    ports: dockerType.DockerContainerCreatePort[]
+    mounts: dockerType.DockerContainerCreateMount[]
+    restartPolicy: dockerType.DockerContainerCreateRestartPolicy
+    maximumRetryCount: number | null
+    networkId: string
     autoRemove: boolean
   }
   containerResourceStats?: Record<
     string,
     {
-      data: {
-        cpuCorePercent: number
-        memoryWorkingSetBytes: number
-        memoryLimitBytes: number
-        memoryPercent: number
-        networkRxBytes: number
-        networkTxBytes: number
-      }
+      data: dockerType.ContainerResourceUsageSummary
       fetchedAt: number
     }
   >
-  utils?: {
-    getStateIcon: (state: string | undefined) => string
-    formatPorts: (ports: dockerType.Port[] | undefined) => string
-    getContainerIP: (
-      networkSettings: dockerType.ContainerSummaryNetworkSettings | null | undefined,
-    ) => string
-  }
   nodeId: string
 }>()
 
@@ -55,7 +42,7 @@ defineEmits<{
     e: 'action',
     id: string | null | (string | null)[],
     name: string | null | (string | null)[],
-    action: 'start' | 'stop' | 'restart' | 'remove',
+    action: dockerType.DockerContainerAction,
   ): void
   (e: 'update:containerStep', value: 'selectImage' | 'config'): void
   (e: 'update:selectedImageId', value: string | null): void
@@ -64,11 +51,12 @@ defineEmits<{
     value: {
       name: string
       command: string
-      env: string
-      ports: string
-      volumes: string
-      restartPolicy: string
-      network: string
+      environment: Array<{ name: string; value: string }>
+      ports: dockerType.DockerContainerCreatePort[]
+      mounts: dockerType.DockerContainerCreateMount[]
+      restartPolicy: dockerType.DockerContainerCreateRestartPolicy
+      maximumRetryCount: number | null
+      networkId: string
       autoRemove: boolean
     },
   ): void
@@ -94,9 +82,8 @@ const DockerContainerDetail = defineAsyncComponent(() => import('./DockerContain
 
 <template>
   <div class="docker-containers" data-page="docker-containers">
-    <DockerContainerCreateWizard v-if="store.isContainerCreateActive" />
     <DockerContainerDetail
-      v-else-if="store.isContainerDetailActive && selectedContainerId"
+      v-if="store.isContainerDetailActive && selectedContainerId"
       :container-id="selectedContainerId"
       :node-id="nodeId"
       @back="
@@ -105,6 +92,8 @@ const DockerContainerDetail = defineAsyncComponent(() => import('./DockerContain
           selectedContainerId = null
         }
       "
+      @logs-active-change="(value) => $emit('logsActiveChange', value)"
+      @terminal-active-change="(value) => $emit('terminalActiveChange', value)"
     />
     <DockerContainerList
       v-else
@@ -115,6 +104,7 @@ const DockerContainerDetail = defineAsyncComponent(() => import('./DockerContain
         }
       "
     />
+    <DockerContainerCreateWizard v-if="store.isContainerCreateActive" />
   </div>
 </template>
 

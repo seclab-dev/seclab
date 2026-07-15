@@ -86,7 +86,7 @@ export const useContainerProcesses = ({
         return
       }
 
-      processError.value = res.message || '无法获取进程列表'
+      processError.value = res.message || t('app.docker.containers.processLoadFailed')
       processRows.value = []
     } finally {
       if (currentRequest === requestVersion) {

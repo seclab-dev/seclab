@@ -65,7 +65,12 @@ export const useContainerHistoryCharts = ({ t }: UseContainerHistoryChartsOption
   const formatTimeLabel = (timestamp: number) => {
     const date = new Date(timestamp * 1000)
     if (Number.isNaN(date.getTime())) return '-'
-    return date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
+    return date.toLocaleString(undefined, {
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+    })
   }
 
   const ensureChartInstance = (

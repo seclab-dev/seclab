@@ -6,17 +6,16 @@ import { useI18n } from 'vue-i18n'
 type UseContainerInspectDataOptions = {
   selectedContainerId: Ref<string | null>
   nodeId: Ref<string> | ComputedRef<string>
-  onError: (message: string) => void
 }
 
 export const useContainerInspectData = ({
   selectedContainerId,
   nodeId,
-  onError,
 }: UseContainerInspectDataOptions) => {
   const { t } = useI18n()
-  const inspectDetail = ref<dockerType.ContainerInspect | null>(null)
+  const inspectDetail = ref<dockerType.DockerContainerDetail | null>(null)
   const isInspectLoading = ref(false)
+  const inspectError = ref<string | null>(null)
   const dockerClient = computed(() => dockerApi.forNode(nodeId.value))
 
   let requestVersion = 0
@@ -25,11 +24,13 @@ export const useContainerInspectData = ({
     requestVersion += 1
     inspectDetail.value = null
     isInspectLoading.value = false
+    inspectError.value = null
   }
 
   const load = async (id: string) => {
     const currentRequest = ++requestVersion
     isInspectLoading.value = true
+    inspectError.value = null
 
     try {
       const res = await dockerClient.value.inspectContainer(id)
@@ -43,11 +44,9 @@ export const useContainerInspectData = ({
       }
 
       inspectDetail.value = null
-      onError(
-        t('app.docker.messages.inspectContainerFailed', {
-          message: res.message || t('common.unknownError'),
-        }),
-      )
+      inspectError.value = t('app.docker.messages.inspectContainerFailed', {
+        message: res.message || t('common.unknownError'),
+      })
     } finally {
       if (currentRequest === requestVersion) {
         isInspectLoading.value = false
@@ -71,6 +70,7 @@ export const useContainerInspectData = ({
   return {
     inspectDetail,
     isInspectLoading,
+    inspectError,
     reloadInspect: async () => {
       const id = selectedContainerId.value
       if (!id) return

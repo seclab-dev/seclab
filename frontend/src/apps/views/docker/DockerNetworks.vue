@@ -125,14 +125,9 @@ const connectableContainers = computed(() => {
     currentDetail.value?.containers.map((container) => container.id) ?? [],
   )
   return store.containers
-    .filter(
-      (container) =>
-        container.State === 'running' && container.Id && !connectedIds.has(container.Id),
-    )
+    .filter((container) => container.state === 'running' && !connectedIds.has(container.id))
     .map((container) => {
-      const id = container.Id!
-      const name = container.Names?.[0]?.replace(/^\//, '') || id.substring(0, 12)
-      return { label: name, value: id }
+      return { label: container.name, value: container.id }
     })
 })
 

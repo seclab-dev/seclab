@@ -2,6 +2,7 @@
 import { SecLabButton, SecLabSelect } from '@/components/ui'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useNotificationStore } from '@/stores/notification'
+import { buildTerminalTheme, useThemeStore } from '@/stores/theme'
 import { useDockerTerminalWs } from './useDockerTerminalWs'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
@@ -12,7 +13,6 @@ type ShellType = 'bash' | 'sh'
 
 const props = defineProps<{
   containerId: string | null
-  containerName?: string | null
   nodeId: string
   active?: boolean
 }>()
@@ -22,6 +22,7 @@ const emit = defineEmits<{
 }>()
 
 const notificationStore = useNotificationStore()
+const themeStore = useThemeStore()
 const { t } = useI18n()
 const {
   connected,
@@ -50,9 +51,6 @@ const shellOptions = [
   { label: 'sh', value: 'sh' },
 ]
 
-const getCssVar = (name: string) =>
-  getComputedStyle(document.documentElement).getPropertyValue(name).trim()
-
 const statusHint = computed(() => {
   if (!props.containerId) return t('app.docker.containers.terminalPanel.selectContainerFirst')
   if (connecting.value) return t('app.docker.containers.terminalPanel.connecting')
@@ -71,17 +69,13 @@ const hasActiveTerminalSession = computed(() => connecting.value || isConnected.
 const mountTerminal = () => {
   if (!terminalHost.value || xterm) return
   xterm = new Terminal({
-    cursorBlink: true,
+    cursorBlink: false,
+    disableStdin: true,
     fontSize: 13,
     lineHeight: 1.2,
     convertEol: false,
     scrollback: 5000,
-    theme: {
-      background: getCssVar('--sdl-bg-canvas') || '#0f172a',
-      foreground: getCssVar('--sdl-text-primary') || '#e2e8f0',
-      cursor: getCssVar('--sdl-primary') || '#f8fafc',
-      selectionBackground: getCssVar('--sdl-bg-hover') || '#334155',
-    },
+    theme: buildTerminalTheme(themeStore.currentTheme),
   })
   fitAddon = new FitAddon()
   xterm.loadAddon(fitAddon)
@@ -117,11 +111,6 @@ const connectTerminal = () => {
   if (!xterm || !fitAddon) return
   fitAddon.fit()
   resetTerminalView()
-  xterm.writeln(
-    t('app.docker.containers.terminalPanel.connectingToContainer', {
-      name: props.containerName || props.containerId,
-    }),
-  )
   openSession({
     container_id: props.containerId,
     shell: selectedShell.value,
@@ -132,10 +121,32 @@ const connectTerminal = () => {
 
 const disconnectTerminal = () => {
   closeSession()
-  if (xterm) {
-    xterm.writeln(`\r\n${t('app.docker.containers.terminalPanel.disconnectedLine')}`)
-  }
 }
+
+const preventInactiveFocus = (event: MouseEvent) => {
+  if (isConnected.value) return
+  event.preventDefault()
+  event.stopPropagation()
+  xterm?.blur()
+}
+
+watch(isConnected, (interactive) => {
+  if (!xterm) return
+  xterm.options.disableStdin = !interactive
+  xterm.options.cursorBlink = interactive
+  if (interactive) {
+    requestAnimationFrame(() => xterm?.focus())
+  } else {
+    xterm.blur()
+  }
+})
+
+watch(
+  () => themeStore.currentTheme,
+  (theme) => {
+    if (xterm) xterm.options.theme = buildTerminalTheme(theme)
+  },
+)
 
 watch(
   () => props.active,
@@ -179,11 +190,6 @@ watch(
           }),
         )
       }
-      xterm.writeln(
-        t('app.docker.containers.terminalPanel.connectedLine', {
-          shell: message.payload.shell,
-        }),
-      )
       return
     }
     if (message.kind === 'terminalOutput') {
@@ -260,8 +266,16 @@ onBeforeUnmount(() => {
         </SecLabButton>
       </div>
     </div>
-    <div class="terminal-host-container">
+    <div
+      class="terminal-host-container"
+      :class="{ 'is-inactive': !isConnected }"
+      :aria-disabled="!isConnected"
+      @mousedown.capture="preventInactiveFocus"
+    >
       <div ref="terminalHost" class="terminal-host" data-native-context-menu />
+      <div v-if="!isConnected" class="terminal-inactive-state" data-slot="terminal-state">
+        {{ statusHint }}
+      </div>
     </div>
   </div>
 </template>
@@ -271,7 +285,10 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   flex: 1;
+  height: 100%;
   min-height: 0;
+  padding: var(--sdl-space-4);
+  box-sizing: border-box;
   gap: var(--sdl-space-3);
 }
 
@@ -309,8 +326,9 @@ onBeforeUnmount(() => {
 }
 
 .terminal-host-container {
+  position: relative;
   flex: 1;
-  min-height: 300px;
+  min-height: 0;
   border: 1px solid var(--sdl-border-default);
   border-radius: var(--sdl-radius-md);
   overflow: hidden;
@@ -325,8 +343,37 @@ onBeforeUnmount(() => {
   box-sizing: border-box;
 }
 
+.terminal-host-container.is-inactive .terminal-host {
+  opacity: 0.55;
+}
+
+.terminal-inactive-state {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 2;
+  max-width: calc(100% - var(--sdl-space-8));
+  padding: var(--sdl-space-2) var(--sdl-space-3);
+  border: 1px solid var(--sdl-border-default);
+  border-radius: var(--sdl-radius-md);
+  background: var(--sdl-bg-panel);
+  color: var(--sdl-text-secondary);
+  font-size: var(--sdl-font-body-sm);
+  text-align: center;
+  pointer-events: none;
+  transform: translate(-50%, -50%);
+}
+
 :deep(.xterm) {
   height: 100%;
   padding: 0;
+}
+
+:deep(.xterm-viewport) {
+  background-color: var(--sdl-bg-canvas) !important;
+}
+
+:deep(.xterm-viewport::-webkit-scrollbar-track) {
+  background: var(--sdl-bg-canvas);
 }
 </style>

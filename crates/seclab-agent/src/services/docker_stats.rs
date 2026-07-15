@@ -2,7 +2,7 @@
 
 use crate::config;
 use crate::models::docker::{
-    ContainerResourceUsageSummary, HostResourceUsageSummary, ResourceSampleStatus,
+    ContainerResourceUsageSample, HostResourceUsageSummary, ResourceSampleStatus,
 };
 use crate::state::AppState;
 use bollard::models::ContainerSummaryStateEnum;
@@ -205,7 +205,7 @@ async fn collect_samples_and_summary(
     docker: &bollard::Docker,
 ) -> anyhow::Result<(
     HostResourceUsageSummary,
-    Vec<(String, ContainerResourceUsageSummary)>,
+    Vec<(String, ContainerResourceUsageSample)>,
 )> {
     let options = query_parameters::ListContainersOptionsBuilder::new()
         .all(true)
@@ -218,7 +218,7 @@ async fn collect_samples_and_summary(
         .collect();
 
     let running_container_count = running_ids.len();
-    let samples: Vec<(String, ContainerResourceUsageSummary)> = stream::iter(running_ids)
+    let samples: Vec<(String, ContainerResourceUsageSample)> = stream::iter(running_ids)
         .map(|id| async {
             let summary = fetch_container_stats_snapshot(docker, &id).await;
             summary.map(|value| (id, value))
@@ -300,7 +300,7 @@ async fn cleanup_old_stats(state: &AppState) -> anyhow::Result<()> {
 async fn fetch_container_stats_snapshot(
     docker: &bollard::Docker,
     id: &str,
-) -> Option<ContainerResourceUsageSummary> {
+) -> Option<ContainerResourceUsageSample> {
     let stats_options = query_parameters::StatsOptionsBuilder::new()
         .stream(false)
         .one_shot(true)
@@ -353,7 +353,7 @@ async fn fetch_container_stats_snapshot(
         0.0
     };
 
-    Some(ContainerResourceUsageSummary {
+    Some(ContainerResourceUsageSample {
         cpu_core_percent,
         memory_working_set_bytes,
         memory_limit_bytes,

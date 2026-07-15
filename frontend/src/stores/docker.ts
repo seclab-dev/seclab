@@ -84,7 +84,13 @@ export const useDockerStore = defineStore('docker', () => {
   const overviewHistoryError = ref<string | null>(null)
 
   // ─── 容器列表 ───
-  const containers = ref<dockerType.ContainerSummary[]>([])
+  const containers = ref<dockerType.DockerContainerSummary[]>([])
+  const containerListLoading = ref(false)
+  const containerListError = ref<string | null>(null)
+  const containerListLoadedAt = ref<number | null>(null)
+  const containerActionLoadingIds = ref<string[]>([])
+  const containerStatsLoading = ref(false)
+  const containerStatsError = ref<string | null>(null)
   const containerResourceStats = ref<Record<string, ContainerStatsEntry>>({})
   const isContainerDetailActive = ref(false)
 
@@ -142,14 +148,27 @@ export const useDockerStore = defineStore('docker', () => {
   const isContainerCreateActive = ref(false)
   const containerStep = ref<'selectImage' | 'config'>('selectImage')
   const selectedImageId = ref<string | null>(null)
-  const containerForm = ref({
+  const containerCreateLoading = ref(false)
+  const containerCreateError = ref<string | null>(null)
+  const containerForm = ref<{
+    name: string
+    command: string
+    environment: Array<{ name: string; value: string }>
+    ports: dockerType.DockerContainerCreatePort[]
+    mounts: dockerType.DockerContainerCreateMount[]
+    restartPolicy: dockerType.DockerContainerCreateRestartPolicy
+    maximumRetryCount: number | null
+    networkId: string
+    autoRemove: boolean
+  }>({
     name: '',
     command: '',
-    env: '',
-    ports: '',
-    volumes: '',
+    environment: [],
+    ports: [],
+    mounts: [],
     restartPolicy: 'no',
-    network: '',
+    maximumRetryCount: null,
+    networkId: '',
     autoRemove: false,
   })
 
@@ -177,6 +196,9 @@ export const useDockerStore = defineStore('docker', () => {
   let volumeListRequestSequence = 0
   let volumeDetailRequestSequence = 0
   let volumeNodeId: string | null = null
+  let containerListRequestSequence = 0
+  let containerStatsRequestSequence = 0
+  let containerNodeId: string | null = null
 
   // ─── 轮询定时器 ───
   let resourceUsageTimer: number | null = null
@@ -214,7 +236,16 @@ export const useDockerStore = defineStore('docker', () => {
     overviewHistoryHours.value = 1
     overviewHistoryError.value = null
     containers.value = []
+    containerListLoading.value = false
+    containerListError.value = null
+    containerListLoadedAt.value = null
+    containerActionLoadingIds.value = []
+    containerStatsLoading.value = false
+    containerStatsError.value = null
     containerResourceStats.value = {}
+    containerNodeId = null
+    containerListRequestSequence += 1
+    containerStatsRequestSequence += 1
     composeProjects.value = []
     imagesList.value = []
     imageListLoading.value = false
@@ -271,6 +302,9 @@ export const useDockerStore = defineStore('docker', () => {
     pruneLoading.value = false
     composeContainers.value = []
     projectLogs.value = []
+    isContainerCreateActive.value = false
+    containerCreateLoading.value = false
+    containerCreateError.value = null
     overviewCache.value = null
   }
 
@@ -435,25 +469,43 @@ export const useDockerStore = defineStore('docker', () => {
   }
 
   /** 获取所有容器列表 */
-  const fetchContainers = async () => {
-    if (!dockerAvailable.value) return
-    const res = await dockerClient.value.listContainers()
-    if (!res.success) {
-      notificationStore.error(
-        t('app.docker.messages.listContainersFailed', {
-          message: res.message || t('common.unknownError'),
-        }),
-      )
+  const fetchContainers = async (): Promise<boolean> => {
+    if (!dockerAvailable.value) return false
+    const nodeId = nodeStore.currentNodeId || 'local'
+    if (containerNodeId !== nodeId) {
       containers.value = []
-      return
+      containerResourceStats.value = {}
+      containerListLoadedAt.value = null
+      containerStatsError.value = null
+      containerStatsRequestSequence += 1
+      containerNodeId = nodeId
     }
-    containers.value = res.data || []
+    const sequence = ++containerListRequestSequence
+    containerListLoading.value = true
+    containerListError.value = null
+    const res = await dockerClient.value.listContainers()
+    if (
+      sequence !== containerListRequestSequence ||
+      nodeId !== (nodeStore.currentNodeId || 'local')
+    ) {
+      return false
+    }
+    containerListLoading.value = false
+    if (!res.success || !res.data) {
+      containerListError.value = t('app.docker.messages.listContainersFailed', {
+        message: res.message || t('common.unknownError'),
+      })
+      return false
+    }
+    containers.value = res.data
+    containerListLoadedAt.value = Date.now()
     const runningIds = (res.data || [])
-      .filter((c) => c.State === 'running' && c.Id)
-      .map((c) => c.Id!)
+      .filter((container) => container.state === 'running')
+      .map((container) => container.id)
     if (runningIds.length > 0 && !isContainerDetailActive.value) {
       void queueContainerStatsFetch(runningIds)
     }
+    return true
   }
 
   /** 获取 Compose 项目列表 */
@@ -841,14 +893,35 @@ export const useDockerStore = defineStore('docker', () => {
       pendingContainerStatIds.clear()
       containerStatsTimer = null
       if (batchIds.length === 0) return
-      const res = await dockerClient.value.fetchContainerResourceUsageSummaries({ ids: batchIds })
-      if (res.success && res.data) {
-        const now = Date.now()
-        const updates = { ...containerResourceStats.value }
-        for (const [id, summary] of Object.entries(res.data.summaries || {})) {
-          updates[id] = { data: summary, fetchedAt: now }
+      if (containerStatsLoading.value) {
+        batchIds.forEach((id) => pendingContainerStatIds.add(id))
+        return
+      }
+      const nodeId = nodeStore.currentNodeId || 'local'
+      const sequence = ++containerStatsRequestSequence
+      containerStatsLoading.value = true
+      try {
+        const res = await dockerClient.value.fetchContainerResourceUsageSummaries({ ids: batchIds })
+        if (
+          sequence !== containerStatsRequestSequence ||
+          nodeId !== (nodeStore.currentNodeId || 'local')
+        ) {
+          return
         }
-        containerResourceStats.value = updates
+        if (res.success && res.data) {
+          const now = Date.now()
+          const updates = { ...containerResourceStats.value }
+          for (const [id, summary] of Object.entries(res.data.summaries || {})) {
+            updates[id] = { data: summary, fetchedAt: now }
+          }
+          containerResourceStats.value = updates
+          containerStatsError.value = null
+        } else {
+          containerStatsError.value = res.message || t('common.unknownError')
+        }
+      } finally {
+        if (sequence === containerStatsRequestSequence) containerStatsLoading.value = false
+        if (pendingContainerStatIds.size > 0) void queueContainerStatsFetch([])
       }
     }, 150)
   }
@@ -894,8 +967,8 @@ export const useDockerStore = defineStore('docker', () => {
       if (activeMenuGetter() !== 'containers') return
       if (isContainerDetailActive.value) return
       const runningIds = containers.value
-        .filter((c) => c.State === 'running' && c.Id)
-        .map((c) => c.Id!)
+        .filter((container) => container.state === 'running')
+        .map((container) => container.id)
       if (runningIds.length > 0) void queueContainerStatsFetch(runningIds)
     }, CONTAINER_STATS_TTL)
   }
@@ -937,16 +1010,19 @@ export const useDockerStore = defineStore('docker', () => {
   const handleContainerAction = async (
     idOrIds: string | null | (string | null)[],
     nameOrNames: string | null | (string | null)[],
-    action: 'start' | 'stop' | 'restart' | 'remove' | 'pause' | 'unpause' | 'kill',
-  ) => {
+    action: dockerType.DockerContainerAction,
+  ): Promise<boolean> => {
     const ids = Array.isArray(idOrIds) ? idOrIds : [idOrIds]
     const names = Array.isArray(nameOrNames) ? nameOrNames : [nameOrNames]
     const validTargets = ids
-      .map((id, index) => ({ id, name: names[index] }))
-      .filter((item) => item.id && item.name)
+      .map((id, index) => ({ id: id || '', name: names[index] || id || '' }))
+      .filter((item) => item.id)
     if (validTargets.length === 0) {
       notificationStore.error(t('app.docker.messages.invalidContainerNameOrId'))
-      return
+      return false
+    }
+    if (validTargets.some(({ id }) => containerActionLoadingIds.value.includes(id))) {
+      return false
     }
     let confirmed = true
     if (action === 'remove') {
@@ -962,31 +1038,65 @@ export const useDockerStore = defineStore('docker', () => {
         t('confirmation.cancel'),
       )
     }
-    if (!confirmed) return
+    if (!confirmed) return false
 
-    // pause / unpause / kill 使用专用 API 端点
-    if (action === 'pause' || action === 'unpause' || action === 'kill') {
-      let hasError = false
-      await Promise.all(
-        validTargets.map(async ({ id, name }) => {
-          let res
-          if (action === 'pause') res = await dockerClient.value.pauseContainer(id as string)
-          else if (action === 'unpause')
-            res = await dockerClient.value.unpauseContainer(id as string)
-          else res = await dockerClient.value.killContainer(id as string)
-          if (!res.success) {
-            notificationStore.error(
-              t('app.docker.messages.containerActionFailed', {
-                name,
-                action,
-                message: res.message || t('common.unknownError'),
-              }),
-            )
-            hasError = true
-          }
-        }),
-      )
-      if (!hasError) {
+    const targetIds = validTargets.map(({ id }) => id)
+    containerActionLoadingIds.value = [...containerActionLoadingIds.value, ...targetIds]
+    let succeeded = false
+    try {
+      if (validTargets.length > 1) {
+        const res = await dockerClient.value.batchContainerAction({ ids: targetIds, action })
+        if (!res.success || !res.data) {
+          notificationStore.error(
+            t('app.docker.messages.containerActionFailed', {
+              name: t('app.docker.messages.containerCount', { count: validTargets.length }),
+              action,
+              message: res.message || t('common.unknownError'),
+            }),
+          )
+          return false
+        }
+        const failures = res.data.items.filter((item) => !item.success)
+        failures.forEach((item) => {
+          notificationStore.error(
+            t('app.docker.messages.containerActionFailed', {
+              name: item.name,
+              action,
+              message: item.errorMessage || t('common.unknownError'),
+            }),
+          )
+        })
+        succeeded = failures.length === 0
+      } else {
+        const [{ id, name }] = validTargets
+        const client = dockerClient.value
+        const res =
+          action === 'start'
+            ? await client.startContainer(id)
+            : action === 'stop'
+              ? await client.stopContainer(id)
+              : action === 'restart'
+                ? await client.restartContainer(id)
+                : action === 'pause'
+                  ? await client.pauseContainer(id)
+                  : action === 'unpause'
+                    ? await client.unpauseContainer(id)
+                    : action === 'kill'
+                      ? await client.killContainer(id)
+                      : await client.removeContainer(id)
+        if (!res.success) {
+          notificationStore.error(
+            t('app.docker.messages.containerActionFailed', {
+              name,
+              action,
+              message: res.message || t('common.unknownError'),
+            }),
+          )
+          return false
+        }
+        succeeded = true
+      }
+      if (succeeded) {
         notificationStore.success(
           t('app.docker.messages.containerActionSuccess', {
             count: validTargets.length,
@@ -994,37 +1104,13 @@ export const useDockerStore = defineStore('docker', () => {
           }),
         )
       }
-    } else {
-      let hasError = false
-      await Promise.all(
-        validTargets.map(async ({ id, name }) => {
-          const res = await dockerClient.value.performAction({
-            id: id as string,
-            name: name as string,
-            action,
-          })
-          if (!res.success) {
-            notificationStore.error(
-              t('app.docker.messages.containerActionFailed', {
-                name,
-                action,
-                message: res.message || t('common.unknownError'),
-              }),
-            )
-            hasError = true
-          }
-        }),
+      await Promise.all([fetchContainers(), fetchComposeProjects(), fetchOverviewData()])
+      return succeeded
+    } finally {
+      containerActionLoadingIds.value = containerActionLoadingIds.value.filter(
+        (id) => !targetIds.includes(id),
       )
-      if (!hasError) {
-        notificationStore.success(
-          t('app.docker.messages.containerActionSuccess', {
-            count: validTargets.length,
-            action,
-          }),
-        )
-      }
     }
-    await Promise.all([fetchContainers(), fetchComposeProjects(), fetchOverviewData()])
   }
 
   /** Compose 项目操作 */
@@ -1323,13 +1409,15 @@ export const useDockerStore = defineStore('docker', () => {
     containerForm.value = {
       name: '',
       command: '',
-      env: '',
-      ports: '',
-      volumes: '',
+      environment: [],
+      ports: [],
+      mounts: [],
       restartPolicy: 'no',
-      network: '',
+      maximumRetryCount: null,
+      networkId: '',
       autoRemove: false,
     }
+    containerCreateError.value = null
   }
 
   /** 启动容器创建流程 */
@@ -1344,6 +1432,7 @@ export const useDockerStore = defineStore('docker', () => {
 
   /** 取消容器创建 */
   const cancelContainerCreate = () => {
+    if (containerCreateLoading.value) return
     isContainerCreateActive.value = false
     selectedImageId.value = null
     containerStep.value = 'selectImage'
@@ -1352,6 +1441,7 @@ export const useDockerStore = defineStore('docker', () => {
 
   /** 提交容器创建 */
   const submitContainerConfig = async () => {
+    if (containerCreateLoading.value) return
     if (!selectedImageId.value) {
       notificationStore.error(t('app.docker.messages.imageRequired'))
       return
@@ -1360,30 +1450,37 @@ export const useDockerStore = defineStore('docker', () => {
       notificationStore.error(t('app.docker.messages.containerNameRequired'))
       return
     }
-    const res = await dockerClient.value.createContainer({
-      name: containerForm.value.name.trim(),
-      image: selectedImageId.value,
-      command: containerForm.value.command || undefined,
-      env: containerForm.value.env || undefined,
-      ports: containerForm.value.ports || undefined,
-      volumes: containerForm.value.volumes || undefined,
-      restartPolicy: containerForm.value.restartPolicy || undefined,
-      network: containerForm.value.network || undefined,
-      autoRemove: containerForm.value.autoRemove,
-      autoStart: true,
-    })
-    if (res.success) {
-      notificationStore.success(
-        t('app.docker.messages.createContainerSuccess', { name: containerForm.value.name }),
-      )
-      cancelContainerCreate()
-      await Promise.all([fetchContainers(), fetchComposeProjects(), fetchOverviewData()])
-    } else {
-      notificationStore.error(
-        t('app.docker.messages.createContainerFailed', {
+    containerCreateLoading.value = true
+    containerCreateError.value = null
+    try {
+      const res = await dockerClient.value.createContainer({
+        name: containerForm.value.name.trim(),
+        imageRef: selectedImageId.value,
+        command: containerForm.value.command ? ['/bin/sh', '-c', containerForm.value.command] : [],
+        environment: containerForm.value.environment,
+        ports: containerForm.value.ports,
+        mounts: containerForm.value.mounts,
+        restartPolicy: containerForm.value.restartPolicy,
+        maximumRetryCount: containerForm.value.maximumRetryCount ?? undefined,
+        networkId: containerForm.value.networkId || undefined,
+        autoRemove: containerForm.value.autoRemove,
+        autoStart: true,
+      })
+      if (res.success) {
+        notificationStore.success(
+          t('app.docker.messages.createContainerSuccess', { name: containerForm.value.name }),
+        )
+        isContainerCreateActive.value = false
+        resetContainerForm()
+        selectedImageId.value = null
+        await Promise.all([fetchContainers(), fetchComposeProjects(), fetchOverviewData()])
+      } else {
+        containerCreateError.value = t('app.docker.messages.createContainerFailed', {
           message: res.message || t('common.unknownError'),
-        }),
-      )
+        })
+      }
+    } finally {
+      containerCreateLoading.value = false
     }
   }
 
@@ -1601,6 +1698,12 @@ export const useDockerStore = defineStore('docker', () => {
 
     // 容器
     containers,
+    containerListLoading,
+    containerListError,
+    containerListLoadedAt,
+    containerActionLoadingIds,
+    containerStatsLoading,
+    containerStatsError,
     containerResourceStats,
     isContainerDetailActive,
 
@@ -1656,6 +1759,8 @@ export const useDockerStore = defineStore('docker', () => {
 
     // 容器创建
     isContainerCreateActive,
+    containerCreateLoading,
+    containerCreateError,
     containerStep,
     selectedImageId,
     selectedImageLabel,

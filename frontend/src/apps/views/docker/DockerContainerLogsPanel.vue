@@ -1,6 +1,14 @@
 <script setup lang="ts">
-import { SecLabButton, SecLabTabs, SecLabLoading } from '@/components/ui'
-import { computed, watch } from 'vue'
+import {
+  SecLabAlert,
+  SecLabButton,
+  SecLabEmpty,
+  SecLabInput,
+  SecLabLoading,
+  SecLabTabs,
+  SecLabTag,
+} from '@/components/ui'
+import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useContainerLogs, type LogMode } from './composables/useContainerLogs'
 import { ansiToHtml } from '@/utils/ansi'
@@ -39,17 +47,27 @@ const {
   statusText,
   autoScrollEl,
   realtimeSubscribed,
+  logError,
+  isPaused,
+  pausedLineCount,
   loadLatestLogs,
   switchMode,
+  togglePaused,
+  clearLogs,
 } = useContainerLogs({
   containerId: containerIdRef,
   nodeId: nodeIdRef,
   active: activeRef,
 })
 
-const logHtml = computed(() => {
-  return logLines.value.map(ansiToHtml).join('\n')
+const keyword = ref('')
+const visibleLines = computed(() => {
+  const query = keyword.value.trim().toLowerCase()
+  return query
+    ? logLines.value.filter((line) => line.toLowerCase().includes(query))
+    : logLines.value
 })
+const logHtml = computed(() => visibleLines.value.map(ansiToHtml).join('\n'))
 
 // --- Panel-specific Logic ---
 
@@ -59,6 +77,8 @@ const logHtml = computed(() => {
 const handleModeChange = (mode: LogMode) => {
   switchMode(mode)
 }
+
+const normalizeMode = (value: unknown): LogMode => (value === 'latest' ? 'latest' : 'realtime')
 
 /**
  * 刷新最新日志（仅 latest 模式下可用）。
@@ -82,36 +102,79 @@ watch(
 </script>
 
 <template>
-  <div class="container-logs-panel">
-    <div class="logs-header">
+  <div class="container-logs-panel" data-ui="container-runtime-logs">
+    <div class="logs-header" data-ui="toolbar">
       <div class="logs-title">
         <span class="logs-name">{{ t('app.docker.containers.logsPanel.title') }}</span>
         <span class="logs-subtitle">{{ props.containerName || props.containerId || '' }}</span>
       </div>
       <div class="logs-actions">
-        <span class="logs-status">{{ statusText }}</span>
+        <SecLabTag
+          :type="logError ? 'danger' : realtimeSubscribed ? 'success' : 'info'"
+          effect="plain"
+        >
+          {{ statusText }}
+        </SecLabTag>
+        <SecLabInput
+          id="docker-container-log-search"
+          v-model="keyword"
+          name="docker-container-log-search"
+          :placeholder="t('app.docker.containers.logsPanel.searchPlaceholder')"
+          clearable
+          class="log-search"
+        />
         <SecLabTabs
           :model-value="logMode"
           class="log-modes"
           :tabs="logModeTabs"
-          @update:model-value="(val: any) => handleModeChange(val)"
+          @update:model-value="(value) => handleModeChange(normalizeMode(value))"
         />
         <SecLabButton
+          v-if="logMode === 'realtime'"
           size="small"
-          :disabled="logMode !== 'latest'"
+          type="secondary"
+          @click="togglePaused"
+        >
+          {{
+            isPaused
+              ? t('app.docker.containers.logsPanel.resume', { count: pausedLineCount })
+              : t('app.docker.containers.logsPanel.pause')
+          }}
+        </SecLabButton>
+        <SecLabButton
+          v-if="logMode === 'latest'"
+          size="small"
           :loading="isLoading"
           @click="refreshLatest"
         >
           {{ t('common.refresh') }}
         </SecLabButton>
+        <SecLabButton size="small" type="secondary" @click="clearLogs">
+          {{ t('app.docker.containers.logsPanel.clear') }}
+        </SecLabButton>
       </div>
     </div>
 
-    <div class="logs-body">
-      <SecLabLoading :loading="isLoading" />
-      <div class="log-scroll" data-native-context-menu>
-        <pre v-if="logLines.length" ref="autoScrollEl" class="log-content" v-html="logHtml"></pre>
-        <div v-else class="log-empty">{{ t('app.docker.containers.logsPanel.empty') }}</div>
+    <SecLabAlert
+      v-if="logError"
+      type="error"
+      :title="t('app.docker.containers.logsPanel.fetchError')"
+      :description="logError"
+      data-ui="container-log-error"
+    />
+
+    <div class="logs-body" data-slot="log-output">
+      <SecLabLoading :loading="isLoading" cover />
+      <div ref="autoScrollEl" class="log-scroll" data-native-context-menu>
+        <pre v-if="visibleLines.length" class="log-content" v-html="logHtml"></pre>
+        <SecLabEmpty
+          v-else
+          :description="
+            keyword
+              ? t('app.docker.containers.logsPanel.filteredEmpty')
+              : t('app.docker.containers.logsPanel.empty')
+          "
+        />
       </div>
     </div>
   </div>
@@ -123,13 +186,18 @@ watch(
   flex-direction: column;
   gap: var(--sdl-space-3);
   flex: 1;
+  height: 100%;
   min-height: 0;
+  padding: var(--sdl-space-4);
+  box-sizing: border-box;
 }
 
 .logs-header {
   display: flex;
-  flex-direction: column;
+  align-items: center;
+  justify-content: space-between;
   gap: var(--sdl-space-2);
+  flex-wrap: wrap;
 }
 
 .logs-title {
@@ -158,6 +226,10 @@ watch(
   flex-wrap: wrap;
 }
 
+.log-search {
+  width: 220px;
+}
+
 .log-modes {
   width: auto;
 }
@@ -170,12 +242,6 @@ watch(
 .log-modes :deep(.sl-tabs-item) {
   height: 32px;
   font-size: var(--sdl-font-body-sm);
-}
-
-.logs-status {
-  color: var(--sdl-text-muted);
-  font-size: var(--sdl-font-caption);
-  margin-right: var(--sdl-space-2);
 }
 
 .logs-body {
@@ -199,26 +265,6 @@ watch(
   line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-all;
-  flex: 1;
-  min-height: 0;
-  height: 100%;
-  max-height: 100%;
-  overflow: auto;
-  scrollbar-width: thin;
-}
-
-.log-content::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
-}
-
-.log-content::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-.log-content::-webkit-scrollbar-thumb {
-  background-color: var(--sdl-scrollbar-thumb);
-  border-radius: var(--sdl-radius-pill);
 }
 
 .log-scroll {
@@ -226,15 +272,7 @@ watch(
   flex-direction: column;
   flex: 1;
   min-height: 0;
-  overflow: hidden;
-}
-
-.log-empty {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  height: 100%;
-  color: var(--sdl-text-muted);
-  font-size: var(--sdl-font-body-sm);
+  overflow: auto;
+  scrollbar-width: thin;
 }
 </style>

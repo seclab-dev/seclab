@@ -87,6 +87,24 @@ fn prepare_proxy_headers(parts: &axum::http::request::Parts) -> HeaderMap {
     headers
 }
 
+/// 为 WebSocket 上游连接仅构造可信操作上下文，避免转发客户端的升级控制头。
+fn prepare_websocket_proxy_headers(
+    admin: &AuthenticatedAdmin,
+    incoming_headers: &HeaderMap,
+) -> HeaderMap {
+    let client_ip = incoming_headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown");
+    let trace_id = logging::resolve_trace_id(incoming_headers);
+    let mut headers = HeaderMap::new();
+    inject_trusted_operation_context(&mut headers, &admin.username, client_ip, &trace_id);
+    headers
+}
+
 fn rebuild_scoped_proxy_path(path_with_query: &str, node_id: &str) -> String {
     let prefix = format!("/api/v1/node/{node_id}");
     match path_with_query.strip_prefix(&prefix) {
@@ -121,6 +139,8 @@ pub async fn websocket_proxy_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
     OriginalUri(uri): OriginalUri,
+    admin: AuthenticatedAdmin,
+    incoming_headers: HeaderMap,
 ) -> Response {
     let path = uri
         .path_and_query()
@@ -129,9 +149,10 @@ pub async fn websocket_proxy_handler(
         .to_string();
 
     let node_name = resolve_node_name(&state, None).await;
+    let headers = prepare_websocket_proxy_headers(&admin, &incoming_headers);
     ws.on_upgrade(move |socket| async move {
         match NodeRuntimeClient::from_node_route(&state.metadata_db, None).await {
-            Ok(client) => handle_socket(socket, Arc::new(client), path).await,
+            Ok(client) => handle_socket(socket, Arc::new(client), path, headers).await,
             Err(err) => {
                 runtime_metrics::record_proxy_ws(false);
                 warn!(
@@ -152,6 +173,8 @@ pub async fn websocket_proxy_handler_for_node(
     State(state): State<Arc<AppState>>,
     OriginalUri(uri): OriginalUri,
     axum::extract::Path((node_id, _path)): axum::extract::Path<(String, String)>,
+    admin: AuthenticatedAdmin,
+    incoming_headers: HeaderMap,
 ) -> impl IntoResponse {
     let raw_path = uri
         .path_and_query()
@@ -160,9 +183,10 @@ pub async fn websocket_proxy_handler_for_node(
         .to_string();
     let path = rebuild_scoped_proxy_path(&raw_path, &node_id);
     let node_name = resolve_node_name(&state, Some(node_id.as_str())).await;
+    let headers = prepare_websocket_proxy_headers(&admin, &incoming_headers);
     ws.on_upgrade(move |socket| async move {
         match NodeRuntimeClient::from_node_route(&state.metadata_db, Some(node_id.as_str())).await {
-            Ok(client) => handle_socket(socket, Arc::new(client), path).await,
+            Ok(client) => handle_socket(socket, Arc::new(client), path, headers).await,
             Err(err) => {
                 runtime_metrics::record_proxy_ws(false);
                 warn!(
@@ -190,12 +214,19 @@ async fn handle_socket(
     mut client_ws: WebSocket,
     runtime_client: Arc<NodeRuntimeClient>,
     path: String,
+    headers: HeaderMap,
 ) {
     let url = runtime_client.build_ws_uri(&path);
     info!("Attempting to connect to target WebSocket: {}", url);
 
     // Establish outgoing WebSocket connection using reqwest-websocket
-    let target_ws_result = runtime_client.client.get(&url).upgrade().send().await;
+    let target_ws_result = runtime_client
+        .client
+        .get(&url)
+        .headers(headers)
+        .upgrade()
+        .send()
+        .await;
 
     let target_ws = match target_ws_result {
         Ok(response) => match response.into_websocket().await {

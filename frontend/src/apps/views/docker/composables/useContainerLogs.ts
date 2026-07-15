@@ -16,7 +16,6 @@
 import { computed, nextTick, onBeforeUnmount, ref, watch, type ComputedRef, type Ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { dockerApi } from '@/api/modules/docker'
-import { useNotificationStore } from '@/stores/notification'
 import { useWebSocketStore } from '@/stores/websocket'
 import { useNodeStore } from '@/stores/node'
 
@@ -49,7 +48,6 @@ export function useContainerLogs(options: UseContainerLogsOptions) {
   const { containerId, active, nodeId } = options
 
   const { t } = useI18n()
-  const notificationStore = useNotificationStore()
   const wsStore = useWebSocketStore()
   const nodeStore = useNodeStore()
 
@@ -73,6 +71,15 @@ export function useContainerLogs(options: UseContainerLogsOptions) {
   /** 是否正在加载 */
   const isLoading = ref(false)
 
+  /** 当前加载或实时流错误。 */
+  const logError = ref<string | null>(null)
+
+  /** 用户是否暂停将实时日志追加到可见缓冲。 */
+  const isPaused = ref(false)
+
+  /** 暂停期间暂存的新日志。 */
+  const pausedLines = ref<string[]>([])
+
   /** 实时流是否已结束 */
   const streamEnded = ref(false)
 
@@ -81,15 +88,16 @@ export function useContainerLogs(options: UseContainerLogsOptions) {
 
   /** 组件存活标记，防止卸载后异步操作写入 DOM */
   const isAlive = ref(true)
+  let requestVersion = 0
 
   /** 日志滚动容器的模板引用，由消费者通过 `ref` 绑定 */
   const autoScrollEl = ref<HTMLElement | null>(null)
 
   /** 模式切换标签定义 */
-  const logModeTabs = [
+  const logModeTabs = computed(() => [
     { label: t('app.docker.containers.logsPanel.realtimeLogs'), name: 'realtime' },
     { label: t('app.docker.containers.logsPanel.latest'), name: 'latest' },
-  ]
+  ])
 
   // --------------- 状态文本 ---------------
 
@@ -102,6 +110,7 @@ export function useContainerLogs(options: UseContainerLogsOptions) {
     if (logMode.value === 'latest') {
       return t('app.docker.containers.logsPanel.latestManual')
     }
+    if (isPaused.value) return t('app.docker.containers.logsPanel.paused')
     if (streamEnded.value) return t('app.docker.containers.logsPanel.streamEnded')
     if (wsStore.connecting) return t('app.docker.containers.logsPanel.connecting')
     if (wsStore.connected) return t('app.docker.containers.logsPanel.connected')
@@ -178,14 +187,17 @@ export function useContainerLogs(options: UseContainerLogsOptions) {
       if (kind === 'snapshot') {
         setLines(payload.lines, true)
       } else if (kind === 'append') {
-        appendLines(payload.lines)
+        if (isPaused.value) {
+          pausedLines.value = [...pausedLines.value, ...payload.lines].slice(-MAX_LINES)
+        } else {
+          appendLines(payload.lines)
+        }
       } else if (kind === 'end') {
         streamEnded.value = true
         realtimeSubscribed.value = false
-        notificationStore.info(payload.message || t('app.docker.containers.logsPanel.streamEnded'))
       } else if (kind === 'error') {
         realtimeSubscribed.value = false
-        notificationStore.error(payload.message || t('app.docker.containers.logsPanel.fetchError'))
+        logError.value = payload.message || t('app.docker.containers.logsPanel.fetchError')
       }
     },
     { deep: true },
@@ -198,25 +210,34 @@ export function useContainerLogs(options: UseContainerLogsOptions) {
    */
   const loadLatestLogs = async () => {
     if (!containerId.value) {
-      notificationStore.error(t('app.docker.containers.logsPanel.missingContainerForLogs'))
+      logError.value = t('app.docker.containers.logsPanel.missingContainerForLogs')
       return
     }
+    const requestId = containerId.value
+    const requestNodeId = resolvedNodeId.value
+    const currentRequest = ++requestVersion
     isLoading.value = true
+    logError.value = null
     try {
-      const client = dockerApi.forNode(resolvedNodeId.value)
-      const res = await client.fetchContainerLogs(containerId.value, 100)
-      if (!isAlive.value) return
+      const client = dockerApi.forNode(requestNodeId)
+      const res = await client.fetchContainerLogs(requestId, 100)
+      if (
+        !isAlive.value ||
+        currentRequest !== requestVersion ||
+        containerId.value !== requestId ||
+        resolvedNodeId.value !== requestNodeId
+      ) {
+        return
+      }
       if (res.success && res.data) {
         setLines(res.data, false)
       } else {
-        notificationStore.error(
-          t('app.docker.containers.logsPanel.latestFailed', {
-            message: res.message || t('common.unknownError'),
-          }),
-        )
+        logError.value = t('app.docker.containers.logsPanel.latestFailed', {
+          message: res.message || t('common.unknownError'),
+        })
       }
     } finally {
-      isLoading.value = false
+      if (currentRequest === requestVersion) isLoading.value = false
       if (active.value && logMode.value === 'latest' && logLines.value.length > 0) {
         await scrollToBottom()
       }
@@ -230,11 +251,14 @@ export function useContainerLogs(options: UseContainerLogsOptions) {
    */
   const startRealtime = () => {
     if (!containerId.value) {
-      notificationStore.error(t('app.docker.containers.logsPanel.missingContainerForRealtime'))
+      logError.value = t('app.docker.containers.logsPanel.missingContainerForRealtime')
       return
     }
     streamEnded.value = false
     isLoading.value = true
+    logError.value = null
+    isPaused.value = false
+    pausedLines.value = []
     logLines.value = []
     wsStore.subscribeToContainerLogs(containerId.value, resolvedNodeId.value)
     realtimeSubscribed.value = true
@@ -250,6 +274,16 @@ export function useContainerLogs(options: UseContainerLogsOptions) {
       wsStore.unsubscribeFromContainerLogs(target, resolvedNodeId.value)
     }
     realtimeSubscribed.value = false
+  }
+
+  /** 暂停或恢复实时日志展示；恢复时按原顺序合并暂存行。 */
+  const togglePaused = () => {
+    if (logMode.value !== 'realtime') return
+    isPaused.value = !isPaused.value
+    if (!isPaused.value && pausedLines.value.length > 0) {
+      appendLines(pausedLines.value)
+      pausedLines.value = []
+    }
   }
 
   // --------------- 模式切换 ---------------
@@ -280,6 +314,10 @@ export function useContainerLogs(options: UseContainerLogsOptions) {
       }
       streamEnded.value = false
       logLines.value = []
+      logError.value = null
+      isPaused.value = false
+      pausedLines.value = []
+      requestVersion += 1
       if (!next) return
       if (!active.value) return
       if (logMode.value === 'realtime') {
@@ -295,8 +333,11 @@ export function useContainerLogs(options: UseContainerLogsOptions) {
   watch(active, (isActive) => {
     if (!containerId.value) return
     if (!isActive) {
+      requestVersion += 1
       stopRealtime(containerId.value)
       isLoading.value = false
+      isPaused.value = false
+      pausedLines.value = []
       return
     }
     if (logMode.value === 'realtime') {
@@ -310,6 +351,7 @@ export function useContainerLogs(options: UseContainerLogsOptions) {
 
   onBeforeUnmount(() => {
     isAlive.value = false
+    requestVersion += 1
     stopRealtime()
   })
 
@@ -322,6 +364,9 @@ export function useContainerLogs(options: UseContainerLogsOptions) {
     logText,
     /** 加载状态 */
     isLoading,
+    logError,
+    isPaused,
+    pausedLineCount: computed(() => pausedLines.value.length),
     /** 当前日志模式 */
     logMode,
     /** 模式切换标签定义 */
@@ -346,6 +391,7 @@ export function useContainerLogs(options: UseContainerLogsOptions) {
     startRealtime,
     /** 停止实时日志订阅 */
     stopRealtime,
+    togglePaused,
     /** 切换日志模式 */
     switchMode,
   }

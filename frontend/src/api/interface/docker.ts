@@ -200,6 +200,68 @@ export interface ContainerSummary {
   Mounts?: MountPoint[]
 }
 
+export type DockerContainerState =
+  | 'created'
+  | 'running'
+  | 'paused'
+  | 'restarting'
+  | 'stopping'
+  | 'exited'
+  | 'removing'
+  | 'dead'
+  | 'unknown'
+
+export type DockerContainerManagementKind = 'suite' | 'compose' | 'custom'
+
+/** 容器在当前模块中的管理归属。 */
+export interface DockerContainerManagement {
+  kind: DockerContainerManagementKind
+  ownerName?: string
+  readOnly: boolean
+}
+
+/** 容器状态允许执行的操作。 */
+export interface DockerContainerCapabilities {
+  canStart: boolean
+  canStop: boolean
+  canRestart: boolean
+  canPause: boolean
+  canUnpause: boolean
+  canKill: boolean
+  canRemove: boolean
+  canExec: boolean
+}
+
+/** 容器端口映射摘要。 */
+export interface DockerContainerPort {
+  hostIp?: string
+  hostPort?: number
+  containerPort: number
+  protocol: string
+}
+
+/** 容器健康检查摘要。 */
+export interface DockerContainerHealth {
+  status: string
+  failingStreak: number
+}
+
+/** 容器列表使用的稳定领域摘要。 */
+export interface DockerContainerSummary {
+  id: string
+  name: string
+  imageRef: string
+  imageId: string
+  command: string
+  createdAt: number
+  state: DockerContainerState
+  statusText: string
+  health?: DockerContainerHealth
+  ports: DockerContainerPort[]
+  management: DockerContainerManagement
+  capabilities: DockerContainerCapabilities
+}
+
 /** Docker 镜像列表使用的稳定领域摘要。 */
 export interface DockerImageSummary {
   id: string
@@ -240,25 +302,72 @@ export interface DockerImageDistributionCreateRequest {
   targetNodeIds: string[]
 }
 
-/** 容器操作请求参数 */
-export interface ActionRequest {
-  id: string
-  name: string
-  action: 'start' | 'stop' | 'restart' | 'remove'
+export type DockerContainerAction =
+  | 'start'
+  | 'stop'
+  | 'restart'
+  | 'pause'
+  | 'unpause'
+  | 'kill'
+  | 'remove'
+
+/** 批量执行容器生命周期动作。 */
+export interface DockerContainerBatchActionRequest {
+  ids: string[]
+  action: DockerContainerAction
 }
 
-/** 创建容器请求参数 */
-export interface ContainerCreateRequest {
+/** 单个容器的批量动作执行结果。 */
+export interface DockerContainerBatchActionItem {
+  id: string
   name: string
-  image: string
-  command?: string
-  env?: string
-  ports?: string
-  volumes?: string
-  restartPolicy?: string
-  network?: string
-  autoRemove?: boolean
-  autoStart?: boolean
+  success: boolean
+  state?: DockerContainerState
+  errorCode?: string
+  errorMessage?: string
+}
+
+export interface DockerContainerBatchActionResult {
+  items: DockerContainerBatchActionItem[]
+}
+
+export type DockerContainerCreateMountKind = 'bind' | 'volume'
+export type DockerContainerCreateRestartPolicy = 'no' | 'always' | 'unless_stopped' | 'on_failure'
+
+export interface DockerContainerCreatePort {
+  hostIp?: string
+  hostPort?: number
+  containerPort: number
+  protocol: 'tcp' | 'udp' | 'sctp'
+}
+
+export interface DockerContainerCreateMount {
+  kind: DockerContainerCreateMountKind
+  source: string
+  target: string
+  readOnly: boolean
+}
+
+/** 创建容器的结构化请求。 */
+export interface DockerContainerCreateRequest {
+  name: string
+  imageRef: string
+  command: string[]
+  environment: Array<{ name: string; value: string }>
+  ports: DockerContainerCreatePort[]
+  mounts: DockerContainerCreateMount[]
+  restartPolicy: DockerContainerCreateRestartPolicy
+  maximumRetryCount?: number
+  networkId?: string
+  autoRemove: boolean
+  autoStart: boolean
+}
+
+export interface DockerContainerCreateResult {
+  id: string
+  name: string
+  started: boolean
+  warnings: string[]
 }
 
 /** 容器重命名请求 */
@@ -290,61 +399,40 @@ export interface ContainerStatsBatchResponse {
   summaries: Record<string, ContainerResourceUsageSummary>
 }
 
-/** 容器详情 (inspect) 的简化版本 */
-export interface ContainerInspect {
-  Id?: string
-  Name?: string
-  Created?: string
-  Path?: string
-  Args?: string[]
-  State?: {
-    Status?: string
-    Running?: boolean
-    Paused?: boolean
-    Restarting?: boolean
-    OOMKilled?: boolean
-    Dead?: boolean
-    Pid?: number
-    ExitCode?: number
-    Error?: string
-    StartedAt?: string
-    FinishedAt?: string
-  }
-  Config?: {
-    Hostname?: string
-    Image?: string
-    Cmd?: string[]
-    Env?: string[]
-    Labels?: Record<string, string>
-    WorkingDir?: string
-    User?: string
-  }
-  HostConfig?: {
-    NetworkMode?: string
-    RestartPolicy?: {
-      Name?: string
-      MaximumRetryCount?: number
-    }
-  }
-  NetworkSettings?: {
-    Networks?: Record<
-      string,
-      {
-        IPAddress?: string
-        Gateway?: string
-        MacAddress?: string
-        NetworkID?: string
-      }
-    >
-  }
-  Mounts?: Array<{
-    Type?: string
-    Source?: string
-    Destination?: string
-    Mode?: string
-    RW?: boolean
-    Propagation?: string
+/** 容器详情使用的稳定领域模型。 */
+export interface DockerContainerDetail {
+  summary: DockerContainerSummary
+  createdAt?: string
+  startedAt?: string
+  finishedAt?: string
+  exitCode?: number
+  errorMessage?: string
+  oomKilled: boolean
+  restartCount: number
+  restartPolicy: { name: string; maximumRetryCount: number }
+  entrypoint: string[]
+  command: string[]
+  environment: Array<{ name: string; value: string }>
+  mounts: Array<{
+    kind: string
+    name?: string
+    source: string
+    target: string
+    readOnly: boolean
+    mode?: string
   }>
+  networks: Array<{
+    id: string
+    name: string
+    endpointId: string
+    macAddress: string
+    ipv4Address: string
+    ipv6Address: string
+    gateway: string
+    aliases: string[]
+  }>
+  labels: Record<string, string>
+  logDriver: string
 }
 
 /** Compose 项目创建请求 */
@@ -480,12 +568,14 @@ export interface NetworkDisconnectRequest {
 
 /** 容器资源统计快照。 */
 export interface ContainerResourceUsageSummary {
+  status: ResourceSampleStatus
+  collectedAt: number | null
   cpuCorePercent: number
   memoryWorkingSetBytes: number
   memoryLimitBytes: number
   memoryPercent: number
-  networkRxBytes: number
-  networkTxBytes: number
+  networkRxBytesPerSecond: number | null
+  networkTxBytesPerSecond: number | null
 }
 
 export type ResourceSampleStatus = 'fresh' | 'partial' | 'stale' | 'unavailable'

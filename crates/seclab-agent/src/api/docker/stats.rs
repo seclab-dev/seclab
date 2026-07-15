@@ -10,8 +10,8 @@ use axum::response::{IntoResponse, Response};
 use bollard::query_parameters;
 use chrono::Utc;
 use serde::Deserialize;
-use sqlx::FromRow;
-use std::collections::HashMap;
+use sqlx::{FromRow, QueryBuilder, Sqlite};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::info;
 
@@ -35,6 +35,7 @@ struct SummaryRow {
 
 #[derive(Debug, FromRow)]
 struct ContainerRow {
+    container_id: String,
     created_at: i64,
     cpu_core_percent: f64,
     memory_working_set_bytes: i64,
@@ -92,6 +93,7 @@ pub async fn container_summary(
     let row = sqlx::query_as::<_, ContainerRow>(
         r#"
         SELECT
+            container_id,
             created_at,
             cpu_core_percent,
             memory_working_set_bytes,
@@ -102,21 +104,18 @@ pub async fn container_summary(
         FROM docker_metrics_container
         WHERE container_id = ?
         ORDER BY created_at DESC
-        LIMIT 1
+        LIMIT 2
         "#,
     )
     .bind(&id)
-    .fetch_optional(&state.metadata_db)
+    .fetch_all(&state.metadata_db)
     .await?;
 
-    match row {
-        Some(row) => Ok(ApiResponse::success_with_raw(
-            "Container resource summary loaded",
-            Some(row_to_container_summary(row)),
-        )
-        .into_response()),
-        None => Err(ApiError::NotFound),
-    }
+    let summary = row_to_container_summary(&row, Utc::now().timestamp());
+    Ok(
+        ApiResponse::success_with_raw("Container resource summary loaded", Some(summary))
+            .into_response(),
+    )
 }
 
 /// 返回单个容器在时间窗口内的资源趋势。
@@ -131,6 +130,7 @@ pub async fn container_history(
     let rows = sqlx::query_as::<_, ContainerRow>(
         r#"
         SELECT
+            container_id,
             created_at,
             cpu_core_percent,
             memory_working_set_bytes,
@@ -169,14 +169,7 @@ pub async fn container_histories(
     Json(payload): Json<docker::ContainerStatsHistoryQuery>,
 ) -> ApiResult<Response> {
     info!("Requesting batch container resource usage history (cache)");
-    let mut ids = payload.ids;
-    ids.sort();
-    ids.dedup();
-    if ids.len() > 5 {
-        return Err(ApiError::BadRequest(
-            "At most 5 containers can be queried at once".to_string(),
-        ));
-    }
+    let ids = normalize_stats_ids(payload.ids, 5)?;
     let hours = clamp_hours(payload.hours);
     let cutoff = Utc::now().timestamp() - hours * 3600;
 
@@ -198,27 +191,11 @@ pub async fn container_histories(
         }
     }
 
+    let rows = query_history_rows(&state, &ids, cutoff).await?;
+    let mut grouped = group_container_rows(rows);
     let mut containers = Vec::with_capacity(ids.len());
     for id in ids {
-        let rows = sqlx::query_as::<_, ContainerRow>(
-            r#"
-            SELECT
-                created_at,
-                cpu_core_percent,
-                memory_working_set_bytes,
-                memory_limit_bytes,
-                memory_percent,
-                network_rx_bytes,
-                network_tx_bytes
-            FROM docker_metrics_container
-            WHERE container_id = ? AND created_at >= ?
-            ORDER BY created_at ASC
-            "#,
-        )
-        .bind(&id)
-        .bind(cutoff)
-        .fetch_all(&state.metadata_db)
-        .await?;
+        let rows = grouped.remove(&id).unwrap_or_default();
         containers.push(docker::ContainerStatsHistoryAllItem {
             name: name_map.get(&id).cloned().unwrap_or_else(|| id.clone()),
             id,
@@ -243,32 +220,14 @@ pub async fn container_summaries(
         "Requesting batch container resource usage summary (cache): {} ids",
         payload.ids.len()
     );
+    let ids = normalize_stats_ids(payload.ids, 50)?;
     let mut summaries: HashMap<String, docker::ContainerResourceUsageSummary> = HashMap::new();
-
-    for id in payload.ids {
-        let row = sqlx::query_as::<_, ContainerRow>(
-            r#"
-            SELECT
-                created_at,
-                cpu_core_percent,
-                memory_working_set_bytes,
-                memory_limit_bytes,
-                memory_percent,
-                network_rx_bytes,
-                network_tx_bytes
-            FROM docker_metrics_container
-            WHERE container_id = ?
-            ORDER BY created_at DESC
-            LIMIT 1
-            "#,
-        )
-        .bind(&id)
-        .fetch_optional(&state.metadata_db)
-        .await?;
-
-        if let Some(row) = row {
-            summaries.insert(id, row_to_container_summary(row));
-        }
+    let rows = query_latest_rows(&state, &ids).await?;
+    let mut grouped = group_container_rows(rows);
+    let now = Utc::now().timestamp();
+    for id in ids {
+        let rows = grouped.remove(&id).unwrap_or_default();
+        summaries.insert(id, row_to_container_summary(&rows, now));
     }
 
     let response = docker::ContainerStatsBatchResponse { summaries };
@@ -278,20 +237,174 @@ pub async fn container_summaries(
     )
 }
 
+/// 使用单次 SQL 查询多个容器的时间窗口数据。
+async fn query_history_rows(
+    state: &AppState,
+    ids: &[String],
+    cutoff: i64,
+) -> ApiResult<Vec<ContainerRow>> {
+    let mut query = QueryBuilder::<Sqlite>::new(
+        r#"
+        SELECT
+            container_id,
+            created_at,
+            cpu_core_percent,
+            memory_working_set_bytes,
+            memory_limit_bytes,
+            memory_percent,
+            network_rx_bytes,
+            network_tx_bytes
+        FROM docker_metrics_container
+        WHERE container_id IN (
+        "#,
+    );
+    {
+        let mut separated = query.separated(", ");
+        for id in ids {
+            separated.push_bind(id);
+        }
+    }
+    query
+        .push(") AND created_at >= ")
+        .push_bind(cutoff)
+        .push(" ORDER BY container_id ASC, created_at ASC");
+    Ok(query
+        .build_query_as::<ContainerRow>()
+        .fetch_all(&state.metadata_db)
+        .await?)
+}
+
+/// 使用窗口函数一次读取每个容器最近两个采样点。
+async fn query_latest_rows(state: &AppState, ids: &[String]) -> ApiResult<Vec<ContainerRow>> {
+    let mut query = QueryBuilder::<Sqlite>::new(
+        r#"
+        SELECT
+            container_id,
+            created_at,
+            cpu_core_percent,
+            memory_working_set_bytes,
+            memory_limit_bytes,
+            memory_percent,
+            network_rx_bytes,
+            network_tx_bytes
+        FROM (
+            SELECT
+                container_id,
+                created_at,
+                cpu_core_percent,
+                memory_working_set_bytes,
+                memory_limit_bytes,
+                memory_percent,
+                network_rx_bytes,
+                network_tx_bytes,
+                ROW_NUMBER() OVER (
+                    PARTITION BY container_id ORDER BY created_at DESC
+                ) AS sample_rank
+            FROM docker_metrics_container
+            WHERE container_id IN (
+        "#,
+    );
+    {
+        let mut separated = query.separated(", ");
+        for id in ids {
+            separated.push_bind(id);
+        }
+    }
+    query.push(
+        r#"
+            )
+        )
+        WHERE sample_rank <= 2
+        ORDER BY container_id ASC, created_at DESC
+        "#,
+    );
+    Ok(query
+        .build_query_as::<ContainerRow>()
+        .fetch_all(&state.metadata_db)
+        .await?)
+}
+
+/// 按容器 ID 聚合已按时间排序的采样行。
+fn group_container_rows(rows: Vec<ContainerRow>) -> HashMap<String, Vec<ContainerRow>> {
+    let mut grouped: HashMap<String, Vec<ContainerRow>> = HashMap::new();
+    for row in rows {
+        grouped
+            .entry(row.container_id.clone())
+            .or_default()
+            .push(row);
+    }
+    grouped
+}
+
+/// 清理并限制统计查询的容器 ID。
+fn normalize_stats_ids(ids: Vec<String>, limit: usize) -> ApiResult<Vec<String>> {
+    if ids.is_empty() {
+        return Err(ApiError::validation("container ids must not be empty"));
+    }
+    if ids.len() > limit {
+        return Err(ApiError::validation(format!(
+            "at most {limit} containers can be queried at once"
+        )));
+    }
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::with_capacity(ids.len());
+    for id in ids {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(ApiError::validation("container id must not be empty"));
+        }
+        if seen.insert(id.to_string()) {
+            normalized.push(id.to_string());
+        }
+    }
+    Ok(normalized)
+}
+
 fn clamp_hours(value: Option<i64>) -> i64 {
     let max_hours = config::stats_retention_hours() as i64;
     let hours = value.unwrap_or(max_hours).max(1);
     hours.min(max_hours)
 }
 
-fn row_to_container_summary(row: ContainerRow) -> docker::ContainerResourceUsageSummary {
+fn row_to_container_summary(
+    rows: &[ContainerRow],
+    now: i64,
+) -> docker::ContainerResourceUsageSummary {
+    let Some(current) = rows.first() else {
+        return unavailable_container_summary();
+    };
+    let previous = rows.get(1);
+    let (network_rx_bytes_per_second, network_tx_bytes_per_second) =
+        network_rates(previous, current);
+    let stale_after = config::stats_sample_interval().as_secs() as i64 * 2;
+    let status = if now - current.created_at > stale_after {
+        docker::ResourceSampleStatus::Stale
+    } else {
+        docker::ResourceSampleStatus::Fresh
+    };
     docker::ContainerResourceUsageSummary {
-        cpu_core_percent: row.cpu_core_percent,
-        memory_working_set_bytes: row.memory_working_set_bytes as u64,
-        memory_limit_bytes: row.memory_limit_bytes as u64,
-        memory_percent: row.memory_percent,
-        network_rx_bytes: row.network_rx_bytes as u64,
-        network_tx_bytes: row.network_tx_bytes as u64,
+        status,
+        collected_at: Some(current.created_at),
+        cpu_core_percent: current.cpu_core_percent,
+        memory_working_set_bytes: current.memory_working_set_bytes.max(0) as u64,
+        memory_limit_bytes: current.memory_limit_bytes.max(0) as u64,
+        memory_percent: current.memory_percent,
+        network_rx_bytes_per_second,
+        network_tx_bytes_per_second,
+    }
+}
+
+/// 构造没有任何可用采样的容器资源状态。
+fn unavailable_container_summary() -> docker::ContainerResourceUsageSummary {
+    docker::ContainerResourceUsageSummary {
+        status: docker::ResourceSampleStatus::Unavailable,
+        collected_at: None,
+        cpu_core_percent: 0.0,
+        memory_working_set_bytes: 0,
+        memory_limit_bytes: 0,
+        memory_percent: 0.0,
+        network_rx_bytes_per_second: None,
+        network_tx_bytes_per_second: None,
     }
 }
 
@@ -309,26 +422,11 @@ fn row_to_summary_point(row: SummaryRow) -> docker::HostResourceUsagePoint {
 }
 
 fn rows_to_container_points(rows: Vec<ContainerRow>) -> Vec<docker::ContainerResourceUsagePoint> {
-    let max_gap_seconds = (config::stats_sample_interval().as_secs() as i64 * 5) / 2;
     let mut previous: Option<&ContainerRow> = None;
     let mut points = Vec::with_capacity(rows.len());
     for row in &rows {
-        let (network_rx_bytes_per_second, network_tx_bytes_per_second) = previous
-            .filter(|previous| {
-                let gap = row.created_at - previous.created_at;
-                gap > 0
-                    && gap <= max_gap_seconds
-                    && row.network_rx_bytes >= previous.network_rx_bytes
-                    && row.network_tx_bytes >= previous.network_tx_bytes
-            })
-            .map(|previous| {
-                let elapsed = (row.created_at - previous.created_at) as f64;
-                (
-                    Some((row.network_rx_bytes - previous.network_rx_bytes) as f64 / elapsed),
-                    Some((row.network_tx_bytes - previous.network_tx_bytes) as f64 / elapsed),
-                )
-            })
-            .unwrap_or((None, None));
+        let (network_rx_bytes_per_second, network_tx_bytes_per_second) =
+            network_rates(previous, row);
         points.push(docker::ContainerResourceUsagePoint {
             timestamp: row.created_at,
             cpu_core_percent: row.cpu_core_percent,
@@ -343,12 +441,41 @@ fn rows_to_container_points(rows: Vec<ContainerRow>) -> Vec<docker::ContainerRes
     points
 }
 
+/// 根据相邻累计计数计算网络速率，重置或长间断返回空值。
+fn network_rates(
+    previous: Option<&ContainerRow>,
+    current: &ContainerRow,
+) -> (Option<f64>, Option<f64>) {
+    let max_gap_seconds = (config::stats_sample_interval().as_secs() as i64 * 5) / 2;
+    previous
+        .filter(|previous| {
+            let gap = current.created_at - previous.created_at;
+            gap > 0
+                && gap <= max_gap_seconds
+                && current.network_rx_bytes >= previous.network_rx_bytes
+                && current.network_tx_bytes >= previous.network_tx_bytes
+        })
+        .map(|previous| {
+            let elapsed = (current.created_at - previous.created_at) as f64;
+            (
+                Some((current.network_rx_bytes - previous.network_rx_bytes) as f64 / elapsed),
+                Some((current.network_tx_bytes - previous.network_tx_bytes) as f64 / elapsed),
+            )
+        })
+        .unwrap_or((None, None))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ContainerRow, rows_to_container_points};
+    use super::{
+        ContainerRow, normalize_stats_ids, row_to_container_summary, rows_to_container_points,
+    };
+    use crate::config;
+    use crate::models::docker::ResourceSampleStatus;
 
     fn row(created_at: i64, rx: i64, tx: i64) -> ContainerRow {
         ContainerRow {
+            container_id: "container".to_string(),
             created_at,
             cpu_core_percent: 120.0,
             memory_working_set_bytes: 1024,
@@ -376,5 +503,37 @@ mod tests {
         ]);
         assert_eq!(points[1].network_rx_bytes_per_second, None);
         assert_eq!(points[2].network_rx_bytes_per_second, None);
+    }
+
+    #[test]
+    fn latest_summary_exposes_rate_and_freshness() {
+        let interval = config::stats_sample_interval().as_secs() as i64;
+        let now = 10_000;
+        let rows = vec![row(now - 1, 700, 500), row(now - 61, 100, 200)];
+        let summary = row_to_container_summary(&rows, now);
+        assert_eq!(summary.status, ResourceSampleStatus::Fresh);
+        assert_eq!(summary.network_rx_bytes_per_second, Some(10.0));
+        assert_eq!(summary.network_tx_bytes_per_second, Some(5.0));
+
+        let stale = row_to_container_summary(&[row(now - interval * 3, 100, 100)], now);
+        assert_eq!(stale.status, ResourceSampleStatus::Stale);
+        let unavailable = row_to_container_summary(&[], now);
+        assert_eq!(unavailable.status, ResourceSampleStatus::Unavailable);
+    }
+
+    #[test]
+    fn stats_query_ids_are_stable_and_bounded() {
+        let ids = normalize_stats_ids(
+            vec![
+                " first ".to_string(),
+                "second".to_string(),
+                "first".to_string(),
+            ],
+            5,
+        )
+        .expect("ids");
+        assert_eq!(ids, vec!["first", "second"]);
+        assert!(normalize_stats_ids(Vec::new(), 5).is_err());
+        assert!(normalize_stats_ids(vec!["id".to_string(); 6], 5).is_err());
     }
 }

@@ -198,10 +198,13 @@ pub fn docker_router() -> Router<Arc<AppState>> {
         )
         .route("/info", get(info))
         .route("/overview/realtime", post(overview_realtime))
-        .route("/action", post(containers::handle_action))
         .route(
             "/containers",
             get(containers::list_containers).post(containers::create_container),
+        )
+        .route(
+            "/containers/actions",
+            post(containers::batch_container_action),
         )
         .route(
             "/compose/containers",
@@ -234,6 +237,12 @@ pub fn docker_router() -> Router<Arc<AppState>> {
         .route(
             "/containers/{id}/rename",
             post(containers::rename_container),
+        )
+        .route("/containers/{id}/start", post(containers::start_container))
+        .route("/containers/{id}/stop", post(containers::stop_container))
+        .route(
+            "/containers/{id}/restart",
+            post(containers::restart_container),
         )
         .route("/containers/{id}/pause", post(containers::pause_container))
         .route(

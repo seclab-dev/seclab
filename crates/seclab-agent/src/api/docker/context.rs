@@ -46,6 +46,11 @@ where
 }
 
 impl DockerOperationContext {
+    /// 从 Master 注入的可信内部请求头建立操作上下文。
+    pub fn from_trusted_headers(headers: &HeaderMap) -> Option<Self> {
+        parse_context(headers)
+    }
+
     /// 创建供后台任务使用的系统身份。
     pub fn system(source: impl Into<String>) -> Self {
         Self {
@@ -156,7 +161,7 @@ impl DockerOperationContext {
 
 /// 从可信内部请求头建立 Docker 操作上下文。
 pub async fn operation_context_layer(mut request: Request, next: Next) -> Response {
-    if let Some(context) = parse_context(request.headers()) {
+    if let Some(context) = DockerOperationContext::from_trusted_headers(request.headers()) {
         request.extensions_mut().insert(context);
     }
     next.run(request).await

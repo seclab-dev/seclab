@@ -1,6 +1,8 @@
 //! WebSocket API：与前端建立双向通信入口。
 
-use crate::api::process::process_manager_websocket_handler;
+use crate::api::{
+    docker::context::DockerOperationContext, process::process_manager_websocket_handler,
+};
 use crate::services::websocket_messages::{
     ClientWsMessage, LogPayload, MessagePayload, ServerWsMessage, TerminalClientWsMessage,
     TerminalClosePayload, TerminalErrorPayload, TerminalExitPayload, TerminalInputPayload,
@@ -8,13 +10,15 @@ use crate::services::websocket_messages::{
     TerminalStartedPayload,
 };
 use crate::state::AppState;
+use crate::types::ApiError;
 use axum::{
     Router,
     extract::{
         State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    response::IntoResponse,
+    http::HeaderMap,
+    response::{IntoResponse, Response},
     routing::get,
 };
 use bollard::{
@@ -24,7 +28,7 @@ use bollard::{
 };
 use chrono::{DateTime, Local};
 use futures_util::{SinkExt, StreamExt};
-use serde_json;
+use serde_json::{self, json};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -167,24 +171,39 @@ fn spawn_log_streaming_task(
             ..Default::default()
         };
 
-        let lines = docker
-            .logs(&container_id, Some(initial_logs_options))
-            .collect::<Vec<_>>()
+        let mut initial_stream = docker.logs(&container_id, Some(initial_logs_options));
+        let mut lines = Vec::new();
+        while let Some(item) = initial_stream.next().await {
+            match item {
+                Ok(log) => {
+                    if let Some(line) = format_log_output(log) {
+                        lines.push(line);
+                    }
+                }
+                Err(error) => {
+                    error!(
+                        "Failed to fetch initial logs for {}: {}",
+                        container_id, error
+                    );
+                    let _ = tx
+                        .send(ServerWsMessage::Error(MessagePayload {
+                            container_id: container_id.clone(),
+                            message: format!("failed to fetch logs: {error}"),
+                        }))
+                        .await;
+                    return;
+                }
+            }
+        }
+        if tx
+            .send(ServerWsMessage::Snapshot(LogPayload {
+                container_id: container_id.clone(),
+                lines,
+            }))
             .await
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter_map(format_log_output)
-            .collect::<Vec<_>>();
-        if !lines.is_empty()
-            && tx
-                .send(ServerWsMessage::Snapshot(LogPayload {
-                    container_id: container_id.clone(),
-                    lines,
-                }))
-                .await
-                .is_err()
+            .is_err()
         {
-            return; // 发送失败，退出任务
+            return;
         }
 
         // 2. 实时流式传输新日志
@@ -238,9 +257,14 @@ fn spawn_log_streaming_task(
 /// 终端 WebSocket 升级入口。
 async fn terminal_websocket_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_terminal_socket(state, socket))
+) -> Result<Response, ApiError> {
+    let context = DockerOperationContext::from_trusted_headers(&headers)
+        .ok_or(ApiError::ForbiddenResource)?;
+    Ok(ws
+        .on_upgrade(move |socket| handle_terminal_socket(state, context, socket))
+        .into_response())
 }
 
 type TerminalSessionMap = HashMap<String, TerminalSession>;
@@ -252,7 +276,11 @@ struct TerminalSession {
 }
 
 /// 处理终端 WebSocket 连接。
-async fn handle_terminal_socket(state: Arc<AppState>, socket: WebSocket) {
+async fn handle_terminal_socket(
+    state: Arc<AppState>,
+    context: DockerOperationContext,
+    socket: WebSocket,
+) {
     info!("New terminal WebSocket client connected.");
 
     let (mut sender, mut receiver) = socket.split();
@@ -283,6 +311,7 @@ async fn handle_terminal_socket(state: Arc<AppState>, socket: WebSocket) {
                                 let _ = handle_terminal_start(
                                     payload,
                                     state.clone(),
+                                    &context,
                                     tx.clone(),
                                     cleanup_tx.clone(),
                                     &mut sessions,
@@ -343,6 +372,7 @@ async fn handle_terminal_socket(state: Arc<AppState>, socket: WebSocket) {
 async fn handle_terminal_start(
     payload: TerminalStartPayload,
     state: Arc<AppState>,
+    context: &DockerOperationContext,
     tx: mpsc::Sender<TerminalServerWsMessage>,
     cleanup_tx: mpsc::Sender<String>,
     sessions: &mut TerminalSessionMap,
@@ -358,6 +388,15 @@ async fn handle_terminal_start(
         Ok(client) => client,
         Err(err) => {
             let message = err.message.into_owned();
+            context
+                .record_failure(
+                    &state.metadata_db,
+                    "container.exec",
+                    Some(("container", &payload.container_id)),
+                    json!({ "name": payload.container_id }),
+                    &message,
+                )
+                .await;
             let _ = tx
                 .send(TerminalServerWsMessage::TerminalError(
                     TerminalErrorPayload { message },
@@ -366,6 +405,65 @@ async fn handle_terminal_start(
             return Err(());
         }
     };
+
+    let inspect = match docker
+        .inspect_container(
+            &payload.container_id,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+    {
+        Ok(inspect) => inspect,
+        Err(err) => {
+            let message = format!("failed to inspect terminal container: {err}");
+            context
+                .record_failure(
+                    &state.metadata_db,
+                    "container.exec",
+                    Some(("container", &payload.container_id)),
+                    json!({ "name": payload.container_id }),
+                    &message,
+                )
+                .await;
+            let _ = tx
+                .send(TerminalServerWsMessage::TerminalError(
+                    TerminalErrorPayload { message },
+                ))
+                .await;
+            return Err(());
+        }
+    };
+    let container_name = inspect
+        .name
+        .as_deref()
+        .map(|name| name.trim_start_matches('/').to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| payload.container_id.clone());
+    let running = inspect
+        .state
+        .as_ref()
+        .and_then(|state| state.status.as_ref())
+        .map(ToString::to_string)
+        .as_deref()
+        == Some("running");
+    if !running {
+        let message = "terminal requires a running container".to_string();
+        context
+            .record_failure(
+                &state.metadata_db,
+                "container.exec",
+                Some(("container", &container_name)),
+                json!({ "name": container_name }),
+                &message,
+            )
+            .await;
+        let _ = tx
+            .send(TerminalServerWsMessage::TerminalError(
+                TerminalErrorPayload { message },
+            ))
+            .await;
+        return Err(());
+    }
 
     let start_result = if preferred_shell == "bash" {
         match create_terminal_session(
@@ -413,11 +511,19 @@ async fn handle_terminal_start(
     let (session, actual_shell) = match start_result {
         Ok(value) => value,
         Err(err) => {
+            let message = format!("failed to start terminal: {err}");
+            context
+                .record_failure(
+                    &state.metadata_db,
+                    "container.exec",
+                    Some(("container", &container_name)),
+                    json!({ "name": container_name }),
+                    &message,
+                )
+                .await;
             let _ = tx
                 .send(TerminalServerWsMessage::TerminalError(
-                    TerminalErrorPayload {
-                        message: format!("failed to start terminal: {err}"),
-                    },
+                    TerminalErrorPayload { message },
                 ))
                 .await;
             return Err(());
@@ -426,6 +532,16 @@ async fn handle_terminal_start(
 
     let session_id = session.exec_id.clone();
     sessions.insert(session_id.clone(), session);
+
+    context
+        .record_success(
+            &state.metadata_db,
+            "container.exec",
+            Some(("container", &container_name)),
+            json!({ "name": container_name }),
+            false,
+        )
+        .await;
 
     let _ = tx
         .send(TerminalServerWsMessage::TerminalStarted(

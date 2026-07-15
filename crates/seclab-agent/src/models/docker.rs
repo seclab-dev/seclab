@@ -4,23 +4,44 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
-/// 容器动作请求，包含目标与操作类型。
-#[derive(Debug, Deserialize)]
-pub struct ActionRequest {
-    pub id: String,
-    /// 为了减少一次查询`name`的请求
-    pub name: String,
-    pub action: ContainerAction,
-}
-
-/// 区分操作类型
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ContainerAction {
+/// Docker 容器生命周期动作。
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DockerContainerAction {
     Start,
     Stop,
     Restart,
+    Pause,
+    Unpause,
+    Kill,
     Remove,
+}
+
+/// 批量执行容器生命周期动作的请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerContainerBatchActionRequest {
+    pub ids: Vec<String>,
+    pub action: DockerContainerAction,
+}
+
+/// 单个容器的批量动作执行结果。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerContainerBatchActionItem {
+    pub id: String,
+    pub name: String,
+    pub success: bool,
+    pub state: Option<DockerContainerState>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+}
+
+/// Docker 容器批量动作结果。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerContainerBatchActionResult {
+    pub items: Vec<DockerContainerBatchActionItem>,
 }
 
 /// Docker 容器状态分布。
@@ -33,6 +54,164 @@ pub struct ContainerStateCounts {
     pub restarting: usize,
     pub exited: usize,
     pub other: usize,
+}
+
+/// Docker 容器在容器模块中的归属类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DockerContainerManagementKind {
+    Suite,
+    Compose,
+    Custom,
+}
+
+impl DockerContainerManagementKind {
+    /// 返回用于日志和错误详情的稳定标识。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Suite => "suite",
+            Self::Compose => "compose",
+            Self::Custom => "custom",
+        }
+    }
+}
+
+/// Docker 容器的管理归属。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerContainerManagement {
+    pub kind: DockerContainerManagementKind,
+    pub owner_name: Option<String>,
+    pub read_only: bool,
+}
+
+/// 供前端稳定消费的 Docker 容器状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DockerContainerState {
+    Created,
+    Running,
+    Paused,
+    Restarting,
+    Stopping,
+    Exited,
+    Removing,
+    Dead,
+    Unknown,
+}
+
+/// 容器模块允许执行的状态相关操作。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerContainerCapabilities {
+    pub can_start: bool,
+    pub can_stop: bool,
+    pub can_restart: bool,
+    pub can_pause: bool,
+    pub can_unpause: bool,
+    pub can_kill: bool,
+    pub can_remove: bool,
+    pub can_exec: bool,
+}
+
+/// 容器端口映射摘要。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerContainerPort {
+    pub host_ip: Option<String>,
+    pub host_port: Option<u16>,
+    pub container_port: u16,
+    pub protocol: String,
+}
+
+/// 容器健康检查摘要。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerContainerHealth {
+    pub status: String,
+    pub failing_streak: i64,
+}
+
+/// Docker 容器列表使用的稳定领域摘要。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerContainerSummary {
+    pub id: String,
+    pub name: String,
+    pub image_ref: String,
+    pub image_id: String,
+    pub command: String,
+    pub created_at: i64,
+    pub state: DockerContainerState,
+    pub status_text: String,
+    pub health: Option<DockerContainerHealth>,
+    pub ports: Vec<DockerContainerPort>,
+    pub management: DockerContainerManagement,
+    pub capabilities: DockerContainerCapabilities,
+}
+
+/// 容器环境变量键值。
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerContainerEnvironmentVariable {
+    pub name: String,
+    pub value: String,
+}
+
+/// 容器挂载详情。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerContainerMount {
+    pub kind: String,
+    pub name: Option<String>,
+    pub source: String,
+    pub target: String,
+    pub read_only: bool,
+    pub mode: Option<String>,
+}
+
+/// 容器网络端点详情。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerContainerNetworkEndpoint {
+    pub id: String,
+    pub name: String,
+    pub endpoint_id: String,
+    pub mac_address: String,
+    pub ipv4_address: String,
+    pub ipv6_address: String,
+    pub gateway: String,
+    pub aliases: Vec<String>,
+}
+
+/// 容器重启策略详情。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerContainerRestartPolicy {
+    pub name: String,
+    pub maximum_retry_count: i64,
+}
+
+/// Docker 容器详情使用的稳定领域模型。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerContainerDetail {
+    pub summary: DockerContainerSummary,
+    pub created_at: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub exit_code: Option<i64>,
+    pub error_message: Option<String>,
+    pub oom_killed: bool,
+    pub restart_count: i64,
+    pub restart_policy: DockerContainerRestartPolicy,
+    pub entrypoint: Vec<String>,
+    pub command: Vec<String>,
+    pub environment: Vec<DockerContainerEnvironmentVariable>,
+    pub mounts: Vec<DockerContainerMount>,
+    pub networks: Vec<DockerContainerNetworkEndpoint>,
+    pub labels: HashMap<String, String>,
+    pub log_driver: String,
 }
 
 /// Docker Compose 项目健康状态分布。
@@ -74,20 +253,82 @@ pub struct ContainerRef {
     pub name: String,
 }
 
-/// 创建容器所需的参数集合。
+/// 创建容器时支持的挂载类型。
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DockerContainerCreateMountKind {
+    Bind,
+    Volume,
+}
+
+/// 创建容器时的结构化端口映射。
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerContainerCreatePort {
+    pub host_ip: Option<String>,
+    pub host_port: Option<u16>,
+    pub container_port: u16,
+    pub protocol: String,
+}
+
+/// 创建容器时的结构化挂载配置。
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerContainerCreateMount {
+    pub kind: DockerContainerCreateMountKind,
+    pub source: String,
+    pub target: String,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+/// 创建容器时支持的重启策略。
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DockerContainerCreateRestartPolicy {
+    #[default]
+    No,
+    Always,
+    UnlessStopped,
+    OnFailure,
+}
+
+/// 创建容器所需的结构化参数。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ContainerCreateRequest {
+pub struct DockerContainerCreateRequest {
     pub name: String,
-    pub image: String,
-    pub command: Option<String>,
-    pub env: Option<String>,
-    pub ports: Option<String>,
-    pub volumes: Option<String>,
-    pub restart_policy: Option<String>,
-    pub network: Option<String>,
-    pub auto_remove: Option<bool>,
-    pub auto_start: Option<bool>,
+    pub image_ref: String,
+    #[serde(default)]
+    pub command: Vec<String>,
+    #[serde(default)]
+    pub environment: Vec<DockerContainerEnvironmentVariable>,
+    #[serde(default)]
+    pub ports: Vec<DockerContainerCreatePort>,
+    #[serde(default)]
+    pub mounts: Vec<DockerContainerCreateMount>,
+    #[serde(default)]
+    pub restart_policy: DockerContainerCreateRestartPolicy,
+    pub maximum_retry_count: Option<i64>,
+    pub network_id: Option<String>,
+    #[serde(default)]
+    pub auto_remove: bool,
+    #[serde(default = "default_auto_start")]
+    pub auto_start: bool,
+}
+
+/// 容器创建完成后的稳定结果。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerContainerCreateResult {
+    pub id: String,
+    pub name: String,
+    pub started: bool,
+    pub warnings: Vec<String>,
+}
+
+fn default_auto_start() -> bool {
+    true
 }
 
 /// 容器重命名请求。
@@ -110,14 +351,6 @@ pub struct ContainerExecRequest {
 pub struct ContainerExecResult {
     pub exit_code: Option<i64>,
     pub output: String,
-}
-
-/// 删除容器时的可选参数。
-#[derive(Debug, Deserialize)]
-pub struct ContainerRemoveQuery {
-    pub force: Option<bool>,
-    pub volumes: Option<bool>,
-    pub link: Option<bool>,
 }
 
 /// 创建 Compose 项目的请求体。
@@ -291,16 +524,29 @@ pub enum ResourceSampleStatus {
     Unavailable,
 }
 
-/// Docker 容器资源统计快照。
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ContainerResourceUsageSummary {
+/// Docker 采样器内部保存的容器累计资源计数。
+#[derive(Debug)]
+pub struct ContainerResourceUsageSample {
     pub cpu_core_percent: f64,
     pub memory_working_set_bytes: u64,
     pub memory_limit_bytes: u64,
     pub memory_percent: f64,
     pub network_rx_bytes: u64,
     pub network_tx_bytes: u64,
+}
+
+/// Docker 容器最新资源统计及数据新鲜度。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerResourceUsageSummary {
+    pub status: ResourceSampleStatus,
+    pub collected_at: Option<i64>,
+    pub cpu_core_percent: f64,
+    pub memory_working_set_bytes: u64,
+    pub memory_limit_bytes: u64,
+    pub memory_percent: f64,
+    pub network_rx_bytes_per_second: Option<f64>,
+    pub network_tx_bytes_per_second: Option<f64>,
 }
 
 /// Docker 宿主机资源汇总。

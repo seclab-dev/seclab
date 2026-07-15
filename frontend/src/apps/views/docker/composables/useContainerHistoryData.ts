@@ -40,7 +40,7 @@ export const useContainerHistoryData = ({
     }
     historyError.value = null
 
-    const res = await dockerClient.value.fetchContainerResourceUsageHistory(id)
+    const res = await dockerClient.value.fetchContainerResourceUsageHistory(id, 1)
 
     if (currentRequest !== requestVersion) return
     if (selectedContainerId.value !== id) return

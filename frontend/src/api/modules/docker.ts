@@ -25,14 +25,34 @@ const createScopedDockerApi = (nodeId?: string) => ({
     )
   },
   listContainers: () => {
-    return http.get<docker.ContainerSummary[]>(buildDockerPath('/agent/docker/containers', nodeId))
+    return http.get<docker.DockerContainerSummary[]>(
+      buildDockerPath('/agent/docker/containers', nodeId),
+    )
   },
-  createContainer: (payload: docker.ContainerCreateRequest) => {
-    return http.post(buildDockerPath('/agent/docker/containers', nodeId), payload)
+  createContainer: (payload: docker.DockerContainerCreateRequest) => {
+    return http.post<docker.DockerContainerCreateResult>(
+      buildDockerPath('/agent/docker/containers', nodeId),
+      payload,
+    )
   },
   inspectContainer: (id: string) => {
-    return http.get<docker.ContainerInspect>(
+    return http.get<docker.DockerContainerDetail>(
       buildDockerPath(`/agent/docker/containers/${encodeURIComponent(id)}`, nodeId),
+    )
+  },
+  startContainer: (id: string) => {
+    return http.post(
+      buildDockerPath(`/agent/docker/containers/${encodeURIComponent(id)}/start`, nodeId),
+    )
+  },
+  stopContainer: (id: string) => {
+    return http.post(
+      buildDockerPath(`/agent/docker/containers/${encodeURIComponent(id)}/stop`, nodeId),
+    )
+  },
+  restartContainer: (id: string) => {
+    return http.post(
+      buildDockerPath(`/agent/docker/containers/${encodeURIComponent(id)}/restart`, nodeId),
     )
   },
   renameContainer: (id: string, payload: docker.ContainerRenameRequest) => {
@@ -54,6 +74,17 @@ const createScopedDockerApi = (nodeId?: string) => ({
   killContainer: (id: string) => {
     return http.post(
       buildDockerPath(`/agent/docker/containers/${encodeURIComponent(id)}/kill`, nodeId),
+    )
+  },
+  removeContainer: (id: string) => {
+    return http.delete(
+      buildDockerPath(`/agent/docker/containers/${encodeURIComponent(id)}`, nodeId),
+    )
+  },
+  batchContainerAction: (payload: docker.DockerContainerBatchActionRequest) => {
+    return http.post<docker.DockerContainerBatchActionResult>(
+      buildDockerPath('/agent/docker/containers/actions', nodeId),
+      payload,
     )
   },
   execContainer: (id: string, payload: docker.ContainerExecRequest) => {
@@ -202,9 +233,6 @@ const createScopedDockerApi = (nodeId?: string) => ({
       buildDockerPath(`/agent/docker/networks/${encodeURIComponent(id)}/disconnect`, nodeId),
       payload,
     )
-  },
-  performAction: (data: docker.ActionRequest) => {
-    return http.post<null>(buildDockerPath('/agent/docker/action', nodeId), data)
   },
   fetchDockerActivityLogs: (payload: docker.DockerActivityLogQuery) => {
     return http.post<docker.DockerActivityLogPage>(

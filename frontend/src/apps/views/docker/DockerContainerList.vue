@@ -1,81 +1,109 @@
 <script setup lang="ts">
 /**
  * @file DockerContainerList.vue
- * @description Docker 容器列表组件，展示所有容器，支持搜索、批量操作和单容器管理。
+ * @description Docker 容器摘要、筛选、资源状态和生命周期操作管理页。
  */
 
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useDockerStore } from '@/stores/docker'
-import { useNotificationStore } from '@/stores/notification'
 import { useContainerResourceStats } from './composables/useContainerResourceStats'
 import { getStateIcon, formatPercent, formatBytes } from '@/utils/docker-format'
-import { isSuiteManagedResource } from './docker-suite-labels'
 import {
+  SecLabActionMenu,
+  SecLabAlert,
   SecLabButton,
-  SecLabTag,
   SecLabCheckbox,
   SecLabEmpty,
   SecLabInput,
-  SecLabActionMenu,
+  SecLabLoading,
+  SecLabSelect,
+  SecLabTable,
+  SecLabTag,
 } from '@/components/ui'
-import SecLabTable, { type SecLabTableColumn } from '@/components/ui/SecLabTable.vue'
+import type { SecLabTableColumn } from '@/components/ui/SecLabTable.vue'
 import SecLabIcon from '@/components/icons/SecLabIcon.vue'
-import type * as dockerType from '@/api/interface/docker'
+import type {
+  DockerContainerAction,
+  DockerContainerManagementKind,
+  DockerContainerState,
+  DockerContainerSummary,
+} from '@/api/interface/docker'
 
 const emit = defineEmits<{
-  /** 触发打开详情页事件 */
-  (e: 'open-detail', id: string): void
+  /** 打开指定容器的详情。 */
+  (event: 'open-detail', id: string): void
 }>()
 
 const { t } = useI18n()
 const store = useDockerStore()
-const notificationStore = useNotificationStore()
+const search = ref('')
+const stateFilter = ref<'' | DockerContainerState>('')
+const managementFilter = ref<'' | DockerContainerManagementKind>('')
+const selectedIds = ref<Set<string>>(new Set())
 
-// ─── 搜索过滤 ───
-const searchQuery = ref('')
+const stateOptions = computed(() => [
+  { label: t('app.docker.containers.filters.allStates'), value: '' },
+  ...(['running', 'paused', 'restarting', 'created', 'exited', 'dead', 'unknown'] as const).map(
+    (value) => ({ label: t(`app.docker.containers.states.${value}`), value }),
+  ),
+])
+
+const managementOptions = computed(() => [
+  { label: t('app.docker.containers.filters.allManagement'), value: '' },
+  ...(['custom', 'compose', 'suite'] as const).map((value) => ({
+    label: t(`app.docker.containers.management.${value}`),
+    value,
+  })),
+])
 
 const filteredContainers = computed(() => {
-  const query = searchQuery.value.trim().toLowerCase()
-  if (!query) return store.containers
-  return store.containers.filter((c) => {
-    const name = c.Names?.[0]?.replace(/^\//, '').toLowerCase() || ''
-    const id = c.Id?.toLowerCase() || ''
-    const image = c.Image?.toLowerCase() || ''
-    return name.includes(query) || id.includes(query) || image.includes(query)
+  const keyword = search.value.trim().toLowerCase()
+  return store.containers.filter((container) => {
+    if (
+      keyword &&
+      !container.name.toLowerCase().includes(keyword) &&
+      !container.id.toLowerCase().includes(keyword) &&
+      !container.imageRef.toLowerCase().includes(keyword)
+    ) {
+      return false
+    }
+    if (stateFilter.value && container.state !== stateFilter.value) return false
+    if (managementFilter.value && container.management.kind !== managementFilter.value) return false
+    return true
   })
 })
 
-// ─── 多选状态管理 ───
-const selectedIds = ref<Set<string>>(new Set())
-
-const isAllSelected = computed(() => {
-  const list = filteredContainers.value
-  return list.length > 0 && selectedIds.value.size === list.length
-})
-
+const selectableContainers = computed(() =>
+  filteredContainers.value.filter((container) => !container.management.readOnly),
+)
+const isAllSelected = computed(
+  () =>
+    selectableContainers.value.length > 0 &&
+    selectableContainers.value.every((container) => selectedIds.value.has(container.id)),
+)
 const isIndeterminate = computed(() => {
-  const list = filteredContainers.value
-  return selectedIds.value.size > 0 && selectedIds.value.size < list.length
+  const selectedCount = selectableContainers.value.filter((container) =>
+    selectedIds.value.has(container.id),
+  ).length
+  return selectedCount > 0 && selectedCount < selectableContainers.value.length
 })
+const selectedContainers = computed(() =>
+  store.containers.filter((container) => selectedIds.value.has(container.id)),
+)
 
-const handleSelectAll = (val: boolean) => {
-  if (val) {
-    selectedIds.value = new Set(filteredContainers.value.map((c) => c.Id as string))
-  } else {
-    selectedIds.value.clear()
-  }
-}
+watch(
+  () => store.containers,
+  (containers) => {
+    const availableIds = new Set(
+      containers
+        .filter((container) => !container.management.readOnly)
+        .map((container) => container.id),
+    )
+    selectedIds.value = new Set([...selectedIds.value].filter((id) => availableIds.has(id)))
+  },
+)
 
-const handleSelectRow = (id: string, val: boolean) => {
-  if (val) {
-    selectedIds.value.add(id)
-  } else {
-    selectedIds.value.delete(id)
-  }
-}
-
-// ─── 性能指标 Hook ───
 const {
   getContainerStats,
   requestContainerStats,
@@ -87,317 +115,446 @@ const {
   formatBytes,
 })
 
-// ─── 表格列配置 ───
 const columns = computed<SecLabTableColumn[]>(() => [
   { label: '', width: 48, align: 'center', slot: 'selection', headerSlot: 'selectionHeader' },
-  { label: t('app.docker.containers.name'), minWidth: 240, slot: 'name' },
-  { label: t('app.docker.containers.status'), width: 100, align: 'center', slot: 'status' },
-  { label: t('app.docker.containers.resources'), minWidth: 320, slot: 'resource' },
-  { label: t('app.docker.containers.actions'), width: 120, align: 'center', slot: 'actions' },
+  { label: t('app.docker.containers.name'), minWidth: 180, slot: 'name' },
+  { label: t('app.docker.containers.managementLabel'), width: 145, slot: 'management' },
+  { label: t('app.docker.containers.status'), width: 145, slot: 'status', align: 'center' },
+  { label: t('app.docker.containers.ports'), minWidth: 165, slot: 'ports', align: 'center' },
+  { label: t('app.docker.containers.resources'), minWidth: 260, slot: 'resource' },
+  { label: t('app.docker.containers.actions'), width: 100, align: 'center', slot: 'actions' },
 ])
 
-// ─── 单容器操作 ───
-const handleAction = async (
-  containerId: string | null,
-  containerName: string | null,
-  action: 'start' | 'stop' | 'restart' | 'remove' | 'pause' | 'unpause' | 'kill',
-) => {
-  await store.handleContainerAction(containerId, containerName, action)
+function setSelectAll(selected: boolean): void {
+  selectedIds.value = selected
+    ? new Set(selectableContainers.value.map((container) => container.id))
+    : new Set()
 }
 
-const handleDelete = async (
-  containerId: string | null,
-  containerName: string | null,
-  containerState: string | undefined,
-) => {
-  if (containerState === 'running') {
-    notificationStore.error(
-      t('app.docker.containers.messages.deleteStateBlocked', { state: containerState }),
-    )
-    return
-  }
-  await store.handleContainerAction(containerId, containerName, 'remove')
+function setRowSelected(id: string, selected: boolean): void {
+  const next = new Set(selectedIds.value)
+  if (selected) next.add(id)
+  else next.delete(id)
+  selectedIds.value = next
 }
 
-// ─── 批量操作 ───
-const handleBatchAction = async (
-  action: 'start' | 'stop' | 'restart' | 'remove' | 'pause' | 'unpause' | 'kill',
-) => {
-  const ids = Array.from(selectedIds.value)
-  if (ids.length === 0) return
-  const names = ids.map(
-    (id) => store.containers.find((c) => c.Id === id)?.Names?.[0]?.replace(/^\//, '') || id,
-  )
+function managementLabel(container: DockerContainerSummary): string {
+  const label = t(`app.docker.containers.management.${container.management.kind}`)
+  return container.management.ownerName ? `${label} · ${container.management.ownerName}` : label
+}
 
-  // 删除操作特殊检查：禁止删除运行中的容器
-  if (action === 'remove') {
-    const hasRunning = ids.some((id) => {
-      const state = store.containers.find((c) => c.Id === id)?.State
-      return state === 'running'
+function managementTagType(container: DockerContainerSummary): 'primary' | 'info' | 'default' {
+  if (container.management.kind === 'suite') return 'primary'
+  if (container.management.kind === 'compose') return 'info'
+  return 'default'
+}
+
+function stateTagType(
+  state: DockerContainerState,
+): 'success' | 'warning' | 'danger' | 'info' | 'default' {
+  if (state === 'running') return 'success'
+  if (state === 'paused' || state === 'restarting' || state === 'stopping') return 'warning'
+  if (state === 'dead') return 'danger'
+  if (state === 'exited') return 'info'
+  return 'default'
+}
+
+function formatPorts(container: DockerContainerSummary): string {
+  if (container.ports.length === 0) return '-'
+  return container.ports
+    .map((port) => {
+      const target = `${port.containerPort}/${port.protocol}`
+      if (!port.hostPort) return target
+      return `${port.hostIp || '0.0.0.0'}:${port.hostPort} → ${target}`
     })
-    if (hasRunning) {
-      notificationStore.error(t('app.docker.containers.messages.deleteRunningBlocked'))
-      return
-    }
+    .join(', ')
+}
+
+function openDetail(container: DockerContainerSummary): void {
+  emit('open-detail', container.id)
+  requestContainerStats(container.id, container.state)
+}
+
+async function handleAction(
+  container: DockerContainerSummary,
+  action: DockerContainerAction,
+): Promise<void> {
+  await store.handleContainerAction(container.id, container.name, action)
+}
+
+async function handleBatchAction(action: DockerContainerAction): Promise<void> {
+  const containers = selectedContainers.value
+  if (containers.length === 0) return
+  const succeeded = await store.handleContainerAction(
+    containers.map((container) => container.id),
+    containers.map((container) => container.name),
+    action,
+  )
+  if (succeeded) selectedIds.value = new Set()
+}
+
+function supportsSelectedAction(capability: keyof DockerContainerSummary['capabilities']): boolean {
+  return selectedContainers.value.some((container) => container.capabilities[capability])
+}
+
+const batchActions = computed(() => [
+  {
+    label: t('app.docker.containers.batchStart'),
+    handler: () => handleBatchAction('start'),
+    disabled: !supportsSelectedAction('canStart'),
+  },
+  {
+    label: t('app.docker.containers.batchStop'),
+    handler: () => handleBatchAction('stop'),
+    disabled: !supportsSelectedAction('canStop'),
+  },
+  {
+    label: t('app.docker.containers.batchRestart'),
+    handler: () => handleBatchAction('restart'),
+    disabled: !supportsSelectedAction('canRestart'),
+  },
+  {
+    label: t('app.docker.containers.batchPause'),
+    handler: () => handleBatchAction('pause'),
+    disabled: !supportsSelectedAction('canPause'),
+  },
+  {
+    label: t('app.docker.containers.batchUnpause'),
+    handler: () => handleBatchAction('unpause'),
+    disabled: !supportsSelectedAction('canUnpause'),
+  },
+  {
+    label: t('app.docker.containers.batchKill'),
+    handler: () => handleBatchAction('kill'),
+    disabled: !supportsSelectedAction('canKill'),
+    class: 'btn-delete',
+  },
+  {
+    label: t('app.docker.containers.batchDelete'),
+    handler: () => handleBatchAction('remove'),
+    disabled: !supportsSelectedAction('canRemove'),
+    class: 'btn-delete',
+  },
+])
+
+function rowActions(container: DockerContainerSummary) {
+  if (container.management.readOnly) {
+    return [
+      {
+        label: t(`app.docker.containers.readOnly.${container.management.kind}`),
+        handler: () => undefined,
+        disabled: true,
+      },
+    ]
   }
-
-  await store.handleContainerAction(ids, names, action)
-  selectedIds.value.clear()
-}
-
-// ─── 创建容器 ───
-const triggerCreate = async () => {
-  await store.startContainerCreateFlow()
-}
-
-// ─── 查看详情 ───
-const openContainerDetail = (containerId: string | undefined, state?: string) => {
-  if (!containerId) return
-  emit('open-detail', containerId)
-  requestContainerStats(containerId, state)
+  const loading = store.containerActionLoadingIds.includes(container.id)
+  return [
+    {
+      label: t('app.docker.containers.startContainer'),
+      handler: () => handleAction(container, 'start'),
+      disabled: loading || !container.capabilities.canStart,
+    },
+    {
+      label: t('app.docker.containers.stopContainer'),
+      handler: () => handleAction(container, 'stop'),
+      disabled: loading || !container.capabilities.canStop,
+    },
+    {
+      label: t('app.docker.containers.restartContainer'),
+      handler: () => handleAction(container, 'restart'),
+      disabled: loading || !container.capabilities.canRestart,
+    },
+    {
+      label: t('app.docker.containers.pauseContainer'),
+      handler: () => handleAction(container, 'pause'),
+      disabled: loading || !container.capabilities.canPause,
+    },
+    {
+      label: t('app.docker.containers.unpauseContainer'),
+      handler: () => handleAction(container, 'unpause'),
+      disabled: loading || !container.capabilities.canUnpause,
+    },
+    {
+      label: t('app.docker.containers.killContainer'),
+      handler: () => handleAction(container, 'kill'),
+      disabled: loading || !container.capabilities.canKill,
+      class: 'btn-delete',
+    },
+    {
+      label: t('app.docker.containers.removeContainer'),
+      handler: () => handleAction(container, 'remove'),
+      disabled: loading || !container.capabilities.canRemove,
+      class: 'btn-delete',
+    },
+  ]
 }
 </script>
 
 <template>
-  <div class="container-list" data-ui="docker-container-list">
-    <div class="card-actions" data-ui="docker-container-actions">
-      <!-- 搜索框 -->
-      <div class="search-wrapper">
-        <SecLabInput
-          v-model="searchQuery"
-          :placeholder="t('app.docker.containers.containerNamePlaceholder')"
-          clearable
-          data-ui="container-search-input"
-          class="search-input"
+  <div class="container-list" data-page="docker-container-list">
+    <div class="container-toolbar" data-ui="toolbar">
+      <SecLabInput
+        id="docker-container-search"
+        v-model="search"
+        name="docker-container-search"
+        :placeholder="t('app.docker.containers.containerNamePlaceholder')"
+        clearable
+        class="search-input"
+        data-slot="search"
+      />
+      <SecLabSelect
+        v-model="stateFilter"
+        :options="stateOptions"
+        class="filter-select"
+        data-slot="state-filter"
+      />
+      <SecLabSelect
+        v-model="managementFilter"
+        :options="managementOptions"
+        class="filter-select"
+        data-slot="management-filter"
+      />
+      <div class="toolbar-spacer" />
+      <div v-if="selectedIds.size > 0" class="batch-control" data-slot="batch-actions">
+        <span>{{ t('app.docker.containers.selectedCount', { count: selectedIds.size }) }}</span>
+        <SecLabActionMenu
+          :label="t('app.docker.containers.batchActions')"
+          :actions="batchActions"
         />
       </div>
-
-      <!-- 批量操作 -->
-      <div class="batch-actions" v-if="selectedIds.size > 0">
-        <SecLabButton @click="handleBatchAction('start')" data-ui="batch-start-btn" size="small">
-          {{ t('app.docker.containers.batchStart') }}
-        </SecLabButton>
-        <SecLabButton @click="handleBatchAction('stop')" data-ui="batch-stop-btn" size="small">
-          {{ t('app.docker.containers.batchStop') }}
-        </SecLabButton>
-        <SecLabButton
-          @click="handleBatchAction('restart')"
-          data-ui="batch-restart-btn"
-          size="small"
-        >
-          {{ t('app.docker.containers.batchRestart') }}
-        </SecLabButton>
-        <SecLabButton @click="handleBatchAction('pause')" data-ui="batch-pause-btn" size="small">
-          {{ t('app.docker.containers.batchPause') }}
-        </SecLabButton>
-        <SecLabButton
-          @click="handleBatchAction('unpause')"
-          data-ui="batch-unpause-btn"
-          size="small"
-        >
-          {{ t('app.docker.containers.batchUnpause') }}
-        </SecLabButton>
-        <SecLabButton
-          @click="handleBatchAction('kill')"
-          type="danger"
-          data-ui="batch-kill-btn"
-          size="small"
-        >
-          {{ t('app.docker.containers.batchKill') }}
-        </SecLabButton>
-        <SecLabButton
-          type="danger"
-          @click="handleBatchAction('remove')"
-          data-ui="batch-remove-btn"
-          size="small"
-        >
-          {{ t('app.docker.containers.batchDelete') }}
-        </SecLabButton>
-      </div>
-
-      <SecLabButton type="primary" @click="triggerCreate" data-ui="create-container-btn">
+      <SecLabButton
+        type="secondary"
+        :loading="store.containerListLoading && store.containers.length > 0"
+        data-ui="refresh-containers"
+        @click="store.fetchContainers"
+      >
+        {{ t('common.refresh') }}
+      </SecLabButton>
+      <SecLabButton
+        type="primary"
+        data-ui="create-container"
+        @click="store.startContainerCreateFlow"
+      >
         {{ t('app.docker.containers.create') }}
       </SecLabButton>
     </div>
 
-    <!-- 容器表格 -->
-    <div class="container-table-wrapper" data-ui="docker-container-table">
+    <SecLabAlert
+      v-if="store.containerListError && store.containers.length > 0"
+      type="warning"
+      :title="t('app.docker.containers.refreshFailed')"
+      :description="store.containerListError"
+      data-ui="container-refresh-error"
+    />
+    <SecLabAlert
+      v-if="store.containerStatsError"
+      type="warning"
+      :title="t('app.docker.containers.statsUnavailable')"
+      :description="store.containerStatsError"
+      data-ui="container-stats-error"
+    />
+
+    <div class="container-table-wrapper" data-ui="table">
+      <SecLabAlert
+        v-if="store.containerListError && store.containers.length === 0"
+        type="error"
+        :title="t('app.docker.containers.loadFailed')"
+        :description="store.containerListError"
+      />
       <SecLabEmpty
-        v-if="filteredContainers.length === 0"
-        :description="t('app.docker.containers.noContainers')"
+        v-else-if="!store.containerListLoading && filteredContainers.length === 0"
+        :description="
+          store.containers.length > 0
+            ? t('app.docker.containers.filteredEmpty')
+            : t('app.docker.containers.noContainers')
+        "
       />
       <SecLabTable
-        v-else
+        v-else-if="filteredContainers.length > 0"
         :data="filteredContainers"
         :columns="columns"
         border
         @row-mouseenter="handleContainerRowMouseEnter"
       >
-        <!-- 表头全选 -->
         <template #selectionHeader>
           <SecLabCheckbox
             :model-value="isAllSelected"
             :indeterminate="isIndeterminate"
-            @update:model-value="handleSelectAll"
+            :disabled="selectableContainers.length === 0"
+            @update:model-value="setSelectAll"
           />
         </template>
 
-        <!-- 行选择 -->
-        <template #selection="{ row: container }: { row: dockerType.ContainerSummary }">
+        <template #selection="{ row: container }: { row: DockerContainerSummary }">
           <SecLabCheckbox
-            v-if="container.Id"
-            :model-value="selectedIds.has(container.Id)"
-            @update:model-value="(val) => handleSelectRow(container.Id!, val)"
+            :model-value="selectedIds.has(container.id)"
+            :disabled="container.management.readOnly"
+            @update:model-value="(selected) => setRowSelected(container.id, selected)"
           />
         </template>
 
-        <!-- 容器名称 -->
-        <template #name="{ row: container }: { row: dockerType.ContainerSummary }">
-          <div class="resource-name-cell">
-            <SecLabButton
-              type="secondary"
-              size="small"
-              @click="openContainerDetail(container?.Id, container?.State)"
-            >
-              {{ container?.Names?.[0]?.replace(/^\//, '') || 'N/A' }}
-            </SecLabButton>
-            <SecLabTag v-if="isSuiteManagedResource(container?.Labels)" type="primary" size="small">
-              {{ t('app.docker.suiteManaged') }}
+        <template #name="{ row: container }: { row: DockerContainerSummary }">
+          <button type="button" class="name-link" @click="openDetail(container)">
+            {{ container.name }}
+          </button>
+        </template>
+
+        <template #management="{ row: container }: { row: DockerContainerSummary }">
+          <SecLabTag :type="managementTagType(container)" effect="light">
+            {{ managementLabel(container) }}
+          </SecLabTag>
+        </template>
+
+        <template #status="{ row: container }: { row: DockerContainerSummary }">
+          <div class="status-cell">
+            <SecLabTag :type="stateTagType(container.state)" effect="light">
+              <SecLabIcon :name="getStateIcon(container.state)" :size="14" />
+              {{ t(`app.docker.containers.states.${container.state}`) }}
             </SecLabTag>
           </div>
         </template>
 
-        <!-- 运行状态 -->
-        <template #status="{ row: container }: { row: dockerType.ContainerSummary }">
-          <SecLabTag :type="container?.State === 'running' ? 'success' : 'info'">
-            <SecLabIcon :name="getStateIcon(container?.State)" :size="14" />
+        <template #ports="{ row: container }: { row: DockerContainerSummary }">
+          <span class="mono ports-text">{{ formatPorts(container) }}</span>
+        </template>
+
+        <template #resource="{ row: container }: { row: DockerContainerSummary }">
+          <div
+            v-if="getContainerStats(container.id)?.status === 'fresh'"
+            class="resource-cell mono"
+          >
+            <span>CPU {{ formatPercent(getContainerStats(container.id)?.cpuCorePercent) }}</span>
+            <span>MEM {{ formatPercent(getContainerStats(container.id)?.memoryPercent) }}</span>
+            <span>NET {{ formatNetworkUsage(container.id) }}</span>
+          </div>
+          <SecLabTag
+            v-else-if="getContainerStats(container.id)?.status === 'stale'"
+            type="warning"
+            effect="plain"
+          >
+            {{ t('app.docker.containers.statsStale') }}
           </SecLabTag>
+          <span v-else class="muted">-</span>
         </template>
 
-        <!-- 资源占用 -->
-        <template #resource="{ row: container }: { row: dockerType.ContainerSummary }">
-          <template v-if="container.Id && getContainerStats(container.Id)">
-            <div class="resource-line">
-              CPU {{ formatPercent(getContainerStats(container?.Id)?.cpuCorePercent) }}
-            </div>
-            <div class="resource-line">
-              MEM {{ formatPercent(getContainerStats(container?.Id)?.memoryPercent) }}
-            </div>
-            <div class="resource-line">NET {{ formatNetworkUsage(container?.Id) }}</div>
-          </template>
-          <span v-else class="resource-muted">-</span>
-        </template>
-
-        <!-- 单行操作 -->
-        <template #actions="{ row: container }: { row: dockerType.ContainerSummary }">
-          <SecLabActionMenu
-            :label="t('common.actions')"
-            :actions="[
-              {
-                label: t('app.docker.containers.startContainer'),
-                handler: () =>
-                  handleAction(
-                    container?.Id ?? null,
-                    container?.Names?.[0]?.replace(/^\//, '') ?? null,
-                    'start',
-                  ),
-                disabled: container?.State === 'running',
-              },
-              {
-                label: t('app.docker.containers.stopContainer'),
-                handler: () =>
-                  handleAction(
-                    container?.Id ?? null,
-                    container?.Names?.[0]?.replace(/^\//, '') ?? null,
-                    'stop',
-                  ),
-                disabled: container?.State !== 'running',
-              },
-              {
-                label: t('app.docker.containers.restartContainer'),
-                handler: () =>
-                  handleAction(
-                    container?.Id ?? null,
-                    container?.Names?.[0]?.replace(/^\//, '') ?? null,
-                    'restart',
-                  ),
-              },
-              {
-                label: t('app.docker.containers.removeContainer'),
-                handler: () =>
-                  handleDelete(
-                    container?.Id ?? null,
-                    container?.Names?.[0]?.replace(/^\//, '') ?? null,
-                    container?.State,
-                  ),
-                disabled: container?.State === 'running',
-                tooltip:
-                  container?.State === 'running'
-                    ? t('app.docker.containers.messages.deleteRunningBlocked')
-                    : undefined,
-                class: 'btn-delete',
-              },
-            ]"
-          />
-        </template>
-
-        <template #empty>
-          <SecLabEmpty :description="t('app.docker.containers.noContainers')" />
+        <template #actions="{ row: container }: { row: DockerContainerSummary }">
+          <SecLabActionMenu :label="t('common.actions')" :actions="rowActions(container)" />
         </template>
       </SecLabTable>
+      <SecLabLoading :loading="store.containerListLoading && store.containers.length === 0" cover />
     </div>
   </div>
 </template>
 
 <style scoped>
 .container-list {
-  display: flex;
-  flex-direction: column;
   flex: 1;
   min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--sdl-bg-panel);
 }
 
-.card-actions {
+.container-toolbar {
+  flex-shrink: 0;
   display: flex;
-  justify-content: flex-end;
   align-items: center;
-  margin-bottom: var(--sdl-space-4);
   gap: var(--sdl-space-3);
+  padding: var(--sdl-space-3) var(--sdl-space-4);
+  border-bottom: 1px solid var(--sdl-border-subtle);
 }
 
-.search-wrapper {
-  margin-right: auto;
-  width: 280px;
+.search-input {
+  width: min(300px, 28vw);
 }
 
-.batch-actions {
+.filter-select {
+  width: 150px;
+}
+
+.toolbar-spacer {
+  flex: 1;
+}
+
+.batch-control {
   display: flex;
+  align-items: center;
   gap: var(--sdl-space-2);
-  flex-wrap: wrap;
+  color: var(--sdl-text-secondary);
+  font-size: var(--sdl-font-caption);
 }
 
 .container-table-wrapper {
+  position: relative;
   flex: 1;
   min-height: 0;
-  overflow: hidden;
+  overflow: auto;
+  padding: var(--sdl-space-4);
 }
 
-.resource-line {
-  line-height: 1.4;
-  font-family: var(--sdl-font-mono);
-  font-size: var(--sdl-font-caption);
-  color: var(--sdl-text-secondary);
-}
-
-.resource-muted {
-  color: var(--sdl-text-subtle);
-  font-style: italic;
-}
-
-.resource-name-cell {
+.status-cell,
+.resource-cell {
+  display: flex;
   min-width: 0;
-  display: inline-flex;
+}
+
+.name-link {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--sdl-accent-primary);
+  font: inherit;
+  font-weight: var(--sdl-font-weight-semibold);
+  cursor: pointer;
+}
+
+.name-link:hover {
+  text-decoration: underline;
+}
+
+.muted {
+  color: var(--sdl-text-subtle);
+  font-size: var(--sdl-font-caption);
+}
+
+.status-cell {
+  flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
+  justify-content: center;
+  gap: var(--sdl-space-1);
+}
+
+.resource-cell {
+  flex-direction: column;
+  gap: 2px;
+  color: var(--sdl-text-secondary);
+  font-size: var(--sdl-font-caption);
+}
+
+.mono {
+  font-family: var(--sdl-font-mono);
+}
+
+.ports-text {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--sdl-text-secondary);
+  font-size: var(--sdl-font-caption);
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+@media (max-width: 900px) {
+  .container-toolbar {
+    flex-wrap: wrap;
+  }
+
+  .search-input {
+    width: 100%;
+  }
+
+  .toolbar-spacer {
+    display: none;
+  }
 }
 </style>
