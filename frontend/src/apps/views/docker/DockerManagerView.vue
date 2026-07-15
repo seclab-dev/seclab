@@ -193,7 +193,6 @@ watch(
         store.stopContainerStatsPolling()
         break
       case 'images':
-        fetchAction = store.fetchImagesList()
         store.stopContainerStatsPolling()
         break
       case 'volumes':
@@ -296,7 +295,6 @@ onUnmounted(() => {
         :is="activeComponent"
         :containers="store.containers"
         :projects="store.composeProjects"
-        :images-list="store.imagesList"
         :container-resource-stats="store.containerResourceStats"
         :is-create-active="
           activeMenu === 'containers'
@@ -317,7 +315,6 @@ onUnmounted(() => {
         @project-action="store.handleComposeProjectAction"
         @edit-compose="store.handleEditComposeConfig"
         @create="handleCreateClick"
-        @delete-image="store.handleDeleteImage"
         @cancel-create="store.cancelContainerCreate"
         @submit-create="store.submitContainerConfig"
         @fetch-container-stats="store.fetchContainerResourceStats"

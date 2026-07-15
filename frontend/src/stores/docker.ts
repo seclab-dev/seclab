@@ -92,7 +92,20 @@ export const useDockerStore = defineStore('docker', () => {
   const composeProjects = ref<dockerType.ComposeProjectSummary[]>([])
 
   // ─── 镜像 / 网络 / 卷 / 系统 ───
-  const imagesList = ref<dockerType.ImageSummary[]>([])
+  const imagesList = ref<dockerType.DockerImageSummary[]>([])
+  const imageListLoading = ref(false)
+  const imageListError = ref<string | null>(null)
+  const imageListLoadedAt = ref<number | null>(null)
+  const imageDeleteLoadingId = ref<string | null>(null)
+  const controllerImages = ref<dockerType.DockerImageSummary[]>([])
+  const controllerImageLoading = ref(false)
+  const controllerImageError = ref<string | null>(null)
+  const controllerImageLoadedAt = ref<number | null>(null)
+  const imageDistributionTask = ref<dockerType.DockerImageDistributionTask | null>(null)
+  const imageDistributionLoading = ref(false)
+  const imageDistributionError = ref<string | null>(null)
+  const imageDistributionStarting = ref(false)
+  const imageDistributionCanceling = ref(false)
   const networks = ref<dockerType.DockerNetworkSummary[]>([])
   const networkListLoading = ref(false)
   const networkListError = ref<string | null>(null)
@@ -154,6 +167,10 @@ export const useDockerStore = defineStore('docker', () => {
   const overviewRefreshInProgress = ref(false)
   const historyRefreshInProgress = ref(false)
   let historyRefreshQueued = false
+  let imageListRequestSequence = 0
+  let imageNodeId: string | null = null
+  let controllerImageRequestSequence = 0
+  let imageDistributionRequestSequence = 0
   let networkListRequestSequence = 0
   let networkDetailRequestSequence = 0
   let networkNodeId: string | null = null
@@ -172,9 +189,9 @@ export const useDockerStore = defineStore('docker', () => {
 
   // ─── 选中镜像标签 (计算属性) ───
   const selectedImageLabel = computed(() => {
-    const img = imagesList.value.find((i) => i.Id === selectedImageId.value)
+    const img = imagesList.value.find((i) => i.id === selectedImageId.value)
     if (!img) return ''
-    return img.RepoTags?.[0] || img.Id?.substring(7, 19) || img.Id || ''
+    return img.tags[0] || img.id.replace(/^sha256:/, '').substring(0, 12)
   })
 
   // ========================================
@@ -200,6 +217,23 @@ export const useDockerStore = defineStore('docker', () => {
     containerResourceStats.value = {}
     composeProjects.value = []
     imagesList.value = []
+    imageListLoading.value = false
+    imageListError.value = null
+    imageListLoadedAt.value = null
+    imageDeleteLoadingId.value = null
+    imageNodeId = null
+    imageListRequestSequence += 1
+    controllerImages.value = []
+    controllerImageLoading.value = false
+    controllerImageError.value = null
+    controllerImageLoadedAt.value = null
+    controllerImageRequestSequence += 1
+    imageDistributionTask.value = null
+    imageDistributionLoading.value = false
+    imageDistributionError.value = null
+    imageDistributionStarting.value = false
+    imageDistributionCanceling.value = false
+    imageDistributionRequestSequence += 1
     networks.value = []
     networkListLoading.value = false
     networkListError.value = null
@@ -438,19 +472,164 @@ export const useDockerStore = defineStore('docker', () => {
     }
   }
 
-  /** 获取镜像列表 */
-  const fetchImagesList = async () => {
-    if (!dockerAvailable.value) return
-    const res = await dockerClient.value.listImages()
-    if (res.success) {
-      imagesList.value = res.data || []
-    } else {
-      notificationStore.error(
-        t('app.docker.messages.listImagesFailed', {
-          message: res.message || t('common.unknownError'),
-        }),
-      )
+  /** 获取当前节点镜像列表，并阻止旧节点响应覆盖当前数据。 */
+  const fetchImagesList = async (): Promise<boolean> => {
+    if (!dockerAvailable.value) return false
+    const nodeId = nodeStore.currentNodeId || 'local'
+    if (imageListLoading.value && imageNodeId === nodeId) return false
+    if (imageNodeId !== nodeId) {
       imagesList.value = []
+      imageListLoadedAt.value = null
+      imageNodeId = nodeId
+    }
+    const sequence = ++imageListRequestSequence
+    imageListLoading.value = true
+    imageListError.value = null
+    try {
+      const res = await dockerClient.value.listImages()
+      if (
+        sequence !== imageListRequestSequence ||
+        nodeId !== (nodeStore.currentNodeId || 'local')
+      ) {
+        return false
+      }
+      if (!res.success) {
+        imageListError.value = res.message || t('common.unknownError')
+        return false
+      }
+      imagesList.value = res.data || []
+      imageListLoadedAt.value = Date.now()
+      return true
+    } catch (error) {
+      if (sequence === imageListRequestSequence) {
+        imageListError.value = error instanceof Error ? error.message : String(error)
+      }
+      return false
+    } finally {
+      if (sequence === imageListRequestSequence) imageListLoading.value = false
+    }
+  }
+
+  /** 获取主控镜像库。 */
+  const fetchControllerImages = async (): Promise<boolean> => {
+    if (controllerImageLoading.value) return false
+    const sequence = ++controllerImageRequestSequence
+    controllerImageLoading.value = true
+    controllerImageError.value = null
+    try {
+      const res = await dockerApi.fetchControllerImages()
+      if (sequence !== controllerImageRequestSequence) return false
+      if (!res.success) {
+        controllerImageError.value = res.message || t('common.unknownError')
+        return false
+      }
+      controllerImages.value = res.data || []
+      controllerImageLoadedAt.value = Date.now()
+      return true
+    } catch (error) {
+      if (sequence === controllerImageRequestSequence) {
+        controllerImageError.value = error instanceof Error ? error.message : String(error)
+      }
+      return false
+    } finally {
+      if (sequence === controllerImageRequestSequence) controllerImageLoading.value = false
+    }
+  }
+
+  /** 恢复保留期内最近的未结束分发任务。 */
+  const fetchRecentImageDistributionTask = async (): Promise<boolean> => {
+    if (imageDistributionLoading.value) return false
+    const sequence = ++imageDistributionRequestSequence
+    imageDistributionLoading.value = true
+    imageDistributionError.value = null
+    try {
+      const res = await dockerApi.fetchRecentImageDistributionTasks()
+      if (sequence !== imageDistributionRequestSequence) return false
+      if (!res.success) {
+        imageDistributionError.value = res.message || t('common.unknownError')
+        return false
+      }
+      const tasks = res.data || []
+      imageDistributionTask.value =
+        tasks.find((task) => ['pending', 'running'].includes(task.status)) || tasks[0] || null
+      return true
+    } catch (error) {
+      if (sequence === imageDistributionRequestSequence) {
+        imageDistributionError.value = error instanceof Error ? error.message : String(error)
+      }
+      return false
+    } finally {
+      if (sequence === imageDistributionRequestSequence) imageDistributionLoading.value = false
+    }
+  }
+
+  /** 创建主控镜像批量分发任务。 */
+  const startImageDistribution = async (
+    payload: dockerType.DockerImageDistributionCreateRequest,
+  ): Promise<boolean> => {
+    if (imageDistributionStarting.value) return false
+    imageDistributionStarting.value = true
+    imageDistributionError.value = null
+    try {
+      const res = await dockerApi.startImageDistributionTask(payload)
+      if (!res.success || !res.data) {
+        imageDistributionError.value = res.message || t('common.unknownError')
+        return false
+      }
+      imageDistributionTask.value = res.data
+      return true
+    } catch (error) {
+      imageDistributionError.value = error instanceof Error ? error.message : String(error)
+      return false
+    } finally {
+      imageDistributionStarting.value = false
+    }
+  }
+
+  /** 刷新当前批量分发任务，禁止轮询请求重叠。 */
+  const fetchImageDistributionTask = async (): Promise<boolean> => {
+    const taskId = imageDistributionTask.value?.taskId
+    if (!taskId || imageDistributionLoading.value) return false
+    const sequence = ++imageDistributionRequestSequence
+    imageDistributionLoading.value = true
+    try {
+      const res = await dockerApi.fetchImageDistributionTask(taskId)
+      if (sequence !== imageDistributionRequestSequence) return false
+      if (!res.success || !res.data) {
+        imageDistributionError.value = res.message || t('common.unknownError')
+        return false
+      }
+      imageDistributionTask.value = res.data
+      imageDistributionError.value = null
+      return true
+    } catch (error) {
+      if (sequence === imageDistributionRequestSequence) {
+        imageDistributionError.value = error instanceof Error ? error.message : String(error)
+      }
+      return false
+    } finally {
+      if (sequence === imageDistributionRequestSequence) imageDistributionLoading.value = false
+    }
+  }
+
+  /** 取消当前批量分发任务。 */
+  const cancelImageDistribution = async (): Promise<boolean> => {
+    const taskId = imageDistributionTask.value?.taskId
+    if (!taskId || imageDistributionCanceling.value) return false
+    imageDistributionCanceling.value = true
+    try {
+      const res = await dockerApi.cancelImageDistributionTask(taskId)
+      if (!res.success || !res.data) {
+        imageDistributionError.value = res.message || t('common.unknownError')
+        return false
+      }
+      imageDistributionTask.value = res.data
+      return true
+    } catch (error) {
+      imageDistributionError.value = error instanceof Error ? error.message : String(error)
+      return false
+    } finally {
+      imageDistributionCanceling.value = false
     }
   }
 
@@ -933,36 +1112,41 @@ export const useDockerStore = defineStore('docker', () => {
   }
 
   /** 删除镜像 */
-  const handleDeleteImage = async ({ id, containers }: { id: string; containers: number }) => {
+  const handleDeleteImage = async (id: string): Promise<boolean> => {
     if (!id) {
       notificationStore.error(t('app.docker.messages.invalidImageId'))
-      return
+      return false
     }
-    const image = imagesList.value.find((i) => i.Id === id)
-    const displayName =
-      image?.RepoTags?.[0] || image?.Id?.substring(7, 19) || id.substring(7, 19) || id
-    if (containers > 0) {
-      notificationStore.error(t('app.docker.messages.imageInUse', { name: displayName }))
-      return
-    }
+    if (imageDeleteLoadingId.value) return false
+    const image = imagesList.value.find((item) => item.id === id)
+    const displayName = image?.tags[0] || id.replace(/^sha256:/, '').substring(0, 12) || id
     const confirmed = await modalStore.showConfirmation(
-      t('app.docker.messages.deleteImageConfirm', { name: displayName }),
+      t('app.docker.messages.deleteImageConfirmAllTags', {
+        name: displayName,
+        count: image?.tags.length || 0,
+      }),
       t('app.docker.messages.deleteConfirmTitle'),
       t('app.docker.messages.deleteAction'),
       t('confirmation.cancel'),
     )
-    if (!confirmed) return
-    const res = await dockerClient.value.removeImage({ id, name: displayName })
-    if (res.success) {
+    if (!confirmed) return false
+    imageDeleteLoadingId.value = id
+    try {
+      const res = await dockerClient.value.removeImage(id)
+      if (!res.success) {
+        notificationStore.error(
+          t('app.docker.messages.deleteImageFailed', {
+            name: displayName,
+            message: res.message || t('common.unknownError'),
+          }),
+        )
+        return false
+      }
       notificationStore.success(t('app.docker.messages.deleteImageSuccess', { name: displayName }))
       await Promise.all([fetchImagesList(), fetchOverviewData()])
-    } else {
-      notificationStore.error(
-        t('app.docker.messages.deleteImageFailed', {
-          name: displayName,
-          message: res.message || t('common.unknownError'),
-        }),
-      )
+      return true
+    } finally {
+      imageDeleteLoadingId.value = null
     }
   }
 
@@ -1393,6 +1577,19 @@ export const useDockerStore = defineStore('docker', () => {
 
     // 镜像 / 网络 / 卷 / 系统
     imagesList,
+    imageListLoading,
+    imageListError,
+    imageListLoadedAt,
+    imageDeleteLoadingId,
+    controllerImages,
+    controllerImageLoading,
+    controllerImageError,
+    controllerImageLoadedAt,
+    imageDistributionTask,
+    imageDistributionLoading,
+    imageDistributionError,
+    imageDistributionStarting,
+    imageDistributionCanceling,
     networks,
     networkListLoading,
     networkListError,
@@ -1446,6 +1643,11 @@ export const useDockerStore = defineStore('docker', () => {
     fetchContainers,
     fetchComposeProjects,
     fetchImagesList,
+    fetchControllerImages,
+    fetchRecentImageDistributionTask,
+    startImageDistribution,
+    fetchImageDistributionTask,
+    cancelImageDistribution,
     fetchNetworks,
     fetchVolumes,
     fetchVolumeDetail,

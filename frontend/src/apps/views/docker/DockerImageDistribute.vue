@@ -1,588 +1,599 @@
 <script setup lang="ts">
 /**
  * @file DockerImageDistribute.vue
- * @description 将主控已有镜像通过统一镜像任务分发到节点。
+ * @description 从主控镜像库向多个在线节点创建并跟踪批量分发任务。
  */
 
-import { computed, ref, onMounted, onUnmounted, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { useNotificationStore } from '@/stores/notification'
 import { nodesApi, type NodeSummaryResponse } from '@/api/modules/nodes'
-import { dockerApi, type ImagePullProgress } from '@/api/modules/docker'
-import type { ImageSummary } from '@/api/interface/docker'
-import { SecLabButton, SecLabCheckbox, SecLabTag, SecLabEmpty, SecLabSelect } from '@/components/ui'
+import type {
+  DockerImageDistributionTarget,
+  DockerImageStage,
+  DockerImageTaskStatus,
+} from '@/api/interface/docker'
+import { useDockerStore } from '@/stores/docker'
+import {
+  SecLabAlert,
+  SecLabButton,
+  SecLabCheckbox,
+  SecLabDialog,
+  SecLabEmpty,
+  SecLabInput,
+  SecLabLoading,
+  SecLabSelect,
+  SecLabTable,
+  SecLabTag,
+} from '@/components/ui'
+import type { SecLabTableColumn } from '@/components/ui/SecLabTable.vue'
+
+const POLL_INTERVAL_MS = 1500
+const terminalStatuses: DockerImageTaskStatus[] = ['success', 'failed', 'cancelled']
 
 const { t } = useI18n()
-const notificationStore = useNotificationStore()
-
-const selectedLocalImage = ref<string | null>(null)
-const controllerImages = ref<ImageSummary[]>([])
-
-// ─── 节点选择与上传 ───
-const nodeList = ref<NodeSummaryResponse[]>([])
+const store = useDockerStore()
+const selectedImageRef = ref<string | null>(null)
 const selectedNodeIds = ref<string[]>([])
-const isSubmitting = ref(false)
-const taskIds = ref<Record<string, string>>({})
-const distributeProgress = ref<Record<string, ImagePullProgress>>({})
+const draftSelectedNodeIds = ref<string[]>([])
+const nodeDialogVisible = ref(false)
+const nodeSearch = ref('')
+const nodes = ref<NodeSummaryResponse[]>([])
+const nodesLoading = ref(false)
+const nodesError = ref('')
+let nodeRequestSequence = 0
+let pollTimer: number | null = null
 
-let timer: number | null = null
+const controllerImageOptions = computed(() =>
+  store.controllerImages.flatMap((image) => {
+    if (image.tags.length) return image.tags.map((tag) => ({ label: tag, value: tag }))
+    const shortId = image.id.replace(/^sha256:/, '').substring(0, 12)
+    return [{ label: `<none> (${shortId})`, value: image.id }]
+  }),
+)
 
-// ─── 镜像选项 ───
-const localImageOptions = computed(() => {
-  const options: { label: string; value: string }[] = []
-  controllerImages.value.forEach((img) => {
-    if (img.RepoTags && img.RepoTags.length > 0) {
-      img.RepoTags.forEach((tag: string) => {
-        options.push({ label: tag, value: tag })
-      })
-    } else if (img.Id) {
-      const shortId = img.Id.substring(7, 19)
-      options.push({ label: `<none> (${shortId})`, value: img.Id })
-    }
-  })
-  return options
+const remoteNodes = computed(() => nodes.value.filter((node) => node.nodeId !== 'local'))
+const filteredNodes = computed(() => {
+  const query = nodeSearch.value.trim().toLowerCase()
+  if (!query) return remoteNodes.value
+  return remoteNodes.value.filter(
+    (node) =>
+      node.name.toLowerCase().includes(query) ||
+      node.nodeId.toLowerCase().includes(query) ||
+      (node.address || '').toLowerCase().includes(query),
+  )
 })
+const selectableFilteredNodes = computed(() =>
+  filteredNodes.value.filter((node) => node.status === 'online'),
+)
+const allFilteredSelected = computed(
+  () =>
+    selectableFilteredNodes.value.length > 0 &&
+    selectableFilteredNodes.value.every((node) => draftSelectedNodeIds.value.includes(node.nodeId)),
+)
+const taskActive = computed(() =>
+  store.imageDistributionTask
+    ? !terminalStatuses.includes(store.imageDistributionTask.status)
+    : false,
+)
+const failedTargets = computed(
+  () => store.imageDistributionTask?.targets.filter((target) => target.status === 'failed') || [],
+)
 
-// ─── 节点获取与初始化 ───
-const fetchNodes = async () => {
+const nodeColumns = computed<SecLabTableColumn[]>(() => [
+  { label: '', width: 52, slot: 'selection', headerSlot: 'selectionHeader', align: 'center' },
+  { label: t('app.docker.images.distribute.nodes.name'), minWidth: 180, slot: 'name' },
+  { label: t('app.docker.images.distribute.nodes.address'), minWidth: 180, slot: 'address' },
+  { label: t('app.docker.images.distribute.nodes.status'), width: 100, slot: 'status' },
+])
+const progressColumns = computed<SecLabTableColumn[]>(() => [
+  { label: t('app.docker.images.distribute.nodes.name'), minWidth: 160, prop: 'nodeName' },
+  { label: t('app.docker.images.distribute.progress.status'), width: 110, slot: 'status' },
+  { label: t('app.docker.images.distribute.progress.stage'), width: 120, slot: 'stage' },
+  { label: t('app.docker.images.distribute.progress.progress'), minWidth: 180, slot: 'progress' },
+  { label: t('app.docker.images.distribute.progress.error'), minWidth: 220, slot: 'error' },
+])
+
+/** 获取节点列表，并阻止旧响应覆盖较新的选择数据。 */
+async function fetchNodes() {
+  if (nodesLoading.value) return
+  const sequence = ++nodeRequestSequence
+  nodesLoading.value = true
+  nodesError.value = ''
   try {
-    const res = await nodesApi.list()
-    nodeList.value = res.data || []
-  } catch (e) {
-    console.error('Failed to load nodes:', e)
-  }
-}
-
-const fetchControllerImages = async () => {
-  const response = await dockerApi.fetchLocalImages()
-  controllerImages.value = response.data || []
-}
-
-// ─── 分发目标过滤 ───
-const filteredNodeList = computed(() => {
-  return nodeList.value.filter((node) => node.nodeId !== 'local')
-})
-
-// ─── 节点全选逻辑 ───
-const isAllSelected = computed({
-  get() {
-    return (
-      filteredNodeList.value.length > 0 &&
-      selectedNodeIds.value.length === filteredNodeList.value.length
+    const response = await nodesApi.list()
+    if (sequence !== nodeRequestSequence) return
+    if (!response.success) {
+      nodesError.value = response.message || t('common.unknownError')
+      return
+    }
+    nodes.value = response.data || []
+    const validIds = new Set(
+      remoteNodes.value.filter((node) => node.status === 'online').map((node) => node.nodeId),
     )
-  },
-  set(val: boolean) {
-    if (val) {
-      selectedNodeIds.value = filteredNodeList.value.map((n) => n.nodeId)
-    } else {
-      selectedNodeIds.value = []
+    selectedNodeIds.value = selectedNodeIds.value.filter((id) => validIds.has(id))
+  } catch (error) {
+    if (sequence === nodeRequestSequence) {
+      nodesError.value = error instanceof Error ? error.message : String(error)
     }
-  },
-})
-
-const toggleNodeSelect = (nodeId: string) => {
-  const index = selectedNodeIds.value.indexOf(nodeId)
-  if (index > -1) {
-    selectedNodeIds.value.splice(index, 1)
-  } else {
-    selectedNodeIds.value.push(nodeId)
+  } finally {
+    if (sequence === nodeRequestSequence) nodesLoading.value = false
   }
 }
 
-// ─── 开始分发 ───
-const startDistribute = async () => {
-  if (!selectedLocalImage.value) return
-  if (selectedNodeIds.value.length === 0) return
-
-  isSubmitting.value = true
-  taskIds.value = {}
-  distributeProgress.value = {}
-
-  selectedNodeIds.value.forEach((id) => {
-    distributeProgress.value[id] = {
-      taskId: '',
-      nodeId: id,
-      imageRef: selectedLocalImage.value!,
-      progressPercent: 0,
-      status: 'pending',
-      stage: 'checking',
-      statusText: '',
-    }
-  })
-
-  try {
-    for (const nodeId of selectedNodeIds.value) {
-      const response = await dockerApi.startImageTask({
-        nodeId,
-        imageRef: selectedLocalImage.value,
-        sourceMode: 'controller-first',
-      })
-      if (!response.success || !response.data?.taskId) throw new Error(response.message)
-      taskIds.value[nodeId] = response.data.taskId
-    }
-    startPolling()
-  } catch (e) {
-    console.error('Distribute error:', e)
-    const errMsg = e instanceof Error ? e.message : String(e)
-    notificationStore.error(t('app.docker.images.distribute.actions.failed', { error: errMsg }))
-    isSubmitting.value = false
-  }
-}
-
-// ─── 状态轮询 ───
-const startPolling = () => {
-  if (timer) clearInterval(timer)
-
-  void fetchDistributeProgress()
-  timer = window.setInterval(fetchDistributeProgress, 1000)
-}
-
-const fetchDistributeProgress = async () => {
-  try {
-    for (const [nodeId, currentTaskId] of Object.entries(taskIds.value)) {
-      const response = await dockerApi.fetchImageTaskProgress(currentTaskId)
-      if (response.success && response.data) distributeProgress.value[nodeId] = response.data
-    }
-    const allFinished = Object.values(distributeProgress.value).every((item) =>
-      ['success', 'failed', 'cancelled'].includes(item.status),
-    )
-    if (allFinished) {
-      if (timer) clearInterval(timer)
-      timer = null
-      isSubmitting.value = false
-    }
-  } catch (e) {
-    console.error('Polling status failed:', e)
-  }
-}
-
-onMounted(() => {
+function openNodeDialog() {
+  draftSelectedNodeIds.value = [...selectedNodeIds.value]
+  nodeSearch.value = ''
+  nodeDialogVisible.value = true
   void fetchNodes()
-  void fetchControllerImages()
-})
+}
 
-onUnmounted(() => {
-  if (timer) {
-    clearInterval(timer)
+function closeNodeDialog() {
+  nodeDialogVisible.value = false
+}
+
+function applyNodeSelection() {
+  selectedNodeIds.value = [...draftSelectedNodeIds.value]
+  nodeDialogVisible.value = false
+}
+
+function toggleNode(node: NodeSummaryResponse, checked: boolean) {
+  if (node.status !== 'online') return
+  const ids = new Set(draftSelectedNodeIds.value)
+  if (checked) ids.add(node.nodeId)
+  else ids.delete(node.nodeId)
+  draftSelectedNodeIds.value = [...ids]
+}
+
+function toggleAllFiltered(checked: boolean) {
+  const ids = new Set(draftSelectedNodeIds.value)
+  for (const node of selectableFilteredNodes.value) {
+    if (checked) ids.add(node.nodeId)
+    else ids.delete(node.nodeId)
   }
-})
+  draftSelectedNodeIds.value = [...ids]
+}
 
-// 监听本地镜像的列表变化，自动选择第一个
+async function startDistribution() {
+  if (!selectedImageRef.value || !selectedNodeIds.value.length) return
+  const started = await store.startImageDistribution({
+    imageRef: selectedImageRef.value,
+    targetNodeIds: selectedNodeIds.value,
+  })
+  if (started) schedulePoll(0)
+}
+
+async function retryFailed() {
+  const task = store.imageDistributionTask
+  if (!task || !failedTargets.value.length) return
+  selectedImageRef.value = task.imageRef
+  selectedNodeIds.value = failedTargets.value.map((target) => target.nodeId)
+  await startDistribution()
+}
+
+function clearPollTimer() {
+  if (pollTimer !== null) window.clearTimeout(pollTimer)
+  pollTimer = null
+}
+
+function schedulePoll(delay = POLL_INTERVAL_MS) {
+  clearPollTimer()
+  if (!taskActive.value || document.hidden) return
+  pollTimer = window.setTimeout(async () => {
+    await store.fetchImageDistributionTask()
+    schedulePoll()
+  }, delay)
+}
+
+function handleVisibilityChange() {
+  if (document.hidden) clearPollTimer()
+  else if (taskActive.value) schedulePoll(0)
+}
+
+function statusType(status: DockerImageTaskStatus) {
+  if (status === 'success') return 'success'
+  if (status === 'failed') return 'danger'
+  if (status === 'cancelled') return 'default'
+  if (status === 'running') return 'primary'
+  return 'warning'
+}
+
+function statusLabel(status: DockerImageTaskStatus) {
+  return t(`app.docker.images.distribute.status.${status}`)
+}
+
+function stageLabel(stage: DockerImageStage) {
+  return t(`app.docker.images.distribute.stage.${stage}`)
+}
+
+function targetStageLabel(target: DockerImageDistributionTarget) {
+  return terminalStatuses.includes(target.status) ? '-' : stageLabel(target.stage)
+}
+
 watch(
-  controllerImages,
-  (next) => {
-    if (next.length > 0 && !selectedLocalImage.value) {
-      const firstImg = next.find((img) => img.RepoTags && img.RepoTags.length > 0)
-      if (firstImg && firstImg.RepoTags && firstImg.RepoTags.length > 0) {
-        selectedLocalImage.value = firstImg.RepoTags[0]
-      } else if (next[0]?.Id) {
-        selectedLocalImage.value = next[0].Id
-      }
-    }
+  () => store.imageDistributionTask?.status,
+  () => {
+    if (taskActive.value) schedulePoll()
+    else clearPollTimer()
+  },
+)
+
+watch(
+  controllerImageOptions,
+  (options) => {
+    if (!selectedImageRef.value && options[0]) selectedImageRef.value = String(options[0].value)
   },
   { immediate: true },
 )
+
+onMounted(async () => {
+  document.addEventListener('visibilitychange', handleVisibilityChange)
+  await Promise.all([
+    store.fetchControllerImages(),
+    store.fetchRecentImageDistributionTask(),
+    fetchNodes(),
+  ])
+  if (taskActive.value) schedulePoll(0)
+})
+
+onBeforeUnmount(() => {
+  nodeRequestSequence += 1
+  clearPollTimer()
+  document.removeEventListener('visibilitychange', handleVisibilityChange)
+})
 </script>
 
 <template>
-  <div class="distribute-container" data-ui="docker-image-distribute">
-    <!-- 左侧：文件上传与配置 -->
-    <div class="distribute-panel-left">
-      <div class="local-distribute-panel" data-ui="distribute-local-panel">
-        <div class="panel-section">
-          <label class="section-label">{{
-            t('app.docker.images.distribute.selectLocal.title')
-          }}</label>
-          <SecLabSelect
-            v-if="localImageOptions.length > 0"
-            v-model="selectedLocalImage"
-            :options="localImageOptions"
-            :placeholder="t('app.docker.images.distribute.selectLocal.placeholder')"
-            class="select-local"
-            data-ui="distribute-select-image"
-          />
-          <div v-else class="select-empty-state" data-ui="distribute-select-image-empty">
-            {{ t('app.docker.images.distribute.selectLocal.empty') }}
-          </div>
-        </div>
-      </div>
-
-      <div class="action-bar">
-        <SecLabButton
-          type="primary"
-          :disabled="!selectedLocalImage || selectedNodeIds.length === 0 || isSubmitting"
-          class="btn-start"
-          @click="startDistribute"
-          data-ui="distribute-submit-btn"
-        >
-          <span v-if="isSubmitting" class="spinner">⏳</span>
-          <span>{{
-            isSubmitting
-              ? t('app.docker.images.distribute.actions.submitting')
-              : t('app.docker.images.distribute.actions.submit')
-          }}</span>
-        </SecLabButton>
-      </div>
-    </div>
-
-    <!-- 右侧：节点选择与状态追踪 -->
-    <div class="distribute-panel-right">
-      <div class="panel-header">
-        <div class="panel-title">{{ t('app.docker.images.distribute.nodes.title') }}</div>
-        <div class="select-all-wrapper">
-          <SecLabCheckbox v-model="isAllSelected" data-ui="distribute-select-all-nodes">{{
-            t('app.docker.images.distribute.nodes.selectAll')
-          }}</SecLabCheckbox>
-        </div>
-      </div>
-
-      <div class="node-list-wrapper">
-        <div
-          v-for="node in filteredNodeList"
-          :key="node.nodeId"
-          class="node-item"
-          :class="{
-            'is-checked': selectedNodeIds.includes(node.nodeId),
-            'is-active-task': distributeProgress[node.nodeId],
-          }"
-          @click="toggleNodeSelect(node.nodeId)"
-          data-ui="node-item"
-        >
-          <div class="node-checkbox-area" @click.stop>
-            <SecLabCheckbox
-              :model-value="selectedNodeIds.includes(node.nodeId)"
-              @change="toggleNodeSelect(node.nodeId)"
-            />
-          </div>
-
-          <div class="node-info-area">
-            <div class="node-name-row">
-              <span class="node-name">{{ node.name }}</span>
-              <SecLabTag v-if="node.status === 'online'" type="success" size="small">{{
-                t('app.docker.images.distribute.nodes.online')
-              }}</SecLabTag>
-              <SecLabTag v-else type="default" size="small">{{
-                t('app.docker.images.distribute.nodes.offline')
-              }}</SecLabTag>
-            </div>
-            <div class="node-addr">{{ node.address || '-' }}</div>
-          </div>
-
-          <!-- 进度跟踪部分 -->
-          <div v-if="distributeProgress[node.nodeId]" class="node-status-area" @click.stop>
-            <div class="status-tags-row">
-              <SecLabTag v-if="distributeProgress[node.nodeId].status === 'pending'" type="default">
-                {{ t('app.docker.images.distribute.nodes.waiting') }}
-              </SecLabTag>
-              <SecLabTag
-                v-else-if="distributeProgress[node.nodeId].stage === 'exporting'"
-                type="warning"
-              >
-                {{ t('app.docker.images.distribute.nodes.exporting') }}
-              </SecLabTag>
-              <SecLabTag
-                v-else-if="distributeProgress[node.nodeId].stage === 'uploading'"
-                type="primary"
-              >
-                {{
-                  t('app.docker.images.distribute.nodes.uploading', {
-                    percent: distributeProgress[node.nodeId].progressPercent,
-                  })
-                }}
-              </SecLabTag>
-              <SecLabTag
-                v-else-if="distributeProgress[node.nodeId].stage === 'loading'"
-                type="warning"
-              >
-                {{ t('app.docker.images.distribute.nodes.loading') }}
-              </SecLabTag>
-              <SecLabTag
-                v-else-if="distributeProgress[node.nodeId].status === 'running'"
-                type="primary"
-                :title="distributeProgress[node.nodeId].statusText"
-              >
-                {{ distributeProgress[node.nodeId].statusText }}
-              </SecLabTag>
-              <SecLabTag
-                v-else-if="distributeProgress[node.nodeId].status === 'success'"
-                type="success"
-              >
-                {{ t('app.docker.images.distribute.nodes.success') }}
-              </SecLabTag>
-              <SecLabTag
-                v-else-if="distributeProgress[node.nodeId].status === 'failed'"
-                type="danger"
-                :title="
-                  distributeProgress[node.nodeId].registryError ||
-                  distributeProgress[node.nodeId].controllerError
-                "
-              >
-                {{ t('app.docker.images.distribute.nodes.failed') }}
-              </SecLabTag>
-            </div>
-
-            <!-- 进度条 -->
-            <div class="progress-bar-container">
-              <div
-                class="progress-bar-fill"
-                :class="distributeProgress[node.nodeId].status"
-                :style="{ width: `${distributeProgress[node.nodeId].progressPercent}%` }"
-              ></div>
-            </div>
-          </div>
-        </div>
-
-        <SecLabEmpty
-          v-if="filteredNodeList.length === 0"
-          :description="t('app.docker.images.distribute.nodes.empty')"
+  <div class="distribution-page" data-page="docker-image-distribution">
+    <div class="distribution-toolbar" data-ui="toolbar">
+      <div class="toolbar-field image-field">
+        <span class="field-label">{{ t('app.docker.images.distribute.selectLocal.title') }}</span>
+        <SecLabSelect
+          v-model="selectedImageRef"
+          :options="controllerImageOptions"
+          :placeholder="t('app.docker.images.distribute.selectLocal.placeholder')"
+          :disabled="store.controllerImageLoading || taskActive"
+          data-ui="distribution-image-select"
         />
       </div>
+      <div class="toolbar-field node-field">
+        <span class="field-label">{{ t('app.docker.images.distribute.nodes.title') }}</span>
+        <SecLabButton
+          :disabled="taskActive"
+          data-ui="distribution-node-select"
+          @click="openNodeDialog"
+        >
+          {{ t('app.docker.images.distribute.nodes.selected', { count: selectedNodeIds.length }) }}
+        </SecLabButton>
+      </div>
+      <SecLabButton
+        type="primary"
+        :loading="store.imageDistributionStarting"
+        :disabled="!selectedImageRef || !selectedNodeIds.length || taskActive"
+        class="start-button"
+        data-ui="distribution-start-button"
+        @click="startDistribution"
+      >
+        {{ t('app.docker.images.distribute.actions.submit') }}
+      </SecLabButton>
     </div>
+
+    <SecLabAlert
+      v-if="store.controllerImageError"
+      type="warning"
+      :title="t('app.docker.images.distribute.selectLocal.loadFailed')"
+      :description="store.controllerImageError"
+      show-icon
+    />
+    <SecLabAlert
+      v-if="store.imageDistributionError"
+      type="warning"
+      :title="t('app.docker.images.distribute.progress.refreshFailed')"
+      :description="store.imageDistributionError"
+      show-icon
+    />
+
+    <div class="distribution-content" data-slot="content">
+      <div v-if="store.imageDistributionTask" class="task-result" data-ui="distribution-task">
+        <div class="task-header" data-slot="header">
+          <div class="task-title">
+            <span>{{ store.imageDistributionTask.imageRef }}</span>
+            <SecLabTag :type="statusType(store.imageDistributionTask.status)">
+              {{ statusLabel(store.imageDistributionTask.status) }}
+            </SecLabTag>
+          </div>
+          <div class="task-actions">
+            <SecLabButton
+              v-if="taskActive"
+              type="danger"
+              size="small"
+              :loading="store.imageDistributionCanceling"
+              @click="store.cancelImageDistribution"
+            >
+              {{ t('app.docker.images.distribute.actions.cancel') }}
+            </SecLabButton>
+            <SecLabButton v-if="failedTargets.length" size="small" @click="retryFailed">
+              {{ t('app.docker.images.distribute.actions.retryFailed') }}
+            </SecLabButton>
+          </div>
+        </div>
+        <SecLabTable :data="store.imageDistributionTask.targets" :columns="progressColumns" border>
+          <template #status="{ row }: { row: DockerImageDistributionTarget }">
+            <SecLabTag :type="statusType(row.status)" size="small">
+              {{ statusLabel(row.status) }}
+            </SecLabTag>
+          </template>
+          <template #stage="{ row }: { row: DockerImageDistributionTarget }">
+            {{ targetStageLabel(row) }}
+          </template>
+          <template #progress="{ row }: { row: DockerImageDistributionTarget }">
+            <div class="progress-cell">
+              <div class="progress-track">
+                <div
+                  class="progress-fill"
+                  :class="row.status"
+                  :style="{ width: `${row.progressPercent}%` }"
+                />
+              </div>
+              <span>{{ row.progressPercent }}%</span>
+            </div>
+          </template>
+          <template #error="{ row }: { row: DockerImageDistributionTarget }">
+            <span class="error-summary" :title="row.errorSummary">{{
+              row.errorSummary || '-'
+            }}</span>
+          </template>
+        </SecLabTable>
+      </div>
+      <SecLabEmpty
+        v-else-if="!store.imageDistributionLoading"
+        :description="t('app.docker.images.distribute.progress.empty')"
+      />
+      <SecLabLoading
+        :loading="store.imageDistributionLoading && !store.imageDistributionTask"
+        cover
+      />
+    </div>
+
+    <SecLabDialog
+      :visible="nodeDialogVisible"
+      :title="t('app.docker.images.distribute.nodes.dialogTitle')"
+      width="720px"
+      data-ui="distribution-node-dialog"
+      @close="closeNodeDialog"
+    >
+      <div class="node-dialog-body" data-slot="body">
+        <SecLabInput
+          v-model="nodeSearch"
+          :placeholder="t('app.docker.images.distribute.nodes.searchPlaceholder')"
+          clearable
+        />
+        <SecLabAlert
+          v-if="nodesError"
+          type="error"
+          :description="nodesError"
+          show-icon
+          data-ui="distribution-node-error"
+        />
+        <div class="node-table-shell">
+          <SecLabTable :data="filteredNodes" :columns="nodeColumns" border>
+            <template #selectionHeader>
+              <SecLabCheckbox
+                :model-value="allFilteredSelected"
+                :disabled="!selectableFilteredNodes.length"
+                @change="toggleAllFiltered"
+              />
+            </template>
+            <template #selection="{ row }: { row: NodeSummaryResponse }">
+              <SecLabCheckbox
+                :model-value="draftSelectedNodeIds.includes(row.nodeId)"
+                :disabled="row.status !== 'online'"
+                @change="(checked) => toggleNode(row, checked)"
+              />
+            </template>
+            <template #name="{ row }: { row: NodeSummaryResponse }">
+              <div class="node-name-cell">
+                <span>{{ row.name }}</span>
+                <span class="node-id">{{ row.nodeId }}</span>
+              </div>
+            </template>
+            <template #address="{ row }: { row: NodeSummaryResponse }">
+              {{ row.address || '-' }}
+            </template>
+            <template #status="{ row }: { row: NodeSummaryResponse }">
+              <SecLabTag :type="row.status === 'online' ? 'success' : 'default'" size="small">
+                {{
+                  row.status === 'online'
+                    ? t('app.docker.images.distribute.nodes.online')
+                    : t('app.docker.images.distribute.nodes.offline')
+                }}
+              </SecLabTag>
+            </template>
+            <template #empty>
+              <SecLabEmpty :description="t('app.docker.images.distribute.nodes.empty')" />
+            </template>
+          </SecLabTable>
+          <SecLabLoading :loading="nodesLoading && !nodes.length" cover />
+        </div>
+      </div>
+      <template #footer>
+        <SecLabButton @click="closeNodeDialog">{{ t('common.cancel') }}</SecLabButton>
+        <SecLabButton type="primary" @click="applyNodeSelection">
+          {{
+            t('app.docker.images.distribute.nodes.confirmSelection', {
+              count: draftSelectedNodeIds.length,
+            })
+          }}
+        </SecLabButton>
+      </template>
+    </SecLabDialog>
   </div>
 </template>
 
 <style scoped>
-.distribute-container {
-  display: flex;
-  gap: var(--sdl-space-5);
-  flex: 1;
-  min-height: 0;
-  height: 100%;
-}
-
-.distribute-panel-left {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  gap: var(--sdl-space-4);
-  max-width: 50%;
-}
-
-.distribute-panel-right {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  background-color: var(--sdl-bg-input);
-  border: 1px solid var(--sdl-border-default);
-  border-radius: var(--sdl-radius-md);
-  padding: var(--sdl-space-4);
-  min-height: 0;
-}
-
-.local-distribute-panel {
-  flex: 1;
-  min-height: 0;
+.distribution-page {
   display: flex;
   flex-direction: column;
   gap: var(--sdl-space-3);
-  background-color: rgba(255, 255, 255, 0.02);
-  border: 1px dashed var(--sdl-border-default);
-  border-radius: var(--sdl-radius-md);
-  padding: var(--sdl-space-4);
+  height: 100%;
+  min-height: 0;
 }
 
-.panel-section {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sdl-space-2);
-}
-
-.section-label {
-  font-size: var(--sdl-font-body-xs);
-  font-weight: 600;
-  color: var(--sdl-text-secondary);
-}
-
-.select-empty-state {
-  min-height: 38px;
-  display: flex;
-  align-items: center;
-  padding: 0 var(--sdl-space-3);
+.distribution-toolbar {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto;
+  align-items: end;
+  gap: var(--sdl-space-3);
+  padding: var(--sdl-space-3);
   border: 1px solid var(--sdl-border-default);
-  border-radius: var(--sdl-radius-sm);
-  background-color: rgba(255, 255, 255, 0.02);
-  color: var(--sdl-text-muted);
-  font-size: var(--sdl-font-body-sm);
+  border-radius: var(--sdl-radius-md);
+  background: var(--sdl-bg-input);
 }
 
-.action-bar {
-  margin-top: auto;
+.image-field {
+  grid-column: 1 / -1;
 }
 
-.btn-start {
+.image-field :deep(.sl-select),
+.image-field :deep(.sl-select-trigger) {
   width: 100%;
-  height: 44px;
-  font-size: var(--sdl-font-body-sm);
-  font-weight: 600;
-}
-
-.panel-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: var(--sdl-space-3);
-  padding-bottom: var(--sdl-space-2);
-  border-bottom: 1px solid var(--sdl-border-default);
-}
-
-.panel-title {
-  font-size: var(--sdl-font-body-md);
-  font-weight: 600;
-  color: var(--sdl-text-primary);
-}
-
-.node-list-wrapper {
-  flex: 1;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: var(--sdl-space-2);
-  padding-right: var(--sdl-space-1);
-}
-
-.node-item {
-  display: flex;
-  align-items: center;
-  padding: var(--sdl-space-3) var(--sdl-space-4);
-  background-color: rgba(255, 255, 255, 0.02);
-  border: 1px solid var(--sdl-border-default);
-  border-radius: var(--sdl-radius-md);
-  cursor: pointer;
-  transition: all 0.2s ease;
-  gap: var(--sdl-space-4);
-}
-
-.node-item:hover {
-  background-color: rgba(255, 255, 255, 0.05);
-  border-color: var(--sdl-border-hover);
-}
-
-.node-item.is-checked {
-  border-color: rgba(var(--sdl-primary-rgb), 0.5);
-  background-color: rgba(var(--sdl-primary-rgb), 0.03);
-  box-shadow: 0 0 10px rgba(var(--sdl-primary-rgb), 0.05);
-}
-
-.node-checkbox-area {
-  display: flex;
-  align-items: center;
-}
-
-.node-info-area {
-  flex: 1;
   min-width: 0;
 }
 
-.node-name-row {
+.image-field :deep(.sl-select-label) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.node-field {
+  min-width: 0;
+}
+
+.toolbar-field {
+  display: grid;
+  min-width: 0;
+  gap: var(--sdl-space-1);
+}
+
+.field-label {
+  color: var(--sdl-text-secondary);
+  font-size: var(--sdl-font-body-xs);
+  font-weight: 600;
+}
+
+.start-button {
+  min-width: 150px;
+}
+
+.distribution-content {
+  position: relative;
+  flex: 1;
+  min-height: 180px;
+  overflow: auto;
+}
+
+.task-result {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sdl-space-3);
+}
+
+.task-header,
+.task-title,
+.task-actions {
   display: flex;
   align-items: center;
   gap: var(--sdl-space-2);
 }
 
-.node-name {
-  font-weight: 500;
-  color: var(--sdl-text-primary);
+.task-header {
+  justify-content: space-between;
 }
 
-.node-addr {
-  font-size: var(--sdl-font-body-xs);
-  color: var(--sdl-text-muted);
-  margin-top: var(--sdl-space-1);
+.task-title > span:first-child {
+  font-family: var(--sdl-font-mono);
+  font-weight: 600;
 }
 
-.node-status-area {
+.progress-cell {
+  display: grid;
+  grid-template-columns: minmax(80px, 1fr) 40px;
+  align-items: center;
+  gap: var(--sdl-space-2);
+}
+
+.progress-track {
+  height: 6px;
+  overflow: hidden;
+  border-radius: 3px;
+  background: var(--sdl-bg-input);
+}
+
+.progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--sdl-primary);
+  transition: width 0.2s ease;
+}
+
+.progress-fill.success {
+  background: var(--sdl-success);
+}
+
+.progress-fill.failed {
+  background: var(--sdl-danger);
+}
+
+.error-summary {
+  display: block;
+  overflow: hidden;
+  color: var(--sdl-text-secondary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.node-dialog-body {
   display: flex;
   flex-direction: column;
-  align-items: flex-end;
-  gap: var(--sdl-space-2);
-  width: 140px;
+  gap: var(--sdl-space-3);
 }
 
-.status-tags-row {
-  display: flex;
-  gap: var(--sdl-space-2);
+.node-table-shell {
+  position: relative;
+  max-height: 360px;
+  min-height: 160px;
+  overflow: auto;
 }
 
-.progress-bar-container {
-  width: 100%;
-  height: 4px;
-  background-color: rgba(255, 255, 255, 0.08);
-  border-radius: 2px;
-  overflow: hidden;
+.node-name-cell {
+  display: grid;
+  gap: 2px;
 }
 
-.progress-bar-fill {
-  height: 100%;
-  width: 0;
-  transition: width 0.3s ease;
-  border-radius: 2px;
+.node-id {
+  color: var(--sdl-text-muted);
+  font-family: var(--sdl-font-mono);
+  font-size: var(--sdl-font-body-xs);
 }
 
-.progress-bar-fill.exporting {
-  background-color: var(--sdl-warning);
-}
-
-.progress-bar-fill.uploading {
-  background-color: var(--sdl-primary);
-  background-image: linear-gradient(
-    45deg,
-    rgba(255, 255, 255, 0.15) 25%,
-    transparent 25%,
-    transparent 50%,
-    rgba(255, 255, 255, 0.15) 50%,
-    rgba(255, 255, 255, 0.15) 75%,
-    transparent 75%,
-    transparent
-  );
-  background-size: 1rem 1rem;
-  animation: progress-bar-stripes 1s linear infinite;
-}
-
-.progress-bar-fill.loading {
-  background-color: var(--sdl-warning);
-  background-image: linear-gradient(
-    45deg,
-    rgba(255, 255, 255, 0.15) 25%,
-    transparent 25%,
-    transparent 50%,
-    rgba(255, 255, 255, 0.15) 50%,
-    rgba(255, 255, 255, 0.15) 75%,
-    transparent 75%,
-    transparent
-  );
-  background-size: 1rem 1rem;
-  animation: progress-bar-stripes 1s linear infinite;
-}
-
-.progress-bar-fill.success {
-  background-color: var(--sdl-success);
-}
-
-.progress-bar-fill.failed {
-  background-color: var(--sdl-danger);
-}
-
-@keyframes progress-bar-stripes {
-  from {
-    background-position: 1rem 0;
+@media (max-width: 760px) {
+  .distribution-toolbar {
+    grid-template-columns: 1fr;
+    align-items: stretch;
   }
-  to {
-    background-position: 0 0;
-  }
-}
 
-.spinner {
-  display: inline-block;
-  animation: spin 1s linear infinite;
-  margin-right: 8px;
-}
-
-@keyframes spin {
-  from {
-    transform: rotate(0deg);
+  .image-field {
+    grid-column: auto;
   }
-  to {
-    transform: rotate(360deg);
+
+  .start-button {
+    width: 100%;
+  }
+
+  .task-header {
+    align-items: flex-start;
+    flex-direction: column;
   }
 }
 </style>

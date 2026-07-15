@@ -98,7 +98,7 @@ export const getContainerIP = (
  * 格式化镜像标签数组为逗号分隔的字符串。
  * @param tags 镜像标签数组
  */
-export const formatImageTags = (tags: dockerType.ImageSummary['RepoTags'] | undefined): string => {
+export const formatImageTags = (tags: string[] | undefined): string => {
   if (!tags || tags.length === 0) return '<none>:<none>'
   return tags.join(', ')
 }

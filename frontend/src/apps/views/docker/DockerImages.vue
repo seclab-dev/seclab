@@ -1,7 +1,7 @@
 <script setup lang="ts">
 /**
  * @file DockerImages.vue
- * @description Docker 镜像模块外壳组件，通过 Tab 切换本地镜像列表及镜像分发管理。
+ * @description Docker 镜像模块外壳，通过 Tab 切换本地镜像、仓库获取和批量分发。
  */
 
 import { ref, computed, defineAsyncComponent } from 'vue'
@@ -21,20 +21,6 @@ import {
   SecLabSwitch,
   SecLabTabs,
 } from '@/components/ui'
-import type * as dockerType from '@/api/interface/docker'
-
-// 声明原有属性以确保与主视图组件通信时的 TypeScript 类型兼容性
-defineProps<{
-  imagesList: dockerType.ImageSummary[]
-  utils?: {
-    formatImageTags: (tags: dockerType.ImageSummary['RepoTags'] | undefined) => string
-    formatBytes: (bytes: number | undefined) => string
-  }
-}>()
-
-defineEmits<{
-  (e: 'deleteImage', payload: { id: string; containers: number }): void
-}>()
 
 const { t } = useI18n()
 const store = useDockerStore()

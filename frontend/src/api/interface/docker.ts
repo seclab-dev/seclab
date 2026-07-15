@@ -200,95 +200,44 @@ export interface ContainerSummary {
   Mounts?: MountPoint[]
 }
 
-interface ImageManifestSummarySize {
-  /** Total is the total size (in bytes) of all the locally present data related to this manifest and its children. */
-  Total: number
-
-  /** Content is the size (in bytes) of all the locally present content in the content store referenced by this manifest and its children. */
-  Content: number
+/** Docker 镜像列表使用的稳定领域摘要。 */
+export interface DockerImageSummary {
+  id: string
+  tags: string[]
+  digests: string[]
+  createdAt: number
+  sizeBytes: number
+  containerCount: number
+  dangling: boolean
 }
 
-type ImageManifestSummaryKindEnum = '' | 'image' | 'attestation' | 'unknown'
+export type DockerImageTaskStatus = 'pending' | 'running' | 'success' | 'failed' | 'cancelled'
+export type DockerImageSource = 'target' | 'controller' | 'registry'
+export type DockerImageStage = 'checking' | 'exporting' | 'uploading' | 'loading' | 'pulling'
 
-interface ImageManifestSummaryImageDataSize {
-  /** Unpacked is the size (in bytes) of the locally unpacked (uncompressed) image content that's directly usable by the containers running this image. It's independent of the distributable content - e.g. the image might still have an unpacked data that's still used by some container even when the distributable/compressed content is already gone. */
-  unpacked: number
+/** 单个目标节点的镜像分发状态。 */
+export interface DockerImageDistributionTarget {
+  nodeId: string
+  nodeName: string
+  status: DockerImageTaskStatus
+  source?: DockerImageSource
+  stage: DockerImageStage
+  progressPercent: number
+  errorSummary?: string
 }
 
-interface ImageManifestSummaryImageData {
-  /** OCI platform of the image. This will be the platform specified in the manifest descriptor from the index/manifest list. */
-  Platform: OciPlatform
-
-  /** The IDs of the containers that are using this image. */
-  Containers: string[]
-
-  Size: ImageManifestSummaryImageDataSize
+/** 主控镜像批量分发任务。 */
+export interface DockerImageDistributionTask {
+  taskId: string
+  imageRef: string
+  status: DockerImageTaskStatus
+  createdAt: number
+  targets: DockerImageDistributionTarget[]
 }
 
-interface ImageManifestSummaryAttestationData {
-  /** The digest of the image manifest that this attestation is for. */
-  _for: string
-}
-
-interface ImageManifestSummary {
-  /** ID is the content-addressable ID of an image and is the same as the digest of the image manifest. */
-  ID: string
-
-  Descriptor: OciDescriptor
-
-  /** Indicates whether all the child content (image config, layers) is fully available locally. */
-  Available: boolean
-
-  Size: ImageManifestSummarySize
-
-  /**
-   * The kind of the manifest.
-   * - "image": Image manifest that can be used to start a container.
-   * - "attestation": Attestation manifest produced by the Buildkit builder for a specific image manifest.
-   */
-  Kind?: ImageManifestSummaryKindEnum
-
-  ImageData?: ImageManifestSummaryImageData
-
-  AttestationData?: ImageManifestSummaryAttestationData
-}
-
-export interface ImageSummary {
-  /** ID is the content-addressable ID of an image. */
-  Id: string
-
-  /** ID of the parent image. */
-  ParentId: string
-
-  /** List of image names/tags in the local image cache that reference this image. */
-  RepoTags: string[]
-
-  /** List of content-addressable digests of locally available image manifests. */
-  RepoDigests: string[]
-
-  /** Date and time at which the image was created as a Unix timestamp. */
-  Created: number
-
-  /** Total size of the image including all layers it is composed of. */
-  Size: number
-
-  /** Total size of image layers that are shared between this image and other images. */
-  SharedSize: number
-
-  /** Total size of the image including all layers (deprecated, optional). */
-  VirtualSize?: number
-
-  /** User-defined key/value metadata. */
-  Labels: Record<string, string>
-
-  /** Number of containers using this image. */
-  Containers: number
-
-  /** List of manifests available in this image (optional). */
-  Manifests?: ImageManifestSummary[]
-
-  /** OCI descriptor of the image target (optional). */
-  Descriptor?: OciDescriptor
+export interface DockerImageDistributionCreateRequest {
+  imageRef: string
+  targetNodeIds: string[]
 }
 
 /** 容器操作请求参数 */
@@ -641,25 +590,6 @@ export interface DockerDiskUsageSummary {
 export interface ContainerRef {
   id: string
   name: string
-}
-
-/** 镜像引用 */
-export interface ImageRef {
-  id: string
-  name: string
-}
-
-/**
- * 镜像删除响应项
- * - untagged：被取消 tag 的镜像 ID
- * - deleted：被真正删除的镜像 ID
- */
-export interface ImageDeleteResponseItem {
-  /** The image ID of an image that was untagged */
-  Untagged?: string
-
-  /** The image ID of an image that was deleted */
-  Deleted?: string
 }
 
 /** Docker 系统信息 */

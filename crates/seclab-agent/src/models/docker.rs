@@ -54,16 +54,22 @@ pub struct ImageCounts {
     pub dangling: usize,
 }
 
+/// Docker 镜像列表使用的稳定领域摘要。
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerImageSummary {
+    pub id: String,
+    pub tags: Vec<String>,
+    pub digests: Vec<String>,
+    pub created_at: i64,
+    pub size_bytes: i64,
+    pub container_count: i64,
+    pub dangling: bool,
+}
+
 /// 精简的容器引用信息。
 #[derive(Debug, Deserialize)]
 pub struct ContainerRef {
-    pub id: String,
-    pub name: String,
-}
-
-/// 精简的镜像引用信息。
-#[derive(Debug, Deserialize)]
-pub struct ImageRef {
     pub id: String,
     pub name: String,
 }

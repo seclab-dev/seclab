@@ -128,7 +128,7 @@ const createScopedDockerApi = (nodeId?: string) => ({
     )
   },
   listImages: () => {
-    return http.get<docker.ImageSummary[]>(buildDockerPath('/agent/docker/images', nodeId))
+    return http.get<docker.DockerImageSummary[]>(buildDockerPath('/agent/docker/images', nodeId))
   },
   fetchDaemonSettings: () => {
     return http.get<docker.DockerDaemonSettings>(
@@ -266,10 +266,9 @@ const createScopedDockerApi = (nodeId?: string) => ({
       },
     )
   },
-  removeImage: (payload: docker.ImageRef) => {
-    return http.delete<docker.ImageDeleteResponseItem[]>(
-      buildDockerPath('/agent/docker/image/remove', nodeId),
-      payload,
+  removeImage: (id: string) => {
+    return http.delete<unknown[]>(
+      buildDockerPath(`/agent/docker/images/${encodeURIComponent(id)}`, nodeId),
     )
   },
   resolveImage: (imageName: string) => {
@@ -356,7 +355,17 @@ export const dockerApi = Object.assign(createScopedDockerApi(), {
     http.get<ImagePullProgress>(`/docker/image-tasks/${encodeURIComponent(taskId)}/progress`),
   cancelImageTask: (taskId: string) =>
     http.delete<ImagePullProgress>(`/docker/image-tasks/${encodeURIComponent(taskId)}`),
-  fetchLocalImages: () => {
-    return http.get<docker.ImageSummary[]>('/docker/local-images')
-  },
+  fetchControllerImages: () => http.get<docker.DockerImageSummary[]>('/docker/controller/images'),
+  startImageDistributionTask: (payload: docker.DockerImageDistributionCreateRequest) =>
+    http.post<docker.DockerImageDistributionTask>('/docker/image-distribution-tasks', payload),
+  fetchImageDistributionTask: (taskId: string) =>
+    http.get<docker.DockerImageDistributionTask>(
+      `/docker/image-distribution-tasks/${encodeURIComponent(taskId)}`,
+    ),
+  fetchRecentImageDistributionTasks: () =>
+    http.get<docker.DockerImageDistributionTask[]>('/docker/image-distribution-tasks/recent'),
+  cancelImageDistributionTask: (taskId: string) =>
+    http.delete<docker.DockerImageDistributionTask>(
+      `/docker/image-distribution-tasks/${encodeURIComponent(taskId)}`,
+    ),
 })

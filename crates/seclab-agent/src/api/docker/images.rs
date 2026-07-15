@@ -3,7 +3,7 @@
 use crate::api::docker::context::DockerOperationContext;
 use crate::models::docker;
 use crate::state::AppState;
-use crate::types::{AgentError, ApiResponse, ApiResult};
+use crate::types::{AgentError, ApiError, ApiResponse, ApiResult};
 
 use axum::{
     Json,
@@ -13,10 +13,12 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use bollard::models::ImageSummary;
+use bollard::Docker;
+use bollard::models::{ContainerSummary, ImageSummary};
 use bollard::query_parameters;
 use bollard::query_parameters::{CreateImageOptions, ImportImageOptions};
 use futures_util::{StreamExt, TryStreamExt};
+use seclab_contracts::api::ErrorCode;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -255,14 +257,51 @@ pub async fn list_images(State(state): State<Arc<AppState>>) -> ApiResult<Respon
     let images: Vec<ImageSummary> = docker
         .list_images(Some(query_parameters::ListImagesOptions::default()))
         .await?;
+    let images = normalized_image_list(images);
     Ok(ApiResponse::success_with_raw("Image list loaded", Some(images)).into_response())
+}
+
+/// 将 Docker 原始镜像摘要转换为稳定排序的领域列表。
+fn normalized_image_list(images: Vec<ImageSummary>) -> Vec<docker::DockerImageSummary> {
+    let mut images = images
+        .into_iter()
+        .map(|image| {
+            let dangling = image.repo_tags.is_empty()
+                || image.repo_tags.iter().all(|tag| tag == "<none>:<none>");
+            docker::DockerImageSummary {
+                id: image.id,
+                tags: image.repo_tags,
+                digests: image.repo_digests,
+                created_at: image.created,
+                size_bytes: image.size,
+                container_count: image.containers.max(0),
+                dangling,
+            }
+        })
+        .collect::<Vec<_>>();
+    images.sort_by(|left, right| {
+        image_sort_key(left)
+            .cmp(&image_sort_key(right))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    images
+}
+
+/// 返回镜像稳定排序使用的首个有效标签。
+fn image_sort_key(image: &docker::DockerImageSummary) -> String {
+    image
+        .tags
+        .iter()
+        .find(|tag| tag.as_str() != "<none>:<none>")
+        .map(|tag| tag.to_lowercase())
+        .unwrap_or_else(|| image.id.to_lowercase())
 }
 
 /// 根据镜像 ID 或名称删除一个本地 Docker 镜像。
 ///
 /// # 参数
 /// - `state`: 共享的应用状态。
-/// - `query`: 包含要删除镜像的 ID 或名称 (`docker::ImageRef`) 的查询参数。
+/// - `id`: 待删除镜像的内容寻址 ID。
 ///
 /// # 处理流程
 /// 1. 调用 `bollard` 的 `remove_image` 方法执行删除操作。
@@ -271,15 +310,24 @@ pub async fn list_images(State(state): State<Arc<AppState>>) -> ApiResult<Respon
 pub async fn remove_image(
     State(state): State<Arc<AppState>>,
     context: DockerOperationContext,
-    Query(query): Query<docker::ImageRef>,
+    Path(id): Path<String>,
 ) -> ApiResult<Response> {
-    info!("Requesting Remove {} image", query.name);
-    let image_name = query.name.clone();
+    info!(image_id = %id, "Requesting Docker image removal");
+    let mut image_name = id.clone();
     let result: ApiResult<Response> = async {
         let docker = state.docker_client().await?;
+        let image = docker.inspect_image(&id).await?;
+        image_name = image
+            .repo_tags
+            .as_ref()
+            .and_then(|tags| tags.first())
+            .cloned()
+            .unwrap_or_else(|| id.clone());
+        let references = list_image_references(&docker, &id).await?;
+        ensure_image_unused(&references)?;
         let images = docker
             .remove_image(
-                &query.id,
+                &id,
                 Some(query_parameters::RemoveImageOptions::default()),
                 None,
             )
@@ -287,17 +335,72 @@ pub async fn remove_image(
         Ok(ApiResponse::success_with_raw("Image removed", Some(images)).into_response())
     }
     .await;
-    info!("{} image removed", query.name);
     context
         .finish(
             &state.metadata_db,
             "image.remove",
-            Some(("image", &query.id)),
+            Some(("image", &id)),
             json!({ "name": image_name }),
             true,
             result,
         )
         .await
+}
+
+/// 查询所有引用指定镜像的容器。
+async fn list_image_references(docker: &Docker, image_id: &str) -> ApiResult<Vec<String>> {
+    let filters = HashMap::from([("ancestor".to_string(), vec![image_id.to_string()])]);
+    let options = query_parameters::ListContainersOptionsBuilder::new()
+        .all(true)
+        .filters(&filters)
+        .build();
+    let containers = docker.list_containers(Some(options)).await?;
+    Ok(image_reference_names(&containers))
+}
+
+/// 从容器摘要提取稳定排序且可安全展示的名称。
+fn image_reference_names(containers: &[ContainerSummary]) -> Vec<String> {
+    let mut names = containers
+        .iter()
+        .map(|container| {
+            container
+                .names
+                .as_ref()
+                .and_then(|names| names.first())
+                .map(|name| name.trim_start_matches('/').to_string())
+                .filter(|name| !name.is_empty())
+                .or_else(|| {
+                    container
+                        .id
+                        .as_ref()
+                        .map(|id| id.chars().take(12).collect())
+                })
+                .unwrap_or_else(|| "unknown".to_string())
+        })
+        .collect::<Vec<_>>();
+    names.sort_by_key(|name| name.to_lowercase());
+    names
+}
+
+/// 拒绝删除仍被容器引用的镜像。
+fn ensure_image_unused(references: &[String]) -> ApiResult<()> {
+    if references.is_empty() {
+        return Ok(());
+    }
+    let names = references
+        .iter()
+        .take(5)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(ApiError::conflict(
+        ErrorCode::DockerImageInUse,
+        format!(
+            "image is referenced by {} container(s): {names}",
+            references.len()
+        ),
+    )
+    .with_detail(names))
 }
 
 /// 搜索 Docker Hub 镜像仓库。
@@ -709,7 +812,7 @@ pub async fn pull_registry_image(
     let (from_image, tag) = split_registry_image_ref(image_ref);
     let options = CreateImageOptions {
         from_image: Some(from_image),
-        tag: Some(tag),
+        tag,
         ..Default::default()
     };
     let mut stream = docker.create_image(Some(options), None, None);
@@ -732,15 +835,18 @@ pub async fn pull_registry_image(
     Ok(())
 }
 
-fn split_registry_image_ref(image_ref: &str) -> (String, String) {
+fn split_registry_image_ref(image_ref: &str) -> (String, Option<String>) {
+    if image_ref.contains("@sha256:") {
+        return (image_ref.to_string(), None);
+    }
     let slash = image_ref.rfind('/').unwrap_or(0);
     if let Some(colon) = image_ref.rfind(':').filter(|colon| *colon > slash) {
         (
             image_ref[..colon].to_string(),
-            image_ref[colon + 1..].to_string(),
+            Some(image_ref[colon + 1..].to_string()),
         )
     } else {
-        (image_ref.to_string(), "latest".to_string())
+        (image_ref.to_string(), Some("latest".to_string()))
     }
 }
 
@@ -1033,21 +1139,81 @@ async fn load_image_inner(state: Arc<AppState>, mut multipart: Multipart) -> Api
 mod tests {
     use super::*;
 
+    fn image(id: &str, tags: &[&str], size: i64, containers: i64) -> ImageSummary {
+        ImageSummary {
+            id: id.to_string(),
+            repo_tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
+            repo_digests: vec![format!("{id}@sha256:digest")],
+            created: 100,
+            size,
+            containers,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn normalizes_and_sorts_image_summaries() {
+        let result = normalized_image_list(vec![
+            image("sha256:z", &["zeta:latest"], 20, -1),
+            image("sha256:a", &[], 10, 2),
+            image("sha256:b", &["Alpha:1"], 30, 1),
+        ]);
+
+        assert_eq!(result[0].tags, vec!["Alpha:1"]);
+        assert_eq!(result[1].id, "sha256:a");
+        assert!(result[1].dangling);
+        assert_eq!(result[1].container_count, 2);
+        assert_eq!(result[2].container_count, 0);
+    }
+
+    #[test]
+    fn extracts_stable_container_reference_names() {
+        let containers = vec![
+            ContainerSummary {
+                id: Some("bbbbbbbbbbbb999".to_string()),
+                names: Some(vec!["/zeta".to_string()]),
+                ..Default::default()
+            },
+            ContainerSummary {
+                id: Some("aaaaaaaaaaaa888".to_string()),
+                names: None,
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(
+            image_reference_names(&containers),
+            vec!["aaaaaaaaaaaa".to_string(), "zeta".to_string()]
+        );
+    }
+
+    #[test]
+    fn rejects_image_referenced_by_containers() {
+        let error = ensure_image_unused(&["app".to_string()]).expect_err("image must be in use");
+
+        assert_eq!(error.status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(error.code, ErrorCode::DockerImageInUse);
+    }
+
     #[test]
     fn splits_registry_port_and_tag() {
         assert_eq!(
             split_registry_image_ref("registry.local:5000/team/app:1.2.3"),
             (
                 "registry.local:5000/team/app".to_string(),
-                "1.2.3".to_string()
+                Some("1.2.3".to_string())
             )
         );
         assert_eq!(
             split_registry_image_ref("registry.local:5000/team/app"),
             (
                 "registry.local:5000/team/app".to_string(),
-                "latest".to_string()
+                Some("latest".to_string())
             )
+        );
+        assert_eq!(
+            split_registry_image_ref("team/app@sha256:0123456789abcdef"),
+            ("team/app@sha256:0123456789abcdef".to_string(), None)
         );
     }
 

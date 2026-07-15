@@ -22,6 +22,7 @@ import {
   SecLabInput,
   SecLabSelect,
   SecLabTag,
+  SecLabTabs,
 } from '@/components/ui'
 
 const SEARCH_PAGE_SIZE = 20
@@ -32,6 +33,10 @@ const { t } = useI18n()
 const dockerStore = useDockerStore()
 const nodeStore = useNodeStore()
 const notificationStore = useNotificationStore()
+const activeMode = ref<'search' | 'reference'>('search')
+const directReference = ref('')
+const directReferenceError = ref('')
+const activeImageRef = ref('')
 
 const keyword = ref('')
 const searchResults = ref<ImageSearchResult[]>([])
@@ -53,6 +58,8 @@ const pullProgress = ref<ImagePullProgress | null>(null)
 const isStartingPull = ref(false)
 const isCanceling = ref(false)
 let pollTimer: number | null = null
+let searchRequestSequence = 0
+let tagRequestSequence = 0
 
 const currentNodeName = computed(() => {
   const node = nodeStore.nodes.find((item) => item.id === nodeStore.currentNodeId)
@@ -60,6 +67,13 @@ const currentNodeName = computed(() => {
 })
 
 const canSearch = computed(() => keyword.value.trim().length > 0 && !isSearching.value)
+const modeTabs = computed(() => [
+  { label: t('app.docker.images.registry.modes.search'), name: 'search' },
+  { label: t('app.docker.images.registry.modes.reference'), name: 'reference' },
+])
+const canPullReference = computed(
+  () => directReference.value.trim().length > 0 && !isPulling.value && !isStartingPull.value,
+)
 const isPulling = computed(
   () => pullProgress.value?.status === 'pending' || pullProgress.value?.status === 'running',
 )
@@ -94,7 +108,7 @@ const formatCount = (value?: number) => {
 
 const stopPolling = () => {
   if (pollTimer !== null) {
-    window.clearInterval(pollTimer)
+    window.clearTimeout(pollTimer)
     pollTimer = null
   }
 }
@@ -122,15 +136,18 @@ const searchImages = async (append = false) => {
   const normalizedKeyword = keyword.value.trim()
   if (!normalizedKeyword || isSearching.value) return
 
+  const nodeId = nodeStore.currentNodeId
+  const sequence = ++searchRequestSequence
   isSearching.value = true
   searchError.value = ''
   const nextPage = append ? searchPage.value + 1 : 1
   try {
-    const response = await dockerApi.forNode(nodeStore.currentNodeId).searchImages({
+    const response = await dockerApi.forNode(nodeId).searchImages({
       keyword: normalizedKeyword,
       page: nextPage,
       pageSize: SEARCH_PAGE_SIZE,
     })
+    if (sequence !== searchRequestSequence || nodeId !== nodeStore.currentNodeId) return
     if (!response.success || !response.data) {
       searchError.value = response.message || t('common.unknownError')
       if (!append) searchResults.value = []
@@ -144,9 +161,9 @@ const searchImages = async (append = false) => {
   } catch (error) {
     console.error('Failed to search images:', error)
     searchError.value = error instanceof Error ? error.message : String(error)
-    if (!append) searchResults.value = []
+    if (!append && sequence === searchRequestSequence) searchResults.value = []
   } finally {
-    isSearching.value = false
+    if (sequence === searchRequestSequence) isSearching.value = false
   }
 }
 
@@ -171,15 +188,18 @@ const loadTags = async (append = false) => {
   if (!selectedImage.value || isLoadingTags.value) return
   if (append && !tagHasMore.value) return
 
+  const nodeId = nodeStore.currentNodeId
+  const sequence = ++tagRequestSequence
   isLoadingTags.value = true
   tagError.value = ''
   const nextPage = append ? tagPage.value + 1 : 1
   try {
-    const response = await dockerApi.forNode(nodeStore.currentNodeId).fetchImageTags({
+    const response = await dockerApi.forNode(nodeId).fetchImageTags({
       repository: selectedImage.value.repository,
       page: nextPage,
       pageSize: TAG_PAGE_SIZE,
     })
+    if (sequence !== tagRequestSequence || nodeId !== nodeStore.currentNodeId) return
     if (!response.success || !response.data) {
       tagError.value = response.message || t('common.unknownError')
       if (!append) tags.value = []
@@ -191,9 +211,9 @@ const loadTags = async (append = false) => {
   } catch (error) {
     console.error('Failed to load image tags:', error)
     tagError.value = error instanceof Error ? error.message : String(error)
-    if (!append) tags.value = []
+    if (!append && sequence === tagRequestSequence) tags.value = []
   } finally {
-    isLoadingTags.value = false
+    if (sequence === tagRequestSequence) isLoadingTags.value = false
   }
 }
 
@@ -229,7 +249,7 @@ const fetchPullProgress = async (taskId: string) => {
     pullProgress.value = {
       taskId,
       nodeId: nodeStore.currentNodeId,
-      imageRef: `${selectedImage.value?.repository || ''}:${selectedTag.value}`,
+      imageRef: activeImageRef.value,
       status: 'failed',
       stage: 'pulling',
       progressPercent: pullProgress.value?.progressPercent ?? 0,
@@ -243,21 +263,22 @@ const fetchPullProgress = async (taskId: string) => {
 
 const startPolling = (taskId: string) => {
   stopPolling()
-  void fetchPullProgress(taskId)
-  pollTimer = window.setInterval(() => {
-    void fetchPullProgress(taskId)
-  }, 1000)
+  const poll = async () => {
+    await fetchPullProgress(taskId)
+    if (isPulling.value) pollTimer = window.setTimeout(poll, 1000)
+  }
+  void poll()
 }
 
-const pullImage = async () => {
-  if (!selectedImage.value || isStartingPull.value) return
-
+const startImagePull = async (imageRef: string) => {
+  if (!imageRef || isStartingPull.value) return
   isStartingPull.value = true
   pullProgress.value = null
+  activeImageRef.value = imageRef
   try {
     const response = await dockerApi.startImageTask({
       nodeId: nodeStore.currentNodeId,
-      imageRef: `${selectedImage.value.repository}:${selectedTag.value || DEFAULT_TAG}`,
+      imageRef,
       sourceMode: 'controller-first',
     })
     if (response.success && response.data?.taskId) {
@@ -276,6 +297,21 @@ const pullImage = async () => {
   } finally {
     isStartingPull.value = false
   }
+}
+
+const pullImage = async () => {
+  if (!selectedImage.value) return
+  await startImagePull(`${selectedImage.value.repository}:${selectedTag.value || DEFAULT_TAG}`)
+}
+
+const pullDirectReference = async () => {
+  const imageRef = directReference.value.trim()
+  directReferenceError.value = ''
+  if (!imageRef || /\s/.test(imageRef) || imageRef.includes('://')) {
+    directReferenceError.value = t('app.docker.images.registry.referenceInvalid')
+    return
+  }
+  await startImagePull(imageRef)
 }
 
 const cancelPull = async () => {
@@ -302,6 +338,8 @@ const cancelPull = async () => {
 }
 
 watch(keyword, () => {
+  searchRequestSequence += 1
+  isSearching.value = false
   searchResults.value = []
   searchError.value = ''
   searchPage.value = 1
@@ -310,11 +348,17 @@ watch(keyword, () => {
 watch(
   () => nodeStore.currentNodeId,
   () => {
+    searchRequestSequence += 1
+    tagRequestSequence += 1
     keyword.value = ''
     searchResults.value = []
     searchError.value = ''
     searchPage.value = 1
     searchHasMore.value = false
+    isSearching.value = false
+    isLoadingTags.value = false
+    directReference.value = ''
+    directReferenceError.value = ''
     resetDialogState()
   },
 )
@@ -333,91 +377,159 @@ onBeforeUnmount(() => {
       data-ui="registry-target-hint"
     />
 
-    <div class="registry-form" data-ui="registry-search-form">
-      <SecLabInput
-        v-model="keyword"
-        :placeholder="t('app.docker.images.registry.placeholder')"
-        :disabled="isSearching"
-        data-ui="registry-image-input"
-        @keyup.enter="searchImages(false)"
+    <SecLabTabs v-model="activeMode" :tabs="modeTabs" data-ui="registry-mode-tabs" />
+
+    <div v-if="activeMode === 'search'" class="registry-mode" data-slot="docker-hub-search">
+      <div class="registry-form" data-ui="registry-search-form">
+        <SecLabInput
+          id="docker-image-registry-search"
+          v-model="keyword"
+          name="docker-image-registry-search"
+          :placeholder="t('app.docker.images.registry.placeholder')"
+          :disabled="isSearching"
+          data-ui="registry-image-input"
+          @keyup.enter="searchImages(false)"
+        />
+        <SecLabButton
+          type="primary"
+          :disabled="!canSearch"
+          class="registry-action-button"
+          data-ui="registry-search-button"
+          @click="searchImages(false)"
+        >
+          {{
+            isSearching
+              ? t('app.docker.images.registry.searching')
+              : t('app.docker.images.registry.search')
+          }}
+        </SecLabButton>
+      </div>
+
+      <SecLabAlert
+        v-if="searchError"
+        type="error"
+        show-icon
+        :description="t('app.docker.images.registry.searchFailed', { error: searchError })"
+        data-ui="registry-search-error"
       />
-      <SecLabButton
-        type="primary"
-        :disabled="!canSearch"
-        class="registry-action-button"
-        data-ui="registry-search-button"
-        @click="searchImages(false)"
-      >
-        {{
-          isSearching
-            ? t('app.docker.images.registry.searching')
-            : t('app.docker.images.registry.search')
-        }}
-      </SecLabButton>
+
+      <div class="image-results" data-ui="registry-search-results">
+        <div v-if="searchResults.length" class="image-list">
+          <div
+            v-for="image in searchResults"
+            :key="image.repository"
+            class="image-row"
+            data-ui="registry-image-result"
+          >
+            <div class="image-main">
+              <div class="image-title">
+                <span>{{ image.displayName }}</span>
+                <SecLabTag v-if="image.isOfficial" type="success">
+                  {{ t('app.docker.images.registry.official') }}
+                </SecLabTag>
+                <SecLabTag v-else-if="image.isAutomated" type="warning">
+                  {{ t('app.docker.images.registry.automated') }}
+                </SecLabTag>
+              </div>
+              <p class="image-description">
+                {{ image.description || t('app.docker.images.registry.noDescription') }}
+              </p>
+              <div class="image-meta">
+                <span>{{
+                  t('app.docker.images.registry.stars', { count: formatCount(image.starCount) })
+                }}</span>
+                <span>{{
+                  t('app.docker.images.registry.pulls', { count: formatCount(image.pullCount) })
+                }}</span>
+              </div>
+            </div>
+            <SecLabButton
+              type="primary"
+              size="small"
+              data-ui="registry-download-button"
+              @click="openDownloadDialog(image)"
+            >
+              {{ t('app.docker.images.registry.download') }}
+            </SecLabButton>
+          </div>
+        </div>
+        <SecLabButton
+          v-if="searchHasMore"
+          :disabled="isSearching"
+          class="load-more-button"
+          data-ui="registry-load-more"
+          @click="searchImages(true)"
+        >
+          {{
+            isSearching
+              ? t('app.docker.images.registry.loadingMore')
+              : t('app.docker.images.registry.loadMore')
+          }}
+        </SecLabButton>
+      </div>
     </div>
 
-    <SecLabAlert
-      v-if="searchError"
-      type="error"
-      show-icon
-      :description="t('app.docker.images.registry.searchFailed', { error: searchError })"
-      data-ui="registry-search-error"
-    />
-
-    <section class="image-results" data-ui="registry-search-results">
-      <div v-if="searchResults.length" class="image-list">
-        <article
-          v-for="image in searchResults"
-          :key="image.repository"
-          class="image-row"
-          data-ui="registry-image-result"
+    <div v-else class="registry-mode reference-mode" data-slot="direct-reference">
+      <SecLabAlert
+        type="info"
+        show-icon
+        :description="t('app.docker.images.registry.referenceHint')"
+      />
+      <div class="registry-form" data-ui="registry-reference-form">
+        <SecLabInput
+          id="docker-image-reference"
+          v-model="directReference"
+          name="docker-image-reference"
+          :placeholder="t('app.docker.images.registry.referencePlaceholder')"
+          :disabled="isPulling || isStartingPull"
+          data-ui="registry-reference-input"
+          @keyup.enter="pullDirectReference"
+        />
+        <SecLabButton
+          type="primary"
+          :loading="isStartingPull"
+          :disabled="!canPullReference"
+          class="registry-action-button"
+          data-ui="registry-reference-pull"
+          @click="pullDirectReference"
         >
-          <div class="image-main">
-            <div class="image-title">
-              <span>{{ image.displayName }}</span>
-              <SecLabTag v-if="image.isOfficial" type="success">
-                {{ t('app.docker.images.registry.official') }}
-              </SecLabTag>
-              <SecLabTag v-else-if="image.isAutomated" type="warning">
-                {{ t('app.docker.images.registry.automated') }}
-              </SecLabTag>
-            </div>
-            <p class="image-description">
-              {{ image.description || t('app.docker.images.registry.noDescription') }}
-            </p>
-            <div class="image-meta">
-              <span>{{
-                t('app.docker.images.registry.stars', { count: formatCount(image.starCount) })
-              }}</span>
-              <span>{{
-                t('app.docker.images.registry.pulls', { count: formatCount(image.pullCount) })
-              }}</span>
-            </div>
-          </div>
-          <SecLabButton
-            type="primary"
-            size="small"
-            data-ui="registry-download-button"
-            @click="openDownloadDialog(image)"
-          >
-            {{ t('app.docker.images.registry.download') }}
-          </SecLabButton>
-        </article>
+          {{ t('app.docker.images.registry.pull') }}
+        </SecLabButton>
+      </div>
+      <SecLabAlert
+        v-if="directReferenceError"
+        type="error"
+        show-icon
+        :description="directReferenceError"
+      />
+      <div
+        v-if="visiblePullProgress"
+        class="inline-pull-progress"
+        data-ui="reference-pull-progress"
+      >
+        <div class="progress-track">
+          <div
+            class="progress-fill"
+            :class="visiblePullProgress.status"
+            :style="{ width: `${visiblePullProgress.progressPercent}%` }"
+          />
+        </div>
+        <div class="progress-inline-meta">
+          <span>{{ visiblePullProgress.progressPercent }}%</span>
+          <span>{{ pullStatusText }}</span>
+        </div>
       </div>
       <SecLabButton
-        v-if="searchHasMore"
-        :disabled="isSearching"
-        class="load-more-button"
-        data-ui="registry-load-more"
-        @click="searchImages(true)"
+        v-if="isPulling"
+        type="danger"
+        size="small"
+        :loading="isCanceling"
+        class="reference-cancel-button"
+        @click="cancelPull"
       >
-        {{
-          isSearching
-            ? t('app.docker.images.registry.loadingMore')
-            : t('app.docker.images.registry.loadMore')
-        }}
+        {{ t('app.docker.images.registry.cancel') }}
       </SecLabButton>
-    </section>
+    </div>
 
     <SecLabDialog
       :visible="dialogVisible"
@@ -520,6 +632,22 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: var(--sdl-space-3);
   max-width: 760px;
+}
+
+.registry-mode {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+  gap: var(--sdl-space-3);
+}
+
+.reference-mode {
+  max-width: 860px;
+}
+
+.reference-cancel-button {
+  align-self: flex-start;
 }
 
 .registry-form :deep(.sdl-input-wrapper) {

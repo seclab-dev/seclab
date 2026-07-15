@@ -23,9 +23,10 @@ const AGENT_AVAILABILITY_PATH: &str = "/api/v1/agent/docker/images/availability"
 const AGENT_LOAD_PATH: &str = "/api/v1/agent/docker/images/load";
 const AGENT_PULL_TASKS_PATH: &str = "/api/v1/agent/docker/image-pull-tasks";
 const TASK_TTL: Duration = Duration::from_secs(30 * 60);
+const MAX_DISTRIBUTION_ERROR_CHARS: usize = 512;
 
 /// 镜像任务状态。
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ImageTaskStatus {
     Pending,
@@ -36,7 +37,7 @@ pub enum ImageTaskStatus {
 }
 
 /// 镜像最终来源。
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ImageSource {
     Target,
@@ -45,7 +46,7 @@ pub enum ImageSource {
 }
 
 /// 镜像任务当前阶段。
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageStage {
     Checking,
@@ -75,6 +76,46 @@ pub struct ImageTask {
     finished_at: Option<Instant>,
 }
 
+/// 单个目标节点的镜像分发状态。
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageDistributionTarget {
+    pub node_id: String,
+    pub node_name: String,
+    pub status: ImageTaskStatus,
+    pub source: Option<ImageSource>,
+    pub stage: ImageStage,
+    pub progress_percent: u8,
+    pub error_summary: Option<String>,
+}
+
+/// 主控镜像批量分发任务快照。
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageDistributionTask {
+    pub task_id: String,
+    pub image_ref: String,
+    pub status: ImageTaskStatus,
+    pub created_at: i64,
+    pub targets: Vec<ImageDistributionTarget>,
+}
+
+#[derive(Clone, Debug)]
+struct ImageDistributionRecord {
+    task_id: String,
+    image_ref: String,
+    created_at: i64,
+    created_instant: Instant,
+    targets: Vec<ImageDistributionRecordTarget>,
+}
+
+#[derive(Clone, Debug)]
+struct ImageDistributionRecordTarget {
+    node_id: String,
+    node_name: String,
+    child_task_id: String,
+}
+
 #[derive(Default)]
 struct AcquisitionGate {
     running: bool,
@@ -85,6 +126,7 @@ struct AcquisitionGate {
 #[derive(Clone, Default)]
 pub struct ImageAcquisitionService {
     tasks: Arc<Mutex<HashMap<String, ImageTask>>>,
+    distributions: Arc<Mutex<HashMap<String, ImageDistributionRecord>>>,
     gates: Arc<AsyncMutex<HashMap<String, AcquisitionGate>>>,
 }
 
@@ -148,6 +190,121 @@ impl ImageAcquisitionService {
             task.status_text = "Cancelling image acquisition".to_string();
         }
         Some(task.clone())
+    }
+
+    /// 在全部目标完成校验后一次性创建批量分发任务。
+    pub fn start_distribution(
+        &self,
+        state: Arc<AppState>,
+        image_ref: String,
+        targets: Vec<(String, String)>,
+    ) -> ImageDistributionTask {
+        self.cleanup();
+        let task_id = Uuid::new_v4().to_string();
+        let created_at = chrono::Utc::now().timestamp();
+        let children = targets
+            .into_iter()
+            .map(|(node_id, node_name)| {
+                let child = self.start(Arc::clone(&state), node_id.clone(), image_ref.clone());
+                ImageDistributionRecordTarget {
+                    node_id,
+                    node_name,
+                    child_task_id: child.task_id,
+                }
+            })
+            .collect::<Vec<_>>();
+        let record = ImageDistributionRecord {
+            task_id: task_id.clone(),
+            image_ref,
+            created_at,
+            created_instant: Instant::now(),
+            targets: children,
+        };
+        self.distributions
+            .lock()
+            .expect("image distribution lock poisoned")
+            .insert(task_id.clone(), record);
+        self.get_distribution(&task_id)
+            .expect("new image distribution task must exist")
+    }
+
+    /// 读取批量分发任务的聚合快照。
+    pub fn get_distribution(&self, task_id: &str) -> Option<ImageDistributionTask> {
+        self.cleanup();
+        let record = self
+            .distributions
+            .lock()
+            .expect("image distribution lock poisoned")
+            .get(task_id)
+            .cloned()?;
+        Some(self.distribution_snapshot(&record))
+    }
+
+    /// 返回保留期内的批量分发任务，最新任务排在最前。
+    pub fn recent_distributions(&self) -> Vec<ImageDistributionTask> {
+        self.cleanup();
+        let mut records = self
+            .distributions
+            .lock()
+            .expect("image distribution lock poisoned")
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.task_id.cmp(&left.task_id))
+        });
+        records
+            .iter()
+            .map(|record| self.distribution_snapshot(record))
+            .collect()
+    }
+
+    /// 请求取消批量任务中尚未结束的全部目标。
+    pub fn cancel_distribution(&self, task_id: &str) -> Option<ImageDistributionTask> {
+        let child_ids = self
+            .distributions
+            .lock()
+            .expect("image distribution lock poisoned")
+            .get(task_id)?
+            .targets
+            .iter()
+            .map(|target| target.child_task_id.clone())
+            .collect::<Vec<_>>();
+        for child_id in child_ids {
+            self.cancel(&child_id);
+        }
+        self.get_distribution(task_id)
+    }
+
+    fn distribution_snapshot(&self, record: &ImageDistributionRecord) -> ImageDistributionTask {
+        let tasks = self.tasks.lock().expect("image task lock poisoned");
+        let targets = record
+            .targets
+            .iter()
+            .filter_map(|target| {
+                let task = tasks.get(&target.child_task_id)?;
+                Some(ImageDistributionTarget {
+                    node_id: target.node_id.clone(),
+                    node_name: target.node_name.clone(),
+                    status: task.status,
+                    source: task.source,
+                    stage: task.stage,
+                    progress_percent: task.progress_percent,
+                    error_summary: (task.status == ImageTaskStatus::Failed)
+                        .then(|| sanitize_distribution_error(&task.status_text)),
+                })
+            })
+            .collect::<Vec<_>>();
+        ImageDistributionTask {
+            task_id: record.task_id.clone(),
+            image_ref: record.image_ref.clone(),
+            status: distribution_status(&targets),
+            created_at: record.created_at,
+            targets,
+        }
     }
 
     /// 同步确保镜像在节点可用，供套件安装流程复用。
@@ -283,7 +440,7 @@ impl ImageAcquisitionService {
             return Err(anyhow!("image acquisition cancelled"));
         }
 
-        let controller = local_docker();
+        let controller = local_docker().await;
         if let Ok(docker) = controller
             && docker.inspect_image(image_ref).await.is_ok()
         {
@@ -388,7 +545,76 @@ impl ImageAcquisitionService {
                 task.finished_at
                     .is_none_or(|time| time.elapsed() < TASK_TTL)
             });
+        self.distributions
+            .lock()
+            .expect("image distribution lock poisoned")
+            .retain(|_, task| task.created_instant.elapsed() < TASK_TTL);
     }
+}
+
+/// 根据全部目标状态计算批量任务终态。
+fn distribution_status(targets: &[ImageDistributionTarget]) -> ImageTaskStatus {
+    if targets.iter().any(|target| {
+        matches!(
+            target.status,
+            ImageTaskStatus::Pending | ImageTaskStatus::Running
+        )
+    }) {
+        ImageTaskStatus::Running
+    } else if targets
+        .iter()
+        .any(|target| target.status == ImageTaskStatus::Failed)
+    {
+        ImageTaskStatus::Failed
+    } else if targets
+        .iter()
+        .any(|target| target.status == ImageTaskStatus::Cancelled)
+    {
+        ImageTaskStatus::Cancelled
+    } else {
+        ImageTaskStatus::Success
+    }
+}
+
+/// 截断并脱敏可返回前端的分发错误摘要。
+fn sanitize_distribution_error(value: &str) -> String {
+    let mut sanitized = value
+        .chars()
+        .take(MAX_DISTRIBUTION_ERROR_CHARS)
+        .collect::<String>();
+    for key in ["password", "token", "authorization"] {
+        sanitized = redact_error_assignment(&sanitized, key);
+    }
+    sanitized
+        .chars()
+        .take(MAX_DISTRIBUTION_ERROR_CHARS)
+        .collect()
+}
+
+fn redact_error_assignment(value: &str, key: &str) -> String {
+    let mut output = value.to_string();
+    let mut search_from = 0;
+    loop {
+        let lower = output.to_ascii_lowercase();
+        let Some(relative) = lower[search_from..].find(key) else {
+            break;
+        };
+        let start = search_from + relative + key.len();
+        let Some(separator) = lower[start..].find(['=', ':']) else {
+            break;
+        };
+        let value_start = start + separator + 1;
+        let value_end = lower[value_start..]
+            .find([',', '&', ' ', '\n'])
+            .map(|offset| value_start + offset)
+            .unwrap_or(output.len());
+        output.replace_range(value_start..value_end, "[REDACTED]");
+        search_from = value_start + "[REDACTED]".len();
+        if search_from >= output.len() {
+            break;
+        }
+    }
+    output
 }
 
 fn image_log_descriptor(
@@ -419,8 +645,13 @@ fn image_log_descriptor(
     }
 }
 
-fn local_docker() -> anyhow::Result<Docker> {
-    Docker::connect_with_local_defaults().context("controller Docker is unavailable")
+async fn local_docker() -> anyhow::Result<Docker> {
+    let docker =
+        Docker::connect_with_local_defaults().context("controller Docker is unavailable")?;
+    docker
+        .negotiate_version()
+        .await
+        .context("failed to negotiate controller Docker API version")
 }
 
 async fn image_available(client: &NodeRuntimeClient, image_ref: &str) -> anyhow::Result<bool> {
@@ -550,5 +781,47 @@ mod tests {
                 "platformLog.docker.imageAcquisition.controllerTransferred"
             )
         );
+    }
+
+    #[test]
+    fn distribution_terminal_status_has_stable_priority() {
+        let target = |status| ImageDistributionTarget {
+            node_id: "node".to_string(),
+            node_name: "Node".to_string(),
+            status,
+            source: None,
+            stage: ImageStage::Checking,
+            progress_percent: 0,
+            error_summary: None,
+        };
+
+        assert_eq!(
+            distribution_status(&[target(ImageTaskStatus::Success)]),
+            ImageTaskStatus::Success
+        );
+        assert_eq!(
+            distribution_status(&[
+                target(ImageTaskStatus::Success),
+                target(ImageTaskStatus::Failed)
+            ]),
+            ImageTaskStatus::Failed
+        );
+        assert_eq!(
+            distribution_status(&[
+                target(ImageTaskStatus::Cancelled),
+                target(ImageTaskStatus::Running)
+            ]),
+            ImageTaskStatus::Running
+        );
+    }
+
+    #[test]
+    fn distribution_error_summary_is_redacted_and_limited() {
+        let value = format!("token=secret password:guess {}", "x".repeat(600));
+        let sanitized = sanitize_distribution_error(&value);
+
+        assert!(!sanitized.contains("secret"));
+        assert!(!sanitized.contains("guess"));
+        assert!(sanitized.chars().count() <= MAX_DISTRIBUTION_ERROR_CHARS);
     }
 }

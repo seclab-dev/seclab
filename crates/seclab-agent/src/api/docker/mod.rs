@@ -264,6 +264,7 @@ pub fn docker_router() -> Router<Arc<AppState>> {
             get(containers::latest_container_logs),
         )
         .route("/images", get(images::list_images))
+        .route("/images/{id}", delete(images::remove_image))
         .route("/images/export", get(images::export_image))
         .route("/images/load", post(images::load_image))
         .route("/images/resolve", post(images::resolve_image))
@@ -279,7 +280,6 @@ pub fn docker_router() -> Router<Arc<AppState>> {
             "/image-pull-tasks/{task_id}",
             delete(images::cancel_pull_image),
         )
-        .route("/image/remove", delete(images::remove_image))
         .route(
             "/networks",
             get(networks::list_networks).post(networks::create_network),

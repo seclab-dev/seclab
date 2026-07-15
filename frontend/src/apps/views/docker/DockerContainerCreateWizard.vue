@@ -24,11 +24,10 @@ const notificationStore = useNotificationStore()
 // ─── 镜像选项 ───
 const imageOptions = computed(() => {
   return (store.imagesList || []).map((img) => ({
-    value: img.Id || '',
+    value: img.id,
     label:
-      img.RepoTags?.[0] ||
-      img.Id?.substring(7, 19) ||
-      img.Id ||
+      img.tags[0] ||
+      img.id.replace(/^sha256:/, '').substring(0, 12) ||
       t('app.docker.containers.unknownImage'),
   }))
 })

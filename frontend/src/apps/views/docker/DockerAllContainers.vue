@@ -11,7 +11,6 @@ import type * as dockerType from '@/api/interface/docker'
 // 声明原有属性以确保与主视图组件通信时的 TypeScript 类型兼容性
 defineProps<{
   containers: dockerType.ContainerSummary[]
-  imagesList?: dockerType.ImageSummary[]
   networks?: dockerType.DockerNetworkSummary[]
   isCreateActive?: boolean
   containerStep?: 'selectImage' | 'config'
