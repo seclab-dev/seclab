@@ -450,13 +450,90 @@ pub struct ComposeProjectValidateResponse {
     pub config: Option<String>,
 }
 
-/// 卷创建请求体
+/// Docker 卷归属类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DockerVolumeManagementKind {
+    Suite,
+    Compose,
+    Custom,
+}
+
+impl DockerVolumeManagementKind {
+    /// 返回操作日志使用的稳定字符串。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Suite => "suite",
+            Self::Compose => "compose",
+            Self::Custom => "custom",
+        }
+    }
+}
+
+/// Docker 卷归属信息。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerVolumeManagement {
+    pub kind: DockerVolumeManagementKind,
+    pub owner_name: Option<String>,
+    pub read_only: bool,
+}
+
+/// Docker 卷在当前模块允许执行的操作。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerVolumeCapabilities {
+    pub can_remove: bool,
+}
+
+/// Docker 卷列表摘要。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerVolumeSummary {
+    pub name: String,
+    pub driver: String,
+    pub created_at: Option<i64>,
+    pub management: DockerVolumeManagement,
+    pub capabilities: DockerVolumeCapabilities,
+}
+
+/// Docker 卷列表响应。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerVolumeListResponse {
+    pub items: Vec<DockerVolumeSummary>,
+    pub warnings: Vec<String>,
+}
+
+/// 引用 Docker 卷的容器挂载信息。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerVolumeContainerReference {
+    pub id: String,
+    pub name: String,
+    pub state: String,
+    pub destination: Option<String>,
+    pub read_only: bool,
+}
+
+/// Docker 卷详情。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerVolumeDetail {
+    pub summary: DockerVolumeSummary,
+    pub mountpoint: String,
+    pub scope: String,
+    pub options: HashMap<String, String>,
+    pub labels: HashMap<String, String>,
+    pub referenced_containers: Vec<DockerVolumeContainerReference>,
+}
+
+/// Docker 本地卷创建请求体。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct VolumeCreateRequest {
+pub struct DockerVolumeCreateRequest {
     pub name: String,
-    pub driver: Option<String>,
-    pub driver_opts: Option<HashMap<String, String>>,
+    pub options: Option<HashMap<String, String>>,
     pub labels: Option<HashMap<String, String>>,
 }
 

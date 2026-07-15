@@ -104,7 +104,16 @@ export const useDockerStore = defineStore('docker', () => {
   const networkDeleteLoadingId = ref<string | null>(null)
   const networkConnectLoading = ref(false)
   const networkDisconnectLoading = ref<Record<string, boolean>>({})
-  const volumes = ref<dockerType.VolumeSummary[]>([])
+  const volumes = ref<dockerType.DockerVolumeSummary[]>([])
+  const volumeWarnings = ref<string[]>([])
+  const volumeListLoading = ref(false)
+  const volumeListError = ref<string | null>(null)
+  const volumeDetail = ref<dockerType.DockerVolumeDetail | null>(null)
+  const volumeDetailLoading = ref(false)
+  const volumeDetailError = ref<string | null>(null)
+  const volumeCreateLoading = ref(false)
+  const volumeCreateError = ref<string | null>(null)
+  const volumeDeleteLoadingName = ref<string | null>(null)
   const systemInfo = ref<dockerType.DockerSystemInfo | null>(null)
   const systemInfoLoading = ref(false)
   const systemInfoError = ref<string | null>(null)
@@ -148,6 +157,9 @@ export const useDockerStore = defineStore('docker', () => {
   let networkListRequestSequence = 0
   let networkDetailRequestSequence = 0
   let networkNodeId: string | null = null
+  let volumeListRequestSequence = 0
+  let volumeDetailRequestSequence = 0
+  let volumeNodeId: string | null = null
 
   // ─── 轮询定时器 ───
   let resourceUsageTimer: number | null = null
@@ -203,6 +215,18 @@ export const useDockerStore = defineStore('docker', () => {
     networkListRequestSequence += 1
     networkDetailRequestSequence += 1
     volumes.value = []
+    volumeWarnings.value = []
+    volumeListLoading.value = false
+    volumeListError.value = null
+    volumeDetail.value = null
+    volumeDetailLoading.value = false
+    volumeDetailError.value = null
+    volumeCreateLoading.value = false
+    volumeCreateError.value = null
+    volumeDeleteLoadingName.value = null
+    volumeNodeId = null
+    volumeListRequestSequence += 1
+    volumeDetailRequestSequence += 1
     systemInfo.value = null
     systemInfoLoading.value = false
     systemInfoError.value = null
@@ -465,15 +489,66 @@ export const useDockerStore = defineStore('docker', () => {
     return false
   }
 
-  /** 获取卷列表 */
-  const fetchVolumes = async () => {
-    if (!dockerAvailable.value) return
-    const res = await dockerClient.value.listVolumes()
-    if (res.success) {
-      volumes.value = (res.data as { Volumes?: dockerType.VolumeSummary[] })?.Volumes || []
-    } else {
+  /** 获取卷摘要列表，并阻止旧节点响应覆盖当前状态。 */
+  const fetchVolumes = async (): Promise<boolean> => {
+    if (!dockerAvailable.value) return false
+    const nodeId = nodeStore.currentNodeId || 'local'
+    if (volumeNodeId !== nodeId) {
       volumes.value = []
+      volumeWarnings.value = []
+      volumeDetail.value = null
+      volumeDetailLoading.value = false
+      volumeDetailError.value = null
+      volumeDetailRequestSequence += 1
+      volumeNodeId = nodeId
     }
+    const sequence = ++volumeListRequestSequence
+    volumeListLoading.value = true
+    volumeListError.value = null
+    const res = await dockerClient.value.listVolumes()
+    if (sequence !== volumeListRequestSequence || nodeId !== (nodeStore.currentNodeId || 'local')) {
+      return false
+    }
+    volumeListLoading.value = false
+    if (res.success && res.data) {
+      volumes.value = res.data.items
+      volumeWarnings.value = res.data.warnings
+      return true
+    }
+    volumeListError.value = t('app.docker.messages.listVolumesFailed', {
+      message: res.message || t('common.unknownError'),
+    })
+    return false
+  }
+
+  /** 按需获取卷详情和引用容器。 */
+  const fetchVolumeDetail = async (name: string): Promise<boolean> => {
+    const nodeId = nodeStore.currentNodeId || 'local'
+    const sequence = ++volumeDetailRequestSequence
+    volumeDetailLoading.value = true
+    volumeDetailError.value = null
+    const res = await dockerClient.value.inspectVolume(name)
+    if (
+      sequence !== volumeDetailRequestSequence ||
+      nodeId !== (nodeStore.currentNodeId || 'local')
+    ) {
+      return false
+    }
+    volumeDetailLoading.value = false
+    if (res.success && res.data) {
+      volumeDetail.value = res.data
+      return true
+    }
+    volumeDetailError.value = res.message || t('common.unknownError')
+    return false
+  }
+
+  /** 清除卷详情并使尚未返回的详情请求失效。 */
+  const clearVolumeDetail = (): void => {
+    volumeDetailRequestSequence += 1
+    volumeDetail.value = null
+    volumeDetailLoading.value = false
+    volumeDetailError.value = null
   }
 
   /** 获取 Docker 系统信息 */
@@ -1188,56 +1263,55 @@ export const useDockerStore = defineStore('docker', () => {
     }
   }
 
-  /** 创建数据卷 */
-  const handleCreateVolume = async (payload: {
-    name: string
-    driver?: string
-    labels?: string
-  }) => {
-    const { parseLabels } = await import('@/utils/docker-format')
-    const parsedLabels = payload.labels ? parseLabels(payload.labels) : null
-    if (payload.labels && parsedLabels === null) {
-      notificationStore.error(t('app.docker.messages.invalidLabels'))
-      return
-    }
-    const res = await dockerClient.value.createVolume({
-      name: payload.name,
-      driver: payload.driver || 'local',
-      labels: parsedLabels || undefined,
-    })
-    if (res.success) {
+  /** 创建本地数据卷，仅成功时刷新列表。 */
+  const createVolume = async (payload: dockerType.DockerVolumeCreateRequest): Promise<boolean> => {
+    if (volumeCreateLoading.value) return false
+    volumeCreateLoading.value = true
+    volumeCreateError.value = null
+    try {
+      const res = await dockerClient.value.createVolume(payload)
+      if (!res.success) {
+        volumeCreateError.value = t('app.docker.messages.createVolumeFailed', {
+          message: res.message || t('common.unknownError'),
+        })
+        return false
+      }
       notificationStore.success(
         t('app.docker.messages.createVolumeSuccess', { name: payload.name }),
       )
       await fetchVolumes()
-    } else {
-      notificationStore.error(
-        t('app.docker.messages.createVolumeFailed', {
-          message: res.message || t('common.unknownError'),
-        }),
-      )
+      return true
+    } finally {
+      volumeCreateLoading.value = false
     }
   }
 
-  /** 删除数据卷 */
-  const handleDeleteVolume = async (name: string) => {
+  /** 删除允许管理的数据卷，并保留失败后的现有列表。 */
+  const removeVolume = async (volume: dockerType.DockerVolumeSummary): Promise<boolean> => {
+    if (!volume.capabilities.canRemove || volumeDeleteLoadingName.value) return false
     const confirmed = await modalStore.showConfirmation(
-      t('app.docker.messages.deleteVolumeConfirm', { name }),
+      t('app.docker.messages.deleteVolumeConfirm', { name: volume.name }),
       t('app.docker.messages.deleteConfirmTitle'),
       t('app.docker.messages.deleteAction'),
       t('confirmation.cancel'),
     )
-    if (!confirmed) return
-    const res = await dockerClient.value.removeVolume(name)
-    if (res.success) {
+    if (!confirmed) return false
+    volumeDeleteLoadingName.value = volume.name
+    try {
+      const res = await dockerClient.value.removeVolume(volume.name)
+      if (!res.success) {
+        notificationStore.error(
+          t('app.docker.messages.deleteVolumeFailed', {
+            message: res.message || t('common.unknownError'),
+          }),
+        )
+        return false
+      }
       notificationStore.success(t('app.docker.messages.deleteVolumeSuccess'))
       await fetchVolumes()
-    } else {
-      notificationStore.error(
-        t('app.docker.messages.deleteVolumeFailed', {
-          message: res.message || t('common.unknownError'),
-        }),
-      )
+      return true
+    } finally {
+      volumeDeleteLoadingName.value = null
     }
   }
 
@@ -1331,6 +1405,15 @@ export const useDockerStore = defineStore('docker', () => {
     networkConnectLoading,
     networkDisconnectLoading,
     volumes,
+    volumeWarnings,
+    volumeListLoading,
+    volumeListError,
+    volumeDetail,
+    volumeDetailLoading,
+    volumeDetailError,
+    volumeCreateLoading,
+    volumeCreateError,
+    volumeDeleteLoadingName,
     systemInfo,
     systemInfoLoading,
     systemInfoError,
@@ -1365,6 +1448,8 @@ export const useDockerStore = defineStore('docker', () => {
     fetchImagesList,
     fetchNetworks,
     fetchVolumes,
+    fetchVolumeDetail,
+    clearVolumeDetail,
     fetchDockerInfo,
     fetchDockerDiskUsage,
     fetchComposeContainers,
@@ -1410,8 +1495,8 @@ export const useDockerStore = defineStore('docker', () => {
 
     // 编排与系统操作
     handleScaleComposeProject,
-    handleCreateVolume,
-    handleDeleteVolume,
+    createVolume,
+    removeVolume,
     handlePruneSystem,
 
     // 工具

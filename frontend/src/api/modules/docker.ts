@@ -143,21 +143,23 @@ const createScopedDockerApi = (nodeId?: string) => ({
     )
   },
   listVolumes: () => {
-    return http.get(buildDockerPath('/agent/docker/volumes', nodeId))
+    return http.get<docker.DockerVolumeListResponse>(
+      buildDockerPath('/agent/docker/volumes', nodeId),
+    )
   },
-  createVolume: (payload: {
-    name: string
-    driver?: string
-    driverOpts?: Record<string, string>
-    labels?: Record<string, string>
-  }) => {
-    return http.post(buildDockerPath('/agent/docker/volumes', nodeId), payload)
+  createVolume: (payload: docker.DockerVolumeCreateRequest) => {
+    return http.post<docker.DockerVolumeSummary>(
+      buildDockerPath('/agent/docker/volumes', nodeId),
+      payload,
+    )
   },
   removeVolume: (name: string) => {
     return http.delete(buildDockerPath(`/agent/docker/volumes/${encodeURIComponent(name)}`, nodeId))
   },
   inspectVolume: (name: string) => {
-    return http.get(buildDockerPath(`/agent/docker/volumes/${encodeURIComponent(name)}`, nodeId))
+    return http.get<docker.DockerVolumeDetail>(
+      buildDockerPath(`/agent/docker/volumes/${encodeURIComponent(name)}`, nodeId),
+    )
   },
   dfSystem: () => {
     return http.get<docker.DockerDiskUsageSummary>(

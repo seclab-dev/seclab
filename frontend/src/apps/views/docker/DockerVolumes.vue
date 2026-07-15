@@ -1,324 +1,540 @@
 <script setup lang="ts">
-import SecLabTable, { type SecLabTableColumn } from '@/components/ui/SecLabTable.vue'
+import { computed, ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
+import type { SecLabTableColumn } from '@/components/ui/SecLabTable.vue'
 import {
+  SecLabActionMenu,
+  SecLabAlert,
   SecLabButton,
-  SecLabTag,
-  SecLabInput,
+  SecLabDescriptions,
+  SecLabDialog,
+  SecLabDrawer,
   SecLabEmpty,
   SecLabFormItem,
+  SecLabInput,
+  SecLabLoading,
   SecLabSelect,
-  SecLabActionMenu,
+  SecLabTable,
+  SecLabTag,
 } from '@/components/ui'
-import { computed, ref } from 'vue'
-import { useI18n } from 'vue-i18n'
+import type {
+  DockerVolumeContainerReference,
+  DockerVolumeManagementKind,
+  DockerVolumeSummary,
+} from '@/api/interface/docker'
 import { useDockerStore } from '@/stores/docker'
-import { useNotificationStore } from '@/stores/notification'
-import { isSuiteManagedResource } from './docker-suite-labels'
+import { useNodeStore } from '@/stores/node'
+import { formatKeyValue, parseKeyValueLines } from '@/utils/docker-format'
+import { formatDateTime } from '@/utils/time'
 
-/**
- * @file DockerVolumes.vue
- * @description Docker 卷管理组件，支持列表展示、新建卷与删除卷，严格遵循 SDL 设计规范。
- */
+defineOptions({ inheritAttrs: false })
 
-const { t, locale } = useI18n()
-const dockerStore = useDockerStore()
-const notificationStore = useNotificationStore()
+/** Docker 卷列表、本地卷创建和按需详情管理页。 */
+const { t } = useI18n()
+const store = useDockerStore()
+const nodeStore = useNodeStore()
 
-/** 搜索关键词 */
-const searchQuery = ref('')
+const search = ref('')
+const managementFilter = ref<'' | DockerVolumeManagementKind>('')
+const createVisible = ref(false)
+const advancedVisible = ref(false)
+const createError = ref('')
+const detailVisible = ref(false)
+const selectedSummary = ref<DockerVolumeSummary | null>(null)
+const form = ref({ name: '', options: '', labels: '' })
 
-/** 新建卷相关状态 */
-const isCreateActive = ref(false)
-const isSubmitting = ref(false)
-const volumeForm = ref({
-  name: '',
-  driver: 'local',
-  labels: '',
-})
+const columns = computed<SecLabTableColumn[]>(() => [
+  { label: t('app.docker.volumes.columns.name'), minWidth: 230, slot: 'name' },
+  { label: t('app.docker.volumes.columns.management'), width: 150, slot: 'management' },
+  {
+    label: t('app.docker.volumes.columns.createdAt'),
+    width: 180,
+    slot: 'createdAt',
+    align: 'center',
+  },
+  { label: t('app.docker.volumes.columns.actions'), width: 110, align: 'center', slot: 'actions' },
+])
 
-const driverOptions = [{ label: 'local', value: 'local' }]
+const referenceColumns = computed<SecLabTableColumn[]>(() => [
+  { label: t('app.docker.volumes.detail.containerName'), minWidth: 170, slot: 'name' },
+  {
+    label: t('app.docker.volumes.detail.containerState'),
+    width: 110,
+    slot: 'state',
+    align: 'center',
+  },
+  { label: t('app.docker.volumes.detail.destination'), minWidth: 180, slot: 'destination' },
+  {
+    label: t('app.docker.volumes.detail.accessMode'),
+    width: 100,
+    slot: 'accessMode',
+    align: 'center',
+  },
+])
 
-/**
- * 获取数据源
- */
-const volumeSource = computed(() => dockerStore.volumes ?? [])
+const managementOptions = computed(() => [
+  { label: t('app.docker.volumes.filters.allManagement'), value: '' },
+  ...(['suite', 'compose', 'custom'] as const).map((value) => ({
+    label: t(`app.docker.volumes.management.${value}`),
+    value,
+  })),
+])
 
-/**
- * 根据搜索关键词过滤卷列表
- */
 const filteredVolumes = computed(() => {
-  const query = searchQuery.value.trim().toLowerCase()
-  if (!query) return volumeSource.value
-  return volumeSource.value.filter((v) => {
-    const name: string = v?.Name || ''
-    return name.toLowerCase().includes(query)
+  const keyword = search.value.trim().toLowerCase()
+  return store.volumes.filter((volume) => {
+    if (keyword && !volume.name.toLowerCase().includes(keyword)) return false
+    if (managementFilter.value && volume.management.kind !== managementFilter.value) return false
+    return true
   })
 })
 
-/** 卷表格列定义 */
-const columns = computed<SecLabTableColumn[]>(() => [
-  { label: t('app.docker.volumes.name'), minWidth: 220, slot: 'name' },
-  { label: t('app.docker.volumes.driver'), width: 120, slot: 'driver' },
-  { label: t('app.docker.volumes.mountpoint'), minWidth: 260, slot: 'mountpoint' },
-  { label: t('app.docker.volumes.scope'), width: 100, align: 'center', slot: 'scope' },
-  { label: t('app.docker.volumes.createdAt'), width: 200, slot: 'createdAt' },
-  { label: t('app.docker.volumes.actions.menu'), width: 120, align: 'center', slot: 'actions' },
-])
+const currentDetail = computed(() => store.volumeDetail)
+const currentSummary = computed(() => currentDetail.value?.summary ?? selectedSummary.value)
 
-/**
- * 格式化卷的创建时间
- */
-const formatCreatedAt = (createdAt: string | undefined): string => {
-  if (!createdAt) return '-'
-  const date = new Date(createdAt)
-  if (isNaN(date.getTime())) return '-'
-  return date.toLocaleString(locale.value === 'zh' ? 'zh-CN' : 'en-US')
+const detailItems = computed(() => {
+  const summary = currentSummary.value
+  if (!summary) return []
+  return [
+    { label: t('app.docker.volumes.detail.name'), value: summary.name },
+    { label: t('app.docker.volumes.detail.management'), value: managementLabel(summary) },
+    { label: t('app.docker.volumes.detail.createdAt'), value: formatDateTime(summary.createdAt) },
+    { label: t('app.docker.volumes.detail.scope'), value: currentDetail.value?.scope || '-' },
+    {
+      label: t('app.docker.volumes.detail.referenceCount'),
+      value: currentDetail.value ? String(currentDetail.value.referencedContainers.length) : '-',
+    },
+    {
+      label: t('app.docker.volumes.detail.mountpoint'),
+      value: currentDetail.value?.mountpoint || '-',
+      span: 2,
+    },
+    {
+      label: t('app.docker.volumes.detail.options'),
+      value: formatKeyValue(currentDetail.value?.options),
+      span: 2,
+    },
+    {
+      label: t('app.docker.volumes.detail.labels'),
+      value: formatKeyValue(currentDetail.value?.labels),
+      span: 2,
+    },
+  ]
+})
+
+/** 返回卷归属的本地化名称。 */
+function managementLabel(volume: DockerVolumeSummary): string {
+  const label = t(`app.docker.volumes.management.${volume.management.kind}`)
+  return volume.management.ownerName ? `${label} · ${volume.management.ownerName}` : label
 }
 
-/** 处理搜索输入 */
-const handleSearchInput = (value: string | number | null) => {
-  searchQuery.value = typeof value === 'string' ? value : value == null ? '' : String(value)
+/** 返回卷归属标签的固定 SDL 语义色。 */
+function managementTagType(kind: DockerVolumeManagementKind): 'primary' | 'warning' | 'info' {
+  if (kind === 'custom') return 'primary'
+  if (kind === 'compose') return 'info'
+  return 'warning'
 }
 
-/** 取消创建 */
-const cancelCreate = () => {
-  isCreateActive.value = false
-  volumeForm.value = {
-    name: '',
-    driver: 'local',
-    labels: '',
-  }
+/** 返回托管卷的管理入口说明。 */
+function readOnlyReason(volume: DockerVolumeSummary): string {
+  return t(`app.docker.volumes.readOnly.${volume.management.kind}`)
 }
 
-/** 提交创建 */
-const submitCreate = async () => {
-  if (!volumeForm.value.name.trim()) {
-    notificationStore.error(t('app.docker.messages.volumeNameRequired'))
+/** 返回容器状态标签的语义色。 */
+function stateTagType(state: string): 'success' | 'warning' | 'danger' | 'default' {
+  if (state === 'running') return 'success'
+  if (state === 'paused' || state === 'restarting') return 'warning'
+  if (state === 'exited' || state === 'dead') return 'danger'
+  return 'default'
+}
+
+/** 返回容器状态的本地化名称。 */
+function stateLabel(state: string): string {
+  const knownStates = ['created', 'running', 'paused', 'restarting', 'removing', 'exited', 'dead']
+  return knownStates.includes(state)
+    ? t(`app.docker.volumes.detail.states.${state}`)
+    : t('app.docker.volumes.detail.states.unknown')
+}
+
+/** 打开并重置本地卷创建对话框。 */
+function openCreate(): void {
+  form.value = { name: '', options: '', labels: '' }
+  advancedVisible.value = false
+  createError.value = ''
+  store.volumeCreateError = null
+  createVisible.value = true
+}
+
+/** 在未提交时关闭创建对话框。 */
+function closeCreate(): void {
+  if (store.volumeCreateLoading) return
+  createVisible.value = false
+  createError.value = ''
+  store.volumeCreateError = null
+}
+
+/** 解析高级键值配置并提供字段级错误。 */
+function parseFormMap(value: string, label: string): Record<string, string> | undefined {
+  const parsed = parseKeyValueLines(value)
+  if (parsed === null) throw new Error(t('app.docker.volumes.create.invalidKeyValue', { label }))
+  return Object.keys(parsed).length ? parsed : undefined
+}
+
+/** 校验并提交本地卷创建请求。 */
+async function submitCreate(): Promise<void> {
+  createError.value = ''
+  const name = form.value.name.trim()
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{1,254}$/.test(name)) {
+    createError.value = t('app.docker.volumes.create.invalidName')
     return
   }
-  isSubmitting.value = true
   try {
-    await dockerStore.handleCreateVolume({
-      name: volumeForm.value.name.trim(),
-      driver: volumeForm.value.driver,
-      labels: volumeForm.value.labels.trim() || undefined,
-    })
-    cancelCreate()
-  } finally {
-    isSubmitting.value = false
+    const options = parseFormMap(form.value.options, t('app.docker.volumes.create.options'))
+    const labels = parseFormMap(form.value.labels, t('app.docker.volumes.create.labels'))
+    const reserved = Object.keys(labels ?? {}).find(
+      (key) => key.startsWith('seclab.') || key.startsWith('com.docker.compose.'),
+    )
+    if (reserved) {
+      createError.value = t('app.docker.volumes.create.reservedLabel', { key: reserved })
+      return
+    }
+    if (await store.createVolume({ name, options, labels })) closeCreate()
+  } catch (error) {
+    createError.value = error instanceof Error ? error.message : t('common.unknownError')
   }
 }
 
-/** 删除数据卷 */
-const handleDelete = async (name: string) => {
-  if (!name) return
-  await dockerStore.handleDeleteVolume(name)
+/** 打开卷详情并按需加载引用容器。 */
+async function openDetail(volume: DockerVolumeSummary): Promise<void> {
+  store.clearVolumeDetail()
+  selectedSummary.value = volume
+  detailVisible.value = true
+  await store.fetchVolumeDetail(volume.name)
 }
+
+/** 关闭详情并使未完成的请求失效。 */
+function closeDetail(): void {
+  detailVisible.value = false
+  selectedSummary.value = null
+  store.clearVolumeDetail()
+}
+
+/** 删除允许管理的自定义卷。 */
+async function deleteVolume(volume: DockerVolumeSummary): Promise<void> {
+  if (!volume.capabilities.canRemove) return
+  const deleted = await store.removeVolume(volume)
+  if (deleted && selectedSummary.value?.name === volume.name) closeDetail()
+}
+
+/** 生成卷行操作，并对托管卷提供管理入口说明。 */
+function rowActions(volume: DockerVolumeSummary) {
+  return [
+    {
+      label: t('app.docker.volumes.actions.view'),
+      handler: () => void openDetail(volume),
+    },
+    {
+      label: t('app.docker.volumes.actions.delete'),
+      handler: () => void deleteVolume(volume),
+      class: 'app-btn-delete',
+      disabled: !volume.capabilities.canRemove,
+      tooltip: volume.capabilities.canRemove ? undefined : readOnlyReason(volume),
+    },
+  ]
+}
+
+watch(
+  () => nodeStore.currentNodeId,
+  (_nodeId, previousNodeId) => {
+    if (previousNodeId !== undefined) closeDetail()
+    void store.fetchVolumes()
+  },
+  { immediate: true },
+)
 </script>
 
 <template>
-  <div class="docker-volumes" data-page="docker-volumes">
-    <div class="docker-card">
-      <!-- 顶部工具栏 -->
-      <div v-if="!isCreateActive" class="volume-toolbar">
+  <div class="volume-page" data-page="docker-volumes">
+    <div class="volume-toolbar" data-ui="toolbar">
+      <div class="toolbar-filters" data-slot="filters">
         <SecLabInput
-          :model-value="searchQuery"
-          :placeholder="t('app.docker.volumes.searchPlaceholder')"
-          class="volume-search"
-          @update:model-value="handleSearchInput"
+          v-model="search"
+          class="search-input"
+          :placeholder="t('app.docker.volumes.filters.searchPlaceholder')"
         />
-        <SecLabButton type="primary" class="btn-create" @click="isCreateActive = true">
+        <SecLabSelect
+          v-model="managementFilter"
+          class="filter-select"
+          :options="managementOptions"
+        />
+      </div>
+      <div class="toolbar-actions" data-slot="actions">
+        <SecLabButton :loading="store.volumeListLoading" @click="store.fetchVolumes">
+          {{ t('common.refresh') }}
+        </SecLabButton>
+        <SecLabButton type="primary" @click="openCreate">
           {{ t('app.docker.volumes.actions.create') }}
         </SecLabButton>
       </div>
-
-      <!-- 新建卷面板 -->
-      <div v-if="isCreateActive" class="volume-create-panel">
-        <div class="create-panel-header">
-          <h3>{{ t('app.docker.volumes.create.title') }}</h3>
-        </div>
-
-        <div class="create-panel-body sl-form">
-          <SecLabFormItem :label="t('app.docker.volumes.create.name')" required>
-            <SecLabInput
-              v-model="volumeForm.name"
-              :placeholder="t('app.docker.volumes.create.namePlaceholder')"
-            />
-          </SecLabFormItem>
-
-          <SecLabFormItem :label="t('app.docker.volumes.create.driver')">
-            <SecLabSelect v-model="volumeForm.driver" :options="driverOptions" />
-          </SecLabFormItem>
-
-          <SecLabFormItem :label="t('app.docker.volumes.create.labels')">
-            <SecLabInput
-              v-model="volumeForm.labels"
-              type="textarea"
-              :rows="4"
-              placeholder="e.g. key=value"
-            />
-          </SecLabFormItem>
-        </div>
-
-        <div class="create-panel-footer">
-          <SecLabButton @click="cancelCreate">
-            {{ t('app.docker.volumes.actions.cancel') }}
-          </SecLabButton>
-          <SecLabButton type="primary" :loading="isSubmitting" @click="submitCreate">
-            {{ t('app.docker.volumes.actions.submit') }}
-          </SecLabButton>
-        </div>
-      </div>
-
-      <!-- 卷列表 -->
-      <div v-if="!isCreateActive" class="card-scroll-wrapper">
-        <SecLabTable
-          v-if="filteredVolumes.length > 0"
-          :data="filteredVolumes"
-          :columns="columns"
-          border
-        >
-          <template #name="{ row }: { row: any }">
-            <div class="resource-name-cell">
-              <span class="volume-name">{{ row?.Name || '-' }}</span>
-              <SecLabTag v-if="isSuiteManagedResource(row?.Labels)" type="primary" size="small">
-                {{ t('app.docker.suiteManaged') }}
-              </SecLabTag>
-            </div>
-          </template>
-
-          <template #driver="{ row }: { row: any }">
-            <SecLabTag type="info">{{ row?.Driver || '-' }}</SecLabTag>
-          </template>
-
-          <template #mountpoint="{ row }: { row: any }">
-            <span class="mountpoint-text">{{ row?.Mountpoint || '-' }}</span>
-          </template>
-
-          <template #scope="{ row }: { row: any }">
-            <SecLabTag type="info">{{ row?.Scope || '-' }}</SecLabTag>
-          </template>
-
-          <template #createdAt="{ row }: { row: any }">
-            <span>{{ formatCreatedAt(row?.CreatedAt) }}</span>
-          </template>
-
-          <template #actions="{ row }: { row: any }">
-            <SecLabActionMenu
-              :label="t('app.docker.volumes.actions.menu')"
-              :actions="[
-                {
-                  label: t('app.docker.volumes.actions.delete'),
-                  handler: () => handleDelete(row?.Name),
-                  class: 'btn-delete',
-                },
-              ]"
-            />
-          </template>
-
-          <template #empty>
-            <SecLabEmpty :description="t('app.docker.volumes.empty')" />
-          </template>
-        </SecLabTable>
-
-        <SecLabEmpty v-else :description="t('app.docker.volumes.empty')" />
-      </div>
     </div>
+
+    <SecLabAlert
+      v-if="store.volumeListError"
+      type="warning"
+      :title="t('app.docker.volumes.refreshFailed')"
+      :description="store.volumeListError"
+      show-icon
+      data-ui="volume-list-error"
+    />
+    <SecLabAlert
+      v-if="store.volumeWarnings.length"
+      type="warning"
+      :title="t('app.docker.volumes.daemonWarnings')"
+      :description="store.volumeWarnings.join('; ')"
+      show-icon
+      data-ui="volume-daemon-warnings"
+    />
+
+    <div class="volume-table-shell" data-ui="table">
+      <SecLabTable v-if="filteredVolumes.length" :data="filteredVolumes" :columns="columns" border>
+        <template #name="{ row }: { row: DockerVolumeSummary }">
+          <button class="volume-name" type="button" @click="openDetail(row)">
+            {{ row.name }}
+          </button>
+        </template>
+        <template #management="{ row }: { row: DockerVolumeSummary }">
+          <SecLabTag :type="managementTagType(row.management.kind)" size="small">
+            {{ managementLabel(row) }}
+          </SecLabTag>
+        </template>
+        <template #createdAt="{ row }: { row: DockerVolumeSummary }">
+          {{ formatDateTime(row.createdAt) }}
+        </template>
+        <template #actions="{ row }: { row: DockerVolumeSummary }">
+          <SecLabActionMenu
+            :label="t('app.docker.volumes.actions.menu')"
+            :disabled="store.volumeDeleteLoadingName === row.name"
+            :actions="rowActions(row)"
+          />
+        </template>
+      </SecLabTable>
+      <SecLabEmpty
+        v-else-if="!store.volumeListLoading"
+        :description="
+          search || managementFilter
+            ? t('app.docker.volumes.filteredEmpty')
+            : t('app.docker.volumes.empty')
+        "
+      />
+      <SecLabLoading :loading="store.volumeListLoading && !store.volumes.length" cover />
+    </div>
+
+    <SecLabDialog
+      :visible="createVisible"
+      :title="t('app.docker.volumes.create.title')"
+      width="620px"
+      :close-on-click-overlay="!store.volumeCreateLoading"
+      data-ui="volume-create-dialog"
+      @close="closeCreate"
+    >
+      <div class="create-form" data-slot="body">
+        <SecLabAlert
+          v-if="createError || store.volumeCreateError"
+          type="error"
+          :title="createError || store.volumeCreateError || ''"
+          show-icon
+        />
+        <SecLabFormItem :label="t('app.docker.volumes.create.name')" required>
+          <SecLabInput
+            v-model="form.name"
+            :placeholder="t('app.docker.volumes.create.namePlaceholder')"
+          />
+        </SecLabFormItem>
+        <SecLabButton type="secondary" size="small" @click="advancedVisible = !advancedVisible">
+          {{
+            advancedVisible
+              ? t('app.docker.volumes.create.hideAdvanced')
+              : t('app.docker.volumes.create.showAdvanced')
+          }}
+        </SecLabButton>
+        <div v-if="advancedVisible" class="advanced-fields" data-slot="advanced">
+          <SecLabFormItem
+            :label="t('app.docker.volumes.create.options')"
+            :hint="t('app.docker.volumes.create.keyValueHint')"
+          >
+            <SecLabInput v-model="form.options" type="textarea" :rows="4" />
+          </SecLabFormItem>
+          <SecLabFormItem
+            :label="t('app.docker.volumes.create.labels')"
+            :hint="t('app.docker.volumes.create.labelHint')"
+          >
+            <SecLabInput v-model="form.labels" type="textarea" :rows="4" />
+          </SecLabFormItem>
+        </div>
+      </div>
+      <template #footer>
+        <SecLabButton :disabled="store.volumeCreateLoading" @click="closeCreate">
+          {{ t('common.cancel') }}
+        </SecLabButton>
+        <SecLabButton type="primary" :loading="store.volumeCreateLoading" @click="submitCreate">
+          {{ t('app.docker.volumes.actions.submit') }}
+        </SecLabButton>
+      </template>
+    </SecLabDialog>
+
+    <SecLabDrawer
+      v-model="detailVisible"
+      :title="t('app.docker.volumes.detail.title')"
+      width="760px"
+      data-ui="volume-detail-drawer"
+      @close="closeDetail"
+    >
+      <div class="detail-content" data-slot="detail">
+        <SecLabAlert
+          v-if="currentSummary?.management.readOnly"
+          type="info"
+          :title="t('app.docker.volumes.detail.readOnlyTitle')"
+          :description="readOnlyReason(currentSummary)"
+          show-icon
+        />
+        <SecLabAlert
+          v-if="store.volumeDetailError"
+          type="warning"
+          :title="t('app.docker.volumes.detail.loadFailed')"
+          :description="store.volumeDetailError"
+          show-icon
+        />
+        <SecLabDescriptions v-if="currentSummary" :items="detailItems" :column="2" border />
+
+        <div class="detail-block" data-slot="references">
+          <div class="block-title">{{ t('app.docker.volumes.detail.references') }}</div>
+          <SecLabTable
+            v-if="currentDetail?.referencedContainers.length"
+            :data="currentDetail.referencedContainers"
+            :columns="referenceColumns"
+            border
+          >
+            <template #name="{ row }: { row: DockerVolumeContainerReference }">
+              <span class="container-name">{{ row.name }}</span>
+            </template>
+            <template #state="{ row }: { row: DockerVolumeContainerReference }">
+              <SecLabTag :type="stateTagType(row.state)" size="small">{{
+                stateLabel(row.state)
+              }}</SecLabTag>
+            </template>
+            <template #destination="{ row }: { row: DockerVolumeContainerReference }">
+              <span class="mono-text">{{ row.destination || '-' }}</span>
+            </template>
+            <template #accessMode="{ row }: { row: DockerVolumeContainerReference }">
+              {{
+                row.readOnly
+                  ? t('app.docker.volumes.detail.readOnlyMode')
+                  : t('app.docker.volumes.detail.readWriteMode')
+              }}
+            </template>
+          </SecLabTable>
+          <SecLabEmpty
+            v-else-if="!store.volumeDetailLoading"
+            :description="t('app.docker.volumes.detail.noReferences')"
+          />
+        </div>
+        <SecLabLoading :loading="store.volumeDetailLoading && !currentDetail" cover />
+      </div>
+    </SecLabDrawer>
   </div>
 </template>
 
 <style scoped>
-.docker-volumes {
-  flex-grow: 1;
+.volume-page {
+  height: 100%;
+  min-height: 0;
   display: flex;
   flex-direction: column;
-  min-height: 0;
+  gap: var(--sdl-space-3);
+  padding-top: var(--sdl-space-3);
 }
-
-.docker-card {
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  margin-top: var(--sdl-space-3);
-  background-color: var(--sdl-bg-panel);
-  padding: var(--sdl-space-5);
-  border: 1px solid var(--sdl-border-default);
-  border-radius: var(--sdl-radius-lg);
-  box-sizing: border-box;
-  flex-grow: 1;
-}
-
 .volume-toolbar {
   display: flex;
+  align-items: center;
   justify-content: space-between;
-  align-items: center;
-  margin-bottom: var(--sdl-space-4);
-}
-
-.volume-search {
-  width: 280px;
-}
-
-.volume-create-panel {
-  border: 1px solid var(--sdl-border-default);
-  border-radius: var(--sdl-radius-lg);
-  padding: var(--sdl-space-5);
-  margin-bottom: var(--sdl-space-4);
-  background: var(--sdl-bg-card);
-  display: flex;
-  flex-direction: column;
   gap: var(--sdl-space-4);
+  padding: var(--sdl-space-3) var(--sdl-space-4);
+  border: 1px solid var(--sdl-border-default);
+  border-radius: var(--sdl-radius-md);
+  background: var(--sdl-bg-panel);
+}
+.toolbar-filters,
+.toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sdl-space-2);
+}
+.search-input {
+  width: 240px;
+}
+.filter-select {
+  width: 150px;
+}
+.volume-table-shell {
+  position: relative;
   flex: 1;
-  min-height: 0;
+  min-height: 260px;
+  overflow: auto;
+  border: 1px solid var(--sdl-border-default);
+  border-radius: var(--sdl-radius-md);
+  background: var(--sdl-bg-panel);
 }
-
-.create-panel-header h3 {
-  margin: 0;
+.volume-name {
+  padding: 0;
+  border: 0;
+  background: transparent;
   color: var(--sdl-primary);
-  font-size: var(--sdl-font-title);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  word-break: break-all;
 }
-
-.create-panel-body {
+.volume-name:hover {
+  text-decoration: underline;
+}
+.mono-text {
+  font-family: var(--sdl-font-mono);
+  word-break: break-all;
+}
+.create-form,
+.advanced-fields,
+.detail-content,
+.detail-block {
   display: flex;
   flex-direction: column;
-  gap: var(--sdl-space-2);
-  flex: 1;
-  min-height: 0;
-  overflow: auto;
-}
-
-.create-panel-footer {
-  display: flex;
   gap: var(--sdl-space-3);
-  justify-content: flex-end;
 }
-
-.card-scroll-wrapper {
-  flex: 1;
-  min-height: 0;
-  overflow: auto;
-}
-
-.volume-name {
-  font-family: var(--sdl-font-mono);
-  font-size: var(--sdl-font-caption);
+.block-title {
   color: var(--sdl-text-primary);
-  word-break: break-all;
+  font-weight: 600;
 }
-
-.mountpoint-text {
-  display: inline-block;
-  white-space: pre-wrap;
-  word-break: break-all;
-  font-family: var(--sdl-font-mono);
-  font-size: var(--sdl-font-caption);
-  color: var(--sdl-text-secondary);
+.container-name {
+  font-weight: 600;
 }
-
-.resource-name-cell {
-  min-width: 0;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
+@media (max-width: 980px) {
+  .volume-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .toolbar-filters,
+  .toolbar-actions {
+    flex-wrap: wrap;
+  }
+}
+@media (max-width: 680px) {
+  .search-input,
+  .filter-select {
+    width: 100%;
+  }
+  .toolbar-filters,
+  .toolbar-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
 }
 </style>

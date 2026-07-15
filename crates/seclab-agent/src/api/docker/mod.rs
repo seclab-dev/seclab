@@ -167,17 +167,6 @@ fn summarize_project_states(
     counts
 }
 
-/// 返回当前宿主机的 Docker 卷列表。
-pub async fn volumes(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
-    info!("Requesting docker node");
-    let docker = state.docker_client().await?;
-
-    let volume = docker
-        .list_volumes(Some(query_parameters::ListVolumesOptions::default()))
-        .await?;
-    Ok(ApiResponse::success_with_raw("Docker volumes loaded", Some(volume)).into_response())
-}
-
 /// 返回 Docker 服务是否可用及具体状态。
 pub async fn status(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
     let docker_status = state.docker_status().await;
@@ -305,7 +294,10 @@ pub fn docker_router() -> Router<Arc<AppState>> {
             post(networks::disconnect_network),
         )
         .route("/stats/history", post(stats::history))
-        .route("/volumes", get(volumes).post(volumes::create_volume))
+        .route(
+            "/volumes",
+            get(volumes::list_volumes).post(volumes::create_volume),
+        )
         .route(
             "/volumes/{name}",
             get(volumes::inspect_volume).delete(volumes::remove_volume),

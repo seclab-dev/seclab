@@ -679,14 +679,58 @@ export interface DockerSystemInfo {
   ContainersStopped?: number
 }
 
-/** 卷摘要 */
-export interface VolumeSummary {
-  Name: string
-  Driver: string
-  Mountpoint: string
-  Labels: Record<string, string> | null
-  Scope: string
-  CreatedAt: string
+export type DockerVolumeManagementKind = 'suite' | 'compose' | 'custom'
+
+/** Docker 卷归属信息。 */
+export interface DockerVolumeManagement {
+  kind: DockerVolumeManagementKind
+  ownerName?: string
+  readOnly: boolean
+}
+
+/** Docker 卷在当前模块允许执行的操作。 */
+export interface DockerVolumeCapabilities {
+  canRemove: boolean
+}
+
+/** Docker 卷列表摘要。 */
+export interface DockerVolumeSummary {
+  name: string
+  createdAt?: number
+  management: DockerVolumeManagement
+  capabilities: DockerVolumeCapabilities
+}
+
+/** Docker 卷列表响应。 */
+export interface DockerVolumeListResponse {
+  items: DockerVolumeSummary[]
+  warnings: string[]
+}
+
+/** 引用 Docker 卷的容器挂载信息。 */
+export interface DockerVolumeContainerReference {
+  id: string
+  name: string
+  state: string
+  destination?: string
+  readOnly: boolean
+}
+
+/** Docker 卷详情。 */
+export interface DockerVolumeDetail {
+  summary: DockerVolumeSummary
+  mountpoint: string
+  scope: string
+  options: Record<string, string>
+  labels: Record<string, string>
+  referencedContainers: DockerVolumeContainerReference[]
+}
+
+/** Docker 本地卷创建请求。 */
+export interface DockerVolumeCreateRequest {
+  name: string
+  options?: Record<string, string>
+  labels?: Record<string, string>
 }
 
 /** Compose 服务容器 (通过标签筛选) */

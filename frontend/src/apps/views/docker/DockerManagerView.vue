@@ -197,7 +197,6 @@ watch(
         store.stopContainerStatsPolling()
         break
       case 'volumes':
-        fetchAction = store.fetchVolumes()
         store.stopContainerStatsPolling()
         break
       case 'networks':
@@ -298,7 +297,6 @@ onUnmounted(() => {
         :containers="store.containers"
         :projects="store.composeProjects"
         :images-list="store.imagesList"
-        :volumes="store.volumes"
         :container-resource-stats="store.containerResourceStats"
         :is-create-active="
           activeMenu === 'containers'
