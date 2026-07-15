@@ -257,7 +257,11 @@ watch(
   <div class="volume-page" data-page="docker-volumes">
     <div class="volume-toolbar" data-ui="toolbar">
       <div class="toolbar-filters" data-slot="filters">
+        <label class="sr-only" for="docker-volume-search">
+          {{ t('app.docker.volumes.filters.searchPlaceholder') }}
+        </label>
         <SecLabInput
+          id="docker-volume-search"
           v-model="search"
           class="search-input"
           :placeholder="t('app.docker.volumes.filters.searchPlaceholder')"
@@ -344,8 +348,13 @@ watch(
           :title="createError || store.volumeCreateError || ''"
           show-icon
         />
-        <SecLabFormItem :label="t('app.docker.volumes.create.name')" required>
+        <SecLabFormItem
+          :label="t('app.docker.volumes.create.name')"
+          for="docker-volume-name"
+          required
+        >
           <SecLabInput
+            id="docker-volume-name"
             v-model="form.name"
             :placeholder="t('app.docker.volumes.create.namePlaceholder')"
           />
@@ -361,14 +370,26 @@ watch(
           <SecLabFormItem
             :label="t('app.docker.volumes.create.options')"
             :hint="t('app.docker.volumes.create.keyValueHint')"
+            for="docker-volume-options"
           >
-            <SecLabInput v-model="form.options" type="textarea" :rows="4" />
+            <SecLabInput
+              id="docker-volume-options"
+              v-model="form.options"
+              type="textarea"
+              :rows="4"
+            />
           </SecLabFormItem>
           <SecLabFormItem
             :label="t('app.docker.volumes.create.labels')"
             :hint="t('app.docker.volumes.create.labelHint')"
+            for="docker-volume-labels"
           >
-            <SecLabInput v-model="form.labels" type="textarea" :rows="4" />
+            <SecLabInput
+              id="docker-volume-labels"
+              v-model="form.labels"
+              type="textarea"
+              :rows="4"
+            />
           </SecLabFormItem>
         </div>
       </div>
@@ -515,6 +536,17 @@ watch(
 }
 .container-name {
   font-weight: 600;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 @media (max-width: 980px) {
   .volume-toolbar {

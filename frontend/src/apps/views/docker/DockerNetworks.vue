@@ -370,7 +370,11 @@ watch(
   <div class="network-page" data-page="docker-networks">
     <div class="network-toolbar" data-ui="toolbar">
       <div class="toolbar-filters" data-slot="filters">
+        <label class="sr-only" for="docker-network-search">
+          {{ t('app.docker.networks.filters.searchPlaceholder') }}
+        </label>
         <SecLabInput
+          id="docker-network-search"
           v-model="search"
           class="search-input"
           :placeholder="t('app.docker.networks.filters.searchPlaceholder')"
@@ -453,14 +457,22 @@ watch(
       <div class="create-form" data-slot="body">
         <SecLabAlert v-if="createError" type="error" :title="createError" show-icon />
         <div class="form-grid">
-          <SecLabFormItem :label="t('app.docker.networks.create.name')" required>
+          <SecLabFormItem
+            :label="t('app.docker.networks.create.name')"
+            for="docker-network-name"
+            required
+          >
             <SecLabInput
+              id="docker-network-name"
               v-model="form.name"
               :placeholder="t('app.docker.networks.create.namePlaceholder')"
             />
           </SecLabFormItem>
-          <SecLabFormItem :label="t('app.docker.networks.create.driver')">
-            <SecLabInput model-value="bridge" readonly />
+          <SecLabFormItem
+            :label="t('app.docker.networks.create.driver')"
+            for="docker-network-driver"
+          >
+            <SecLabInput id="docker-network-driver" model-value="bridge" readonly />
           </SecLabFormItem>
         </div>
         <SecLabButton type="secondary" size="small" @click="advancedVisible = !advancedVisible">
@@ -473,20 +485,32 @@ watch(
         <div v-if="advancedVisible" class="advanced-fields" data-slot="advanced">
           <div class="form-group-title">{{ t('app.docker.networks.create.ipv4Title') }}</div>
           <div class="form-grid three-columns">
-            <SecLabFormItem :label="t('app.docker.networks.create.subnet')">
+            <SecLabFormItem
+              :label="t('app.docker.networks.create.subnet')"
+              for="docker-network-ipv4-subnet"
+            >
               <SecLabInput
+                id="docker-network-ipv4-subnet"
                 v-model="form.ipv4Subnet"
                 :placeholder="t('app.docker.networks.create.ipv4SubnetPlaceholder')"
               />
             </SecLabFormItem>
-            <SecLabFormItem :label="t('app.docker.networks.create.gateway')">
+            <SecLabFormItem
+              :label="t('app.docker.networks.create.gateway')"
+              for="docker-network-ipv4-gateway"
+            >
               <SecLabInput
+                id="docker-network-ipv4-gateway"
                 v-model="form.ipv4Gateway"
                 :placeholder="t('app.docker.networks.create.ipv4GatewayPlaceholder')"
               />
             </SecLabFormItem>
-            <SecLabFormItem :label="t('app.docker.networks.create.ipRange')">
+            <SecLabFormItem
+              :label="t('app.docker.networks.create.ipRange')"
+              for="docker-network-ipv4-range"
+            >
               <SecLabInput
+                id="docker-network-ipv4-range"
                 v-model="form.ipv4Range"
                 :placeholder="t('app.docker.networks.create.ipv4RangePlaceholder')"
               />
@@ -505,20 +529,32 @@ watch(
           <template v-if="form.enableIpv6">
             <div class="form-group-title">{{ t('app.docker.networks.create.ipv6Title') }}</div>
             <div class="form-grid three-columns">
-              <SecLabFormItem :label="t('app.docker.networks.create.subnet')">
+              <SecLabFormItem
+                :label="t('app.docker.networks.create.subnet')"
+                for="docker-network-ipv6-subnet"
+              >
                 <SecLabInput
+                  id="docker-network-ipv6-subnet"
                   v-model="form.ipv6Subnet"
                   :placeholder="t('app.docker.networks.create.ipv6SubnetPlaceholder')"
                 />
               </SecLabFormItem>
-              <SecLabFormItem :label="t('app.docker.networks.create.gateway')">
+              <SecLabFormItem
+                :label="t('app.docker.networks.create.gateway')"
+                for="docker-network-ipv6-gateway"
+              >
                 <SecLabInput
+                  id="docker-network-ipv6-gateway"
                   v-model="form.ipv6Gateway"
                   :placeholder="t('app.docker.networks.create.ipv6GatewayPlaceholder')"
                 />
               </SecLabFormItem>
-              <SecLabFormItem :label="t('app.docker.networks.create.ipRange')">
+              <SecLabFormItem
+                :label="t('app.docker.networks.create.ipRange')"
+                for="docker-network-ipv6-range"
+              >
                 <SecLabInput
+                  id="docker-network-ipv6-range"
                   v-model="form.ipv6Range"
                   :placeholder="t('app.docker.networks.create.ipv6RangePlaceholder')"
                 />
@@ -528,14 +564,26 @@ watch(
           <SecLabFormItem
             :label="t('app.docker.networks.create.options')"
             :hint="t('app.docker.networks.create.keyValueHint')"
+            for="docker-network-options"
           >
-            <SecLabInput v-model="form.options" type="textarea" :rows="3" />
+            <SecLabInput
+              id="docker-network-options"
+              v-model="form.options"
+              type="textarea"
+              :rows="3"
+            />
           </SecLabFormItem>
           <SecLabFormItem
             :label="t('app.docker.networks.create.labels')"
             :hint="t('app.docker.networks.create.labelHint')"
+            for="docker-network-labels"
           >
-            <SecLabInput v-model="form.labels" type="textarea" :rows="3" />
+            <SecLabInput
+              id="docker-network-labels"
+              v-model="form.labels"
+              type="textarea"
+              :rows="3"
+            />
           </SecLabFormItem>
         </div>
       </div>
@@ -741,6 +789,17 @@ watch(
 }
 .connect-row > :first-child {
   flex: 1;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 @media (max-width: 980px) {
   .network-toolbar {

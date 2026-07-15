@@ -220,21 +220,34 @@ onMounted(() => void fetchLogs())
   <div class="activity-page" data-page="docker-activity-logs">
     <div class="activity-toolbar" data-ui="activity-log-toolbar">
       <div class="filters" data-slot="filters">
-        <SecLabFormItem :label="t('app.docker.activity.filters.level')">
+        <fieldset class="filter-field">
+          <legend class="filter-field-label">
+            {{ t('app.docker.activity.filters.level') }}
+          </legend>
           <SecLabSelect v-model="filters.level" :options="levelOptions" class="short-filter" />
-        </SecLabFormItem>
-        <SecLabFormItem :label="t('app.docker.activity.filters.source')">
+        </fieldset>
+        <fieldset class="filter-field">
+          <legend class="filter-field-label">
+            {{ t('app.docker.activity.filters.source') }}
+          </legend>
           <SecLabSelect v-model="filters.actorKind" :options="actorOptions" class="short-filter" />
-        </SecLabFormItem>
-        <SecLabFormItem :label="t('app.docker.activity.filters.keyword')">
+        </fieldset>
+        <SecLabFormItem
+          :label="t('app.docker.activity.filters.keyword')"
+          for="docker-activity-log-keyword"
+        >
           <SecLabInput
+            id="docker-activity-log-keyword"
             v-model="filters.keyword"
             class="keyword-filter"
             :placeholder="t('app.docker.activity.filters.keywordPlaceholder')"
             @keyup.enter="applyFilters"
           />
         </SecLabFormItem>
-        <SecLabFormItem :label="t('app.docker.activity.filters.timeRange')">
+        <fieldset class="filter-field">
+          <legend class="filter-field-label">
+            {{ t('app.docker.activity.filters.timeRange') }}
+          </legend>
           <SecLabDateTimeRangePicker
             v-model="filters.timeRange"
             class="time-filter"
@@ -252,7 +265,7 @@ onMounted(() => void fetchLogs())
             :cancel-label="t('common.cancel')"
             @apply="applyFilters"
           />
-        </SecLabFormItem>
+        </fieldset>
       </div>
       <div class="toolbar-actions" data-slot="actions">
         <SecLabButton type="primary" :loading="refreshing" @click="applyFilters">
@@ -344,6 +357,20 @@ onMounted(() => void fetchLogs())
   flex-wrap: wrap;
   gap: var(--sdl-space-3);
   min-width: 0;
+}
+.filter-field {
+  min-width: 0;
+  margin: 0 0 var(--sdl-space-4);
+  padding: 0;
+  border: 0;
+}
+.filter-field-label {
+  margin-bottom: var(--sdl-space-2);
+  padding: 0;
+  color: var(--sdl-text-secondary);
+  font-size: var(--sdl-font-body-sm);
+  font-weight: 600;
+  line-height: 1.4;
 }
 .toolbar-actions {
   display: flex;
