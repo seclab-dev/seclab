@@ -159,6 +159,7 @@ const submitCreate = async () => {
 }
 
 const openConfiguration = async (name: string) => {
+  store.clearComposeProjectConfiguration()
   configurationProjectName.value = name
   configurationYaml.value = ''
   configurationError.value = ''
@@ -166,6 +167,13 @@ const openConfiguration = async (name: string) => {
   if (await store.fetchComposeProjectConfiguration(name)) {
     configurationYaml.value = store.projectConfiguration?.composeYaml || ''
   }
+}
+const closeConfiguration = () => {
+  configurationVisible.value = false
+  configurationProjectName.value = ''
+  configurationYaml.value = ''
+  configurationError.value = ''
+  store.clearComposeProjectConfiguration()
 }
 const saveConfiguration = async () => {
   if (!store.projectConfiguration) return
@@ -184,7 +192,7 @@ const saveConfiguration = async () => {
     store.projectConfiguration.revision,
   )
   if (saved) {
-    configurationVisible.value = false
+    closeConfiguration()
     await loadProjects()
   } else {
     configurationError.value = store.projectConfigurationError || t('common.unknownError')
@@ -300,7 +308,7 @@ watch(
   () => nodeStore.currentNodeId,
   () => {
     closeDetail()
-    configurationVisible.value = false
+    closeConfiguration()
     tasksVisible.value = false
     void Promise.all([loadProjects(1), store.fetchComposeProjectTasks()])
   },
@@ -497,7 +505,7 @@ onUnmounted(() => {
       :title="t('app.docker.projects.configuration.title', { name: configurationProjectName })"
       width="820px"
       data-ui="project-configuration-drawer"
-      @close="store.clearComposeProjectConfiguration"
+      @close="closeConfiguration"
     >
       <div class="configuration-content" data-slot="body">
         <SecLabAlert
@@ -530,7 +538,7 @@ onUnmounted(() => {
         />
       </div>
       <template #footer>
-        <SecLabButton @click="configurationVisible = false">{{ t('common.cancel') }}</SecLabButton>
+        <SecLabButton @click="closeConfiguration">{{ t('common.cancel') }}</SecLabButton>
         <SecLabButton
           type="primary"
           :loading="store.projectMutationLoading"
@@ -732,10 +740,6 @@ onUnmounted(() => {
 }
 .required-mark {
   color: var(--sdl-color-danger);
-}
-.configuration-editor {
-  flex: 1;
-  height: auto;
 }
 @media (max-width: 860px) {
   .project-toolbar,
