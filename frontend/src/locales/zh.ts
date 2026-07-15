@@ -869,6 +869,12 @@ const zh: typeof en = {
             loading: '载入镜像',
             pulling: '仓库拉取',
           },
+          finalStage: {
+            target: '已存在',
+            controller: '已载入',
+            registry: '已拉取',
+            cancelled: '已取消',
+          },
         },
       },
       networks: {

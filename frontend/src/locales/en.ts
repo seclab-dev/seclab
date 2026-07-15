@@ -887,6 +887,12 @@ const en = {
             loading: 'Loading',
             pulling: 'Registry Pull',
           },
+          finalStage: {
+            target: 'Already Present',
+            controller: 'Loaded',
+            registry: 'Pulled',
+            cancelled: 'Cancelled',
+          },
         },
       },
       networks: {

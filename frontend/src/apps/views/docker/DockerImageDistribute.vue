@@ -42,6 +42,7 @@ const nodesLoading = ref(false)
 const nodesError = ref('')
 let nodeRequestSequence = 0
 let pollTimer: number | null = null
+let viewActive = false
 
 const controllerImageOptions = computed(() =>
   store.controllerImages.flatMap((image) => {
@@ -81,7 +82,12 @@ const failedTargets = computed(
 
 const nodeColumns = computed<SecLabTableColumn[]>(() => [
   { label: '', width: 52, slot: 'selection', headerSlot: 'selectionHeader', align: 'center' },
-  { label: t('app.docker.images.distribute.nodes.name'), minWidth: 180, slot: 'name' },
+  {
+    label: t('app.docker.images.distribute.nodes.name'),
+    minWidth: 180,
+    prop: 'name',
+    align: 'center',
+  },
   {
     label: t('app.docker.images.distribute.nodes.address'),
     minWidth: 180,
@@ -202,7 +208,7 @@ function clearPollTimer() {
 
 function schedulePoll(delay = POLL_INTERVAL_MS) {
   clearPollTimer()
-  if (!taskActive.value || document.hidden) return
+  if (!viewActive || !taskActive.value || document.hidden) return
   pollTimer = window.setTimeout(async () => {
     await store.fetchImageDistributionTask()
     schedulePoll()
@@ -231,7 +237,13 @@ function stageLabel(stage: DockerImageStage) {
 }
 
 function targetStageLabel(target: DockerImageDistributionTarget) {
-  return terminalStatuses.includes(target.status) ? '-' : stageLabel(target.stage)
+  if (target.status === 'success' && target.source) {
+    return t(`app.docker.images.distribute.finalStage.${target.source}`)
+  }
+  if (target.status === 'cancelled') {
+    return t('app.docker.images.distribute.finalStage.cancelled')
+  }
+  return stageLabel(target.stage)
 }
 
 watch(
@@ -251,19 +263,22 @@ watch(
 )
 
 onMounted(async () => {
+  viewActive = true
   document.addEventListener('visibilitychange', handleVisibilityChange)
   await Promise.all([
     store.fetchControllerImages(),
     store.fetchRecentImageDistributionTask(),
     fetchNodes(),
   ])
-  if (taskActive.value) schedulePoll(0)
+  if (viewActive && taskActive.value) schedulePoll(0)
 })
 
 onBeforeUnmount(() => {
+  viewActive = false
   nodeRequestSequence += 1
   clearPollTimer()
   document.removeEventListener('visibilitychange', handleVisibilityChange)
+  store.leaveImageDistributionView()
 })
 </script>
 
@@ -322,9 +337,6 @@ onBeforeUnmount(() => {
         <div class="task-header" data-slot="header">
           <div class="task-title">
             <span>{{ store.imageDistributionTask.imageRef }}</span>
-            <SecLabTag :type="statusType(store.imageDistributionTask.status)">
-              {{ statusLabel(store.imageDistributionTask.status) }}
-            </SecLabTag>
           </div>
           <div class="task-actions">
             <SecLabButton
@@ -341,7 +353,12 @@ onBeforeUnmount(() => {
             </SecLabButton>
           </div>
         </div>
-        <SecLabTable :data="store.imageDistributionTask.targets" :columns="progressColumns" border>
+        <SecLabTable
+          :data="store.imageDistributionTask.targets"
+          :columns="progressColumns"
+          class="distribution-table"
+          border
+        >
           <template #status="{ row }: { row: DockerImageDistributionTarget }">
             <SecLabTag :type="statusType(row.status)" size="small">
               {{ statusLabel(row.status) }}
@@ -414,12 +431,6 @@ onBeforeUnmount(() => {
                 :disabled="row.status !== 'online'"
                 @change="(checked) => toggleNode(row, checked)"
               />
-            </template>
-            <template #name="{ row }: { row: NodeSummaryResponse }">
-              <div class="node-name-cell">
-                <span>{{ row.name }}</span>
-                <span class="node-id">{{ row.nodeId }}</span>
-              </div>
             </template>
             <template #address="{ row }: { row: NodeSummaryResponse }">
               {{ row.address || '-' }}
@@ -515,13 +526,21 @@ onBeforeUnmount(() => {
   position: relative;
   flex: 1;
   min-height: 180px;
-  overflow: auto;
+  overflow: hidden;
 }
 
 .task-result {
   display: flex;
   flex-direction: column;
+  height: 100%;
+  min-height: 0;
   gap: var(--sdl-space-3);
+}
+
+.distribution-table {
+  flex: 1;
+  height: auto;
+  min-height: 0;
 }
 
 .task-header,
@@ -589,17 +608,6 @@ onBeforeUnmount(() => {
   max-height: 360px;
   min-height: 160px;
   overflow: auto;
-}
-
-.node-name-cell {
-  display: grid;
-  gap: 2px;
-}
-
-.node-id {
-  color: var(--sdl-text-muted);
-  font-family: var(--sdl-font-mono);
-  font-size: var(--sdl-font-body-xs);
 }
 
 @media (max-width: 760px) {

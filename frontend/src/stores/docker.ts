@@ -551,7 +551,7 @@ export const useDockerStore = defineStore('docker', () => {
       }
       const tasks = res.data || []
       imageDistributionTask.value =
-        tasks.find((task) => ['pending', 'running'].includes(task.status)) || tasks[0] || null
+        tasks.find((task) => ['pending', 'running'].includes(task.status)) || null
       return true
     } catch (error) {
       if (sequence === imageDistributionRequestSequence) {
@@ -568,10 +568,13 @@ export const useDockerStore = defineStore('docker', () => {
     payload: dockerType.DockerImageDistributionCreateRequest,
   ): Promise<boolean> => {
     if (imageDistributionStarting.value) return false
+    const sequence = ++imageDistributionRequestSequence
+    imageDistributionLoading.value = false
     imageDistributionStarting.value = true
     imageDistributionError.value = null
     try {
       const res = await dockerApi.startImageDistributionTask(payload)
+      if (sequence !== imageDistributionRequestSequence) return false
       if (!res.success || !res.data) {
         imageDistributionError.value = res.message || t('common.unknownError')
         return false
@@ -579,17 +582,26 @@ export const useDockerStore = defineStore('docker', () => {
       imageDistributionTask.value = res.data
       return true
     } catch (error) {
-      imageDistributionError.value = error instanceof Error ? error.message : String(error)
+      if (sequence === imageDistributionRequestSequence) {
+        imageDistributionError.value = error instanceof Error ? error.message : String(error)
+      }
       return false
     } finally {
-      imageDistributionStarting.value = false
+      if (sequence === imageDistributionRequestSequence) imageDistributionStarting.value = false
     }
   }
 
   /** 刷新当前批量分发任务，禁止轮询请求重叠。 */
   const fetchImageDistributionTask = async (): Promise<boolean> => {
     const taskId = imageDistributionTask.value?.taskId
-    if (!taskId || imageDistributionLoading.value) return false
+    if (
+      !taskId ||
+      imageDistributionLoading.value ||
+      imageDistributionStarting.value ||
+      imageDistributionCanceling.value
+    ) {
+      return false
+    }
     const sequence = ++imageDistributionRequestSequence
     imageDistributionLoading.value = true
     try {
@@ -616,9 +628,12 @@ export const useDockerStore = defineStore('docker', () => {
   const cancelImageDistribution = async (): Promise<boolean> => {
     const taskId = imageDistributionTask.value?.taskId
     if (!taskId || imageDistributionCanceling.value) return false
+    const sequence = ++imageDistributionRequestSequence
+    imageDistributionLoading.value = false
     imageDistributionCanceling.value = true
     try {
       const res = await dockerApi.cancelImageDistributionTask(taskId)
+      if (sequence !== imageDistributionRequestSequence) return false
       if (!res.success || !res.data) {
         imageDistributionError.value = res.message || t('common.unknownError')
         return false
@@ -626,10 +641,27 @@ export const useDockerStore = defineStore('docker', () => {
       imageDistributionTask.value = res.data
       return true
     } catch (error) {
-      imageDistributionError.value = error instanceof Error ? error.message : String(error)
+      if (sequence === imageDistributionRequestSequence) {
+        imageDistributionError.value = error instanceof Error ? error.message : String(error)
+      }
       return false
     } finally {
-      imageDistributionCanceling.value = false
+      if (sequence === imageDistributionRequestSequence) imageDistributionCanceling.value = false
+    }
+  }
+
+  /** 离开镜像分发页面时废弃在途请求，并清除页面级终态与错误。 */
+  const leaveImageDistributionView = () => {
+    imageDistributionRequestSequence += 1
+    imageDistributionLoading.value = false
+    imageDistributionError.value = null
+    imageDistributionStarting.value = false
+    imageDistributionCanceling.value = false
+    if (
+      imageDistributionTask.value &&
+      ['success', 'failed', 'cancelled'].includes(imageDistributionTask.value.status)
+    ) {
+      imageDistributionTask.value = null
     }
   }
 
@@ -1648,6 +1680,7 @@ export const useDockerStore = defineStore('docker', () => {
     startImageDistribution,
     fetchImageDistributionTask,
     cancelImageDistribution,
+    leaveImageDistributionView,
     fetchNetworks,
     fetchVolumes,
     fetchVolumeDetail,
