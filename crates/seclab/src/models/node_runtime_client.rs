@@ -8,7 +8,7 @@ use axum::{
     http::{HeaderMap, header},
     response::Response,
 };
-use reqwest::{Client, Method};
+use reqwest::{Client, Method, RequestBuilder, StatusCode};
 use seclab_security::client::build_mtls_client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -146,19 +146,63 @@ impl NodeRuntimeClient {
         context: &AgentOperationContext,
     ) -> anyhow::Result<T> {
         let url = self.build_uri(path);
+        let mut request = apply_operation_context(
+            self.client.post(url),
+            "user",
+            &context.actor_name,
+            Some(&context.client_ip),
+            &context.trace_id,
+        )
+        .json(payload);
+        if is_long_running_request(path) {
+            request = request.timeout(Duration::from_secs(PROXY_LONG_RUNNING_REQUEST_TIMEOUT_SECS));
+        }
+        let response = request.send().await?;
+        decode_json_response("POST", path, response).await
+    }
+
+    /// 为后台任务请求注入可信系统操作上下文。
+    pub fn with_system_operation_context(
+        &self,
+        request: RequestBuilder,
+        source: &str,
+        trace_id: &str,
+    ) -> RequestBuilder {
+        apply_operation_context(request, "system", source, None, trace_id)
+    }
+
+    /// 携带可信系统操作上下文发起 POST 请求。
+    pub async fn post_json_with_system_context<T: DeserializeOwned, B: Serialize>(
+        &self,
+        path: &str,
+        payload: &B,
+        source: &str,
+        trace_id: &str,
+    ) -> anyhow::Result<T> {
+        let url = self.build_uri(path);
         let mut request = self
-            .client
-            .post(url)
-            .header("x-seclab-actor-kind", "user")
-            .header("x-seclab-actor-name", &context.actor_name)
-            .header("x-seclab-client-ip", &context.client_ip)
-            .header("x-seclab-trace-id", &context.trace_id)
+            .with_system_operation_context(self.client.post(url), source, trace_id)
             .json(payload);
         if is_long_running_request(path) {
             request = request.timeout(Duration::from_secs(PROXY_LONG_RUNNING_REQUEST_TIMEOUT_SECS));
         }
         let response = request.send().await?;
         decode_json_response("POST", path, response).await
+    }
+
+    /// 携带可信系统操作上下文发起 DELETE 请求。
+    pub async fn delete_json_with_system_context<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        source: &str,
+        trace_id: &str,
+    ) -> anyhow::Result<T> {
+        let url = self.build_uri(path);
+        let response = self
+            .with_system_operation_context(self.client.delete(url), source, trace_id)
+            .send()
+            .await?;
+        decode_json_response("DELETE", path, response).await
     }
 
     /// 发起 PUT 请求并解析 JSON 响应。
@@ -231,6 +275,23 @@ impl NodeRuntimeClient {
     }
 }
 
+fn apply_operation_context(
+    request: RequestBuilder,
+    actor_kind: &str,
+    actor_name: &str,
+    client_ip: Option<&str>,
+    trace_id: &str,
+) -> RequestBuilder {
+    let request = request
+        .header("x-seclab-actor-kind", actor_kind)
+        .header("x-seclab-actor-name", actor_name)
+        .header("x-seclab-trace-id", trace_id);
+    match client_ip {
+        Some(client_ip) => request.header("x-seclab-client-ip", client_ip),
+        None => request,
+    }
+}
+
 fn is_long_running_request(path: &str) -> bool {
     path.contains("/agent/tasks/execute")
         || path.contains("/agent/docker/install")
@@ -256,29 +317,45 @@ async fn decode_json_response<T: DeserializeOwned>(
 ) -> anyhow::Result<T> {
     let status = resp.status();
     let body = resp.text().await?;
-    match serde_json::from_str::<T>(&body) {
+    decode_json_body(method, path, status, &body)
+}
+
+fn decode_json_body<T: DeserializeOwned>(
+    method: &'static str,
+    path: &str,
+    status: StatusCode,
+    body: &str,
+) -> anyhow::Result<T> {
+    if let Ok(error_response) = serde_json::from_str::<RuntimeErrorResponse>(body)
+        && !error_response.success
+    {
+        let detail = runtime_error_detail(&error_response);
+        tracing::warn!(
+            method,
+            path,
+            status = status.as_u16(),
+            response_body = %preview_body(body),
+            "node runtime returned api error response"
+        );
+        return Err(anyhow::anyhow!(
+            "runtime api error: status={}; message={}; detail={detail}",
+            status.as_u16(),
+            error_response.message
+        ));
+    }
+
+    if !status.is_success() {
+        return Err(anyhow::anyhow!(
+            "runtime api error: status={}; body={}",
+            status.as_u16(),
+            preview_body(body)
+        ));
+    }
+
+    match serde_json::from_str::<T>(body) {
         Ok(data) => Ok(data),
         Err(err) => {
-            let preview = preview_body(&body);
-            if let Ok(error_response) = serde_json::from_str::<RuntimeErrorResponse>(&body)
-                && !error_response.success
-            {
-                let detail = runtime_error_detail(&error_response);
-                tracing::warn!(
-                    method,
-                    path,
-                    status = status.as_u16(),
-                    error = %err,
-                    response_body = %preview,
-                    "node runtime returned api error response"
-                );
-                return Err(anyhow::anyhow!(
-                    "runtime api error: status={}; message={}; detail={detail}",
-                    status.as_u16(),
-                    error_response.message
-                ));
-            }
-
+            let preview = preview_body(body);
             tracing::error!(
                 method,
                 path,
@@ -419,14 +496,51 @@ fn dedupe_vary(headers: &mut HeaderMap) {
 
 #[cfg(test)]
 mod tests {
-    use super::{NodeRuntimeClient, is_long_running_request};
+    use super::{
+        NodeRuntimeClient, StatusCode, apply_operation_context, decode_json_body,
+        is_long_running_request,
+    };
     use crate::models::node_identities::{NodeIdentityRecord, insert_node_identity};
     use crate::models::node_sessions::{NodeSessionRecord, insert_node_session};
     use crate::models::nodes::{NewNodeRecord, insert_node};
     use crate::test_support::setup_test_db;
     use chrono::{Duration, Utc};
     use seclab_contracts::api::ErrorCode;
+    use serde_json::Value;
     use uuid::Uuid;
+
+    #[test]
+    fn system_operation_context_sets_trusted_headers() {
+        let request = apply_operation_context(
+            reqwest::Client::new().post("http://localhost/test"),
+            "system",
+            "image-acquisition",
+            None,
+            "trace-1",
+        )
+        .build()
+        .unwrap();
+        assert_eq!(request.headers()["x-seclab-actor-kind"], "system");
+        assert_eq!(
+            request.headers()["x-seclab-actor-name"],
+            "image-acquisition"
+        );
+        assert_eq!(request.headers()["x-seclab-trace-id"], "trace-1");
+        assert!(!request.headers().contains_key("x-seclab-client-ip"));
+    }
+
+    #[test]
+    fn value_response_does_not_hide_runtime_api_error() {
+        let result = decode_json_body::<Value>(
+            "POST",
+            "/api/v1/agent/docker/image-pull-tasks",
+            StatusCode::FORBIDDEN,
+            r#"{"success":false,"code":403,"message":"access forbidden","errorCode":"AUTH_FORBIDDEN","data":"AUTH_FORBIDDEN"}"#,
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("status=403"));
+        assert!(error.contains("AUTH_FORBIDDEN"));
+    }
 
     #[test]
     fn suite_progress_stream_uses_long_timeout() {

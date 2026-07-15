@@ -22,6 +22,7 @@ use uuid::Uuid;
 const AGENT_AVAILABILITY_PATH: &str = "/api/v1/agent/docker/images/availability";
 const AGENT_LOAD_PATH: &str = "/api/v1/agent/docker/images/load";
 const AGENT_PULL_TASKS_PATH: &str = "/api/v1/agent/docker/image-pull-tasks";
+const AGENT_OPERATION_SOURCE: &str = "image-acquisition";
 const TASK_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_DISTRIBUTION_ERROR_CHARS: usize = 512;
 
@@ -433,6 +434,9 @@ impl ImageAcquisitionService {
     ) -> anyhow::Result<ImageSource> {
         self.set_stage(task_id, ImageStage::Checking, 5, "Checking target image");
         let client = NodeRuntimeClient::from_node_route(&state.metadata_db, Some(node_id)).await?;
+        let trace_id = task_id
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         if image_available(&client, image_ref).await? {
             return Ok(ImageSource::Target);
         }
@@ -457,6 +461,7 @@ impl ImageAcquisitionService {
                 &client,
                 image_ref,
                 Arc::clone(cancel),
+                &trace_id,
                 move |progress| {
                     service.set_stage(
                         progress_task_id.as_deref(),
@@ -491,7 +496,7 @@ impl ImageAcquisitionService {
             80,
             "Pulling image from registry",
         );
-        match pull_from_registry(&client, image_ref, cancel, |progress, text| {
+        match pull_from_registry(&client, image_ref, cancel, &trace_id, |progress, text| {
             self.update_optional(task_id, |task| {
                 task.progress_percent = (80 + progress / 5).min(99);
                 task.status_text = text;
@@ -673,6 +678,7 @@ async fn transfer_controller_image(
     client: &NodeRuntimeClient,
     image_ref: &str,
     cancel: Arc<AtomicBool>,
+    trace_id: &str,
     progress: impl Fn(u8) + Send + Sync + 'static,
 ) -> anyhow::Result<()> {
     let stream = docker
@@ -694,11 +700,13 @@ async fn transfer_controller_image(
     let part = reqwest::multipart::Part::stream(reqwest::Body::wrap_stream(stream))
         .file_name("image.tar")
         .mime_str("application/x-tar")?;
-    let response = client
+    let request = client
         .client
         .post(client.build_uri(AGENT_LOAD_PATH))
         .multipart(reqwest::multipart::Form::new().part("file", part))
-        .timeout(Duration::from_secs(600))
+        .timeout(Duration::from_secs(600));
+    let response = client
+        .with_system_operation_context(request, AGENT_OPERATION_SOURCE, trace_id)
         .send()
         .await?;
     if response.status().is_success() {
@@ -716,12 +724,15 @@ async fn pull_from_registry(
     client: &NodeRuntimeClient,
     image_ref: &str,
     cancel: &Arc<AtomicBool>,
+    trace_id: &str,
     progress: impl Fn(u8, String),
 ) -> anyhow::Result<()> {
     let response: Value = client
-        .post_json(
+        .post_json_with_system_context(
             AGENT_PULL_TASKS_PATH,
             &serde_json::json!({"imageName": image_ref}),
+            AGENT_OPERATION_SOURCE,
+            trace_id,
         )
         .await?;
     let task_id = response
@@ -732,7 +743,11 @@ async fn pull_from_registry(
     loop {
         if cancel.load(Ordering::Relaxed) {
             let _: Value = client
-                .delete_json(&format!("{AGENT_PULL_TASKS_PATH}/{task_id}"))
+                .delete_json_with_system_context(
+                    &format!("{AGENT_PULL_TASKS_PATH}/{task_id}"),
+                    AGENT_OPERATION_SOURCE,
+                    trace_id,
+                )
                 .await?;
             return Err(anyhow!("image acquisition cancelled"));
         }
