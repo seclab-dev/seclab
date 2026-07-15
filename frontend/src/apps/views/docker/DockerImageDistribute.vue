@@ -82,13 +82,38 @@ const failedTargets = computed(
 const nodeColumns = computed<SecLabTableColumn[]>(() => [
   { label: '', width: 52, slot: 'selection', headerSlot: 'selectionHeader', align: 'center' },
   { label: t('app.docker.images.distribute.nodes.name'), minWidth: 180, slot: 'name' },
-  { label: t('app.docker.images.distribute.nodes.address'), minWidth: 180, slot: 'address' },
-  { label: t('app.docker.images.distribute.nodes.status'), width: 100, slot: 'status' },
+  {
+    label: t('app.docker.images.distribute.nodes.address'),
+    minWidth: 180,
+    slot: 'address',
+    align: 'center',
+  },
+  {
+    label: t('app.docker.images.distribute.nodes.status'),
+    width: 100,
+    slot: 'status',
+    align: 'center',
+  },
 ])
 const progressColumns = computed<SecLabTableColumn[]>(() => [
-  { label: t('app.docker.images.distribute.nodes.name'), minWidth: 160, prop: 'nodeName' },
-  { label: t('app.docker.images.distribute.progress.status'), width: 110, slot: 'status' },
-  { label: t('app.docker.images.distribute.progress.stage'), width: 120, slot: 'stage' },
+  {
+    label: t('app.docker.images.distribute.nodes.name'),
+    minWidth: 160,
+    prop: 'nodeName',
+    align: 'center',
+  },
+  {
+    label: t('app.docker.images.distribute.progress.status'),
+    width: 110,
+    slot: 'status',
+    align: 'center',
+  },
+  {
+    label: t('app.docker.images.distribute.progress.stage'),
+    width: 120,
+    slot: 'stage',
+    align: 'center',
+  },
   { label: t('app.docker.images.distribute.progress.progress'), minWidth: 180, slot: 'progress' },
   { label: t('app.docker.images.distribute.progress.error'), minWidth: 220, slot: 'error' },
 ])
