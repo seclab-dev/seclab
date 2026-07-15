@@ -139,7 +139,7 @@ fn summarize_container_states(containers: &[ContainerSummary]) -> docker::Contai
 
 /// 汇总登记 Compose 项目的健康状态分布。
 fn summarize_project_states(
-    projects: &[docker::ComposeProjectSummary],
+    projects: &[docker::DockerProjectSummary],
 ) -> docker::ProjectStateCounts {
     let mut counts = docker::ProjectStateCounts {
         total: projects.len(),
@@ -149,19 +149,11 @@ fn summarize_project_states(
         unknown: 0,
     };
     for project in projects {
-        if project.total_containers > 0 && project.running_containers == project.total_containers {
-            counts.healthy += 1;
-        } else if project.running_containers > 0
-            || project.paused_containers > 0
-            || project.restarting_containers > 0
-        {
-            counts.partial += 1;
-        } else if project.total_containers == 0
-            || project.exited_containers == project.total_containers
-        {
-            counts.stopped += 1;
-        } else {
-            counts.unknown += 1;
+        match project.runtime_state {
+            docker::DockerProjectRuntimeState::Running => counts.healthy += 1,
+            docker::DockerProjectRuntimeState::Partial => counts.partial += 1,
+            docker::DockerProjectRuntimeState::Stopped => counts.stopped += 1,
+            docker::DockerProjectRuntimeState::Unknown => counts.unknown += 1,
         }
     }
     counts
@@ -207,14 +199,13 @@ pub fn docker_router() -> Router<Arc<AppState>> {
             post(containers::batch_container_action),
         )
         .route(
-            "/compose/containers",
-            get(containers::list_project_containers),
-        )
-        .route(
             "/compose/projects",
             get(compose::list_projects).post(compose::create_project),
         )
-        .route("/compose/root", get(compose::compose_root))
+        .route(
+            "/compose/projects/{name}",
+            get(compose::project_detail).delete(compose::remove_project),
+        )
         .route(
             "/compose/projects/{name}/start",
             post(compose::start_project),
@@ -224,12 +215,27 @@ pub fn docker_router() -> Router<Arc<AppState>> {
             "/compose/projects/{name}/restart",
             post(compose::restart_project),
         )
-        .route("/compose/projects/{name}/logs", get(compose::project_logs))
         .route(
-            "/compose/projects/{name}/update",
-            post(compose::update_project),
+            "/compose/projects/{name}/deployments",
+            post(compose::redeploy_project),
         )
-        .route("/compose/projects/{name}", delete(compose::delete_project))
+        .route(
+            "/compose/projects/{name}/services/{service}/replicas",
+            axum::routing::put(compose::scale_project_service),
+        )
+        .route(
+            "/compose/projects/{name}/configuration",
+            get(compose::project_configuration).put(compose::update_project_configuration),
+        )
+        .route(
+            "/compose/configurations/validate",
+            post(compose::validate_configuration),
+        )
+        .route("/compose/project-tasks", get(compose::list_project_tasks))
+        .route(
+            "/compose/project-tasks/{task_id}",
+            get(compose::project_task).delete(compose::cancel_project_task),
+        )
         .route(
             "/containers/{id}",
             get(containers::inspect_container).delete(containers::remove_container),
@@ -311,11 +317,6 @@ pub fn docker_router() -> Router<Arc<AppState>> {
             "/volumes/{name}",
             get(volumes::inspect_volume).delete(volumes::remove_volume),
         )
-        .route(
-            "/compose/projects/{name}/scale",
-            post(compose::scale_project),
-        )
-        .route("/compose/validate", post(compose::validate_compose))
         .route("/suites/install", post(suites::install_suite))
         .route("/suites/install-progress", get(suites::install_progress))
         .route(
@@ -346,7 +347,11 @@ pub fn docker_router() -> Router<Arc<AppState>> {
 #[cfg(test)]
 mod tests {
     use super::summarize_project_states;
-    use crate::models::docker::ComposeProjectSummary;
+    use crate::models::docker::{
+        DockerProjectCapabilities, DockerProjectConfigurationState, DockerProjectContainerStates,
+        DockerProjectManageVia, DockerProjectManagement, DockerProjectManagementKind,
+        DockerProjectRuntimeState, DockerProjectSummary,
+    };
 
     fn project(
         total: usize,
@@ -354,18 +359,37 @@ mod tests {
         paused: usize,
         restarting: usize,
         exited: usize,
-    ) -> ComposeProjectSummary {
-        ComposeProjectSummary {
+    ) -> DockerProjectSummary {
+        let runtime_state = if total > 0 && running == total {
+            DockerProjectRuntimeState::Running
+        } else if running > 0 || paused > 0 || restarting > 0 {
+            DockerProjectRuntimeState::Partial
+        } else if total == 0 || exited == total {
+            DockerProjectRuntimeState::Stopped
+        } else {
+            DockerProjectRuntimeState::Unknown
+        };
+        DockerProjectSummary {
             name: "project".to_string(),
-            status: "unknown".to_string(),
-            total_containers: total,
-            running_containers: running,
-            exited_containers: exited,
-            paused_containers: paused,
-            restarting_containers: restarting,
-            has_compose_file: true,
-            compose_dir: None,
-            project_type: None,
+            created_at: 0,
+            runtime_state,
+            configuration_state: DockerProjectConfigurationState::Applied,
+            service_count: 1,
+            container_states: DockerProjectContainerStates {
+                total,
+                running,
+                exited,
+                paused,
+                restarting,
+                other: 0,
+            },
+            management: DockerProjectManagement {
+                kind: DockerProjectManagementKind::Custom,
+                owner_name: None,
+                read_only: false,
+                manage_via: DockerProjectManageVia::Projects,
+            },
+            capabilities: DockerProjectCapabilities::default(),
         }
     }
 

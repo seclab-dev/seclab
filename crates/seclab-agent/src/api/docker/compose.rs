@@ -1,695 +1,1397 @@
-//! Docker Compose API：项目列表、详情与操作。
-//! 基于数据库 docker_compose_projects 进行干净的项目登记与路径维护。
+//! Docker Compose 项目查询、详情与配置 API。
 
-use crate::api::docker::containers::format_log_output;
 use crate::api::docker::context::DockerOperationContext;
 use crate::config;
 use crate::models::docker;
+use crate::services::docker_project_tasks::{self, ComposeCommandResult, NewDockerProjectTask};
+use crate::services::docker_projects::{
+    self, COMPOSE_FILE_NAME, DockerProjectRecord, MAX_COMPOSE_BYTES,
+};
 use crate::state::AppState;
 use crate::types::{ApiError, ApiResponse, ApiResult};
-
 use axum::extract::{Json, Path, Query, State};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use bollard::models::ContainerSummaryStateEnum;
-use bollard::query_parameters::{self, LogsOptions};
-use chrono::{DateTime, Utc};
-use futures_util::StreamExt;
+use bollard::models::ContainerSummary;
+use bollard::query_parameters;
+use seclab_contracts::api::ErrorCode;
 use serde::Deserialize;
-use serde_json::json;
-use std::collections::HashMap;
+use serde_json::Value;
+use sqlx::Row;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path as FsPath, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tracing::info;
+use uuid::Uuid;
 
-const COMPOSE_FILE_NAME: &str = "compose.yaml";
+const COMPOSE_VALIDATION_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// 解析项目的存储目录与形态类型。
-/// 仅从数据库获取项目路径与类型，若记录不存在则直接返回错误。
-async fn resolve_project_meta(
-    state: &Arc<AppState>,
-    name: &str,
-) -> Result<(PathBuf, String), ApiError> {
-    let project = normalize_project_name(name)?;
-    let row = sqlx::query(
-        "SELECT compose_dir, project_type FROM docker_compose_projects WHERE name = ?1",
-    )
-    .bind(&project)
-    .fetch_optional(&state.metadata_db)
-    .await?;
-
-    if let Some(row) = row {
-        use sqlx::Row;
-        let dir: String = row.try_get("compose_dir")?;
-        let ptype: String = row.try_get("project_type")?;
-        Ok((PathBuf::from(dir), ptype))
-    } else {
-        Err(ApiError::BadRequest(format!(
-            "Compose project not registered in database: {}",
-            project
-        )))
-    }
-}
-
-/// 确保 Compose 文件存在并返回其路径。
-async fn ensure_compose_file(state: &Arc<AppState>, project: &str) -> Result<PathBuf, ApiError> {
-    let (dir, _) = resolve_project_meta(state, project).await?;
-    let compose_file = dir.join(COMPOSE_FILE_NAME);
-    if tokio::fs::metadata(&compose_file).await.is_err() {
-        return Err(ApiError::BadRequest(format!(
-            "Compose file does not exist: {}",
-            compose_file.display()
-        )));
-    }
-    Ok(compose_file)
-}
-
-/// 写入 compose 文件并启动项目。
-pub async fn create_project(
-    State(state): State<Arc<AppState>>,
-    context: DockerOperationContext,
-    Json(payload): Json<docker::ComposeProjectCreateRequest>,
-) -> ApiResult<Response> {
-    let requested_name = payload.name.clone();
-    let result: ApiResult<Response> = async {
-    let project = normalize_project_name(&payload.name)?;
-    let ptype = payload
-        .project_type
-        .clone()
-        .unwrap_or_else(|| "docker".to_string());
-
-    let dir = if let Some(custom_dir) = payload.dir.filter(|d| !d.trim().is_empty()) {
-        let p = PathBuf::from(custom_dir);
-        if p.is_absolute() {
-            p
-        } else {
-            config::compose_root_dir().join(p)
-        }
-    } else {
-        let sub_dir = if ptype == "docker" { "docker" } else { &ptype };
-        config::compose_root_dir().join(sub_dir).join(&project)
-    };
-
-    tokio::fs::create_dir_all(&dir).await?;
-    let compose_file = dir.join(COMPOSE_FILE_NAME);
-    tokio::fs::write(&compose_file, payload.compose).await?;
-
-    let dir_str = dir.to_string_lossy().to_string();
-    sqlx::query(
-        "INSERT OR REPLACE INTO docker_compose_projects (name, compose_dir, project_type) VALUES (?1, ?2, ?3)",
-    )
-    .bind(&project)
-    .bind(&dir_str)
-    .bind(&ptype)
-    .execute(&state.metadata_db)
-    .await?;
-
-    run_compose_command(&project, &compose_file, &["up", "-d"]).await?;
-
-    info!("Compose project created: {} in dir {}", project, dir_str);
-        Ok(ApiResponse::ok("Compose project created").into_response())
-    }
-    .await;
-    context
-        .finish(
-            &state.metadata_db,
-            "compose.create",
-            Some(("composeProject", &requested_name)),
-            json!({ "name": requested_name }),
-            false,
-            result,
-        )
-        .await
-}
-
-/// 汇总登记在数据库中的 Compose 项目的运行状态与容器数量。
-pub async fn list_projects(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
-    let list = load_project_summaries(&state).await?;
-    Ok(ApiResponse::success_with_raw("Compose project list loaded", Some(list)).into_response())
-}
-
-/// 汇总登记项目及其容器状态，供项目列表与概览共用。
-pub(crate) async fn load_project_summaries(
-    state: &Arc<AppState>,
-) -> Result<Vec<docker::ComposeProjectSummary>, ApiError> {
-    let docker = state.docker_client().await?;
-    let options = query_parameters::ListContainersOptionsBuilder::new()
-        .all(true)
-        .build();
-    let containers = docker.list_containers(Some(options)).await?;
-
-    // 从数据库中查询所有的项目
-    let mut projects = HashMap::new();
-    let rows = sqlx::query("SELECT name, compose_dir, project_type FROM docker_compose_projects")
-        .fetch_all(&state.metadata_db)
-        .await?;
-    for row in rows {
-        use sqlx::Row;
-        let name: String = row.try_get("name")?;
-        let dir: String = row.try_get("compose_dir")?;
-        let ptype: String = row.try_get("project_type")?;
-
-        let has_compose_file = PathBuf::from(&dir).join(COMPOSE_FILE_NAME).exists();
-
-        projects.insert(
-            name.clone(),
-            docker::ComposeProjectSummary {
-                name,
-                status: "stopped".to_string(),
-                total_containers: 0,
-                running_containers: 0,
-                exited_containers: 0,
-                paused_containers: 0,
-                restarting_containers: 0,
-                has_compose_file,
-                compose_dir: Some(dir),
-                project_type: Some(ptype),
-            },
-        );
-    }
-
-    // 根据当前运行容器的 labels 进行状态和容器计数累加
-    for container in containers {
-        let labels = match &container.labels {
-            Some(labels) => labels,
-            None => continue,
-        };
-        let Some(project) = labels.get("com.docker.compose.project") else {
-            continue;
-        };
-
-        // 干净重构：如果容器的项目不在数据库登记列表中，直接忽略
-        let entry = match projects.get_mut(project) {
-            Some(entry) => entry,
-            None => continue,
-        };
-
-        entry.total_containers += 1;
-        match container.state {
-            Some(ContainerSummaryStateEnum::RUNNING) => entry.running_containers += 1,
-            Some(ContainerSummaryStateEnum::EXITED) => entry.exited_containers += 1,
-            Some(ContainerSummaryStateEnum::PAUSED) => entry.paused_containers += 1,
-            Some(ContainerSummaryStateEnum::RESTARTING) => entry.restarting_containers += 1,
-            _ => {}
-        }
-    }
-
-    // 计算汇总状态
-    for summary in projects.values_mut() {
-        summary.status = if summary.running_containers > 0 {
-            "running".to_string()
-        } else if summary.paused_containers > 0 {
-            "paused".to_string()
-        } else if summary.restarting_containers > 0 {
-            "restarting".to_string()
-        } else if summary.exited_containers > 0 || summary.total_containers == 0 {
-            "stopped".to_string()
-        } else {
-            "unknown".to_string()
-        };
-    }
-
-    let mut list: Vec<docker::ComposeProjectSummary> = projects.into_values().collect();
-    list.sort_by(|a, b| a.name.cmp(&b.name));
-
-    Ok(list)
-}
-
-/// 启动指定的 Compose 项目。
-pub async fn start_project(
-    State(state): State<Arc<AppState>>,
-    context: DockerOperationContext,
-    Path(name): Path<String>,
-) -> ApiResult<Response> {
-    project_command(&state, &context, &name, "compose.start", &["start"]).await
-}
-
-/// 停止指定的 Compose 项目。
-pub async fn stop_project(
-    State(state): State<Arc<AppState>>,
-    context: DockerOperationContext,
-    Path(name): Path<String>,
-) -> ApiResult<Response> {
-    project_command(&state, &context, &name, "compose.stop", &["stop"]).await
-}
-
-/// 重启指定的 Compose 项目。
-pub async fn restart_project(
-    State(state): State<Arc<AppState>>,
-    context: DockerOperationContext,
-    Path(name): Path<String>,
-) -> ApiResult<Response> {
-    project_command(&state, &context, &name, "compose.restart", &["restart"]).await
-}
-
-/// 删除项目时的可选参数（干净重构下已不再强依赖此参数）。
+/// 项目任务列表参数。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DeleteProjectQuery {
-    _delete_files: Option<bool>,
+pub struct DockerProjectTaskListQuery {
+    active: Option<bool>,
+    limit: Option<usize>,
 }
 
-/// 停止并删除 Compose 项目，依据形态类型自动决定是否保留文件。
-pub async fn delete_project(
+/// 项目列表筛选参数。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerProjectListQuery {
+    keyword: Option<String>,
+    management_kind: Option<docker::DockerProjectManagementKind>,
+    runtime_state: Option<docker::DockerProjectRuntimeState>,
+    page: Option<usize>,
+    page_size: Option<usize>,
+}
+
+/// 返回登记项目的分页摘要。
+pub async fn list_projects(
     State(state): State<Arc<AppState>>,
-    context: DockerOperationContext,
-    Path(name): Path<String>,
-    Query(_query): Query<DeleteProjectQuery>,
+    Query(query): Query<DockerProjectListQuery>,
 ) -> ApiResult<Response> {
-    let result: ApiResult<Response> = async {
-        let project = normalize_project_name(&name)?;
-
-        // 不能删除运行中的 Compose 项目
-        let docker = state.docker_client().await?;
-        let mut filters = HashMap::new();
-        filters.insert(
-            "label".to_string(),
-            vec![format!("com.docker.compose.project={}", project)],
-        );
-        filters.insert("status".to_string(), vec!["running".to_string()]);
-        let options = query_parameters::ListContainersOptionsBuilder::new()
-            .all(true)
-            .filters(&filters)
-            .build();
-        let running_containers = docker.list_containers(Some(options)).await?;
-        if !running_containers.is_empty() {
-            return Err(ApiError::BadRequest(
-                "Cannot delete a running compose project. Please stop it first.".to_string(),
-            ));
-        }
-
-        let (dir, ptype) = resolve_project_meta(&state, &project).await?;
-        let compose_file = dir.join(COMPOSE_FILE_NAME);
-        if tokio::fs::metadata(&compose_file).await.is_ok() {
-            run_compose_command(&project, &compose_file, &["down"]).await?;
-        } else {
-            remove_project_containers(&state, &project).await?;
-        }
-
-        // 从数据库中移除登记
-        sqlx::query("DELETE FROM docker_compose_projects WHERE name = ?1")
-            .bind(&project)
-            .execute(&state.metadata_db)
-            .await?;
-
-        // 形态控制删除：
-        // - "docker" 形态：坚决不清除本地文件目录以防止挂载或关键数据丢失
-        // - 其他一键部署形态：彻底清理该项目的整个目录
-        if ptype != "docker" {
-            if !is_safe_project_name(&project) {
-                return Err(ApiError::BadRequest("unsafe project name".to_string()));
-            }
-            if tokio::fs::metadata(&dir).await.is_ok() {
-                tokio::fs::remove_dir_all(&dir).await?;
-            }
-        }
-
-        Ok(ApiResponse::ok("Compose project deleted").into_response())
-    }
-    .await;
-    context
-        .finish(
-            &state.metadata_db,
-            "compose.delete",
-            Some(("composeProject", &name)),
-            json!({ "name": name }),
-            true,
-            result,
-        )
-        .await
-}
-
-/// 拉取最新镜像并重建 Compose 项目。
-pub async fn update_project(
-    State(state): State<Arc<AppState>>,
-    context: DockerOperationContext,
-    Path(name): Path<String>,
-) -> ApiResult<Response> {
-    let result: ApiResult<Response> = async {
-        let project = normalize_project_name(&name)?;
-        let compose_file = ensure_compose_file(&state, &project).await?;
-        run_compose_command(&project, &compose_file, &["pull"]).await?;
-        run_compose_command(&project, &compose_file, &["up", "-d", "--force-recreate"]).await?;
-        Ok(ApiResponse::ok("Compose project updated").into_response())
-    }
-    .await;
-    context
-        .finish(
-            &state.metadata_db,
-            "compose.update",
-            Some(("composeProject", &name)),
-            json!({ "name": name }),
-            false,
-            result,
-        )
-        .await
-}
-
-/// 返回 Compose 项目根目录路径。
-pub async fn compose_root() -> ApiResult<Response> {
-    let root = config::compose_root_dir();
-    Ok(ApiResponse::success_with_raw(
-        "Compose root loaded",
-        Some(root.to_string_lossy().to_string()),
-    )
-    .into_response())
-}
-
-/// 聚合指定 Compose 项目内所有容器的日志。
-pub async fn project_logs(
-    State(state): State<Arc<AppState>>,
-    Path(name): Path<String>,
-    Query(query): Query<docker::ComposeProjectLogsQuery>,
-) -> ApiResult<Response> {
-    let project = normalize_project_name(&name)?;
-    let tail = query.tail.unwrap_or(200).clamp(1, 500);
-    let since = parse_timestamp(query.since.as_deref())?;
-    let until = parse_timestamp(query.until.as_deref())?;
-    let docker = state.docker_client().await?;
-
-    let mut filters = HashMap::new();
-    filters.insert(
-        "label".to_string(),
-        vec![format!("com.docker.compose.project={}", project)],
-    );
-    let options = query_parameters::ListContainersOptionsBuilder::new()
-        .all(true)
-        .filters(&filters)
-        .build();
-    let containers = docker.list_containers(Some(options)).await?;
-
-    let mut lines = Vec::new();
-    for container in containers {
-        let id = match &container.id {
-            Some(id) => id,
-            None => continue,
-        };
-        let name = container
-            .names
-            .as_ref()
-            .and_then(|names| names.first())
-            .map(|value| value.trim_start_matches('/').to_string())
-            .unwrap_or_else(|| id.chars().take(12).collect());
-
-        let options = LogsOptions {
-            stdout: true,
-            stderr: true,
-            timestamps: true,
-            tail: tail.to_string(),
-            since: since.unwrap_or_default(),
-            until: until.unwrap_or_default(),
-            ..Default::default()
-        };
-
-        let mut stream = docker.logs(id, Some(options));
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(log) => {
-                    if let Some(line) = format_log_output(log) {
-                        lines.push(format!("[{}] {}", name, line));
-                    }
-                }
-                Err(err) => {
-                    return Err(ApiError::DockerApi(err));
-                }
-            }
-        }
-    }
-
-    Ok(ApiResponse::success_with_raw("Compose project logs loaded", Some(lines)).into_response())
-}
-
-fn normalize_project_name(name: &str) -> Result<String, ApiError> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return Err(ApiError::BadRequest(
-            "project name must not be empty".to_string(),
-        ));
-    }
-    if trimmed == "." || trimmed == ".." {
-        return Err(ApiError::BadRequest(
-            "invalid project name: must not be '.' or '..'".to_string(),
-        ));
-    }
-    if !trimmed
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    let mut items = load_project_summaries(&state).await?;
+    if let Some(keyword) = query
+        .keyword
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
     {
-        return Err(ApiError::BadRequest(
-            "project name may only contain letters, digits, hyphen, underscore, and dot"
-                .to_string(),
+        let keyword = keyword.to_lowercase();
+        items.retain(|project| {
+            project.name.to_lowercase().contains(&keyword)
+                || project
+                    .management
+                    .owner_name
+                    .as_deref()
+                    .is_some_and(|value| value.to_lowercase().contains(&keyword))
+        });
+    }
+    if let Some(kind) = query.management_kind {
+        items.retain(|project| project.management.kind == kind);
+    }
+    if let Some(runtime_state) = query.runtime_state {
+        items.retain(|project| project.runtime_state == runtime_state);
+    }
+    let total = items.len();
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
+    let offset = page.saturating_sub(1).saturating_mul(page_size);
+    let items = items.into_iter().skip(offset).take(page_size).collect();
+    let response = docker::DockerProjectPage {
+        total,
+        page,
+        page_size,
+        items,
+    };
+    Ok(ApiResponse::success_with_raw("Docker projects loaded", Some(response)).into_response())
+}
+
+/// 返回项目详情；容器事实只通过一次带标签过滤的 Docker list 获取。
+pub async fn project_detail(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> ApiResult<Response> {
+    let record = load_project_record(&state, &name).await?;
+    let containers = list_project_containers(&state, &record.name).await?;
+    let summary = build_summary(&record, &containers).await;
+    let services = build_services(containers);
+    let detail = docker::DockerProjectDetail { summary, services };
+    Ok(ApiResponse::success_with_raw("Docker project loaded", Some(detail)).into_response())
+}
+
+/// 读取用户项目的 Compose 配置。
+pub async fn project_configuration(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> ApiResult<Response> {
+    let record = load_project_record(&state, &name).await?;
+    docker_projects::ensure_mutable(&record)?;
+    let compose_file = PathBuf::from(&record.compose_dir).join(COMPOSE_FILE_NAME);
+    let compose_yaml = tokio::fs::read_to_string(&compose_file)
+        .await
+        .map_err(|_| project_not_found(&record.name, "Compose configuration is missing"))?;
+    let configuration = docker::DockerProjectConfiguration {
+        compose_yaml,
+        revision: record.config_revision,
+        applied_revision: record.applied_revision,
+        state: docker_projects::configuration_state(
+            true,
+            record.config_revision,
+            record.applied_revision,
+        ),
+    };
+    Ok(
+        ApiResponse::success_with_raw("Docker project configuration loaded", Some(configuration))
+            .into_response(),
+    )
+}
+
+/// 校验并原子保存 Compose 配置，不触发部署。
+pub async fn update_project_configuration(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(payload): Json<docker::DockerProjectConfigurationUpdateRequest>,
+) -> ApiResult<Response> {
+    let record = load_project_record(&state, &name).await?;
+    docker_projects::ensure_mutable(&record)?;
+    validate_compose_yaml(&payload.compose_yaml).await?;
+    if record.config_revision != payload.expected_revision {
+        return Err(ApiError::conflict(
+            ErrorCode::DockerProjectRevisionConflict,
+            "Docker project configuration has changed",
         ));
     }
-    Ok(trimmed.to_string())
-}
 
-fn is_safe_project_name(name: &str) -> bool {
-    let trimmed = name.trim();
-    !trimmed.is_empty()
-        && trimmed != "."
-        && trimmed != ".."
-        && trimmed
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-}
+    let compose_file = PathBuf::from(&record.compose_dir).join(COMPOSE_FILE_NAME);
+    let previous = tokio::fs::read(&compose_file).await.ok();
+    let temporary = compose_file.with_extension("yaml.tmp");
+    tokio::fs::write(&temporary, payload.compose_yaml.as_bytes()).await?;
+    tokio::fs::rename(&temporary, &compose_file).await?;
 
-async fn run_compose_command(
-    project: &str,
-    compose_file: &FsPath,
-    args: &[&str],
-) -> Result<(), ApiError> {
-    let output = Command::new("docker")
-        .args(["compose", "-f"])
-        .arg(compose_file)
-        .args(["-p", project])
-        .args(args)
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        let detail = command_error_detail(&output);
-        tracing::error!(
-            project,
-            compose_file = %compose_file.display(),
-            args = ?args,
-            status = ?output.status.code(),
-            stdout = %String::from_utf8_lossy(&output.stdout).trim(),
-            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
-            "docker compose command failed"
-        );
-        return Err(ApiError::BadRequest(format!(
-            "docker compose command failed: {detail}"
-        )));
-    }
-
-    Ok(())
-}
-
-/// 提取 Docker Compose 命令最有价值的错误文本。
-fn command_error_detail(output: &std::process::Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let detail = stderr.trim();
-    if !detail.is_empty() {
-        return detail.to_string();
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let detail = stdout.trim();
-    if !detail.is_empty() {
-        return detail.to_string();
-    }
-    match output.status.code() {
-        Some(code) => format!("docker command exited with code {code}"),
-        None => "docker command terminated without an exit code".to_string(),
-    }
-}
-
-async fn remove_project_containers(state: &Arc<AppState>, project: &str) -> Result<(), ApiError> {
-    let docker = state.docker_client().await?;
-    let mut filters = HashMap::new();
-    filters.insert(
-        "label".to_string(),
-        vec![format!("com.docker.compose.project={}", project)],
-    );
-    let options = query_parameters::ListContainersOptionsBuilder::new()
-        .all(true)
-        .filters(&filters)
-        .build();
-    let containers = docker.list_containers(Some(options)).await?;
-    for container in containers {
-        if let Some(id) = container.id {
-            let remove_options = query_parameters::RemoveContainerOptionsBuilder::new()
-                .force(true)
-                .build();
-            docker.remove_container(&id, Some(remove_options)).await?;
+    let result = sqlx::query(
+        "UPDATE docker_compose_projects SET config_revision = config_revision + 1 \
+         WHERE name = ?1 AND config_revision = ?2",
+    )
+    .bind(&record.name)
+    .bind(payload.expected_revision)
+    .execute(&state.metadata_db)
+    .await;
+    let rows_affected = match result {
+        Ok(result) => result.rows_affected(),
+        Err(error) => {
+            restore_configuration(&compose_file, previous.as_deref()).await;
+            return Err(error.into());
         }
-    }
-    Ok(())
-}
-
-fn parse_timestamp(input: Option<&str>) -> Result<Option<i32>, ApiError> {
-    let Some(value) = input.map(str::trim).filter(|v| !v.is_empty()) else {
-        return Ok(None);
     };
-
-    if let Ok(seconds) = value.parse::<i64>() {
-        return Ok(Some(clamp_i64_to_i32(seconds)));
+    if rows_affected != 1 {
+        restore_configuration(&compose_file, previous.as_deref()).await;
+        return Err(ApiError::conflict(
+            ErrorCode::DockerProjectRevisionConflict,
+            "Docker project configuration has changed",
+        ));
     }
-
-    let parsed = DateTime::parse_from_rfc3339(value).map_err(|_| {
-        ApiError::BadRequest("timestamp must be RFC3339 or Unix seconds".to_string())
-    })?;
-    Ok(Some(clamp_i64_to_i32(
-        parsed.with_timezone(&Utc).timestamp(),
-    )))
+    let revision = record.config_revision + 1;
+    let configuration = docker::DockerProjectConfiguration {
+        compose_yaml: payload.compose_yaml,
+        revision,
+        applied_revision: record.applied_revision,
+        state: docker::DockerProjectConfigurationState::Pending,
+    };
+    Ok(
+        ApiResponse::success_with_raw("Docker project configuration saved", Some(configuration))
+            .into_response(),
+    )
 }
 
-fn clamp_i64_to_i32(value: i64) -> i32 {
-    if value > i64::from(i32::MAX) {
-        i32::MAX
-    } else if value < i64::from(i32::MIN) {
-        i32::MIN
-    } else {
-        value as i32
-    }
-}
-
-/// 伸缩 Compose 项目中指定服务的容器副本数量。
-pub async fn scale_project(
-    State(state): State<Arc<AppState>>,
-    context: DockerOperationContext,
-    Path(name): Path<String>,
-    Json(payload): Json<docker::ComposeProjectScaleRequest>,
+/// 校验 Compose 配置并返回可直接展示的结果。
+pub async fn validate_configuration(
+    Json(payload): Json<docker::DockerProjectConfigurationValidateRequest>,
 ) -> ApiResult<Response> {
-    let service = payload.service.clone();
-    let replicas = payload.replicas;
-    let result: ApiResult<Response> = async {
-        let project = normalize_project_name(&name)?;
-        let compose_file = ensure_compose_file(&state, &project).await?;
-        let scale_arg = format!("{}={}", payload.service, payload.replicas);
-
-        run_compose_command(
-            &project,
-            &compose_file,
-            &["up", "-d", "--scale", &scale_arg],
-        )
-        .await?;
-
-        info!("Compose project scaled: {}/{}", project, scale_arg);
-        Ok(ApiResponse::ok("Compose project scaled").into_response())
-    }
-    .await;
-    context
-        .finish(
-            &state.metadata_db,
-            "compose.scale",
-            Some(("composeProject", &name)),
-            json!({ "name": name, "service": service, "replicas": replicas }),
-            false,
-            result,
-        )
-        .await
-}
-
-async fn project_command(
-    state: &Arc<AppState>,
-    context: &DockerOperationContext,
-    name: &str,
-    event_code: &str,
-    args: &[&str],
-) -> ApiResult<Response> {
-    let result: ApiResult<Response> = async {
-        let project = normalize_project_name(name)?;
-        let compose_file = ensure_compose_file(state, &project).await?;
-        run_compose_command(&project, &compose_file, args).await?;
-        Ok(ApiResponse::ok("Compose project operation completed").into_response())
-    }
-    .await;
-    context
-        .finish(
-            &state.metadata_db,
-            event_code,
-            Some(("composeProject", name)),
-            json!({ "name": name }),
-            false,
-            result,
-        )
-        .await
-}
-
-/// 校验 Compose YAML 配置的合法性。
-pub async fn validate_compose(
-    Json(payload): Json<docker::ComposeProjectValidateRequest>,
-) -> ApiResult<Response> {
-    use std::process::Stdio;
-    use tokio::io::AsyncWriteExt;
-
-    info!("Validating compose YAML configuration");
-    let mut child = Command::new("docker")
-        .args(["compose", "-f", "-", "config"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            ApiError::Internal(format!("Failed to spawn docker compose process: {}", e))
-        })?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(payload.compose.as_bytes())
-            .await
-            .map_err(|e| ApiError::Internal(format!("Failed to write compose payload: {}", e)))?;
-    }
-
-    let output = child.wait_with_output().await?;
-
-    let response = if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        docker::ComposeProjectValidateResponse {
+    let response = match validate_compose_yaml(&payload.compose_yaml).await {
+        Ok(()) => docker::DockerProjectConfigurationValidateResponse {
             valid: true,
             error: None,
-            config: Some(stdout),
+        },
+        Err(error) if error.status == axum::http::StatusCode::BAD_REQUEST => {
+            docker::DockerProjectConfigurationValidateResponse {
+                valid: false,
+                error: Some(error.message.into_owned()),
+            }
         }
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        docker::ComposeProjectValidateResponse {
-            valid: false,
-            error: Some(stderr),
-            config: None,
-        }
+        Err(error) => return Err(error),
     };
-
     Ok(
         ApiResponse::success_with_raw("Compose validation finished", Some(response))
             .into_response(),
     )
 }
 
+/// 创建用户 Compose 项目并立即返回后台任务。
+pub async fn create_project(
+    State(state): State<Arc<AppState>>,
+    context: DockerOperationContext,
+    Json(payload): Json<docker::DockerProjectCreateRequest>,
+) -> ApiResult<Response> {
+    let name = docker_projects::normalize_project_name(&payload.name)?;
+    let exists: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM docker_compose_projects WHERE name = ?1")
+            .bind(&name)
+            .fetch_one(&state.metadata_db)
+            .await?;
+    if exists > 0 {
+        return Err(ApiError::conflict(
+            ErrorCode::DockerProjectAlreadyExists,
+            "Docker project already exists",
+        ));
+    }
+    let task = docker_project_tasks::create(
+        &state.metadata_db,
+        &context,
+        NewDockerProjectTask {
+            project_name: &name,
+            operation: docker::DockerProjectTaskOperation::Create,
+            service_name: None,
+            replicas: None,
+            pull_images: false,
+        },
+    )
+    .await?;
+    let task_id = task.id.clone();
+    tokio::spawn(run_create_task(
+        Arc::clone(&state),
+        task_id,
+        name,
+        payload.compose_yaml,
+    ));
+    Ok(accepted_task(task))
+}
+
+/// 启动项目已有容器。
+pub async fn start_project(
+    State(state): State<Arc<AppState>>,
+    context: DockerOperationContext,
+    Path(name): Path<String>,
+) -> ApiResult<Response> {
+    start_lifecycle_task(
+        state,
+        context,
+        name,
+        docker::DockerProjectTaskOperation::Start,
+    )
+    .await
+}
+
+/// 停止项目已有容器。
+pub async fn stop_project(
+    State(state): State<Arc<AppState>>,
+    context: DockerOperationContext,
+    Path(name): Path<String>,
+) -> ApiResult<Response> {
+    start_lifecycle_task(
+        state,
+        context,
+        name,
+        docker::DockerProjectTaskOperation::Stop,
+    )
+    .await
+}
+
+/// 重启项目已有容器。
+pub async fn restart_project(
+    State(state): State<Arc<AppState>>,
+    context: DockerOperationContext,
+    Path(name): Path<String>,
+) -> ApiResult<Response> {
+    start_lifecycle_task(
+        state,
+        context,
+        name,
+        docker::DockerProjectTaskOperation::Restart,
+    )
+    .await
+}
+
+/// 使用当前已保存配置重新部署项目。
+pub async fn redeploy_project(
+    State(state): State<Arc<AppState>>,
+    context: DockerOperationContext,
+    Path(name): Path<String>,
+    Json(payload): Json<docker::DockerProjectDeploymentRequest>,
+) -> ApiResult<Response> {
+    let record = load_project_record(&state, &name).await?;
+    docker_projects::ensure_mutable(&record)?;
+    ensure_compose_file(&record).await?;
+    let task = docker_project_tasks::create(
+        &state.metadata_db,
+        &context,
+        NewDockerProjectTask {
+            project_name: &record.name,
+            operation: docker::DockerProjectTaskOperation::Redeploy,
+            service_name: None,
+            replicas: None,
+            pull_images: payload.pull_images,
+        },
+    )
+    .await?;
+    tokio::spawn(run_redeploy_task(
+        Arc::clone(&state),
+        task.id.clone(),
+        record,
+        payload.pull_images,
+    ));
+    Ok(accepted_task(task))
+}
+
+/// 调整 Compose 服务副本数。
+pub async fn scale_project_service(
+    State(state): State<Arc<AppState>>,
+    context: DockerOperationContext,
+    Path((name, service)): Path<(String, String)>,
+    Json(payload): Json<docker::DockerProjectScaleRequest>,
+) -> ApiResult<Response> {
+    let record = load_project_record(&state, &name).await?;
+    docker_projects::ensure_mutable(&record)?;
+    ensure_compose_file(&record).await?;
+    let service = normalize_service_name(&service)?;
+    let previous_replicas = count_service_containers(&state, &record.name, &service).await?;
+    let task = docker_project_tasks::create(
+        &state.metadata_db,
+        &context,
+        NewDockerProjectTask {
+            project_name: &record.name,
+            operation: docker::DockerProjectTaskOperation::Scale,
+            service_name: Some(&service),
+            replicas: Some(payload.replicas),
+            pull_images: false,
+        },
+    )
+    .await?;
+    tokio::spawn(run_scale_task(
+        Arc::clone(&state),
+        task.id.clone(),
+        record,
+        service,
+        payload.replicas,
+        previous_replicas,
+    ));
+    Ok(accepted_task(task))
+}
+
+/// 删除用户项目部署和受管配置，保留卷、镜像与绑定目录。
+pub async fn remove_project(
+    State(state): State<Arc<AppState>>,
+    context: DockerOperationContext,
+    Path(name): Path<String>,
+) -> ApiResult<Response> {
+    let record = load_project_record(&state, &name).await?;
+    docker_projects::ensure_mutable(&record)?;
+    preflight_remove(&state, &record).await?;
+    let task = docker_project_tasks::create(
+        &state.metadata_db,
+        &context,
+        NewDockerProjectTask {
+            project_name: &record.name,
+            operation: docker::DockerProjectTaskOperation::Remove,
+            service_name: None,
+            replicas: None,
+            pull_images: false,
+        },
+    )
+    .await?;
+    tokio::spawn(run_remove_task(Arc::clone(&state), task.id.clone(), record));
+    Ok(accepted_task(task))
+}
+
+/// 查询活动任务或最近任务。
+pub async fn list_project_tasks(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<DockerProjectTaskListQuery>,
+) -> ApiResult<Response> {
+    let tasks = docker_project_tasks::list(
+        &state.metadata_db,
+        query.active.unwrap_or(false),
+        query.limit.unwrap_or(20),
+    )
+    .await?;
+    Ok(ApiResponse::success_with_raw("Docker project tasks loaded", Some(tasks)).into_response())
+}
+
+/// 查询单个项目任务。
+pub async fn project_task(
+    State(state): State<Arc<AppState>>,
+    Path(task_id): Path<String>,
+) -> ApiResult<Response> {
+    let task = docker_project_tasks::get(&state.metadata_db, &task_id).await?;
+    Ok(ApiResponse::success_with_raw("Docker project task loaded", Some(task)).into_response())
+}
+
+/// 请求取消项目任务。
+pub async fn cancel_project_task(
+    State(state): State<Arc<AppState>>,
+    context: DockerOperationContext,
+    Path(task_id): Path<String>,
+) -> ApiResult<Response> {
+    let task = docker_project_tasks::cancel(&state.metadata_db, &task_id).await?;
+    context
+        .record_success(
+            &state.metadata_db,
+            "compose.task.cancel_requested",
+            Some(("composeProjectTask", &task_id)),
+            serde_json::json!({ "taskId": task_id, "name": task.project_name }),
+            true,
+        )
+        .await;
+    Ok(
+        ApiResponse::success_with_raw("Docker project task cancellation requested", Some(task))
+            .into_response(),
+    )
+}
+
+async fn start_lifecycle_task(
+    state: Arc<AppState>,
+    context: DockerOperationContext,
+    name: String,
+    operation: docker::DockerProjectTaskOperation,
+) -> ApiResult<Response> {
+    let record = load_project_record(&state, &name).await?;
+    docker_projects::ensure_mutable(&record)?;
+    ensure_compose_file(&record).await?;
+    let task = docker_project_tasks::create(
+        &state.metadata_db,
+        &context,
+        NewDockerProjectTask {
+            project_name: &record.name,
+            operation,
+            service_name: None,
+            replicas: None,
+            pull_images: false,
+        },
+    )
+    .await?;
+    tokio::spawn(run_lifecycle_task(
+        Arc::clone(&state),
+        task.id.clone(),
+        record,
+        operation,
+    ));
+    Ok(accepted_task(task))
+}
+
+async fn run_create_task(
+    state: Arc<AppState>,
+    task_id: String,
+    name: String,
+    compose_yaml: String,
+) {
+    let result = async {
+        docker_project_tasks::update(
+            &state.metadata_db,
+            &task_id,
+            docker::DockerProjectTaskStage::Validating,
+            10,
+        )
+        .await?;
+        validate_compose_yaml(&compose_yaml).await?;
+        let cancellation = require_cancellation(&task_id).await?;
+        let directory = project_directory(&name);
+        docker_project_tasks::update(
+            &state.metadata_db,
+            &task_id,
+            docker::DockerProjectTaskStage::Preparing,
+            25,
+        )
+        .await?;
+        if tokio::fs::metadata(&directory).await.is_ok() {
+            return Err(ApiError::conflict(
+                ErrorCode::DockerProjectAlreadyExists,
+                "Docker project directory already exists",
+            ));
+        }
+        tokio::fs::create_dir_all(&directory).await?;
+        let compose_file = directory.join(COMPOSE_FILE_NAME);
+        tokio::fs::write(&compose_file, compose_yaml.as_bytes()).await?;
+        docker_project_tasks::update(
+            &state.metadata_db,
+            &task_id,
+            docker::DockerProjectTaskStage::Applying,
+            55,
+        )
+        .await?;
+        match docker_project_tasks::run_compose_command(
+            &name,
+            &compose_file,
+            &["up".into(), "-d".into(), "--remove-orphans".into()],
+            &cancellation,
+        )
+        .await?
+        {
+            ComposeCommandResult::Cancelled => return Err(TaskRunError::Cancelled.into()),
+            ComposeCommandResult::Succeeded => {}
+        }
+        docker_project_tasks::update(
+            &state.metadata_db,
+            &task_id,
+            docker::DockerProjectTaskStage::Verifying,
+            90,
+        )
+        .await?;
+        tokio::fs::copy(
+            &compose_file,
+            directory.join(docker_projects::APPLIED_COMPOSE_FILE_NAME),
+        )
+        .await?;
+        sqlx::query(
+            "INSERT INTO docker_compose_projects (\
+                name, compose_dir, management_kind, config_revision, applied_revision\
+             ) VALUES (?1, ?2, 'custom', 1, 1)",
+        )
+        .bind(&name)
+        .bind(directory.to_string_lossy().as_ref())
+        .execute(&state.metadata_db)
+        .await?;
+        Ok::<(), ApiError>(())
+    }
+    .await;
+    match result {
+        Ok(()) => {
+            let _ = docker_project_tasks::succeed(&state.metadata_db, &task_id).await;
+        }
+        Err(error) => {
+            let cancelled = error.message.as_ref() == TaskRunError::Cancelled.message();
+            let warning = cleanup_failed_create(&name).await;
+            if cancelled {
+                let _ = docker_project_tasks::cancelled(
+                    &state.metadata_db,
+                    &task_id,
+                    warning.as_deref(),
+                )
+                .await;
+            } else {
+                let _ = docker_project_tasks::fail(
+                    &state.metadata_db,
+                    &task_id,
+                    &error.to_string(),
+                    warning.as_deref(),
+                )
+                .await;
+            }
+        }
+    }
+}
+
+async fn run_lifecycle_task(
+    state: Arc<AppState>,
+    task_id: String,
+    record: DockerProjectRecord,
+    operation: docker::DockerProjectTaskOperation,
+) {
+    let result = async {
+        let cancellation = require_cancellation(&task_id).await?;
+        docker_project_tasks::update(
+            &state.metadata_db,
+            &task_id,
+            docker::DockerProjectTaskStage::Applying,
+            40,
+        )
+        .await?;
+        let action = match operation {
+            docker::DockerProjectTaskOperation::Start => "start",
+            docker::DockerProjectTaskOperation::Stop => "stop",
+            docker::DockerProjectTaskOperation::Restart => "restart",
+            _ => return Err(ApiError::internal("invalid lifecycle operation")),
+        };
+        run_task_command(&record, &[action.to_string()], &cancellation).await?;
+        docker_project_tasks::update(
+            &state.metadata_db,
+            &task_id,
+            docker::DockerProjectTaskStage::Verifying,
+            90,
+        )
+        .await?;
+        Ok::<(), ApiError>(())
+    }
+    .await;
+    finish_simple_task(&state, &task_id, result).await;
+}
+
+async fn run_redeploy_task(
+    state: Arc<AppState>,
+    task_id: String,
+    record: DockerProjectRecord,
+    pull_images: bool,
+) {
+    let result = async {
+        let cancellation = require_cancellation(&task_id).await?;
+        if pull_images {
+            docker_project_tasks::update(
+                &state.metadata_db,
+                &task_id,
+                docker::DockerProjectTaskStage::Pulling,
+                25,
+            )
+            .await?;
+            run_task_command(&record, &["pull".into()], &cancellation).await?;
+        }
+        docker_project_tasks::update(
+            &state.metadata_db,
+            &task_id,
+            docker::DockerProjectTaskStage::Applying,
+            55,
+        )
+        .await?;
+        run_task_command(
+            &record,
+            &[
+                "up".into(),
+                "-d".into(),
+                "--force-recreate".into(),
+                "--remove-orphans".into(),
+            ],
+            &cancellation,
+        )
+        .await?;
+        let compose_file = PathBuf::from(&record.compose_dir).join(COMPOSE_FILE_NAME);
+        tokio::fs::copy(
+            &compose_file,
+            PathBuf::from(&record.compose_dir).join(docker_projects::APPLIED_COMPOSE_FILE_NAME),
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE docker_compose_projects SET applied_revision = config_revision WHERE name = ?1",
+        )
+        .bind(&record.name)
+        .execute(&state.metadata_db)
+        .await?;
+        Ok::<(), ApiError>(())
+    }
+    .await;
+    if let Err(error) = &result {
+        let warning = rollback_deployment(&state, &task_id, &record).await;
+        if is_cancelled(error) {
+            let _ =
+                docker_project_tasks::cancelled(&state.metadata_db, &task_id, warning.as_deref())
+                    .await;
+        } else {
+            let _ = docker_project_tasks::fail(
+                &state.metadata_db,
+                &task_id,
+                &error.to_string(),
+                warning.as_deref(),
+            )
+            .await;
+        }
+    } else {
+        let _ = docker_project_tasks::succeed(&state.metadata_db, &task_id).await;
+    }
+}
+
+async fn run_scale_task(
+    state: Arc<AppState>,
+    task_id: String,
+    record: DockerProjectRecord,
+    service: String,
+    replicas: usize,
+    previous_replicas: usize,
+) {
+    let result = async {
+        let cancellation = require_cancellation(&task_id).await?;
+        docker_project_tasks::update(
+            &state.metadata_db,
+            &task_id,
+            docker::DockerProjectTaskStage::Applying,
+            50,
+        )
+        .await?;
+        run_task_command(
+            &record,
+            &[
+                "up".into(),
+                "-d".into(),
+                "--scale".into(),
+                format!("{service}={replicas}"),
+            ],
+            &cancellation,
+        )
+        .await
+    }
+    .await;
+    if let Err(error) = &result {
+        let warning = rollback_scale(&state, &task_id, &record, &service, previous_replicas).await;
+        if is_cancelled(error) {
+            let _ =
+                docker_project_tasks::cancelled(&state.metadata_db, &task_id, warning.as_deref())
+                    .await;
+        } else {
+            let _ = docker_project_tasks::fail(
+                &state.metadata_db,
+                &task_id,
+                &error.to_string(),
+                warning.as_deref(),
+            )
+            .await;
+        }
+    } else {
+        let _ = docker_project_tasks::succeed(&state.metadata_db, &task_id).await;
+    }
+}
+
+async fn run_remove_task(state: Arc<AppState>, task_id: String, record: DockerProjectRecord) {
+    let result = async {
+        let cancellation = require_cancellation(&task_id).await?;
+        docker_project_tasks::update(
+            &state.metadata_db,
+            &task_id,
+            docker::DockerProjectTaskStage::CleaningUp,
+            25,
+        )
+        .await?;
+        let directory = PathBuf::from(&record.compose_dir);
+        let compose_file = directory.join(COMPOSE_FILE_NAME);
+        if tokio::fs::metadata(&compose_file).await.is_ok() {
+            run_task_command(
+                &record,
+                &["down".into(), "--remove-orphans".into()],
+                &cancellation,
+            )
+            .await?;
+        } else {
+            remove_stopped_project_containers(&state, &record.name).await?;
+        }
+        let trash = directory.with_extension(format!("removing-{}", Uuid::new_v4()));
+        if tokio::fs::metadata(&directory).await.is_ok() {
+            tokio::fs::rename(&directory, &trash).await?;
+        }
+        let delete = sqlx::query("DELETE FROM docker_compose_projects WHERE name = ?1")
+            .bind(&record.name)
+            .execute(&state.metadata_db)
+            .await;
+        if let Err(error) = delete {
+            if tokio::fs::metadata(&trash).await.is_ok() {
+                let _ = tokio::fs::rename(&trash, &directory).await;
+            }
+            return Err(error.into());
+        }
+        let cleanup_warning = if tokio::fs::metadata(&trash).await.is_ok() {
+            tokio::fs::remove_dir_all(&trash)
+                .await
+                .err()
+                .map(|error| format!("managed project directory cleanup failed: {error}"))
+        } else {
+            None
+        };
+        Ok::<Option<String>, ApiError>(cleanup_warning)
+    }
+    .await;
+    match result {
+        Ok(Some(warning)) => {
+            let _ =
+                docker_project_tasks::succeed_with_warning(&state.metadata_db, &task_id, &warning)
+                    .await;
+        }
+        Ok(None) => {
+            let _ = docker_project_tasks::succeed(&state.metadata_db, &task_id).await;
+        }
+        Err(error) if is_cancelled(&error) => {
+            let _ = docker_project_tasks::cancelled(&state.metadata_db, &task_id, None).await;
+        }
+        Err(error) => {
+            let _ =
+                docker_project_tasks::fail(&state.metadata_db, &task_id, &error.to_string(), None)
+                    .await;
+        }
+    }
+}
+
+async fn run_task_command(
+    record: &DockerProjectRecord,
+    args: &[String],
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> ApiResult<()> {
+    let compose_file = PathBuf::from(&record.compose_dir).join(COMPOSE_FILE_NAME);
+    match docker_project_tasks::run_compose_command(&record.name, &compose_file, args, cancellation)
+        .await?
+    {
+        ComposeCommandResult::Succeeded => Ok(()),
+        ComposeCommandResult::Cancelled => Err(TaskRunError::Cancelled.into()),
+    }
+}
+
+async fn finish_simple_task(state: &Arc<AppState>, task_id: &str, result: ApiResult<()>) {
+    match result {
+        Ok(()) => {
+            let _ = docker_project_tasks::succeed(&state.metadata_db, task_id).await;
+        }
+        Err(error) if is_cancelled(&error) => {
+            let _ = docker_project_tasks::cancelled(&state.metadata_db, task_id, None).await;
+        }
+        Err(error) => {
+            let _ =
+                docker_project_tasks::fail(&state.metadata_db, task_id, &error.to_string(), None)
+                    .await;
+        }
+    }
+}
+
+async fn rollback_deployment(
+    state: &Arc<AppState>,
+    task_id: &str,
+    record: &DockerProjectRecord,
+) -> Option<String> {
+    let backup =
+        PathBuf::from(&record.compose_dir).join(docker_projects::APPLIED_COMPOSE_FILE_NAME);
+    if tokio::fs::metadata(&backup).await.is_err() {
+        return None;
+    }
+    let _ = docker_project_tasks::update(
+        &state.metadata_db,
+        task_id,
+        docker::DockerProjectTaskStage::RollingBack,
+        85,
+    )
+    .await;
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    docker_project_tasks::run_compose_command(
+        &record.name,
+        &backup,
+        &["up".into(), "-d".into(), "--remove-orphans".into()],
+        &cancellation,
+    )
+    .await
+    .err()
+    .map(|error| format!("deployment rollback failed: {error}"))
+}
+
+async fn rollback_scale(
+    state: &Arc<AppState>,
+    task_id: &str,
+    record: &DockerProjectRecord,
+    service: &str,
+    replicas: usize,
+) -> Option<String> {
+    let _ = docker_project_tasks::update(
+        &state.metadata_db,
+        task_id,
+        docker::DockerProjectTaskStage::RollingBack,
+        85,
+    )
+    .await;
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    run_task_command(
+        record,
+        &[
+            "up".into(),
+            "-d".into(),
+            "--scale".into(),
+            format!("{service}={replicas}"),
+        ],
+        &cancellation,
+    )
+    .await
+    .err()
+    .map(|error| format!("scale rollback failed: {error}"))
+}
+
+async fn cleanup_failed_create(name: &str) -> Option<String> {
+    let directory = project_directory(name);
+    let compose_file = directory.join(COMPOSE_FILE_NAME);
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let command_warning = if tokio::fs::metadata(&compose_file).await.is_ok() {
+        docker_project_tasks::run_compose_command(
+            name,
+            &compose_file,
+            &["down".into(), "--remove-orphans".into()],
+            &cancellation,
+        )
+        .await
+        .err()
+        .map(|error| error.to_string())
+    } else {
+        None
+    };
+    let directory_warning = tokio::fs::remove_dir_all(&directory)
+        .await
+        .err()
+        .filter(|_| directory.exists())
+        .map(|error| error.to_string());
+    command_warning.or(directory_warning)
+}
+
+async fn preflight_remove(state: &Arc<AppState>, record: &DockerProjectRecord) -> ApiResult<()> {
+    let compose_file = PathBuf::from(&record.compose_dir).join(COMPOSE_FILE_NAME);
+    if tokio::fs::metadata(&compose_file).await.is_ok() {
+        return Ok(());
+    }
+    let containers = list_project_containers(state, &record.name).await?;
+    let active = containers
+        .iter()
+        .filter(|container| {
+            !matches!(
+                container.state,
+                Some(bollard::models::ContainerSummaryStateEnum::EXITED)
+                    | Some(bollard::models::ContainerSummaryStateEnum::CREATED)
+                    | Some(bollard::models::ContainerSummaryStateEnum::DEAD)
+            )
+        })
+        .collect::<Vec<_>>();
+    if active.is_empty() {
+        return Ok(());
+    }
+    let names = active
+        .iter()
+        .take(5)
+        .filter_map(|container| container.names.as_ref().and_then(|names| names.first()))
+        .map(|name| name.trim_start_matches('/'))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(ApiError::conflict(
+        ErrorCode::DockerProjectInUse,
+        format!("project has {} active container(s): {names}", active.len()),
+    ))
+}
+
+async fn remove_stopped_project_containers(state: &Arc<AppState>, project: &str) -> ApiResult<()> {
+    let docker = state.docker_client().await?;
+    for container in list_project_containers(state, project).await? {
+        if let Some(id) = container.id {
+            docker
+                .remove_container(
+                    &id,
+                    Some(
+                        query_parameters::RemoveContainerOptionsBuilder::new()
+                            .force(false)
+                            .build(),
+                    ),
+                )
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn count_service_containers(
+    state: &Arc<AppState>,
+    project: &str,
+    service: &str,
+) -> ApiResult<usize> {
+    Ok(list_project_containers(state, project)
+        .await?
+        .into_iter()
+        .filter(|container| {
+            container
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("com.docker.compose.service"))
+                .is_some_and(|value| value == service)
+        })
+        .count())
+}
+
+async fn ensure_compose_file(record: &DockerProjectRecord) -> ApiResult<PathBuf> {
+    let path = PathBuf::from(&record.compose_dir).join(COMPOSE_FILE_NAME);
+    if tokio::fs::metadata(&path).await.is_err() {
+        return Err(project_not_found(
+            &record.name,
+            "Compose configuration is missing",
+        ));
+    }
+    Ok(path)
+}
+
+fn normalize_service_name(value: &str) -> ApiResult<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 128
+        || !value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+    {
+        return Err(ApiError::validation("invalid Compose service name"));
+    }
+    Ok(value.to_string())
+}
+
+async fn require_cancellation(task_id: &str) -> ApiResult<tokio_util::sync::CancellationToken> {
+    docker_project_tasks::cancellation(task_id)
+        .await
+        .ok_or_else(|| {
+            ApiError::not_found(ErrorCode::TaskNotFound, "task cancellation state missing")
+        })
+}
+
+fn accepted_task(task: docker::DockerProjectTask) -> Response {
+    let mut response =
+        ApiResponse::success_with_raw("Docker project task accepted", Some(task)).into_response();
+    *response.status_mut() = StatusCode::ACCEPTED;
+    response
+}
+
+enum TaskRunError {
+    Cancelled,
+}
+
+impl TaskRunError {
+    const fn message(&self) -> &'static str {
+        match self {
+            Self::Cancelled => "Docker project task cancelled",
+        }
+    }
+}
+
+impl From<TaskRunError> for ApiError {
+    fn from(value: TaskRunError) -> Self {
+        ApiError::bad_request(ErrorCode::TaskExecutionFailed, value.message())
+    }
+}
+
+fn is_cancelled(error: &ApiError) -> bool {
+    error.message.as_ref() == TaskRunError::Cancelled.message()
+}
+
+/// 汇总所有登记项目，供项目列表与 Docker 概览共用。
+pub(crate) async fn load_project_summaries(
+    state: &Arc<AppState>,
+) -> ApiResult<Vec<docker::DockerProjectSummary>> {
+    let records = load_project_records(state).await?;
+    let docker = state.docker_client().await?;
+    let containers = docker
+        .list_containers(Some(
+            query_parameters::ListContainersOptionsBuilder::new()
+                .all(true)
+                .build(),
+        ))
+        .await?;
+    let registered = records
+        .iter()
+        .map(|record| record.name.as_str())
+        .collect::<HashSet<_>>();
+    let mut grouped: HashMap<String, Vec<ContainerSummary>> = HashMap::new();
+    for container in containers {
+        let project = container
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get("com.docker.compose.project"));
+        if let Some(project) = project.filter(|project| registered.contains(project.as_str())) {
+            grouped.entry(project.clone()).or_default().push(container);
+        }
+    }
+    let mut summaries = Vec::with_capacity(records.len());
+    for record in records {
+        let containers = grouped.remove(&record.name).unwrap_or_default();
+        summaries.push(build_summary(&record, &containers).await);
+    }
+    summaries.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(summaries)
+}
+
+async fn build_summary(
+    record: &DockerProjectRecord,
+    containers: &[ContainerSummary],
+) -> docker::DockerProjectSummary {
+    let mut states = docker::DockerProjectContainerStates::default();
+    let mut services = HashSet::new();
+    for container in containers {
+        docker_projects::add_container_state(&mut states, container.state);
+        if let Some(service) = container
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get("com.docker.compose.service"))
+        {
+            services.insert(service.clone());
+        }
+    }
+    let file_exists =
+        tokio::fs::metadata(PathBuf::from(&record.compose_dir).join(COMPOSE_FILE_NAME))
+            .await
+            .is_ok();
+    let configuration_state = docker_projects::configuration_state(
+        file_exists,
+        record.config_revision,
+        record.applied_revision,
+    );
+    let runtime_state = docker_projects::runtime_state(&states);
+    docker::DockerProjectSummary {
+        name: record.name.clone(),
+        created_at: record.created_at,
+        runtime_state,
+        configuration_state,
+        service_count: services.len(),
+        management: docker_projects::management_for(
+            record.management_kind,
+            record.owner_name.clone(),
+        ),
+        capabilities: docker_projects::capabilities_for(
+            record.management_kind,
+            runtime_state,
+            configuration_state,
+            states.total > 0,
+        ),
+        container_states: states,
+    }
+}
+
+fn build_services(containers: Vec<ContainerSummary>) -> Vec<docker::DockerProjectServiceSummary> {
+    let mut grouped: HashMap<String, Vec<ContainerSummary>> = HashMap::new();
+    for container in containers {
+        let service = container
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get("com.docker.compose.service"))
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+        grouped.entry(service).or_default().push(container);
+    }
+    let mut services = grouped
+        .into_iter()
+        .map(|(name, containers)| {
+            let mut states = docker::DockerProjectContainerStates::default();
+            let mut image = None;
+            let containers = containers
+                .into_iter()
+                .filter_map(|container| {
+                    docker_projects::add_container_state(&mut states, container.state);
+                    if image.is_none() {
+                        image.clone_from(&container.image);
+                    }
+                    normalize_container(container)
+                })
+                .collect::<Vec<_>>();
+            docker::DockerProjectServiceSummary {
+                name,
+                image,
+                runtime_state: docker_projects::runtime_state(&states),
+                container_states: states,
+                containers,
+            }
+        })
+        .collect::<Vec<_>>();
+    services.sort_by_key(|service| service.name.to_lowercase());
+    services
+}
+
+fn normalize_container(
+    container: ContainerSummary,
+) -> Option<docker::DockerProjectContainerSummary> {
+    let id = container.id?;
+    let name = container
+        .names
+        .as_ref()
+        .and_then(|names| names.first())
+        .map(|name| name.trim_start_matches('/').to_string())
+        .unwrap_or_else(|| id.chars().take(12).collect());
+    let mut ip_addresses = container
+        .network_settings
+        .as_ref()
+        .and_then(|settings| settings.networks.as_ref())
+        .into_iter()
+        .flat_map(|networks| networks.values())
+        .flat_map(|endpoint| {
+            [
+                endpoint.ip_address.clone(),
+                endpoint.global_ipv6_address.clone(),
+            ]
+        })
+        .flatten()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    ip_addresses.sort();
+    ip_addresses.dedup();
+    let mut published_ports = container
+        .ports
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|port| {
+            port.public_port.map(|public| {
+                format!(
+                    "{}:{public}->{}{suffix}",
+                    port.ip.unwrap_or_else(|| "0.0.0.0".to_string()),
+                    port.private_port,
+                    suffix = port
+                        .typ
+                        .map(|value| format!("/{value}"))
+                        .unwrap_or_default()
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    published_ports.sort();
+    Some(docker::DockerProjectContainerSummary {
+        id,
+        name,
+        state: container
+            .state
+            .map(|state| state.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        ip_addresses,
+        published_ports,
+    })
+}
+
+pub(crate) async fn load_project_record(
+    state: &Arc<AppState>,
+    name: &str,
+) -> ApiResult<DockerProjectRecord> {
+    let name = docker_projects::normalize_project_name(name)?;
+    let row = sqlx::query(
+        "SELECT name, compose_dir, management_kind, owner_name, \
+         config_revision, applied_revision, created_at \
+         FROM docker_compose_projects WHERE name = ?1",
+    )
+    .bind(&name)
+    .fetch_optional(&state.metadata_db)
+    .await?
+    .ok_or_else(|| project_not_found(&name, "Docker project not found"))?;
+    row_to_record(&row)
+}
+
+async fn load_project_records(state: &Arc<AppState>) -> ApiResult<Vec<DockerProjectRecord>> {
+    let rows = sqlx::query(
+        "SELECT name, compose_dir, management_kind, owner_name, \
+         config_revision, applied_revision, created_at FROM docker_compose_projects",
+    )
+    .fetch_all(&state.metadata_db)
+    .await?;
+    rows.iter().map(row_to_record).collect()
+}
+
+fn row_to_record(row: &sqlx::sqlite::SqliteRow) -> ApiResult<DockerProjectRecord> {
+    let management: String = row.try_get("management_kind")?;
+    Ok(DockerProjectRecord {
+        name: row.try_get("name")?,
+        compose_dir: row.try_get("compose_dir")?,
+        management_kind: docker_projects::parse_management_kind(&management)?,
+        owner_name: row.try_get("owner_name")?,
+        config_revision: row.try_get("config_revision")?,
+        applied_revision: row.try_get("applied_revision")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+async fn list_project_containers(
+    state: &Arc<AppState>,
+    project: &str,
+) -> ApiResult<Vec<ContainerSummary>> {
+    let mut filters = HashMap::new();
+    filters.insert(
+        "label".to_string(),
+        vec![format!("com.docker.compose.project={project}")],
+    );
+    let options = query_parameters::ListContainersOptionsBuilder::new()
+        .all(true)
+        .filters(&filters)
+        .build();
+    Ok(state
+        .docker_client()
+        .await?
+        .list_containers(Some(options))
+        .await?)
+}
+
+pub(crate) fn project_directory(name: &str) -> PathBuf {
+    config::compose_root_dir().join("docker").join(name)
+}
+
+pub(crate) async fn validate_compose_yaml(compose_yaml: &str) -> ApiResult<()> {
+    let compose_yaml = compose_yaml.trim();
+    if compose_yaml.is_empty() {
+        return Err(ApiError::validation("Compose configuration is required"));
+    }
+    if compose_yaml.len() > MAX_COMPOSE_BYTES {
+        return Err(ApiError::validation(
+            "Compose configuration must not exceed 1 MiB",
+        ));
+    }
+    let mut child = Command::new("docker")
+        .args(["compose", "-f", "-", "config", "--format", "json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| ApiError::internal(format!("failed to start Docker Compose: {error}")))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(compose_yaml.as_bytes()).await?;
+    }
+    let output = tokio::time::timeout(COMPOSE_VALIDATION_TIMEOUT, child.wait_with_output())
+        .await
+        .map_err(|_| ApiError::validation("Compose validation timed out"))??;
+    if !output.status.success() {
+        return Err(ApiError::validation(sanitize_error(
+            &String::from_utf8_lossy(&output.stderr),
+        )));
+    }
+    let normalized: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| ApiError::validation(sanitize_error(&error.to_string())))?;
+    reject_reserved_labels(&normalized)?;
+    Ok(())
+}
+
+fn reject_reserved_labels(value: &Value) -> ApiResult<()> {
+    match value {
+        Value::Object(mapping) => {
+            for (key, value) in mapping {
+                if key == "labels" {
+                    inspect_labels(value)?;
+                }
+                reject_reserved_labels(value)?;
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                reject_reserved_labels(value)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn inspect_labels(value: &Value) -> ApiResult<()> {
+    let keys = match value {
+        Value::Object(mapping) => mapping.keys().cloned().collect::<Vec<_>>(),
+        Value::Array(values) => values
+            .iter()
+            .filter_map(Value::as_str)
+            .filter_map(|value| {
+                value
+                    .split_once('=')
+                    .map_or(Some(value), |(key, _)| Some(key))
+            })
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+        _ => return Err(ApiError::validation("Compose labels must be a map or list")),
+    };
+    if keys.iter().any(|key| {
+        let key = key.trim();
+        key.starts_with("seclab.") || key.starts_with("com.docker.compose.")
+    }) {
+        return Err(ApiError::validation(
+            "reserved seclab.* and com.docker.compose.* labels are not allowed",
+        ));
+    }
+    Ok(())
+}
+
+fn sanitize_error(value: &str) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    compact.chars().take(1000).collect()
+}
+
+async fn restore_configuration(path: &FsPath, previous: Option<&[u8]>) {
+    let result = match previous {
+        Some(contents) => tokio::fs::write(path, contents).await,
+        None => tokio::fs::remove_file(path).await,
+    };
+    if let Err(error) = result {
+        tracing::error!(path = %path.display(), %error, "failed to restore Compose configuration");
+    }
+}
+
+fn project_not_found(name: &str, message: &'static str) -> ApiError {
+    ApiError::not_found(ErrorCode::DockerProjectNotFound, message)
+        .with_detail(format!("project={name}"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::command_error_detail;
-    use std::os::unix::process::ExitStatusExt;
-    use std::process::{ExitStatus, Output};
+    use super::*;
 
     #[test]
-    fn compose_error_detail_prefers_stderr() {
-        let output = Output {
-            status: ExitStatus::from_raw(1 << 8),
-            stdout: b"pulling image".to_vec(),
-            stderr: b"manifest unknown".to_vec(),
-        };
-
-        assert_eq!(command_error_detail(&output), "manifest unknown");
-    }
-
-    #[test]
-    fn compose_error_detail_falls_back_to_stdout() {
-        let output = Output {
-            status: ExitStatus::from_raw(1 << 8),
-            stdout: b"network timeout".to_vec(),
-            stderr: Vec::new(),
-        };
-
-        assert_eq!(command_error_detail(&output), "network timeout");
+    fn rejects_reserved_labels_in_map_and_list_forms() {
+        for json in [
+            r#"{"services":{"app":{"labels":{"seclab.owner":"fake"}}}}"#,
+            r#"{"services":{"app":{"labels":["com.docker.compose.project=fake"]}}}"#,
+        ] {
+            let parsed: Value = serde_json::from_str(json).unwrap();
+            assert!(reject_reserved_labels(&parsed).is_err());
+        }
     }
 }

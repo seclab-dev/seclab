@@ -429,10 +429,14 @@ async fn install_suite_inner(
 
     let dir_str = dir.to_string_lossy().to_string();
     sqlx::query(
-        "INSERT INTO docker_compose_projects (name, compose_dir, project_type) VALUES (?1, ?2, 'suite')",
+        "INSERT INTO docker_compose_projects (\
+            name, compose_dir, management_kind, owner_name, \
+            config_revision, applied_revision\
+         ) VALUES (?1, ?2, 'suite', ?3, 1, 1)",
     )
     .bind(&payload.compose_project_name)
     .bind(&dir_str)
+    .bind(&payload.suite_id)
     .execute(&state.metadata_db)
     .await?;
 

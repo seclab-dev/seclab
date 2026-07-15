@@ -22,6 +22,10 @@ setupMonacoWorkers()
 const LARGE_FILE_THRESHOLD = 10 * 1024 * 1024
 
 interface Props {
+  /** 传递到 Monaco 可聚焦输入区的字段 ID */
+  id?: string
+  /** 传统 textarea 模式下的字段名称 */
+  name?: string
   /** 编辑器内容（v-model） */
   modelValue?: string
   /** 语言标识（如 'json', 'yaml', 'typescript'），不传时自动检测 */
@@ -38,9 +42,15 @@ interface Props {
   minimap?: boolean
   /** 原始文件字节数，用于大文件只读保护 */
   fileSize?: number
+  /** 传递到 Monaco 可聚焦编辑区的可访问名称 */
+  ariaLabel?: string
+  /** 传递到 Monaco 可聚焦编辑区的可访问名称元素 ID */
+  ariaLabelledby?: string
 }
 
 const props = withDefaults(defineProps<Props>(), {
+  id: '',
+  name: '',
   modelValue: '',
   language: '',
   filePath: '',
@@ -49,6 +59,8 @@ const props = withDefaults(defineProps<Props>(), {
   wordWrap: true,
   minimap: true,
   fileSize: 0,
+  ariaLabel: '',
+  ariaLabelledby: '',
 })
 
 const emit = defineEmits<{
@@ -66,6 +78,40 @@ let themesRegistered = false
 /** 大文件自动只读 */
 const isLargeFile = computed(() => props.fileSize > LARGE_FILE_THRESHOLD)
 const effectiveReadOnly = computed(() => props.readOnly || isLargeFile.value)
+
+/** 将字段标识同步到 Monaco 当前渲染模式下的真实交互控件。 */
+function syncInteractiveAttributes() {
+  const editorDom = editorInstance.value?.getDomNode()
+  if (!editorDom) return
+
+  const textarea = editorDom.querySelector<HTMLTextAreaElement>('textarea.inputarea')
+  const nativeEditContext = editorDom.querySelector<HTMLElement>('.native-edit-context')
+  const interactiveElement = textarea ?? nativeEditContext
+
+  if (interactiveElement) {
+    if (props.id) interactiveElement.id = props.id
+    else interactiveElement.removeAttribute('id')
+
+    if (props.ariaLabelledby) {
+      interactiveElement.setAttribute('aria-labelledby', props.ariaLabelledby)
+      interactiveElement.removeAttribute('aria-label')
+    } else {
+      interactiveElement.removeAttribute('aria-labelledby')
+      interactiveElement.setAttribute('aria-label', props.ariaLabel || t('common.editor'))
+    }
+  }
+
+  if (textarea) {
+    if (props.name) textarea.name = props.name
+    else textarea.removeAttribute('name')
+  }
+
+  const imeTextarea = editorDom.querySelector<HTMLTextAreaElement>('textarea.ime-text-area')
+  if (imeTextarea) {
+    if (props.id) imeTextarea.id = `${props.id}-ime`
+    else imeTextarea.removeAttribute('id')
+  }
+}
 
 /** 根据文件扩展名推断 Monaco 语言 */
 const EXT_LANG_MAP: Record<string, string> = {
@@ -175,6 +221,7 @@ function createEditor() {
     lineHeight: 1.6,
     wordWrap: props.wordWrap ? 'on' : 'off',
     minimap: { enabled: props.minimap },
+    ariaLabel: props.ariaLabelledby ? '' : props.ariaLabel || t('common.editor'),
     automaticLayout: false,
     scrollBeyondLastLine: false,
     renderLineHighlight: 'line',
@@ -207,6 +254,7 @@ function createEditor() {
   })
 
   editorInstance.value = editor
+  syncInteractiveAttributes()
 
   // 监听容器尺寸变化以触发 layout
   if ('ResizeObserver' in window) {
@@ -229,6 +277,11 @@ watch(
       editor.setValue(newVal)
     }
   },
+)
+
+watch(
+  [() => props.id, () => props.name, () => props.ariaLabel, () => props.ariaLabelledby],
+  syncInteractiveAttributes,
 )
 
 /** 语言变更 → 更新 model language */

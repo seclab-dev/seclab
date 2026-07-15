@@ -13,8 +13,6 @@ import type * as dockerType from '@/api/interface/docker'
 import { useNotificationStore } from '@/stores/notification'
 import { useConfirmationModalStore } from '@/stores/confirmation-modal'
 import { useNodeStore } from '@/stores/node'
-import { useWindowManagerStore } from '@/stores/window-manager'
-import { load as parseYaml } from 'js-yaml'
 
 /** 容器资源统计缓存条目 */
 export interface ContainerStatsEntry {
@@ -56,7 +54,6 @@ export const useDockerStore = defineStore('docker', () => {
   const notificationStore = useNotificationStore()
   const modalStore = useConfirmationModalStore()
   const nodeStore = useNodeStore()
-  const windowStore = useWindowManagerStore()
 
   // ─── Docker 客户端 (响应节点切换) ───
   const dockerClient = computed(() => dockerApi.forNode(nodeStore.currentNodeId))
@@ -95,7 +92,27 @@ export const useDockerStore = defineStore('docker', () => {
   const isContainerDetailActive = ref(false)
 
   // ─── Compose 项目 ───
-  const composeProjects = ref<dockerType.ComposeProjectSummary[]>([])
+  const composeProjects = ref<dockerType.DockerProjectSummary[]>([])
+  const projectTotal = ref(0)
+  const projectPage = ref(1)
+  const projectPageSize = ref(20)
+  const projectListLoading = ref(false)
+  const projectListError = ref<string | null>(null)
+  const projectListLoadedAt = ref<number | null>(null)
+  const projectDetail = ref<dockerType.DockerProjectDetail | null>(null)
+  const projectDetailLoading = ref(false)
+  const projectDetailError = ref<string | null>(null)
+  const projectDetailLoadedAt = ref<number | null>(null)
+  const projectConfiguration = ref<dockerType.DockerProjectConfiguration | null>(null)
+  const projectConfigurationLoading = ref(false)
+  const projectConfigurationError = ref<string | null>(null)
+  const projectConfigurationLoadedAt = ref<number | null>(null)
+  const projectTasks = ref<dockerType.DockerProjectTask[]>([])
+  const projectTasksLoading = ref(false)
+  const projectTasksError = ref<string | null>(null)
+  const projectTasksLoadedAt = ref<number | null>(null)
+  const projectTaskCancelingIds = ref<string[]>([])
+  const projectMutationLoading = ref(false)
 
   // ─── 镜像 / 网络 / 卷 / 系统 ───
   const imagesList = ref<dockerType.DockerImageSummary[]>([])
@@ -141,8 +158,6 @@ export const useDockerStore = defineStore('docker', () => {
   const diskUsageLoading = ref(false)
   const diskUsageError = ref<string | null>(null)
   const pruneLoading = ref(false)
-  const composeContainers = ref<dockerType.ContainerSummary[]>([])
-  const projectLogs = ref<string[]>([])
 
   // ─── 容器创建表单 ───
   const isContainerCreateActive = ref(false)
@@ -172,15 +187,6 @@ export const useDockerStore = defineStore('docker', () => {
     autoRemove: false,
   })
 
-  // ─── 项目创建表单 ───
-  const isProjectCreateActive = ref(false)
-  const projectFormName = ref('')
-  const projectFormDir = ref('')
-  const projectFormCompose = ref(
-    `services:\n  nginx:\n    image:  nginx:latest\n    container_name: nginx\n    ports:\n      - "8080:80"\n`,
-  )
-  const composeYamlError = ref('')
-
   // ─── 缓存与防并发 ───
   const overviewCache = ref<OverviewCacheEntry | null>(null)
   const overviewRefreshInProgress = ref(false)
@@ -199,11 +205,18 @@ export const useDockerStore = defineStore('docker', () => {
   let containerListRequestSequence = 0
   let containerStatsRequestSequence = 0
   let containerNodeId: string | null = null
+  let projectListRequestSequence = 0
+  let projectDetailRequestSequence = 0
+  let projectConfigurationRequestSequence = 0
+  let projectTasksRequestSequence = 0
+  let projectNodeId: string | null = null
+  let projectTasksNodeId: string | null = null
 
   // ─── 轮询定时器 ───
   let resourceUsageTimer: number | null = null
   let resourceHistoryTimer: number | null = null
   let containerStatsPollingTimer: number | null = null
+  let projectTaskPollingTimer: number | null = null
 
   // ─── 容器统计批量队列 ───
   let containerStatsTimer: number | null = null
@@ -247,6 +260,31 @@ export const useDockerStore = defineStore('docker', () => {
     containerListRequestSequence += 1
     containerStatsRequestSequence += 1
     composeProjects.value = []
+    projectTotal.value = 0
+    projectPage.value = 1
+    projectListLoading.value = false
+    projectListError.value = null
+    projectListLoadedAt.value = null
+    projectDetail.value = null
+    projectDetailLoading.value = false
+    projectDetailError.value = null
+    projectDetailLoadedAt.value = null
+    projectConfiguration.value = null
+    projectConfigurationLoading.value = false
+    projectConfigurationError.value = null
+    projectConfigurationLoadedAt.value = null
+    projectTasks.value = []
+    projectTasksLoading.value = false
+    projectTasksError.value = null
+    projectTasksLoadedAt.value = null
+    projectTaskCancelingIds.value = []
+    projectMutationLoading.value = false
+    projectNodeId = null
+    projectTasksNodeId = null
+    projectListRequestSequence += 1
+    projectDetailRequestSequence += 1
+    projectConfigurationRequestSequence += 1
+    projectTasksRequestSequence += 1
     imagesList.value = []
     imageListLoading.value = false
     imageListError.value = null
@@ -300,8 +338,6 @@ export const useDockerStore = defineStore('docker', () => {
     diskUsageLoading.value = false
     diskUsageError.value = null
     pruneLoading.value = false
-    composeContainers.value = []
-    projectLogs.value = []
     isContainerCreateActive.value = false
     containerCreateLoading.value = false
     containerCreateError.value = null
@@ -508,20 +544,119 @@ export const useDockerStore = defineStore('docker', () => {
     return true
   }
 
-  /** 获取 Compose 项目列表 */
-  const fetchComposeProjects = async () => {
-    if (!dockerAvailable.value) return
-    const res = await dockerClient.value.listComposeProjects()
-    if (res.success) {
-      composeProjects.value = res.data || []
-    } else {
-      notificationStore.error(
-        t('app.docker.messages.listProjectsFailed', {
-          message: res.message || t('common.unknownError'),
-        }),
-      )
+  /** 获取 Compose 项目列表，并阻止旧节点响应覆盖当前状态。 */
+  const fetchComposeProjects = async (
+    query: dockerType.DockerProjectListQuery = {},
+  ): Promise<boolean> => {
+    if (!dockerAvailable.value) return false
+    const nodeId = nodeStore.currentNodeId || 'local'
+    if (projectNodeId !== nodeId) {
       composeProjects.value = []
+      projectTotal.value = 0
+      projectListLoadedAt.value = null
+      projectDetail.value = null
+      projectDetailLoading.value = false
+      projectDetailError.value = null
+      projectDetailLoadedAt.value = null
+      projectConfiguration.value = null
+      projectConfigurationLoading.value = false
+      projectConfigurationError.value = null
+      projectConfigurationLoadedAt.value = null
+      projectNodeId = nodeId
+      projectListRequestSequence += 1
+      projectDetailRequestSequence += 1
+      projectConfigurationRequestSequence += 1
+      projectTasksRequestSequence += 1
     }
+    const sequence = ++projectListRequestSequence
+    projectListLoading.value = true
+    projectListError.value = null
+    const res = await dockerClient.value.listComposeProjects({
+      ...query,
+      page: query.page ?? projectPage.value,
+      pageSize: query.pageSize ?? projectPageSize.value,
+    })
+    if (
+      sequence !== projectListRequestSequence ||
+      nodeId !== (nodeStore.currentNodeId || 'local')
+    ) {
+      return false
+    }
+    projectListLoading.value = false
+    if (!res.success || !res.data) {
+      projectListError.value = res.message || t('common.unknownError')
+      return false
+    }
+    composeProjects.value = res.data.items
+    projectTotal.value = res.data.total
+    projectPage.value = res.data.page
+    projectPageSize.value = res.data.pageSize
+    projectListLoadedAt.value = Date.now()
+    return true
+  }
+
+  /** 按需加载项目详情。 */
+  const fetchComposeProjectDetail = async (name: string): Promise<boolean> => {
+    const nodeId = nodeStore.currentNodeId || 'local'
+    const sequence = ++projectDetailRequestSequence
+    projectDetailLoading.value = true
+    projectDetailError.value = null
+    const res = await dockerClient.value.fetchComposeProject(name)
+    if (
+      sequence !== projectDetailRequestSequence ||
+      nodeId !== (nodeStore.currentNodeId || 'local')
+    ) {
+      return false
+    }
+    projectDetailLoading.value = false
+    if (!res.success || !res.data) {
+      projectDetailError.value = res.message || t('common.unknownError')
+      return false
+    }
+    projectDetail.value = res.data
+    projectDetailLoadedAt.value = Date.now()
+    return true
+  }
+
+  /** 清理详情并使进行中的请求失效。 */
+  const clearComposeProjectDetail = () => {
+    projectDetailRequestSequence += 1
+    projectDetail.value = null
+    projectDetailLoading.value = false
+    projectDetailError.value = null
+    projectDetailLoadedAt.value = null
+  }
+
+  /** 加载用户项目配置。 */
+  const fetchComposeProjectConfiguration = async (name: string): Promise<boolean> => {
+    const nodeId = nodeStore.currentNodeId || 'local'
+    const sequence = ++projectConfigurationRequestSequence
+    projectConfigurationLoading.value = true
+    projectConfigurationError.value = null
+    const res = await dockerClient.value.fetchComposeProjectConfiguration(name)
+    if (
+      sequence !== projectConfigurationRequestSequence ||
+      nodeId !== (nodeStore.currentNodeId || 'local')
+    ) {
+      return false
+    }
+    projectConfigurationLoading.value = false
+    if (!res.success || !res.data) {
+      projectConfigurationError.value = res.message || t('common.unknownError')
+      return false
+    }
+    projectConfiguration.value = res.data
+    projectConfigurationLoadedAt.value = Date.now()
+    return true
+  }
+
+  /** 清理配置状态并使进行中的请求失效。 */
+  const clearComposeProjectConfiguration = () => {
+    projectConfigurationRequestSequence += 1
+    projectConfiguration.value = null
+    projectConfigurationLoading.value = false
+    projectConfigurationError.value = null
+    projectConfigurationLoadedAt.value = null
   }
 
   /** 获取当前节点镜像列表，并阻止旧节点响应覆盖当前数据。 */
@@ -852,28 +987,6 @@ export const useDockerStore = defineStore('docker', () => {
     }
   }
 
-  /** 获取 Compose 关联容器列表 */
-  const fetchComposeContainers = async () => {
-    if (!dockerAvailable.value) return
-    const res = await dockerClient.value.listProjectContainers()
-    if (res.success) {
-      composeContainers.value = res.data || []
-    } else {
-      composeContainers.value = []
-    }
-  }
-
-  /** 获取 Compose 项目日志 */
-  const fetchProjectLogs = async (name: string) => {
-    if (!dockerAvailable.value) return
-    const res = await dockerClient.value.fetchComposeProjectLogs(name)
-    if (res.success && res.data) {
-      projectLogs.value = res.data
-    } else {
-      projectLogs.value = []
-    }
-  }
-
   /** 单容器资源统计 (带 TTL 缓存) */
   const fetchContainerResourceStats = async (id: string) => {
     if (!dockerAvailable.value) return
@@ -985,6 +1098,7 @@ export const useDockerStore = defineStore('docker', () => {
     stopOverviewPolling()
     stopHistoryPolling()
     stopContainerStatsPolling()
+    stopProjectTaskPolling()
   }
 
   // ========================================
@@ -1113,120 +1227,222 @@ export const useDockerStore = defineStore('docker', () => {
     }
   }
 
-  /** Compose 项目操作 */
-  const handleComposeProjectAction = async (
-    name: string,
-    action: 'start' | 'stop' | 'restart' | 'delete' | 'deleteFiles' | 'update',
-  ) => {
-    if (!name) {
-      notificationStore.error(t('app.docker.messages.invalidProjectName'))
-      return
-    }
-    // 更新操作
-    if (action === 'update') {
-      const confirmed = await modalStore.showConfirmation(
-        t('app.docker.messages.updateProjectConfirm', { name }),
-        t('app.docker.messages.updateConfirmTitle', { name }),
-        t('app.docker.messages.updateAction'),
-        t('confirmation.cancel'),
-      )
-      if (!confirmed) return
-      const res = await dockerClient.value.updateComposeProject(name)
-      if (res.success) {
-        notificationStore.success(
-          t('app.docker.messages.projectActionSuccess', {
-            name,
-            action: t('app.docker.messages.actionLabels.update'),
-          }),
-        )
-        await Promise.all([fetchComposeProjects(), fetchOverviewData()])
-      } else {
-        notificationStore.error(
-          t('app.docker.messages.projectActionFailed', {
-            name,
-            action: t('app.docker.messages.actionLabels.update'),
-            message: res.message || t('common.unknownError'),
-          }),
-        )
+  /** 将新任务加入任务列表并启动无重叠轮询。 */
+  const acceptProjectTask = (task: dockerType.DockerProjectTask) => {
+    projectTasks.value = [task, ...projectTasks.value.filter((item) => item.id !== task.id)]
+    startProjectTaskPolling()
+  }
+
+  /** 提交项目创建任务。 */
+  const createComposeProject = async (
+    payload: dockerType.DockerProjectCreateRequest,
+  ): Promise<boolean> => {
+    if (projectMutationLoading.value) return false
+    projectMutationLoading.value = true
+    try {
+      const res = await dockerClient.value.createComposeProject(payload)
+      if (!res.success || !res.data) {
+        notificationStore.error(res.message || t('common.unknownError'))
+        return false
       }
-      return
-    }
-    // 删除操作
-    if (action === 'delete' || action === 'deleteFiles') {
-      const deleteFiles = action === 'deleteFiles'
-      const deletePath =
-        composeProjects.value.find((project) => project.name === name)?.composeDir ?? null
-      const message = deleteFiles
-        ? t('app.docker.messages.deleteProjectWithFileConfirm', {
-            name,
-            file: deletePath ?? t('app.docker.messages.composeConfigFile'),
-          })
-        : t('app.docker.messages.deleteProjectConfirm', { name })
-      const confirmed = await modalStore.showConfirmation(
-        message,
-        t('app.docker.messages.deleteConfirmTitle'),
-        t('app.docker.messages.deleteAction'),
-        t('confirmation.cancel'),
-      )
-      if (!confirmed) return
-      const res = await dockerClient.value.deleteComposeProject(
-        name,
-        deleteFiles ? { deleteFiles } : undefined,
-      )
-      if (res.success) {
-        notificationStore.success(t('app.docker.messages.deleteProjectSuccess', { name }))
-        await Promise.all([fetchComposeProjects(), fetchOverviewData()])
-      } else {
-        notificationStore.error(
-          t('app.docker.messages.deleteProjectFailed', {
-            name,
-            message: res.message || t('common.unknownError'),
-          }),
-        )
-      }
-      return
-    }
-    // 启动/停止/重启
-    const actionLabelMap: Record<string, string> = {
-      start: t('app.docker.messages.actionLabels.start'),
-      stop: t('app.docker.messages.actionLabels.stop'),
-      restart: t('app.docker.messages.actionLabels.restart'),
-    }
-    const actionLabel = actionLabelMap[action] || action
-    const res = await (action === 'start'
-      ? dockerClient.value.startComposeProject(name)
-      : action === 'stop'
-        ? dockerClient.value.stopComposeProject(name)
-        : dockerClient.value.restartComposeProject(name))
-    if (res.success) {
-      notificationStore.success(
-        t('app.docker.messages.projectActionSuccess', { name, action: actionLabel }),
-      )
-      await Promise.all([fetchComposeProjects(), fetchOverviewData()])
-    } else {
-      notificationStore.error(
-        t('app.docker.messages.projectActionFailed', {
-          name,
-          action: actionLabel,
-          message: res.message || t('common.unknownError'),
-        }),
-      )
+      acceptProjectTask(res.data)
+      return true
+    } finally {
+      projectMutationLoading.value = false
     }
   }
 
-  /** 打开 Compose 配置文件编辑器 */
-  const handleEditComposeConfig = (name: string) => {
-    if (!name) {
-      notificationStore.error(t('app.docker.messages.invalidProjectName'))
-      return
+  /** 提交项目启停或重启任务。 */
+  const runComposeProjectLifecycle = async (
+    name: string,
+    operation: 'start' | 'stop' | 'restart',
+  ): Promise<boolean> => {
+    if (projectMutationLoading.value) return false
+    projectMutationLoading.value = true
+    try {
+      const res = await (operation === 'start'
+        ? dockerClient.value.startComposeProject(name)
+        : operation === 'stop'
+          ? dockerClient.value.stopComposeProject(name)
+          : dockerClient.value.restartComposeProject(name))
+      if (!res.success || !res.data) {
+        notificationStore.error(res.message || t('common.unknownError'))
+        return false
+      }
+      acceptProjectTask(res.data)
+      return true
+    } finally {
+      projectMutationLoading.value = false
     }
-    const composeDir = composeProjects.value.find((project) => project.name === name)?.composeDir
-    if (!composeDir) {
-      notificationStore.error(t('app.docker.messages.composeDirMissing'))
-      return
+  }
+
+  /** 提交重新部署任务。 */
+  const redeployComposeProject = async (name: string, pullImages: boolean): Promise<boolean> => {
+    if (projectMutationLoading.value) return false
+    projectMutationLoading.value = true
+    try {
+      const res = await dockerClient.value.redeployComposeProject(name, { pullImages })
+      if (!res.success || !res.data) {
+        notificationStore.error(res.message || t('common.unknownError'))
+        return false
+      }
+      acceptProjectTask(res.data)
+      return true
+    } finally {
+      projectMutationLoading.value = false
     }
-    const path = `${composeDir.replace(/\/$/, '')}/compose.yaml`
-    windowStore.openWindowWithPayload('file-editor', { path }, { title: name })
+  }
+
+  /** 提交服务伸缩任务。 */
+  const scaleComposeProjectService = async (
+    name: string,
+    service: string,
+    replicas: number,
+  ): Promise<boolean> => {
+    if (projectMutationLoading.value) return false
+    projectMutationLoading.value = true
+    try {
+      const res = await dockerClient.value.scaleComposeProject(name, service, { replicas })
+      if (!res.success || !res.data) {
+        notificationStore.error(res.message || t('common.unknownError'))
+        return false
+      }
+      acceptProjectTask(res.data)
+      return true
+    } finally {
+      projectMutationLoading.value = false
+    }
+  }
+
+  /** 提交项目删除任务。 */
+  const removeComposeProject = async (name: string): Promise<boolean> => {
+    if (projectMutationLoading.value) return false
+    projectMutationLoading.value = true
+    try {
+      const res = await dockerClient.value.deleteComposeProject(name)
+      if (!res.success || !res.data) {
+        notificationStore.error(res.message || t('common.unknownError'))
+        return false
+      }
+      acceptProjectTask(res.data)
+      return true
+    } finally {
+      projectMutationLoading.value = false
+    }
+  }
+
+  /** 保存配置但不触发部署。 */
+  const saveComposeProjectConfiguration = async (
+    name: string,
+    composeYaml: string,
+    expectedRevision: number,
+  ): Promise<boolean> => {
+    if (projectMutationLoading.value) return false
+    projectMutationLoading.value = true
+    projectConfigurationError.value = null
+    try {
+      const res = await dockerClient.value.updateComposeProjectConfiguration(name, {
+        composeYaml,
+        expectedRevision,
+      })
+      if (!res.success || !res.data) {
+        projectConfigurationError.value = res.message || t('common.unknownError')
+        return false
+      }
+      projectConfiguration.value = res.data
+      return true
+    } finally {
+      projectMutationLoading.value = false
+    }
+  }
+
+  /** 仅使用 Agent Compose 语义校验配置，不执行本地降级。 */
+  const validateComposeYaml = async (
+    composeYaml: string,
+  ): Promise<dockerType.DockerProjectConfigurationValidateResponse | null> => {
+    projectConfigurationError.value = null
+    const res = await dockerClient.value.validateComposeYaml({ composeYaml })
+    if (!res.success || !res.data) {
+      projectConfigurationError.value = res.message || t('common.unknownError')
+      return null
+    }
+    return res.data
+  }
+
+  /** 获取当前节点的最近项目任务。 */
+  const fetchComposeProjectTasks = async (active = false): Promise<boolean> => {
+    const nodeId = nodeStore.currentNodeId || 'local'
+    if (projectTasksLoading.value && projectTasksNodeId === nodeId) return false
+    if (projectTasksNodeId !== nodeId) {
+      projectTasksRequestSequence += 1
+      projectTasksLoading.value = false
+      projectTasks.value = []
+      projectTasksError.value = null
+      projectTasksLoadedAt.value = null
+      projectTasksNodeId = nodeId
+    }
+    const sequence = ++projectTasksRequestSequence
+    projectTasksLoading.value = true
+    const res = await dockerClient.value.listComposeProjectTasks({ active, limit: 20 })
+    if (
+      sequence !== projectTasksRequestSequence ||
+      nodeId !== (nodeStore.currentNodeId || 'local')
+    ) {
+      return false
+    }
+    projectTasksLoading.value = false
+    if (!res.success || !res.data) {
+      projectTasksError.value = res.message || t('common.unknownError')
+      return false
+    }
+    projectTasks.value = res.data
+    projectTasksError.value = null
+    projectTasksLoadedAt.value = Date.now()
+    if (!projectTasks.value.some((task) => task.status === 'queued' || task.status === 'running')) {
+      stopProjectTaskPolling()
+      await Promise.all([fetchComposeProjects(), fetchOverviewData()])
+    }
+    return true
+  }
+
+  /** 取消项目后台任务。 */
+  const cancelComposeProjectTask = async (taskId: string): Promise<boolean> => {
+    if (projectTaskCancelingIds.value.includes(taskId)) return false
+    projectTaskCancelingIds.value = [...projectTaskCancelingIds.value, taskId]
+    try {
+      const res = await dockerClient.value.cancelComposeProjectTask(taskId)
+      if (!res.success) {
+        notificationStore.error(res.message || t('common.unknownError'))
+        return false
+      }
+      await fetchComposeProjectTasks()
+      return true
+    } finally {
+      projectTaskCancelingIds.value = projectTaskCancelingIds.value.filter((id) => id !== taskId)
+    }
+  }
+
+  /** 仅在存在活动任务时轮询，且下一次请求在上一次完成后调度。 */
+  function startProjectTaskPolling() {
+    if (projectTaskPollingTimer !== null) return
+    const poll = async () => {
+      projectTaskPollingTimer = null
+      if (document.hidden) return
+      await fetchComposeProjectTasks()
+      if (
+        projectTasks.value.some((task) => task.status === 'queued' || task.status === 'running')
+      ) {
+        projectTaskPollingTimer = window.setTimeout(poll, 2000)
+      }
+    }
+    projectTaskPollingTimer = window.setTimeout(poll, 500)
+  }
+
+  /** 停止项目任务轮询。 */
+  function stopProjectTaskPolling() {
+    if (projectTaskPollingTimer === null) return
+    window.clearTimeout(projectTaskPollingTimer)
+    projectTaskPollingTimer = null
   }
 
   /** 删除镜像 */
@@ -1484,98 +1700,6 @@ export const useDockerStore = defineStore('docker', () => {
     }
   }
 
-  // ─── 项目创建流程 ───
-
-  /** 取消项目创建 */
-  const cancelProjectCreate = () => {
-    isProjectCreateActive.value = false
-    projectFormName.value = ''
-    projectFormDir.value = ''
-    composeYamlError.value = ''
-  }
-
-  /** 提交项目创建 */
-  const submitProjectForm = async () => {
-    if (!projectFormName.value.trim()) {
-      notificationStore.error(t('app.docker.messages.projectNameRequired'))
-      return
-    }
-    if (!projectFormCompose.value.trim()) {
-      notificationStore.error(t('app.docker.messages.composeRequired'))
-      return
-    }
-    if (composeYamlError.value) {
-      notificationStore.error(
-        t('app.docker.messages.yamlValidationFailed', { message: composeYamlError.value }),
-      )
-      return
-    }
-    const res = await dockerClient.value.createComposeProject({
-      name: projectFormName.value.trim(),
-      compose: projectFormCompose.value,
-      dir: projectFormDir.value.trim() || undefined,
-      projectType: 'docker',
-    })
-    if (res.success) {
-      notificationStore.success(
-        t('app.docker.messages.createProjectSuccess', { name: projectFormName.value }),
-      )
-      cancelProjectCreate()
-      await Promise.all([fetchComposeProjects(), fetchOverviewData()])
-    } else {
-      notificationStore.error(
-        t('app.docker.messages.createProjectFailed', {
-          message: res.message || t('common.unknownError'),
-        }),
-      )
-    }
-  }
-
-  /** 校验 Compose YAML */
-  const validateComposeYaml = async (value: string) => {
-    const trimmed = value.trim()
-    if (!trimmed) {
-      composeYamlError.value = ''
-      return
-    }
-    const res = await dockerClient.value.validateComposeYaml({ compose: trimmed })
-    if (res.success && res.data) {
-      const data = res.data as { valid: boolean; error?: string }
-      if (data.valid) {
-        composeYamlError.value = ''
-      } else {
-        composeYamlError.value = data.error || t('app.docker.messages.yamlParseFailed')
-      }
-    } else {
-      // 降级使用本地 js-yaml 校验
-      try {
-        parseYaml(trimmed)
-        composeYamlError.value = ''
-      } catch (error) {
-        composeYamlError.value =
-          error instanceof Error ? error.message : t('app.docker.messages.yamlParseFailed')
-      }
-    }
-  }
-
-  /** 伸缩 Compose 项目中的指定服务 */
-  const handleScaleComposeProject = async (name: string, service: string, replicas: number) => {
-    if (!name || !service) return
-    const res = await dockerClient.value.scaleComposeProject(name, { service, replicas })
-    if (res.success) {
-      notificationStore.success(
-        t('app.docker.messages.scaleProjectSuccess', { name, service, count: replicas }),
-      )
-      await fetchComposeContainers()
-    } else {
-      notificationStore.error(
-        t('app.docker.messages.scaleProjectFailed', {
-          message: res.message || t('common.unknownError'),
-        }),
-      )
-    }
-  }
-
   /** 创建本地数据卷，仅成功时刷新列表。 */
   const createVolume = async (payload: dockerType.DockerVolumeCreateRequest): Promise<boolean> => {
     if (volumeCreateLoading.value) return false
@@ -1709,6 +1833,26 @@ export const useDockerStore = defineStore('docker', () => {
 
     // Compose 项目
     composeProjects,
+    projectTotal,
+    projectPage,
+    projectPageSize,
+    projectListLoading,
+    projectListError,
+    projectListLoadedAt,
+    projectDetail,
+    projectDetailLoading,
+    projectDetailError,
+    projectDetailLoadedAt,
+    projectConfiguration,
+    projectConfigurationLoading,
+    projectConfigurationError,
+    projectConfigurationLoadedAt,
+    projectTasks,
+    projectTasksLoading,
+    projectTasksError,
+    projectTasksLoadedAt,
+    projectTaskCancelingIds,
+    projectMutationLoading,
 
     // 镜像 / 网络 / 卷 / 系统
     imagesList,
@@ -1754,8 +1898,6 @@ export const useDockerStore = defineStore('docker', () => {
     diskUsageLoading,
     diskUsageError,
     pruneLoading,
-    composeContainers,
-    projectLogs,
 
     // 容器创建
     isContainerCreateActive,
@@ -1766,19 +1908,17 @@ export const useDockerStore = defineStore('docker', () => {
     selectedImageLabel,
     containerForm,
 
-    // 项目创建
-    isProjectCreateActive,
-    projectFormName,
-    projectFormDir,
-    projectFormCompose,
-    composeYamlError,
-
     // 数据获取
     fetchDockerAvailability,
     fetchOverviewData,
     fetchOverviewHistoryAll,
     fetchContainers,
     fetchComposeProjects,
+    fetchComposeProjectDetail,
+    clearComposeProjectDetail,
+    fetchComposeProjectConfiguration,
+    clearComposeProjectConfiguration,
+    fetchComposeProjectTasks,
     fetchImagesList,
     fetchControllerImages,
     fetchRecentImageDistributionTask,
@@ -1792,8 +1932,6 @@ export const useDockerStore = defineStore('docker', () => {
     clearVolumeDetail,
     fetchDockerInfo,
     fetchDockerDiskUsage,
-    fetchComposeContainers,
-    fetchProjectLogs,
     fetchContainerResourceStats,
     loadOverviewData,
     refreshOverviewDataIfNeeded,
@@ -1812,8 +1950,14 @@ export const useDockerStore = defineStore('docker', () => {
 
     // 业务操作
     handleContainerAction,
-    handleComposeProjectAction,
-    handleEditComposeConfig,
+    createComposeProject,
+    runComposeProjectLifecycle,
+    redeployComposeProject,
+    scaleComposeProjectService,
+    removeComposeProject,
+    saveComposeProjectConfiguration,
+    validateComposeYaml,
+    cancelComposeProjectTask,
     handleDeleteImage,
     fetchNetworkDetail,
     clearNetworkDetail,
@@ -1828,13 +1972,9 @@ export const useDockerStore = defineStore('docker', () => {
     submitContainerConfig,
     resetContainerForm,
 
-    // 项目创建
-    cancelProjectCreate,
-    submitProjectForm,
-    validateComposeYaml,
-
     // 编排与系统操作
-    handleScaleComposeProject,
+    startProjectTaskPolling,
+    stopProjectTaskPolling,
     createVolume,
     removeVolume,
     handlePruneSystem,

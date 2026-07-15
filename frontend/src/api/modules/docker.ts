@@ -98,64 +98,101 @@ const createScopedDockerApi = (nodeId?: string) => ({
       buildDockerPath(`/agent/docker/containers/${encodeURIComponent(id)}/top`, nodeId),
     )
   },
-  listProjectContainers: () => {
-    return http.get<docker.ContainerSummary[]>(
-      buildDockerPath('/agent/docker/compose/containers', nodeId),
-    )
-  },
-  listComposeProjects: () => {
-    return http.get<docker.ComposeProjectSummary[]>(
+  listComposeProjects: (params?: docker.DockerProjectListQuery) => {
+    return http.get<docker.DockerProjectPage>(
       buildDockerPath('/agent/docker/compose/projects', nodeId),
+      params,
     )
   },
-  fetchComposeRoot: () => {
-    return http.get<string>(buildDockerPath('/agent/docker/compose/root', nodeId))
+  fetchComposeProject: (name: string) => {
+    return http.get<docker.DockerProjectDetail>(
+      buildDockerPath(`/agent/docker/compose/projects/${encodeURIComponent(name)}`, nodeId),
+    )
   },
-  createComposeProject: (payload: docker.ComposeProjectCreateRequest) => {
-    return http.post(buildDockerPath('/agent/docker/compose/projects', nodeId), payload)
+  createComposeProject: (payload: docker.DockerProjectCreateRequest) => {
+    return http.post<docker.DockerProjectTask>(
+      buildDockerPath('/agent/docker/compose/projects', nodeId),
+      payload,
+    )
   },
   startComposeProject: (name: string) => {
-    return http.post(
+    return http.post<docker.DockerProjectTask>(
       buildDockerPath(`/agent/docker/compose/projects/${encodeURIComponent(name)}/start`, nodeId),
     )
   },
   stopComposeProject: (name: string) => {
-    return http.post(
+    return http.post<docker.DockerProjectTask>(
       buildDockerPath(`/agent/docker/compose/projects/${encodeURIComponent(name)}/stop`, nodeId),
     )
   },
   restartComposeProject: (name: string) => {
-    return http.post(
+    return http.post<docker.DockerProjectTask>(
       buildDockerPath(`/agent/docker/compose/projects/${encodeURIComponent(name)}/restart`, nodeId),
     )
   },
-  updateComposeProject: (name: string) => {
-    return http.post(
-      buildDockerPath(`/agent/docker/compose/projects/${encodeURIComponent(name)}/update`, nodeId),
-    )
-  },
-  scaleComposeProject: (name: string, payload: { service: string; replicas: number }) => {
-    return http.post(
-      buildDockerPath(`/agent/docker/compose/projects/${encodeURIComponent(name)}/scale`, nodeId),
+  redeployComposeProject: (name: string, payload: { pullImages: boolean }) => {
+    return http.post<docker.DockerProjectTask>(
+      buildDockerPath(
+        `/agent/docker/compose/projects/${encodeURIComponent(name)}/deployments`,
+        nodeId,
+      ),
       payload,
     )
   },
-  validateComposeYaml: (payload: { compose: string }) => {
-    return http.post(buildDockerPath('/agent/docker/compose/validate', nodeId), payload)
+  scaleComposeProject: (name: string, service: string, payload: { replicas: number }) => {
+    return http.put<docker.DockerProjectTask>(
+      buildDockerPath(
+        `/agent/docker/compose/projects/${encodeURIComponent(name)}/services/${encodeURIComponent(service)}/replicas`,
+        nodeId,
+      ),
+      payload,
+    )
   },
-  deleteComposeProject: (name: string, params?: docker.ComposeProjectDeleteQuery) => {
-    return http.delete(
+  fetchComposeProjectConfiguration: (name: string) => {
+    return http.get<docker.DockerProjectConfiguration>(
+      buildDockerPath(
+        `/agent/docker/compose/projects/${encodeURIComponent(name)}/configuration`,
+        nodeId,
+      ),
+    )
+  },
+  updateComposeProjectConfiguration: (
+    name: string,
+    payload: docker.DockerProjectConfigurationUpdateRequest,
+  ) => {
+    return http.put<docker.DockerProjectConfiguration>(
+      buildDockerPath(
+        `/agent/docker/compose/projects/${encodeURIComponent(name)}/configuration`,
+        nodeId,
+      ),
+      payload,
+    )
+  },
+  validateComposeYaml: (payload: { composeYaml: string }) => {
+    return http.post<docker.DockerProjectConfigurationValidateResponse>(
+      buildDockerPath('/agent/docker/compose/configurations/validate', nodeId),
+      payload,
+    )
+  },
+  deleteComposeProject: (name: string) => {
+    return http.delete<docker.DockerProjectTask>(
       buildDockerPath(`/agent/docker/compose/projects/${encodeURIComponent(name)}`, nodeId),
+    )
+  },
+  listComposeProjectTasks: (params?: { active?: boolean; limit?: number }) => {
+    return http.get<docker.DockerProjectTask[]>(
+      buildDockerPath('/agent/docker/compose/project-tasks', nodeId),
       params,
     )
   },
-  fetchComposeProjectLogs: (
-    name: string,
-    params?: { tail?: number; since?: string; until?: string },
-  ) => {
-    return http.get<docker.ComposeProjectLogs>(
-      buildDockerPath(`/agent/docker/compose/projects/${encodeURIComponent(name)}/logs`, nodeId),
-      params,
+  fetchComposeProjectTask: (taskId: string) => {
+    return http.get<docker.DockerProjectTask>(
+      buildDockerPath(`/agent/docker/compose/project-tasks/${encodeURIComponent(taskId)}`, nodeId),
+    )
+  },
+  cancelComposeProjectTask: (taskId: string) => {
+    return http.delete<docker.DockerProjectTask>(
+      buildDockerPath(`/agent/docker/compose/project-tasks/${encodeURIComponent(taskId)}`, nodeId),
     )
   },
   listImages: () => {

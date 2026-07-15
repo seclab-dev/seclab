@@ -18,7 +18,7 @@ import { useNodeStore } from '@/stores/node'
 import { useWindowManagerStore } from '@/stores/window-manager'
 
 import DockerOverview from './DockerOverview.vue'
-import DockerProjectContainers from './DockerProjectContainers.vue'
+import DockerProjects from './DockerProjects.vue'
 import DockerAllContainers from './DockerAllContainers.vue'
 import DockerImages from './DockerImages.vue'
 import DockerVolumes from './DockerVolumes.vue'
@@ -54,7 +54,7 @@ const menuItems = computed(() => [
     key: 'projects',
     label: t('app.docker.menu.projects'),
     icon: 'folder',
-    component: markRaw(DockerProjectContainers),
+    component: markRaw(DockerProjects),
   },
   {
     key: 'containers',
@@ -102,14 +102,8 @@ const activeComponent = computed(() => {
   return menuItems.value.find((i) => i.key === activeMenu.value)?.component
 })
 
-/** 处理创建按钮点击（容器/项目共用） */
+/** 处理容器创建按钮点击。 */
 const handleCreateClick = async () => {
-  if (activeMenu.value === 'projects') {
-    store.projectFormName = ''
-    store.composeYamlError = ''
-    store.isProjectCreateActive = true
-    return
-  }
   await store.startContainerCreateFlow()
 }
 
@@ -189,7 +183,6 @@ watch(
         store.startContainerStatsPolling(() => activeMenu.value)
         break
       case 'projects':
-        fetchAction = store.fetchComposeProjects()
         store.stopContainerStatsPolling()
         break
       case 'images':
@@ -214,7 +207,6 @@ watch(
     }
 
     store.isContainerCreateActive = false
-    store.isProjectCreateActive = false
     store.containerStep = 'selectImage'
     store.selectedImageId = null
   },
@@ -295,26 +287,14 @@ onUnmounted(() => {
         v-else
         :is="activeComponent"
         :containers="store.containers"
-        :projects="store.composeProjects"
         :container-resource-stats="store.containerResourceStats"
-        :is-create-active="
-          activeMenu === 'containers'
-            ? store.isContainerCreateActive
-            : activeMenu === 'projects'
-              ? store.isProjectCreateActive
-              : false
-        "
+        :is-create-active="activeMenu === 'containers' ? store.isContainerCreateActive : false"
         :container-step="store.containerStep"
         :selected-image-id="store.selectedImageId"
         :selected-image-label="store.selectedImageLabel"
         :container-form="store.containerForm"
-        :project-form-name="store.projectFormName"
-        :project-form-compose="store.projectFormCompose"
-        :compose-yaml-error="store.composeYamlError"
         :node-id="targetNodeId"
         @action="store.handleContainerAction"
-        @project-action="store.handleComposeProjectAction"
-        @edit-compose="store.handleEditComposeConfig"
         @create="handleCreateClick"
         @cancel-create="store.cancelContainerCreate"
         @submit-create="store.submitContainerConfig"
@@ -322,15 +302,6 @@ onUnmounted(() => {
         @update:container-step="(v: 'selectImage' | 'config') => (store.containerStep = v)"
         @update:selected-image-id="(v: string | null) => (store.selectedImageId = v)"
         @update:container-form="(v: typeof store.containerForm) => (store.containerForm = v)"
-        @cancel-project-create="store.cancelProjectCreate"
-        @submit-project-create="store.submitProjectForm"
-        @update:project-form-name="(v: string) => (store.projectFormName = v)"
-        @update:project-form-compose="
-          (v: string) => {
-            store.projectFormCompose = v
-            store.validateComposeYaml(v)
-          }
-        "
         @update:detail-active="(v: boolean) => (store.isContainerDetailActive = v)"
         @logs-active-change="updateRealtimeLogsActive"
         @terminal-active-change="updateContainerTerminalActive"

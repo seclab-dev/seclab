@@ -435,31 +435,156 @@ export interface DockerContainerDetail {
   logDriver: string
 }
 
-/** Compose 项目创建请求 */
-export interface ComposeProjectCreateRequest {
-  name: string
-  compose: string
-  dir?: string
-  projectType?: string
+export type DockerProjectRuntimeState = 'running' | 'partial' | 'stopped' | 'unknown'
+export type DockerProjectConfigurationState = 'applied' | 'pending' | 'missing'
+export type DockerProjectManagementKind = 'custom' | 'suite' | 'system'
+export type DockerProjectManageVia = 'projects' | 'suite_center' | 'system'
+
+/** Compose 项目的容器状态分布。 */
+export interface DockerProjectContainerStates {
+  total: number
+  running: number
+  paused: number
+  restarting: number
+  exited: number
+  other: number
 }
 
-/** Compose 项目删除参数 */
-export interface ComposeProjectDeleteQuery {
-  deleteFiles?: boolean
+/** Compose 项目的管理归属。 */
+export interface DockerProjectManagement {
+  kind: DockerProjectManagementKind
+  ownerName?: string
+  readOnly: boolean
+  manageVia: DockerProjectManageVia
 }
 
-/** Compose 项目概要 */
-export interface ComposeProjectSummary {
+/** Compose 项目允许执行的操作。 */
+export interface DockerProjectCapabilities {
+  canStart: boolean
+  canStop: boolean
+  canRestart: boolean
+  canRedeploy: boolean
+  canEditConfiguration: boolean
+  canScale: boolean
+  canRemove: boolean
+}
+
+/** Compose 项目列表项。 */
+export interface DockerProjectSummary {
   name: string
-  status: string
-  totalContainers: number
-  runningContainers: number
-  exitedContainers: number
-  pausedContainers: number
-  restartingContainers: number
-  hasComposeFile: boolean
-  composeDir?: string
-  projectType?: string
+  createdAt: number
+  runtimeState: DockerProjectRuntimeState
+  configurationState: DockerProjectConfigurationState
+  serviceCount: number
+  containerStates: DockerProjectContainerStates
+  management: DockerProjectManagement
+  capabilities: DockerProjectCapabilities
+}
+
+/** Compose 项目分页列表。 */
+export interface DockerProjectPage {
+  total: number
+  page: number
+  pageSize: number
+  items: DockerProjectSummary[]
+}
+
+/** Compose 项目列表筛选。 */
+export interface DockerProjectListQuery {
+  keyword?: string
+  managementKind?: DockerProjectManagementKind
+  runtimeState?: DockerProjectRuntimeState
+  page?: number
+  pageSize?: number
+}
+
+/** Compose 服务内的容器摘要。 */
+export interface DockerProjectContainerSummary {
+  id: string
+  name: string
+  state: string
+  ipAddresses: string[]
+  publishedPorts: string[]
+}
+
+/** Compose 服务摘要。 */
+export interface DockerProjectServiceSummary {
+  name: string
+  image?: string
+  runtimeState: DockerProjectRuntimeState
+  containerStates: DockerProjectContainerStates
+  containers: DockerProjectContainerSummary[]
+}
+
+/** Compose 项目详情。 */
+export interface DockerProjectDetail {
+  summary: DockerProjectSummary
+  services: DockerProjectServiceSummary[]
+}
+
+/** Compose 项目创建请求。 */
+export interface DockerProjectCreateRequest {
+  name: string
+  composeYaml: string
+}
+
+/** Compose 项目配置。 */
+export interface DockerProjectConfiguration {
+  composeYaml: string
+  revision: number
+  appliedRevision?: number
+  state: DockerProjectConfigurationState
+}
+
+/** Compose 配置保存请求。 */
+export interface DockerProjectConfigurationUpdateRequest {
+  composeYaml: string
+  expectedRevision: number
+}
+
+/** Compose 配置校验结果。 */
+export interface DockerProjectConfigurationValidateResponse {
+  valid: boolean
+  error?: string
+}
+
+export type DockerProjectTaskOperation =
+  | 'create'
+  | 'start'
+  | 'stop'
+  | 'restart'
+  | 'redeploy'
+  | 'scale'
+  | 'remove'
+export type DockerProjectTaskStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+export type DockerProjectTaskStage =
+  | 'validating'
+  | 'preparing'
+  | 'pulling'
+  | 'applying'
+  | 'verifying'
+  | 'rolling_back'
+  | 'cleaning_up'
+  | 'completed'
+  | 'cancelled'
+  | 'interrupted'
+
+/** Compose 项目后台任务。 */
+export interface DockerProjectTask {
+  id: string
+  projectName: string
+  operation: DockerProjectTaskOperation
+  status: DockerProjectTaskStatus
+  stage: DockerProjectTaskStage
+  progressPercent: number
+  serviceName?: string
+  replicas?: number
+  pullImages: boolean
+  errorSummary?: string
+  cleanupWarning?: string
+  createdAt: number
+  startedAt?: number
+  finishedAt?: number
 }
 
 /** Docker daemon 镜像与代理设置。 */
@@ -468,9 +593,6 @@ export interface DockerDaemonSettings {
   proxy: string
   proxyEnabled: boolean
 }
-
-/** Compose 项目日志响应 */
-export type ComposeProjectLogs = string[]
 
 /** Docker 网络 IPAM 配置。 */
 export interface DockerNetworkIpamConfig {

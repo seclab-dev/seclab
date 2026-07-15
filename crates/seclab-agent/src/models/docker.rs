@@ -353,38 +353,272 @@ pub struct ContainerExecResult {
     pub output: String,
 }
 
-/// 创建 Compose 项目的请求体。
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ComposeProjectCreateRequest {
-    pub name: String,
-    pub compose: String,
-    pub dir: Option<String>,
-    pub project_type: Option<String>,
+/// Compose 项目的运行状态。
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DockerProjectRuntimeState {
+    Running,
+    Partial,
+    Stopped,
+    Unknown,
 }
 
-/// Compose 项目状态与容器数量汇总。
+/// Compose 项目的配置应用状态。
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DockerProjectConfigurationState {
+    Applied,
+    Pending,
+    Missing,
+}
+
+/// Compose 项目的管理归属。
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DockerProjectManagementKind {
+    Custom,
+    Suite,
+    System,
+}
+
+impl DockerProjectManagementKind {
+    /// 返回数据库使用的稳定标识。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Custom => "custom",
+            Self::Suite => "suite",
+            Self::System => "system",
+        }
+    }
+}
+
+/// Compose 项目的管理入口。
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DockerProjectManageVia {
+    Projects,
+    SuiteCenter,
+    System,
+}
+
+/// Compose 项目的归属信息。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerProjectManagement {
+    pub kind: DockerProjectManagementKind,
+    pub owner_name: Option<String>,
+    pub read_only: bool,
+    pub manage_via: DockerProjectManageVia,
+}
+
+/// Compose 项目允许执行的操作。
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerProjectCapabilities {
+    pub can_start: bool,
+    pub can_stop: bool,
+    pub can_restart: bool,
+    pub can_redeploy: bool,
+    pub can_edit_configuration: bool,
+    pub can_scale: bool,
+    pub can_remove: bool,
+}
+
+/// Compose 项目容器状态分布。
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerProjectContainerStates {
+    pub total: usize,
+    pub running: usize,
+    pub paused: usize,
+    pub restarting: usize,
+    pub exited: usize,
+    pub other: usize,
+}
+
+/// Compose 项目列表项。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerProjectSummary {
+    pub name: String,
+    pub created_at: i64,
+    pub runtime_state: DockerProjectRuntimeState,
+    pub configuration_state: DockerProjectConfigurationState,
+    pub service_count: usize,
+    pub container_states: DockerProjectContainerStates,
+    pub management: DockerProjectManagement,
+    pub capabilities: DockerProjectCapabilities,
+}
+
+/// Compose 项目分页列表。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ComposeProjectSummary {
-    pub name: String,
-    pub status: String,
-    pub total_containers: usize,
-    pub running_containers: usize,
-    pub exited_containers: usize,
-    pub paused_containers: usize,
-    pub restarting_containers: usize,
-    pub has_compose_file: bool,
-    pub compose_dir: Option<String>,
-    pub project_type: Option<String>,
+pub struct DockerProjectPage {
+    pub total: usize,
+    pub page: usize,
+    pub page_size: usize,
+    pub items: Vec<DockerProjectSummary>,
 }
 
-/// Compose 项目日志查询参数。
+/// Compose 服务中的容器摘要。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerProjectContainerSummary {
+    pub id: String,
+    pub name: String,
+    pub state: String,
+    pub ip_addresses: Vec<String>,
+    pub published_ports: Vec<String>,
+}
+
+/// Compose 服务运行摘要。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerProjectServiceSummary {
+    pub name: String,
+    pub image: Option<String>,
+    pub runtime_state: DockerProjectRuntimeState,
+    pub container_states: DockerProjectContainerStates,
+    pub containers: Vec<DockerProjectContainerSummary>,
+}
+
+/// Compose 项目详情。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerProjectDetail {
+    pub summary: DockerProjectSummary,
+    pub services: Vec<DockerProjectServiceSummary>,
+}
+
+/// Compose 项目创建请求。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerProjectCreateRequest {
+    pub name: String,
+    pub compose_yaml: String,
+}
+
+/// Compose 配置保存请求。
 #[derive(Debug, Deserialize)]
-pub struct ComposeProjectLogsQuery {
-    pub tail: Option<u16>,
-    pub since: Option<String>,
-    pub until: Option<String>,
+#[serde(rename_all = "camelCase")]
+pub struct DockerProjectConfigurationUpdateRequest {
+    pub compose_yaml: String,
+    pub expected_revision: i64,
+}
+
+/// Compose 配置响应。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerProjectConfiguration {
+    pub compose_yaml: String,
+    pub revision: i64,
+    pub applied_revision: Option<i64>,
+    pub state: DockerProjectConfigurationState,
+}
+
+/// Compose 配置校验请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerProjectConfigurationValidateRequest {
+    pub compose_yaml: String,
+}
+
+/// Compose 配置校验响应。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerProjectConfigurationValidateResponse {
+    pub valid: bool,
+    pub error: Option<String>,
+}
+
+/// Compose 项目重新部署请求。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerProjectDeploymentRequest {
+    #[serde(default)]
+    pub pull_images: bool,
+}
+
+/// Compose 服务副本数修改请求。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerProjectScaleRequest {
+    pub replicas: usize,
+}
+
+/// Compose 项目任务操作。
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DockerProjectTaskOperation {
+    Create,
+    Start,
+    Stop,
+    Restart,
+    Redeploy,
+    Scale,
+    Remove,
+}
+
+impl DockerProjectTaskOperation {
+    /// 返回数据库使用的稳定标识。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+            Self::Redeploy => "redeploy",
+            Self::Scale => "scale",
+            Self::Remove => "remove",
+        }
+    }
+}
+
+/// Compose 项目任务状态。
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DockerProjectTaskStatus {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+/// Compose 项目任务阶段。
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DockerProjectTaskStage {
+    Validating,
+    Preparing,
+    Pulling,
+    Applying,
+    Verifying,
+    RollingBack,
+    CleaningUp,
+    Completed,
+    Cancelled,
+    Interrupted,
+}
+
+/// Compose 项目后台任务。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerProjectTask {
+    pub id: String,
+    pub project_name: String,
+    pub operation: DockerProjectTaskOperation,
+    pub status: DockerProjectTaskStatus,
+    pub stage: DockerProjectTaskStage,
+    pub progress_percent: u8,
+    pub service_name: Option<String>,
+    pub replicas: Option<usize>,
+    pub pull_images: bool,
+    pub error_summary: Option<String>,
+    pub cleanup_warning: Option<String>,
+    pub created_at: i64,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
 }
 
 /// 创建网络的请求参数。
@@ -677,29 +911,6 @@ pub struct DockerDiskUsageSummary {
     pub containers: DockerDiskUsageCategory,
     pub volumes: DockerDiskUsageCategory,
     pub build_cache: DockerDiskUsageCategory,
-}
-
-/// Compose 项目服务伸缩请求体
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ComposeProjectScaleRequest {
-    pub service: String,
-    pub replicas: u32,
-}
-
-/// Compose YAML 格式校验请求体
-#[derive(Debug, Deserialize)]
-pub struct ComposeProjectValidateRequest {
-    pub compose: String,
-}
-
-/// Compose YAML 格式校验响应体
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ComposeProjectValidateResponse {
-    pub valid: bool,
-    pub error: Option<String>,
-    pub config: Option<String>,
 }
 
 /// Docker 卷归属类型。

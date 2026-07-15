@@ -3,22 +3,61 @@
 -- Docker Compose 项目注册。
 CREATE TABLE IF NOT EXISTS docker_compose_projects (
     name TEXT PRIMARY KEY,
-    display_name TEXT, -- 展示名称，允许和 Compose project name 分离。
-    compose_dir TEXT NOT NULL,
-    project_type TEXT NOT NULL DEFAULT 'docker',
-    owner TEXT NOT NULL DEFAULT 'user', -- 项目归属，例如用户创建、套件创建或系统创建。
-    labels_json TEXT NOT NULL DEFAULT '{}', -- Docker 资源来源和治理标签。
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    compose_dir TEXT NOT NULL UNIQUE,
+    management_kind TEXT NOT NULL CHECK (management_kind IN ('custom', 'suite', 'system')),
+    owner_name TEXT,
+    config_revision INTEGER NOT NULL DEFAULT 1 CHECK (config_revision > 0),
+    applied_revision INTEGER CHECK (applied_revision IS NULL OR applied_revision > 0),
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
 CREATE TRIGGER IF NOT EXISTS set_docker_compose_projects_updated_at
 AFTER UPDATE ON docker_compose_projects FOR EACH ROW
 BEGIN
     UPDATE docker_compose_projects
-       SET updated_at = (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+       SET updated_at = unixepoch()
      WHERE name = OLD.name;
 END;
+
+-- Compose 项目后台任务；不保存 YAML、环境变量或命令等敏感内容。
+CREATE TABLE IF NOT EXISTS docker_compose_project_tasks (
+    id TEXT PRIMARY KEY,
+    project_name TEXT NOT NULL,
+    operation TEXT NOT NULL CHECK (
+        operation IN ('create', 'start', 'stop', 'restart', 'redeploy', 'scale', 'remove')
+    ),
+    status TEXT NOT NULL CHECK (
+        status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')
+    ),
+    stage TEXT NOT NULL CHECK (
+        stage IN (
+            'validating', 'preparing', 'pulling', 'applying', 'verifying',
+            'rolling_back', 'cleaning_up', 'completed', 'cancelled', 'interrupted'
+        )
+    ),
+    progress_percent INTEGER NOT NULL DEFAULT 0 CHECK (
+        progress_percent >= 0 AND progress_percent <= 100
+    ),
+    service_name TEXT,
+    replicas INTEGER CHECK (replicas IS NULL OR replicas >= 0),
+    pull_images INTEGER NOT NULL DEFAULT 0 CHECK (pull_images IN (0, 1)),
+    actor_kind TEXT NOT NULL CHECK (actor_kind IN ('user', 'system')),
+    actor_name TEXT NOT NULL,
+    client_ip TEXT,
+    trace_id TEXT,
+    error_summary TEXT,
+    cleanup_warning TEXT,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    started_at INTEGER,
+    finished_at INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_docker_compose_project_tasks_project_status
+    ON docker_compose_project_tasks (project_name, status, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_docker_compose_project_tasks_created_at
+    ON docker_compose_project_tasks (created_at DESC);
 
 -- Docker 宿主机资源汇总缓存。
 CREATE TABLE IF NOT EXISTS docker_metrics_summary (

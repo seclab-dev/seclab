@@ -7,7 +7,8 @@ use crate::db;
 use crate::state::DbPool;
 
 use crate::services::{
-    docker_activity, docker_stats, system_metrics, task_scheduler, websocket::create_channel,
+    docker_activity, docker_project_tasks, docker_stats, system_metrics, task_scheduler,
+    websocket::create_channel,
 };
 use crate::state::AppState;
 use anyhow::Result;
@@ -50,6 +51,7 @@ pub async fn create_router() -> Result<(Router, DbPool)> {
     let pool_for_shutdown = pool.clone();
     tracing::info!("Database connection pool established successfully.");
     let system_metrics_enabled = system_metrics::init_collector_enabled(&pool).await?;
+    docker_project_tasks::initialize(&pool).await?;
 
     // 初始化 Docker 客户端，连接失败时仅记录日志
     let (docker, docker_status) = AppState::init_docker_state().await;
@@ -69,6 +71,7 @@ pub async fn create_router() -> Result<(Router, DbPool)> {
 
     docker_stats::spawn_stats_collector(Arc::clone(&app_state));
     docker_activity::spawn_retention_worker(app_state.metadata_db.clone());
+    docker_project_tasks::spawn_retention_worker(app_state.metadata_db.clone());
     system_metrics::spawn_collector(Arc::clone(&app_state));
     task_scheduler::spawn_scheduler(Arc::clone(&app_state));
 
