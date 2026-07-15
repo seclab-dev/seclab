@@ -100,7 +100,14 @@ const levelTagType = (level: DockerActivityLevel): 'info' | 'warning' | 'danger'
 
 /** 将事件代码与结构化参数转换为当前语言的自然语言内容。 */
 const formatMessage = (log: DockerActivityLogItem): string => {
-  const actionCode = log.eventCode
+  const terminalComposeCode = log.eventCode.match(/^compose\.(.+)\.(succeeded|failed)$/)
+  const actionCode = (
+    terminalComposeCode
+      ? `compose.${terminalComposeCode[1]}`
+      : /^compose\..+\.cancelled$/.test(log.eventCode)
+        ? 'compose.taskCancelled'
+        : log.eventCode
+  )
     .replace('.submitted', 'Submitted')
     .replace('.cancelled', 'Cancelled')
     .replace('.cancel', 'Cancel')
