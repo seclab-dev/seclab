@@ -23,7 +23,6 @@ const emit = defineEmits<{
   (event: 'close'): void
   (event: 'configure', name: string): void
   (event: 'redeploy', name: string): void
-  (event: 'showTasks'): void
 }>()
 const visible = defineModel<boolean>({ required: true })
 const { t } = useI18n()
@@ -114,7 +113,6 @@ const submitScale = async () => {
     )
   ) {
     scaleVisible.value = false
-    emit('showTasks')
   }
 }
 </script>

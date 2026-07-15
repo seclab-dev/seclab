@@ -231,10 +231,13 @@ pub fn docker_router() -> Router<Arc<AppState>> {
             "/compose/configurations/validate",
             post(compose::validate_configuration),
         )
-        .route("/compose/project-tasks", get(compose::list_project_tasks))
         .route(
-            "/compose/project-tasks/{task_id}",
-            get(compose::project_task).delete(compose::cancel_project_task),
+            "/compose/project-operations/{operation_id}",
+            get(compose::project_operation),
+        )
+        .route(
+            "/compose/deployments/active",
+            get(compose::active_deployment),
         )
         .route(
             "/containers/{id}",

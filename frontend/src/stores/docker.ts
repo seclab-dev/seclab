@@ -107,11 +107,8 @@ export const useDockerStore = defineStore('docker', () => {
   const projectConfigurationLoading = ref(false)
   const projectConfigurationError = ref<string | null>(null)
   const projectConfigurationLoadedAt = ref<number | null>(null)
-  const projectTasks = ref<dockerType.DockerProjectTask[]>([])
-  const projectTasksLoading = ref(false)
-  const projectTasksError = ref<string | null>(null)
-  const projectTasksLoadedAt = ref<number | null>(null)
-  const projectTaskCancelingIds = ref<string[]>([])
+  const projectDeploymentProgress = ref<dockerType.DockerProjectTask | null>(null)
+  const projectDeploymentProgressError = ref<string | null>(null)
   const projectMutationLoading = ref(false)
 
   // ─── 镜像 / 网络 / 卷 / 系统 ───
@@ -208,15 +205,17 @@ export const useDockerStore = defineStore('docker', () => {
   let projectListRequestSequence = 0
   let projectDetailRequestSequence = 0
   let projectConfigurationRequestSequence = 0
-  let projectTasksRequestSequence = 0
+  let projectDeploymentRequestSequence = 0
   let projectNodeId: string | null = null
-  let projectTasksNodeId: string | null = null
+  let projectOperationsNodeId: string | null = null
 
   // ─── 轮询定时器 ───
   let resourceUsageTimer: number | null = null
   let resourceHistoryTimer: number | null = null
   let containerStatsPollingTimer: number | null = null
-  let projectTaskPollingTimer: number | null = null
+  let projectOperationPollingTimer: number | null = null
+  let projectOperationPollingInFlight = false
+  const trackedProjectOperations = new Map<string, dockerType.DockerProjectTask>()
 
   // ─── 容器统计批量队列 ───
   let containerStatsTimer: number | null = null
@@ -273,18 +272,17 @@ export const useDockerStore = defineStore('docker', () => {
     projectConfigurationLoading.value = false
     projectConfigurationError.value = null
     projectConfigurationLoadedAt.value = null
-    projectTasks.value = []
-    projectTasksLoading.value = false
-    projectTasksError.value = null
-    projectTasksLoadedAt.value = null
-    projectTaskCancelingIds.value = []
+    projectDeploymentProgress.value = null
+    projectDeploymentProgressError.value = null
     projectMutationLoading.value = false
     projectNodeId = null
-    projectTasksNodeId = null
+    projectOperationsNodeId = null
+    trackedProjectOperations.clear()
+    stopProjectOperationPolling()
     projectListRequestSequence += 1
     projectDetailRequestSequence += 1
     projectConfigurationRequestSequence += 1
-    projectTasksRequestSequence += 1
+    projectDeploymentRequestSequence += 1
     imagesList.value = []
     imageListLoading.value = false
     imageListError.value = null
@@ -566,7 +564,12 @@ export const useDockerStore = defineStore('docker', () => {
       projectListRequestSequence += 1
       projectDetailRequestSequence += 1
       projectConfigurationRequestSequence += 1
-      projectTasksRequestSequence += 1
+      projectDeploymentRequestSequence += 1
+      projectOperationsNodeId = nodeId
+      trackedProjectOperations.clear()
+      projectDeploymentProgress.value = null
+      projectDeploymentProgressError.value = null
+      stopProjectOperationPolling()
     }
     const sequence = ++projectListRequestSequence
     projectListLoading.value = true
@@ -1098,7 +1101,7 @@ export const useDockerStore = defineStore('docker', () => {
     stopOverviewPolling()
     stopHistoryPolling()
     stopContainerStatsPolling()
-    stopProjectTaskPolling()
+    stopProjectOperationPolling()
   }
 
   // ========================================
@@ -1227,10 +1230,23 @@ export const useDockerStore = defineStore('docker', () => {
     }
   }
 
-  /** 将新任务加入任务列表并启动无重叠轮询。 */
-  const acceptProjectTask = (task: dockerType.DockerProjectTask) => {
-    projectTasks.value = [task, ...projectTasks.value.filter((item) => item.id !== task.id)]
-    startProjectTaskPolling()
+  /** 判断项目后台操作是否仍在执行。 */
+  const isProjectOperationActive = (operation: dockerType.DockerProjectTask) =>
+    operation.status === 'queued' || operation.status === 'running'
+
+  /** 跟踪新提交的后台操作；创建和重新部署同时打开部署进度。 */
+  const acceptProjectOperation = (operation: dockerType.DockerProjectTask) => {
+    const nodeId = nodeStore.currentNodeId || 'local'
+    if (projectOperationsNodeId !== nodeId) {
+      trackedProjectOperations.clear()
+      projectOperationsNodeId = nodeId
+    }
+    trackedProjectOperations.set(operation.id, operation)
+    if (operation.operation === 'create' || operation.operation === 'redeploy') {
+      projectDeploymentProgress.value = operation
+      projectDeploymentProgressError.value = null
+    }
+    startProjectOperationPolling()
   }
 
   /** 提交项目创建任务。 */
@@ -1245,7 +1261,7 @@ export const useDockerStore = defineStore('docker', () => {
         notificationStore.error(res.message || t('common.unknownError'))
         return false
       }
-      acceptProjectTask(res.data)
+      acceptProjectOperation(res.data)
       return true
     } finally {
       projectMutationLoading.value = false
@@ -1269,7 +1285,7 @@ export const useDockerStore = defineStore('docker', () => {
         notificationStore.error(res.message || t('common.unknownError'))
         return false
       }
-      acceptProjectTask(res.data)
+      acceptProjectOperation(res.data)
       return true
     } finally {
       projectMutationLoading.value = false
@@ -1286,7 +1302,7 @@ export const useDockerStore = defineStore('docker', () => {
         notificationStore.error(res.message || t('common.unknownError'))
         return false
       }
-      acceptProjectTask(res.data)
+      acceptProjectOperation(res.data)
       return true
     } finally {
       projectMutationLoading.value = false
@@ -1307,7 +1323,7 @@ export const useDockerStore = defineStore('docker', () => {
         notificationStore.error(res.message || t('common.unknownError'))
         return false
       }
-      acceptProjectTask(res.data)
+      acceptProjectOperation(res.data)
       return true
     } finally {
       projectMutationLoading.value = false
@@ -1324,7 +1340,7 @@ export const useDockerStore = defineStore('docker', () => {
         notificationStore.error(res.message || t('common.unknownError'))
         return false
       }
-      acceptProjectTask(res.data)
+      acceptProjectOperation(res.data)
       return true
     } finally {
       projectMutationLoading.value = false
@@ -1369,80 +1385,121 @@ export const useDockerStore = defineStore('docker', () => {
     return res.data
   }
 
-  /** 获取当前节点的最近项目任务。 */
-  const fetchComposeProjectTasks = async (active = false): Promise<boolean> => {
+  /** 恢复当前节点仍在执行的创建或重新部署进度，不加载历史记录。 */
+  const recoverActiveComposeDeployment = async (): Promise<boolean> => {
     const nodeId = nodeStore.currentNodeId || 'local'
-    if (projectTasksLoading.value && projectTasksNodeId === nodeId) return false
-    if (projectTasksNodeId !== nodeId) {
-      projectTasksRequestSequence += 1
-      projectTasksLoading.value = false
-      projectTasks.value = []
-      projectTasksError.value = null
-      projectTasksLoadedAt.value = null
-      projectTasksNodeId = nodeId
-    }
-    const sequence = ++projectTasksRequestSequence
-    projectTasksLoading.value = true
-    const res = await dockerClient.value.listComposeProjectTasks({ active, limit: 20 })
+    const sequence = ++projectDeploymentRequestSequence
+    const res = await dockerClient.value.fetchActiveComposeDeployment()
     if (
-      sequence !== projectTasksRequestSequence ||
+      sequence !== projectDeploymentRequestSequence ||
       nodeId !== (nodeStore.currentNodeId || 'local')
     ) {
       return false
     }
-    projectTasksLoading.value = false
-    if (!res.success || !res.data) {
-      projectTasksError.value = res.message || t('common.unknownError')
+    projectOperationsNodeId = nodeId
+    if (!res.success) {
+      projectDeploymentProgressError.value = res.message || t('common.unknownError')
       return false
     }
-    projectTasks.value = res.data
-    projectTasksError.value = null
-    projectTasksLoadedAt.value = Date.now()
-    if (!projectTasks.value.some((task) => task.status === 'queued' || task.status === 'running')) {
-      stopProjectTaskPolling()
-      await Promise.all([fetchComposeProjects(), fetchOverviewData()])
-    }
+    projectDeploymentProgressError.value = null
+    if (!res.data) return true
+    projectDeploymentProgress.value = res.data
+    trackedProjectOperations.set(res.data.id, res.data)
+    startProjectOperationPolling()
     return true
   }
 
-  /** 取消项目后台任务。 */
-  const cancelComposeProjectTask = async (taskId: string): Promise<boolean> => {
-    if (projectTaskCancelingIds.value.includes(taskId)) return false
-    projectTaskCancelingIds.value = [...projectTaskCancelingIds.value, taskId]
+  /** 提示后台项目操作的最终结果。 */
+  const notifyProjectOperationResult = (operation: dockerType.DockerProjectTask) => {
+    const params = {
+      name: operation.projectName,
+      operation: t(`app.docker.projects.deploymentProgress.operations.${operation.operation}`),
+    }
+    if (operation.status === 'succeeded') {
+      notificationStore.success(t('app.docker.projects.operationResult.succeeded', params))
+    } else if (operation.status === 'cancelled') {
+      notificationStore.warning(t('app.docker.projects.operationResult.cancelled', params))
+    } else {
+      notificationStore.error(
+        operation.errorSummary || t('app.docker.projects.operationResult.failed', params),
+      )
+    }
+  }
+
+  /** 轮询已由当前页面提交或恢复的操作，终态后刷新事实数据。 */
+  const pollProjectOperations = async () => {
+    if (projectOperationPollingInFlight || !trackedProjectOperations.size) return
+    const nodeId = nodeStore.currentNodeId || 'local'
+    if (projectOperationsNodeId !== nodeId) return
+    projectOperationPollingInFlight = true
+    let reachedTerminalState = false
     try {
-      const res = await dockerClient.value.cancelComposeProjectTask(taskId)
-      if (!res.success) {
-        notificationStore.error(res.message || t('common.unknownError'))
-        return false
+      const operationIds = [...trackedProjectOperations.keys()]
+      const responses = await Promise.all(
+        operationIds.map(async (operationId) => ({
+          operationId,
+          response: await dockerClient.value.fetchComposeProjectOperation(operationId),
+        })),
+      )
+      if (nodeId !== (nodeStore.currentNodeId || 'local')) return
+      for (const { operationId, response } of responses) {
+        if (!response.success || !response.data) {
+          if (projectDeploymentProgress.value?.id === operationId) {
+            projectDeploymentProgressError.value = response.message || t('common.unknownError')
+          }
+          continue
+        }
+        const operation = response.data
+        trackedProjectOperations.set(operationId, operation)
+        if (projectDeploymentProgress.value?.id === operationId) {
+          projectDeploymentProgress.value = operation
+          projectDeploymentProgressError.value = null
+        }
+        if (!isProjectOperationActive(operation)) {
+          trackedProjectOperations.delete(operationId)
+          notifyProjectOperationResult(operation)
+          reachedTerminalState = true
+        }
       }
-      await fetchComposeProjectTasks()
-      return true
     } finally {
-      projectTaskCancelingIds.value = projectTaskCancelingIds.value.filter((id) => id !== taskId)
+      projectOperationPollingInFlight = false
+    }
+    if (reachedTerminalState) {
+      await Promise.all([fetchComposeProjects(), fetchOverviewData()])
     }
   }
 
-  /** 仅在存在活动任务时轮询，且下一次请求在上一次完成后调度。 */
-  function startProjectTaskPolling() {
-    if (projectTaskPollingTimer !== null) return
+  /** 启动无重叠的项目操作轮询。 */
+  function startProjectOperationPolling() {
+    if (projectOperationPollingTimer !== null || !trackedProjectOperations.size) return
     const poll = async () => {
-      projectTaskPollingTimer = null
+      projectOperationPollingTimer = null
       if (document.hidden) return
-      await fetchComposeProjectTasks()
-      if (
-        projectTasks.value.some((task) => task.status === 'queued' || task.status === 'running')
-      ) {
-        projectTaskPollingTimer = window.setTimeout(poll, 2000)
+      await pollProjectOperations()
+      if (trackedProjectOperations.size) {
+        projectOperationPollingTimer = window.setTimeout(poll, 2000)
       }
     }
-    projectTaskPollingTimer = window.setTimeout(poll, 500)
+    projectOperationPollingTimer = window.setTimeout(poll, 500)
   }
 
-  /** 停止项目任务轮询。 */
-  function stopProjectTaskPolling() {
-    if (projectTaskPollingTimer === null) return
-    window.clearTimeout(projectTaskPollingTimer)
-    projectTaskPollingTimer = null
+  /** 停止项目操作轮询。 */
+  function stopProjectOperationPolling() {
+    if (projectOperationPollingTimer === null) return
+    window.clearTimeout(projectOperationPollingTimer)
+    projectOperationPollingTimer = null
+  }
+
+  /** 仅允许关闭已经到达终态的部署进度。 */
+  const closeProjectDeploymentProgress = () => {
+    if (
+      projectDeploymentProgress.value &&
+      isProjectOperationActive(projectDeploymentProgress.value)
+    ) {
+      return
+    }
+    projectDeploymentProgress.value = null
+    projectDeploymentProgressError.value = null
   }
 
   /** 删除镜像 */
@@ -1847,11 +1904,8 @@ export const useDockerStore = defineStore('docker', () => {
     projectConfigurationLoading,
     projectConfigurationError,
     projectConfigurationLoadedAt,
-    projectTasks,
-    projectTasksLoading,
-    projectTasksError,
-    projectTasksLoadedAt,
-    projectTaskCancelingIds,
+    projectDeploymentProgress,
+    projectDeploymentProgressError,
     projectMutationLoading,
 
     // 镜像 / 网络 / 卷 / 系统
@@ -1918,7 +1972,7 @@ export const useDockerStore = defineStore('docker', () => {
     clearComposeProjectDetail,
     fetchComposeProjectConfiguration,
     clearComposeProjectConfiguration,
-    fetchComposeProjectTasks,
+    recoverActiveComposeDeployment,
     fetchImagesList,
     fetchControllerImages,
     fetchRecentImageDistributionTask,
@@ -1957,7 +2011,7 @@ export const useDockerStore = defineStore('docker', () => {
     removeComposeProject,
     saveComposeProjectConfiguration,
     validateComposeYaml,
-    cancelComposeProjectTask,
+    closeProjectDeploymentProgress,
     handleDeleteImage,
     fetchNetworkDetail,
     clearNetworkDetail,
@@ -1973,8 +2027,8 @@ export const useDockerStore = defineStore('docker', () => {
     resetContainerForm,
 
     // 编排与系统操作
-    startProjectTaskPolling,
-    stopProjectTaskPolling,
+    startProjectOperationPolling,
+    stopProjectOperationPolling,
     createVolume,
     removeVolume,
     handlePruneSystem,

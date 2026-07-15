@@ -1,5 +1,5 @@
 <script setup lang="ts">
-/** Docker Compose 项目管理页：查询、配置、任务与节点变化均在模块内处理。 */
+/** Docker Compose 项目管理页：查询、配置、部署进度与节点变化均在模块内处理。 */
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useDockerStore } from '@/stores/docker'
@@ -44,7 +44,6 @@ const configurationError = ref('')
 const deploymentVisible = ref(false)
 const deploymentProjectName = ref('')
 const pullImages = ref(false)
-const tasksVisible = ref(false)
 const composeExample = 'services:\n  app:\n    image: nginx:latest\n'
 const createForm = reactive({
   name: '',
@@ -69,14 +68,6 @@ const columns = computed<SecLabTableColumn[]>(() => [
   },
   { label: t('app.docker.projects.columns.actions'), width: 110, align: 'center', slot: 'actions' },
 ])
-const taskColumns = computed<SecLabTableColumn[]>(() => [
-  { label: t('app.docker.projects.tasks.project'), minWidth: 190, slot: 'project' },
-  { label: t('app.docker.projects.tasks.operation'), width: 120, slot: 'operation' },
-  { label: t('app.docker.projects.tasks.status'), width: 120, slot: 'taskStatus' },
-  { label: t('app.docker.projects.tasks.stage'), width: 140, slot: 'stage' },
-  { label: t('app.docker.projects.tasks.progress'), width: 90, slot: 'progress' },
-  { label: t('app.docker.projects.columns.actions'), width: 90, slot: 'taskActions' },
-])
 const managementOptions = computed(() => [
   { label: t('app.docker.projects.filters.allManagement'), value: '' },
   { label: t('app.docker.projects.management.custom'), value: 'custom' },
@@ -96,6 +87,10 @@ const totalPages = computed(() =>
 const hasFilters = computed(() =>
   Boolean(keyword.value || managementKind.value || runtimeState.value),
 )
+const deploymentProgressActive = computed(() => {
+  const progress = store.projectDeploymentProgress
+  return progress?.status === 'queued' || progress?.status === 'running'
+})
 
 const loadProjects = (page = store.projectPage) =>
   store.fetchComposeProjects({
@@ -154,7 +149,6 @@ const submitCreate = async () => {
     })
   ) {
     createVisible.value = false
-    tasksVisible.value = true
   }
 }
 
@@ -207,7 +201,6 @@ const openDeployment = (name: string) => {
 const submitDeployment = async () => {
   if (await store.redeployComposeProject(deploymentProjectName.value, pullImages.value)) {
     deploymentVisible.value = false
-    tasksVisible.value = true
   }
 }
 const removeProject = async (name: string) => {
@@ -217,7 +210,7 @@ const removeProject = async (name: string) => {
     t('common.delete'),
     t('common.cancel'),
   )
-  if (confirmed && (await store.removeComposeProject(name))) tasksVisible.value = true
+  if (confirmed) await store.removeComposeProject(name)
 }
 
 const rowActions = (project: dockerType.DockerProjectSummary) => {
@@ -276,30 +269,27 @@ const statusTagType = (state: dockerType.DockerProjectRuntimeState) => {
   if (state === 'stopped') return 'info'
   return 'default'
 }
-const taskStatusType = (status: dockerType.DockerProjectTaskStatus) => {
+const operationStatusType = (status: dockerType.DockerProjectTaskStatus) => {
   if (status === 'succeeded') return 'success'
   if (status === 'failed') return 'danger'
   if (status === 'cancelled') return 'warning'
   return 'info'
 }
-const taskStageLabel = (task: dockerType.DockerProjectTask) => {
-  if (task.status === 'succeeded' || task.status === 'failed' || task.status === 'cancelled') {
-    return t(`app.docker.projects.tasks.statuses.${task.status}`)
+const operationStageLabel = (operation: dockerType.DockerProjectTask) => {
+  if (
+    operation.status === 'succeeded' ||
+    operation.status === 'failed' ||
+    operation.status === 'cancelled'
+  ) {
+    return t(`app.docker.projects.deploymentProgress.statuses.${operation.status}`)
   }
-  return t(`app.docker.projects.tasks.stages.${task.stage}`)
-}
-const openTasks = async () => {
-  tasksVisible.value = true
-  await store.fetchComposeProjectTasks()
-  if (store.projectTasks.some((task) => task.status === 'queued' || task.status === 'running')) {
-    store.startProjectTaskPolling()
-  }
+  return t(`app.docker.projects.deploymentProgress.stages.${operation.stage}`)
 }
 const handleVisibility = () => {
   if (document.hidden) {
-    store.stopProjectTaskPolling()
+    store.stopProjectOperationPolling()
   } else {
-    void store.fetchComposeProjectTasks().then(() => store.startProjectTaskPolling())
+    void store.recoverActiveComposeDeployment()
   }
 }
 
@@ -309,21 +299,15 @@ watch(
   () => {
     closeDetail()
     closeConfiguration()
-    tasksVisible.value = false
-    void Promise.all([loadProjects(1), store.fetchComposeProjectTasks()])
+    void Promise.all([loadProjects(1), store.recoverActiveComposeDeployment()])
   },
 )
 onMounted(() => {
-  void Promise.all([loadProjects(1), store.fetchComposeProjectTasks()]).then(() => {
-    if (store.projectTasks.some((task) => task.status === 'queued' || task.status === 'running')) {
-      store.startProjectTaskPolling()
-    }
-  })
+  void Promise.all([loadProjects(1), store.recoverActiveComposeDeployment()])
   document.addEventListener('visibilitychange', handleVisibility)
 })
 onUnmounted(() => {
   document.removeEventListener('visibilitychange', handleVisibility)
-  store.stopProjectTaskPolling()
 })
 </script>
 
@@ -357,9 +341,6 @@ onUnmounted(() => {
           @click="loadProjects()"
           >{{ t('common.refresh') }}</SecLabButton
         >
-        <SecLabButton type="secondary" @click="openTasks">{{
-          t('app.docker.projects.tasks.title')
-        }}</SecLabButton>
         <SecLabButton type="primary" @click="openCreate">{{
           t('app.docker.projects.actions.create')
         }}</SecLabButton>
@@ -497,7 +478,6 @@ onUnmounted(() => {
       @close="closeDetail"
       @configure="openConfiguration"
       @redeploy="openDeployment"
-      @show-tasks="tasksVisible = true"
     />
 
     <SecLabDrawer
@@ -581,65 +561,80 @@ onUnmounted(() => {
       </template>
     </SecLabDialog>
 
-    <SecLabDrawer
-      v-model="tasksVisible"
-      :title="t('app.docker.projects.tasks.title')"
-      width="860px"
-      data-ui="project-task-drawer"
+    <SecLabDialog
+      :visible="Boolean(store.projectDeploymentProgress)"
+      :title="t('app.docker.projects.deploymentProgress.title')"
+      width="560px"
+      :close-on-click-overlay="false"
+      data-ui="project-deployment-progress-dialog"
+      @close="store.closeProjectDeploymentProgress"
     >
-      <div class="task-content" data-slot="body">
+      <div v-if="store.projectDeploymentProgress" class="deployment-progress" data-slot="body">
         <SecLabAlert
-          v-if="store.projectTasksError"
+          v-if="store.projectDeploymentProgressError"
           type="warning"
-          :title="t('app.docker.projects.tasks.refreshFailed')"
-          :description="store.projectTasksError"
+          :title="t('app.docker.projects.deploymentProgress.refreshFailed')"
+          :description="store.projectDeploymentProgressError"
           show-icon
         />
-        <SecLabTable
-          v-if="store.projectTasks.length"
-          :data="store.projectTasks"
-          :columns="taskColumns"
-          border
-        >
-          <template #project="{ row }: { row: dockerType.DockerProjectTask }">
-            <div class="task-project">{{ row.projectName }}</div>
-            <div v-if="row.errorSummary" class="task-message task-error">
-              {{ row.errorSummary }}
-            </div>
-            <div v-if="row.cleanupWarning" class="task-message">{{ row.cleanupWarning }}</div>
-          </template>
-          <template #operation="{ row }: { row: dockerType.DockerProjectTask }">{{
-            t(`app.docker.projects.tasks.operations.${row.operation}`)
-          }}</template>
-          <template #taskStatus="{ row }: { row: dockerType.DockerProjectTask }"
-            ><SecLabTag :type="taskStatusType(row.status)">{{
-              t(`app.docker.projects.tasks.statuses.${row.status}`)
-            }}</SecLabTag></template
-          >
-          <template #stage="{ row }: { row: dockerType.DockerProjectTask }">{{
-            taskStageLabel(row)
-          }}</template>
-          <template #progress="{ row }: { row: dockerType.DockerProjectTask }"
-            >{{ row.progressPercent }}%</template
-          >
-          <template #taskActions="{ row }: { row: dockerType.DockerProjectTask }">
-            <SecLabButton
-              v-if="row.status === 'queued' || row.status === 'running'"
-              size="small"
-              type="danger"
-              :loading="store.projectTaskCancelingIds.includes(row.id)"
-              @click="store.cancelComposeProjectTask(row.id)"
-              >{{ t('common.cancel') }}</SecLabButton
-            >
-          </template>
-        </SecLabTable>
-        <SecLabEmpty
-          v-else-if="!store.projectTasksLoading"
-          :description="t('app.docker.projects.tasks.empty')"
+        <div class="deployment-summary">
+          <div>
+            <span>{{ t('app.docker.projects.deploymentProgress.project') }}</span>
+            <strong>{{ store.projectDeploymentProgress.projectName }}</strong>
+          </div>
+          <div>
+            <span>{{ t('app.docker.projects.deploymentProgress.operation') }}</span>
+            <strong>{{
+              t(
+                `app.docker.projects.deploymentProgress.operations.${store.projectDeploymentProgress.operation}`,
+              )
+            }}</strong>
+          </div>
+          <div>
+            <span>{{ t('app.docker.projects.deploymentProgress.status') }}</span>
+            <SecLabTag :type="operationStatusType(store.projectDeploymentProgress.status)">{{
+              t(
+                `app.docker.projects.deploymentProgress.statuses.${store.projectDeploymentProgress.status}`,
+              )
+            }}</SecLabTag>
+          </div>
+          <div>
+            <span>{{ t('app.docker.projects.deploymentProgress.stage') }}</span>
+            <strong>{{ operationStageLabel(store.projectDeploymentProgress) }}</strong>
+          </div>
+        </div>
+        <div class="progress-row">
+          <div class="progress-track" aria-hidden="true">
+            <div
+              class="progress-value"
+              :style="{ width: `${store.projectDeploymentProgress.progressPercent}%` }"
+            />
+          </div>
+          <span>{{ store.projectDeploymentProgress.progressPercent }}%</span>
+        </div>
+        <SecLabAlert
+          v-if="store.projectDeploymentProgress.errorSummary"
+          type="error"
+          :title="t('app.docker.projects.deploymentProgress.failedTitle')"
+          :description="store.projectDeploymentProgress.errorSummary"
+          show-icon
         />
-        <SecLabLoading :loading="store.projectTasksLoading && !store.projectTasks.length" cover />
+        <SecLabAlert
+          v-if="store.projectDeploymentProgress.cleanupWarning"
+          type="warning"
+          :title="t('app.docker.projects.deploymentProgress.cleanupWarning')"
+          :description="store.projectDeploymentProgress.cleanupWarning"
+          show-icon
+        />
       </div>
-    </SecLabDrawer>
+      <template #footer>
+        <SecLabButton
+          :disabled="deploymentProgressActive"
+          @click="store.closeProjectDeploymentProgress"
+          >{{ t('common.close') }}</SecLabButton
+        >
+      </template>
+    </SecLabDialog>
   </div>
 </template>
 
@@ -672,8 +667,7 @@ onUnmounted(() => {
   min-width: 0;
 }
 .project-content,
-.configuration-content,
-.task-content {
+.configuration-content {
   position: relative;
   flex: 1;
   min-height: 0;
@@ -689,18 +683,6 @@ onUnmounted(() => {
   font: inherit;
   font-weight: var(--sdl-font-weight-medium);
 }
-.task-project {
-  font-weight: var(--sdl-font-weight-medium);
-}
-.task-message {
-  margin-top: var(--sdl-space-1);
-  color: var(--sdl-text-muted);
-  font-size: var(--sdl-font-size-xs);
-  overflow-wrap: anywhere;
-}
-.task-error {
-  color: var(--sdl-color-danger);
-}
 .project-pagination {
   display: flex;
   justify-content: flex-end;
@@ -708,11 +690,47 @@ onUnmounted(() => {
 }
 .project-form,
 .configuration-content,
-.task-content,
-.dialog-content {
+.dialog-content,
+.deployment-progress {
   display: flex;
   flex-direction: column;
   gap: var(--sdl-space-4);
+}
+.deployment-summary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--sdl-space-4);
+}
+.deployment-summary > div {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sdl-space-1);
+  min-width: 0;
+}
+.deployment-summary span {
+  color: var(--sdl-text-muted);
+  font-size: var(--sdl-font-size-sm);
+}
+.deployment-summary strong {
+  overflow-wrap: anywhere;
+}
+.progress-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sdl-space-3);
+}
+.progress-track {
+  flex: 1;
+  height: 8px;
+  overflow: hidden;
+  border-radius: var(--sdl-radius-full);
+  background: var(--sdl-bg-muted);
+}
+.progress-value {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--sdl-color-primary);
+  transition: width 180ms ease;
 }
 .compose-editor {
   height: 360px;
@@ -749,6 +767,9 @@ onUnmounted(() => {
   }
   .toolbar-actions {
     justify-content: flex-end;
+  }
+  .deployment-summary {
+    grid-template-columns: 1fr;
   }
 }
 </style>

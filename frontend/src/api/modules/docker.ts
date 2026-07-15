@@ -179,20 +179,17 @@ const createScopedDockerApi = (nodeId?: string) => ({
       buildDockerPath(`/agent/docker/compose/projects/${encodeURIComponent(name)}`, nodeId),
     )
   },
-  listComposeProjectTasks: (params?: { active?: boolean; limit?: number }) => {
-    return http.get<docker.DockerProjectTask[]>(
-      buildDockerPath('/agent/docker/compose/project-tasks', nodeId),
-      params,
+  fetchActiveComposeDeployment: () => {
+    return http.get<docker.DockerProjectTask | null>(
+      buildDockerPath('/agent/docker/compose/deployments/active', nodeId),
     )
   },
-  fetchComposeProjectTask: (taskId: string) => {
+  fetchComposeProjectOperation: (operationId: string) => {
     return http.get<docker.DockerProjectTask>(
-      buildDockerPath(`/agent/docker/compose/project-tasks/${encodeURIComponent(taskId)}`, nodeId),
-    )
-  },
-  cancelComposeProjectTask: (taskId: string) => {
-    return http.delete<docker.DockerProjectTask>(
-      buildDockerPath(`/agent/docker/compose/project-tasks/${encodeURIComponent(taskId)}`, nodeId),
+      buildDockerPath(
+        `/agent/docker/compose/project-operations/${encodeURIComponent(operationId)}`,
+        nodeId,
+      ),
     )
   },
   listImages: () => {

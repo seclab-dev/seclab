@@ -135,24 +135,6 @@ pub async fn cancellation(task_id: &str) -> Option<CancellationToken> {
     CANCELLATIONS.lock().await.get(task_id).cloned()
 }
 
-/// 请求取消活动任务。
-pub async fn cancel(pool: &DbPool, task_id: &str) -> ApiResult<DockerProjectTask> {
-    let task = get(pool, task_id).await?;
-    if matches!(
-        task.status,
-        DockerProjectTaskStatus::Succeeded
-            | DockerProjectTaskStatus::Failed
-            | DockerProjectTaskStatus::Cancelled
-    ) {
-        return Ok(task);
-    }
-    let cancellation = cancellation(task_id).await.ok_or_else(|| {
-        ApiError::not_found(ErrorCode::TaskNotFound, "Docker project task is not active")
-    })?;
-    cancellation.cancel();
-    Ok(task)
-}
-
 /// 将任务推进到运行阶段。
 pub async fn update(
     pool: &DbPool,
@@ -347,34 +329,18 @@ pub async fn get(pool: &DbPool, task_id: &str) -> ApiResult<DockerProjectTask> {
     row_to_task(&row)
 }
 
-/// 查询活动任务及最近终态任务。
-pub async fn list(
-    pool: &DbPool,
-    active_only: bool,
-    limit: usize,
-) -> ApiResult<Vec<DockerProjectTask>> {
-    let limit = limit.clamp(1, 100) as i64;
-    let rows = if active_only {
-        sqlx::query(
-            "SELECT id, project_name, operation, status, stage, progress_percent, service_name, \
-             replicas, pull_images, error_summary, cleanup_warning, created_at, started_at, finished_at \
-             FROM docker_compose_project_tasks WHERE status IN ('queued', 'running') \
-             ORDER BY created_at DESC, id DESC LIMIT ?1",
-        )
-        .bind(limit)
-        .fetch_all(pool)
-        .await?
-    } else {
-        sqlx::query(
-            "SELECT id, project_name, operation, status, stage, progress_percent, service_name, \
-             replicas, pull_images, error_summary, cleanup_warning, created_at, started_at, finished_at \
-             FROM docker_compose_project_tasks ORDER BY created_at DESC, id DESC LIMIT ?1",
-        )
-        .bind(limit)
-        .fetch_all(pool)
-        .await?
-    };
-    rows.iter().map(row_to_task).collect()
+/// 返回最近提交且仍在执行的创建或重新部署操作。
+pub async fn latest_active_deployment(pool: &DbPool) -> ApiResult<Option<DockerProjectTask>> {
+    let row = sqlx::query(
+        "SELECT id, project_name, operation, status, stage, progress_percent, service_name, \
+         replicas, pull_images, error_summary, cleanup_warning, created_at, started_at, finished_at \
+         FROM docker_compose_project_tasks \
+         WHERE status IN ('queued', 'running') AND operation IN ('create', 'redeploy') \
+         ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    row.as_ref().map(row_to_task).transpose()
 }
 
 /// 执行可取消、可超时且不会记录完整命令输出的 Compose 命令。

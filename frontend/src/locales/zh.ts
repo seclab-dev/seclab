@@ -805,15 +805,15 @@ const zh: typeof en = {
           replicas: '副本数',
           invalidReplicas: '请输入不小于 0 的整数',
         },
-        tasks: {
-          title: '项目任务',
-          empty: '暂无项目任务',
-          refreshFailed: '任务状态刷新失败，已保留现有数据',
+        deploymentProgress: {
+          title: '部署进度',
+          refreshFailed: '进度刷新失败，正在等待重新连接',
           project: '项目',
           operation: '操作',
           status: '状态',
           stage: '阶段',
-          progress: '进度',
+          failedTitle: '部署失败',
+          cleanupWarning: '清理警告',
           operations: {
             create: '创建',
             start: '启动',
@@ -842,6 +842,11 @@ const zh: typeof en = {
             cancelled: '已取消',
             interrupted: 'Agent 已重启',
           },
+        },
+        operationResult: {
+          succeeded: '项目“{name}”{operation}完成',
+          failed: '项目“{name}”{operation}失败',
+          cancelled: '项目“{name}”{operation}已取消',
         },
       },
       images: {

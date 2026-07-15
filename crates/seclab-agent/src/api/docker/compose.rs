@@ -29,14 +29,6 @@ use uuid::Uuid;
 
 const COMPOSE_VALIDATION_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// 项目任务列表参数。
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DockerProjectTaskListQuery {
-    active: Option<bool>,
-    limit: Option<usize>,
-}
-
 /// 项目列表筛选参数。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -386,47 +378,23 @@ pub async fn remove_project(
     Ok(accepted_task(task))
 }
 
-/// 查询活动任务或最近任务。
-pub async fn list_project_tasks(
+/// 查询单个后台项目操作，供前端跟踪当前操作终态。
+pub async fn project_operation(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<DockerProjectTaskListQuery>,
+    Path(operation_id): Path<String>,
 ) -> ApiResult<Response> {
-    let tasks = docker_project_tasks::list(
-        &state.metadata_db,
-        query.active.unwrap_or(false),
-        query.limit.unwrap_or(20),
-    )
-    .await?;
-    Ok(ApiResponse::success_with_raw("Docker project tasks loaded", Some(tasks)).into_response())
-}
-
-/// 查询单个项目任务。
-pub async fn project_task(
-    State(state): State<Arc<AppState>>,
-    Path(task_id): Path<String>,
-) -> ApiResult<Response> {
-    let task = docker_project_tasks::get(&state.metadata_db, &task_id).await?;
-    Ok(ApiResponse::success_with_raw("Docker project task loaded", Some(task)).into_response())
-}
-
-/// 请求取消项目任务。
-pub async fn cancel_project_task(
-    State(state): State<Arc<AppState>>,
-    context: DockerOperationContext,
-    Path(task_id): Path<String>,
-) -> ApiResult<Response> {
-    let task = docker_project_tasks::cancel(&state.metadata_db, &task_id).await?;
-    context
-        .record_success(
-            &state.metadata_db,
-            "compose.task.cancel_requested",
-            Some(("composeProjectTask", &task_id)),
-            serde_json::json!({ "taskId": task_id, "name": task.project_name }),
-            true,
-        )
-        .await;
+    let operation = docker_project_tasks::get(&state.metadata_db, &operation_id).await?;
     Ok(
-        ApiResponse::success_with_raw("Docker project task cancellation requested", Some(task))
+        ApiResponse::success_with_raw("Docker project operation loaded", Some(operation))
+            .into_response(),
+    )
+}
+
+/// 返回最近提交且仍在执行的创建或重新部署操作。
+pub async fn active_deployment(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
+    let deployment = docker_project_tasks::latest_active_deployment(&state.metadata_db).await?;
+    Ok(
+        ApiResponse::success_with_raw("Active Docker project deployment loaded", deployment)
             .into_response(),
     )
 }

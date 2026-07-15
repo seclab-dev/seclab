@@ -822,15 +822,15 @@ const en = {
           replicas: 'Replicas',
           invalidReplicas: 'Enter an integer greater than or equal to 0',
         },
-        tasks: {
-          title: 'Project Tasks',
-          empty: 'No project tasks',
-          refreshFailed: 'Task refresh failed. Existing data is retained.',
+        deploymentProgress: {
+          title: 'Deployment Progress',
+          refreshFailed: 'Progress refresh failed. Waiting to reconnect.',
           project: 'Project',
           operation: 'Operation',
           status: 'Status',
           stage: 'Stage',
-          progress: 'Progress',
+          failedTitle: 'Deployment Failed',
+          cleanupWarning: 'Cleanup Warning',
           operations: {
             create: 'Create',
             start: 'Start',
@@ -859,6 +859,11 @@ const en = {
             cancelled: 'Cancelled',
             interrupted: 'Agent Restarted',
           },
+        },
+        operationResult: {
+          succeeded: '{operation} completed for project “{name}”',
+          failed: '{operation} failed for project “{name}”',
+          cancelled: '{operation} cancelled for project “{name}”',
         },
       },
       images: {
