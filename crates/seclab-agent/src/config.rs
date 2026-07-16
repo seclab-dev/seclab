@@ -32,8 +32,6 @@ pub struct AgentConfig {
     pub compose_root_dir: Option<String>,
     pub stats_sample_interval_secs: Option<u64>,
     pub stats_retention_hours: Option<u64>,
-    pub system_metrics_sample_interval_secs: Option<u64>,
-    pub system_metrics_retention_days: Option<u64>,
     #[serde(default)]
     pub controller_compatibility: ControllerCompatibilityConfig,
 }
@@ -203,23 +201,6 @@ pub fn stats_retention_hours() -> u64 {
         .unwrap_or(12)
 }
 
-/// 返回系统监控采样间隔，默认 5 分钟。
-pub fn system_metrics_sample_interval() -> std::time::Duration {
-    let seconds = get()
-        .system_metrics_sample_interval_secs
-        .filter(|value| *value >= 60)
-        .unwrap_or(300);
-    std::time::Duration::from_secs(seconds)
-}
-
-/// 返回系统监控数据保留天数，默认 7 天。
-pub fn system_metrics_retention_days() -> u64 {
-    get()
-        .system_metrics_retention_days
-        .filter(|value| *value >= 1)
-        .unwrap_or(7)
-}
-
 /// 自适应回调地址重写：
 /// 解析传入的回调 URL。如果本地配置中指定了专属的 `seclab_url`，
 /// 则将传入 URL 的 scheme、host、port 替换为 `seclab_url` 的对应值。
@@ -260,8 +241,6 @@ mod tests {
     fn default_stats_values_are_stable() {
         assert_eq!(stats_sample_interval(), Duration::from_secs(60));
         assert_eq!(stats_retention_hours(), 12);
-        assert_eq!(system_metrics_sample_interval(), Duration::from_secs(300));
-        assert_eq!(system_metrics_retention_days(), 7);
     }
 
     #[test]

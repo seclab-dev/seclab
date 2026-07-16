@@ -1,5 +1,6 @@
 //! 应用状态：共享依赖（数据库、Docker 客户端等）聚合。
 
+use crate::services::system_monitoring::SystemMonitoringRuntime;
 use crate::services::websocket;
 use crate::types::{ApiError, ApiResult};
 use bollard::Docker;
@@ -24,7 +25,7 @@ pub struct AppState {
     pub server_name: String,
     pub docker: RwLock<Option<Arc<Docker>>>,
     pub docker_status: RwLock<DockerServiceStatus>,
-    pub system_metrics_enabled: RwLock<bool>,
+    pub system_monitoring: Arc<SystemMonitoringRuntime>,
     pub metadata_db: DbPool,
     pub websocket_sender: tokio::sync::broadcast::Sender<websocket::WebsocketEvent>,
     pub running_task_ids: tokio::sync::Mutex<std::collections::HashSet<i64>>,
@@ -107,17 +108,6 @@ impl AppState {
     /// 刷新并返回当前 Docker 服务状态。
     pub async fn docker_status(&self) -> DockerServiceStatus {
         self.refresh_docker_state().await
-    }
-
-    /// 返回系统监控采集是否启用。
-    pub async fn system_metrics_enabled(&self) -> bool {
-        *self.system_metrics_enabled.read().await
-    }
-
-    /// 更新系统监控采集开关状态。
-    pub async fn set_system_metrics_enabled(&self, enabled: bool) {
-        let mut guard = self.system_metrics_enabled.write().await;
-        *guard = enabled;
     }
 }
 

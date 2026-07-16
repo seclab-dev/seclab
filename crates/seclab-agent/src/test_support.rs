@@ -1,6 +1,6 @@
 //! 测试支持：测试夹具与辅助方法。
 
-use crate::services::websocket;
+use crate::services::{system_monitoring::SystemMonitoringRuntime, websocket};
 use crate::state::AppState;
 use crate::state::DbPool;
 use seclab_contracts::types::DockerServiceStatus;
@@ -27,12 +27,14 @@ pub async fn setup_test_db() -> DbPool {
 
 /// 构建带测试数据库与默认状态的应用实例。
 pub async fn setup_test_state() -> AppState {
+    let metadata_db = setup_test_db().await;
+    let system_monitoring = SystemMonitoringRuntime::load(&metadata_db).await.unwrap();
     AppState {
         server_name: "test-agent".to_string(),
         docker: RwLock::new(None),
         docker_status: RwLock::new(DockerServiceStatus::NotInstalled),
-        system_metrics_enabled: RwLock::new(false),
-        metadata_db: setup_test_db().await,
+        system_monitoring: std::sync::Arc::new(system_monitoring),
+        metadata_db,
         websocket_sender: websocket::create_channel(),
         running_task_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
     }

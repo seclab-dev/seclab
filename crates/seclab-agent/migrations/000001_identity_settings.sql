@@ -28,6 +28,3 @@ CREATE TABLE IF NOT EXISTS agent_settings (
     value TEXT NOT NULL,
     updated_at INTEGER NOT NULL
 );
-
-INSERT OR IGNORE INTO agent_settings (key, value, updated_at)
-VALUES ('system_metrics.collector_enabled', 'true', strftime('%s', 'now'));

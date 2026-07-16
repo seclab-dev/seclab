@@ -1,12 +1,11 @@
 <script setup lang="ts">
 /**
  * @file MonitorChartPanel.vue
- * @description 通用监控图表面板组件，封装 SecLabCard + ECharts 实例管理。
+ * @description 通用监控图表面板组件，封装稳定尺寸的 ECharts 实例管理。
  */
 
 import { ref, watch } from 'vue'
 import { useEChartsInstance } from '@/composables/useEChartsInstance'
-import { SecLabCard } from '@/components/ui'
 
 const props = defineProps<{
   /** 图表标题 */
@@ -41,10 +40,10 @@ defineExpose({ instance })
 </script>
 
 <template>
-  <SecLabCard shadow="never" class="monitor-chart-panel" :class="{ 'is-full-width': fullWidth }">
-    <h3 class="chart-title" data-ui="chart-title">{{ title }}</h3>
-    <div ref="chartRef" class="chart-body" data-ui="chart-body"></div>
-  </SecLabCard>
+  <div class="monitor-chart-panel" :class="{ 'is-full-width': fullWidth }" data-ui="chart-panel">
+    <h3 class="chart-title" data-slot="chart-title">{{ title }}</h3>
+    <div ref="chartRef" class="chart-body" data-slot="chart-canvas"></div>
+  </div>
 </template>
 
 <style scoped>
@@ -52,6 +51,10 @@ defineExpose({ instance })
   display: flex;
   flex-direction: column;
   min-height: 280px;
+  padding: var(--sdl-space-3);
+  border: 1px solid var(--sdl-border-default);
+  border-radius: var(--sdl-radius-md);
+  background: var(--sdl-bg-card);
 }
 
 .monitor-chart-panel.is-full-width {

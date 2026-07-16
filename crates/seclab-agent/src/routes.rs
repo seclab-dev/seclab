@@ -1,14 +1,15 @@
 //! 路由注册：挂载所有 API 子路由并拼装主路由器。
 
 use super::api::{
-    docker, fs, runtime_logs, scheduled_tasks, suite_workloads, system, tasks, upgrade, websocket,
+    docker, fs, runtime_logs, scheduled_tasks, suite_workloads, system, system_monitoring, tasks,
+    upgrade, websocket,
 };
 use crate::db;
 use crate::state::DbPool;
 
 use crate::services::{
-    docker_activity, docker_project_tasks, docker_stats, system_metrics, task_scheduler,
-    websocket::create_channel,
+    docker_activity, docker_project_tasks, docker_stats, system_monitoring as monitoring_service,
+    task_scheduler, websocket::create_channel,
 };
 use crate::state::AppState;
 use anyhow::Result;
@@ -33,6 +34,10 @@ pub fn state_api_router() -> Router<Arc<AppState>> {
         .nest("/runtime-logs", runtime_logs::runtime_log_router())
         .nest("/system", system::system_router())
         .nest(
+            "/system-monitoring",
+            system_monitoring::system_monitoring_router(),
+        )
+        .nest(
             "/tasks",
             tasks::task_router().merge(scheduled_tasks::scheduled_task_router()),
         )
@@ -50,7 +55,8 @@ pub async fn create_router() -> Result<(Router, DbPool)> {
     let pool = db::establish_connection().await;
     let pool_for_shutdown = pool.clone();
     tracing::info!("Database connection pool established successfully.");
-    let system_metrics_enabled = system_metrics::init_collector_enabled(&pool).await?;
+    let system_monitoring =
+        Arc::new(monitoring_service::SystemMonitoringRuntime::load(&pool).await?);
     docker_project_tasks::initialize(&pool).await?;
 
     // 初始化 Docker 客户端，连接失败时仅记录日志
@@ -63,7 +69,7 @@ pub async fn create_router() -> Result<(Router, DbPool)> {
         server_name: "SecLab".to_string(),
         docker: tokio::sync::RwLock::new(docker),
         docker_status: tokio::sync::RwLock::new(docker_status),
-        system_metrics_enabled: tokio::sync::RwLock::new(system_metrics_enabled),
+        system_monitoring: Arc::clone(&system_monitoring),
         metadata_db: pool,
         websocket_sender,
         running_task_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
@@ -72,7 +78,7 @@ pub async fn create_router() -> Result<(Router, DbPool)> {
     docker_stats::spawn_stats_collector(Arc::clone(&app_state));
     docker_activity::spawn_retention_worker(app_state.metadata_db.clone());
     docker_project_tasks::spawn_retention_worker(app_state.metadata_db.clone());
-    system_metrics::spawn_collector(Arc::clone(&app_state));
+    monitoring_service::spawn_sampler(app_state.metadata_db.clone(), system_monitoring);
     task_scheduler::spawn_scheduler(Arc::clone(&app_state));
 
     // 配置 CORS：允许所有来源、常用方法

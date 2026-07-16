@@ -1,13 +1,5 @@
 import http from '@/api'
-import type {
-  AlertThresholds,
-  DiskInfo,
-  HostSystemSummary,
-  SystemAboutInfo,
-  SystemCollectorStatus,
-  SystemHistoryPoint,
-  FirewallStatusInfo,
-} from '../interface/system'
+import type { DiskInfo, SystemAboutInfo, FirewallStatusInfo } from '../interface/system'
 
 const buildSystemPath = (path: string, nodeId?: string) => {
   if (!nodeId || nodeId === 'local') {
@@ -19,9 +11,6 @@ const buildSystemPath = (path: string, nodeId?: string) => {
 const createScopedSystemApi = (nodeId?: string) => ({
   fetchAbout: () => {
     return http.get<SystemAboutInfo>(buildSystemPath('/agent/system/about', nodeId))
-  },
-  fetchSummary: () => {
-    return http.get<HostSystemSummary>(buildSystemPath('/agent/system/summary', nodeId))
   },
   fetchDisks: () => {
     return http.get<DiskInfo[]>(buildSystemPath('/agent/system/disks', nodeId))
@@ -62,37 +51,8 @@ const createScopedSystemApi = (nodeId?: string) => ({
       },
     )
   },
-  fetchHistory: (payload?: { hours?: number }) => {
-    return http.post<SystemHistoryPoint[]>(
-      buildSystemPath('/agent/system/history', nodeId),
-      payload,
-    )
-  },
-  clearHistory: () => {
-    return http.delete<null>(buildSystemPath('/agent/system/history', nodeId))
-  },
-  fetchCollectorStatus: () => {
-    return http.get<SystemCollectorStatus>(
-      buildSystemPath('/agent/system/collector/status', nodeId),
-    )
-  },
-  setCollectorStatus: (enabled: boolean) => {
-    return http.put<SystemCollectorStatus>(
-      buildSystemPath('/agent/system/collector/status', nodeId),
-      { enabled },
-    )
-  },
   detectFirewall: () => {
     return http.get<FirewallStatusInfo>(buildSystemPath('/agent/system/firewall/detect', nodeId))
-  },
-  fetchAlertThresholds: () => {
-    return http.get<AlertThresholds>(buildSystemPath('/agent/system/alert/thresholds', nodeId))
-  },
-  setAlertThresholds: (thresholds: AlertThresholds) => {
-    return http.put<AlertThresholds>(
-      buildSystemPath('/agent/system/alert/thresholds', nodeId),
-      thresholds,
-    )
   },
 })
 

@@ -9,6 +9,7 @@ use axum::{
     response::Response,
 };
 use reqwest::{Client, Method, RequestBuilder, StatusCode};
+use seclab_contracts::api::{ApiResponse as ContractApiResponse, ErrorCode};
 use seclab_security::client::build_mtls_client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -223,6 +224,57 @@ impl NodeRuntimeClient {
         decode_json_response("DELETE", path, resp).await
     }
 
+    /// 读取领域接口并保留 Agent 返回的 HTTP 状态与稳定错误码。
+    pub async fn get_domain<T: DeserializeOwned>(&self, path: &str) -> ApiResult<T> {
+        let response = self
+            .client
+            .get(self.build_uri(path))
+            .send()
+            .await
+            .map_err(AgentClientError::from)?;
+        decode_domain_response(path, response).await
+    }
+
+    /// 携带可信用户上下文更新领域资源。
+    pub async fn put_domain_with_operation_context<T: DeserializeOwned, B: Serialize>(
+        &self,
+        path: &str,
+        payload: &B,
+        context: &AgentOperationContext,
+    ) -> ApiResult<T> {
+        let response = apply_operation_context(
+            self.client.put(self.build_uri(path)),
+            "user",
+            &context.actor_name,
+            Some(&context.client_ip),
+            &context.trace_id,
+        )
+        .json(payload)
+        .send()
+        .await
+        .map_err(AgentClientError::from)?;
+        decode_domain_response(path, response).await
+    }
+
+    /// 携带可信用户上下文删除领域资源。
+    pub async fn delete_domain_with_operation_context<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        context: &AgentOperationContext,
+    ) -> ApiResult<T> {
+        let response = apply_operation_context(
+            self.client.delete(self.build_uri(path)),
+            "user",
+            &context.actor_name,
+            Some(&context.client_ip),
+            &context.trace_id,
+        )
+        .send()
+        .await
+        .map_err(AgentClientError::from)?;
+        decode_domain_response(path, response).await
+    }
+
     /// 通用请求转发
     pub async fn forward_streaming(
         &self,
@@ -273,6 +325,31 @@ impl NodeRuntimeClient {
 
         reqwest_response_to_axum(resp).await
     }
+}
+
+async fn decode_domain_response<T: DeserializeOwned>(
+    path: &str,
+    response: reqwest::Response,
+) -> ApiResult<T> {
+    let status = response.status();
+    let body = response.text().await.map_err(AgentClientError::from)?;
+    let payload = serde_json::from_str::<ContractApiResponse<T>>(&body).map_err(|error| {
+        ApiError::bad_gateway(ErrorCode::AgentRequestFailed, "invalid Agent response")
+            .with_detail(format!("{path}: {error}"))
+    })?;
+    if status.is_success() && payload.success {
+        return payload
+            .data
+            .ok_or_else(|| ApiError::internal("Agent domain response is missing data"));
+    }
+
+    let status = axum::http::StatusCode::from_u16(status.as_u16())
+        .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+    Err(ApiError::new(
+        status,
+        payload.error_code.unwrap_or(ErrorCode::AgentRequestFailed),
+        payload.message,
+    ))
 }
 
 fn apply_operation_context(

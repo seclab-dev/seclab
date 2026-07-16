@@ -2,7 +2,7 @@
 
 use super::{
     apps, auth, desktop_apps, docker, nodes, notifications, platform, runtime, scripts, seclab,
-    security, suites, task_scheduler, upgrades,
+    security, suites, system_monitoring, task_scheduler, upgrades,
 };
 use crate::api::node_proxy;
 use crate::db::init_db_pool;
@@ -36,6 +36,7 @@ pub fn state_api_router(app_state: Arc<AppState>) -> Router<Arc<AppState>> {
         .nest("/platform", platform::platform_log_router())
         .nest("/nodes", nodes::nodes_router())
         .nest("/node", nodes::single_node_router())
+        .nest("/node", system_monitoring::system_monitoring_router())
         .nest("/agent", node_proxy::agent_router())
         .nest("/seclab", seclab::seclab_router())
         .nest("/docker", docker::docker_router())

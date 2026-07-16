@@ -33,6 +33,7 @@ import {
   SecLabTag,
 } from '@/components/ui'
 import type { SecLabTableColumn } from '@/components/ui/SecLabTable.vue'
+import SystemMonitoringSettings from './settings/SystemMonitoringSettings.vue'
 
 const props = defineProps<{
   isMaximized?: boolean
@@ -53,6 +54,7 @@ const appVersion = import.meta.env.VITE_APP_VERSION ?? 'unknown'
 const gitHash = import.meta.env.VITE_GIT_HASH ?? 'unknown'
 
 const networkLoading = ref(false)
+const monitoringBusy = ref(false)
 const networkSaving = ref(false)
 const networkForm = ref({
   host: '',
@@ -156,6 +158,7 @@ const upgradeProgressPercent = computed(() => {
 const settingsBusy = computed(
   () =>
     networkLoading.value ||
+    monitoringBusy.value ||
     networkSaving.value ||
     securityLoading.value ||
     securitySaving.value ||
@@ -190,6 +193,7 @@ const menuItems = computed(() => [
     label: t('app.settings.menu.system'),
     children: [
       { key: 'about', label: t('app.settings.menu.about') },
+      { key: 'monitoring', label: t('app.settings.menu.monitoring') },
       { key: 'network', label: t('app.settings.menu.network') },
       { key: 'security', label: t('app.settings.menu.security') },
       { key: 'upgrade', label: t('app.settings.menu.upgrade') },
@@ -882,7 +886,11 @@ onMounted(() => {
     </div>
 
     <div class="content">
-      <div v-if="activeMenu === 'network'" class="section">
+      <div v-if="activeMenu === 'monitoring'" class="section">
+        <SystemMonitoringSettings @busy-change="monitoringBusy = $event" />
+      </div>
+
+      <div v-else-if="activeMenu === 'network'" class="section">
         <SecLabCard class="card" shadow="never">
           <template #header>
             <h2 class="section-title">{{ t('app.settings.network.label') }}</h2>

@@ -4,6 +4,7 @@ use seclab_contracts::{
     api::{ApiResponse, ErrorCode},
     auth::{AuthBody, AuthSession, AuthUser},
     logging::{PlatformLog, PlatformLogList, PlatformLogQuery},
+    monitoring::{SystemMonitoringOverview, SystemMonitoringSeriesPage, SystemMonitoringSettings},
     notification::{
         NotificationBatchDeletePayload, NotificationCreatePayload, NotificationLevel,
         NotificationList, NotificationQuery, NotificationRecord,
@@ -16,7 +17,6 @@ use seclab_contracts::{
     runtime_logs::{RuntimeLogFile, RuntimeLogLine, RuntimeLogQuery, RuntimeLogQueryResult},
     seclab::{SeclabNetworkConfig, SeclabNetworkUpdateResult},
     telemetry::{LogModule, LogStatus},
-    types::HostSystemSummary,
 };
 use std::path::Path;
 use ts_rs::{Config, Dummy, TS};
@@ -47,6 +47,9 @@ fn export_contract_bindings() {
     export_type::<PlatformLog>(&cfg);
     export_type::<PlatformLogQuery>(&cfg);
     export_type::<PlatformLogList>(&cfg);
+    export_type::<SystemMonitoringOverview>(&cfg);
+    export_type::<SystemMonitoringSeriesPage>(&cfg);
+    export_type::<SystemMonitoringSettings>(&cfg);
     export_type::<NotificationLevel>(&cfg);
     export_type::<NotificationRecord>(&cfg);
     export_type::<NotificationCreatePayload>(&cfg);
@@ -64,7 +67,6 @@ fn export_contract_bindings() {
     export_type::<SignalResult>(&cfg);
     export_type::<ProcessManagerError>(&cfg);
     export_type::<ProcessManagerServerMessage>(&cfg);
-    export_type::<HostSystemSummary>(&cfg);
     export_type::<RuntimeLogFile>(&cfg);
     export_type::<RuntimeLogQuery>(&cfg);
     export_type::<RuntimeLogLine>(&cfg);

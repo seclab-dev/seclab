@@ -6,7 +6,7 @@ use crate::services::logging;
 use crate::services::node_inventory::get_node_display_name;
 use crate::services::runtime_metrics;
 use crate::state::AppState;
-use crate::types::ApiResult;
+use crate::types::{ApiError, ApiResult};
 use axum::{
     Router,
     body::Body,
@@ -21,6 +21,7 @@ use axum::{
 use futures_util::sink::SinkExt;
 use futures_util::stream::StreamExt;
 use reqwest_websocket::{CloseCode, RequestBuilderExt};
+use seclab_contracts::api::ErrorCode;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -68,19 +69,10 @@ fn prepare_proxy_headers(parts: &axum::http::request::Parts) -> HeaderMap {
         }
         return headers;
     };
-    let client_ip = headers
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            parts
-                .extensions
-                .get::<axum::extract::connect_info::ConnectInfo<std::net::SocketAddr>>()
-                .map(|axum::extract::connect_info::ConnectInfo(address)| address.ip().to_string())
-        })
+    let client_ip = admin
+        .session
+        .client_ip
+        .clone()
         .unwrap_or_else(|| "unknown".to_string());
     let trace_id = logging::resolve_trace_id(&headers);
     inject_trusted_operation_context(&mut headers, &admin.username, &client_ip, &trace_id);
@@ -92,13 +84,7 @@ fn prepare_websocket_proxy_headers(
     admin: &AuthenticatedAdmin,
     incoming_headers: &HeaderMap,
 ) -> HeaderMap {
-    let client_ip = incoming_headers
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("unknown");
+    let client_ip = admin.session.client_ip.as_deref().unwrap_or("unknown");
     let trace_id = logging::resolve_trace_id(incoming_headers);
     let mut headers = HeaderMap::new();
     inject_trusted_operation_context(&mut headers, &admin.username, client_ip, &trace_id);
@@ -111,6 +97,17 @@ fn rebuild_scoped_proxy_path(path_with_query: &str, node_id: &str) -> String {
         Some(suffix) => format!("/api/v1{}", suffix),
         None => path_with_query.to_string(),
     }
+}
+
+fn ensure_proxy_path_allowed(path_with_query: &str) -> ApiResult<()> {
+    let path = path_with_query.split('?').next().unwrap_or(path_with_query);
+    if path.starts_with("/api/v1/agent/system-monitoring/") {
+        return Err(ApiError::forbidden(
+            ErrorCode::AuthForbidden,
+            "system monitoring must use the node semantic gateway",
+        ));
+    }
+    Ok(())
 }
 
 async fn resolve_node_name(state: &Arc<AppState>, node_id: Option<&str>) -> Option<String> {
@@ -393,6 +390,7 @@ pub async fn proxy_handler(
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or(ori.path());
+    ensure_proxy_path_allowed(path_with_query)?;
 
     let node_name = resolve_node_name(&state, None).await;
     let runtime_client = match NodeRuntimeClient::from_node_route(&state.metadata_db, None).await {
@@ -440,6 +438,7 @@ pub async fn proxy_handler_for_node(
         .map(|pq| pq.as_str())
         .unwrap_or(ori.path());
     let path_with_query = rebuild_scoped_proxy_path(raw_path, &node_id);
+    ensure_proxy_path_allowed(&path_with_query)?;
     let node_name = resolve_node_name(&state, Some(node_id.as_str())).await;
 
     let runtime_client = match NodeRuntimeClient::from_node_route(
@@ -492,7 +491,7 @@ pub fn agent_router() -> Router<Arc<AppState>> {
 mod tests {
     use super::{
         ACTOR_KIND_HEADER, ACTOR_NAME_HEADER, CLIENT_IP_HEADER, TRACE_ID_HEADER,
-        inject_trusted_operation_context, rebuild_scoped_proxy_path,
+        ensure_proxy_path_allowed, inject_trusted_operation_context, rebuild_scoped_proxy_path,
     };
     use axum::http::{HeaderMap, HeaderValue};
 
@@ -536,5 +535,11 @@ mod tests {
         let path = "/api/v1/node/node-2/agent/system/summary";
         let rewritten = rebuild_scoped_proxy_path(path, "node-1");
         assert_eq!(rewritten, path);
+    }
+
+    #[test]
+    fn semantic_system_monitoring_cannot_bypass_master_gateway() {
+        assert!(ensure_proxy_path_allowed("/api/v1/agent/system-monitoring/settings").is_err());
+        assert!(ensure_proxy_path_allowed("/api/v1/agent/system/about").is_ok());
     }
 }

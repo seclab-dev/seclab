@@ -44,6 +44,28 @@ pub enum LogStatus {
     Failed,
 }
 
+/// 操作日志的影响级别，与业务终态相互独立。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS, sqlx::Type)]
+#[serde(rename_all = "UPPERCASE")]
+#[sqlx(type_name = "TEXT", rename_all = "UPPERCASE")]
+#[ts(export_to = "telemetry/")]
+pub enum PlatformLogLevel {
+    Info,
+    Warning,
+    Error,
+}
+
+impl PlatformLogLevel {
+    /// 返回持久化使用的固定级别字符串。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            PlatformLogLevel::Info => "INFO",
+            PlatformLogLevel::Warning => "WARNING",
+            PlatformLogLevel::Error => "ERROR",
+        }
+    }
+}
+
 impl LogStatus {
     /// 返回持久化使用的固定状态字符串。
     pub const fn as_str(self) -> &'static str {
@@ -97,6 +119,7 @@ pub struct PlatformLogEntryDraft {
     pub target_type: String,
     pub target_id: String,
     pub status: LogStatus,
+    pub level: PlatformLogLevel,
     pub client_ip: IpAddr,
     pub trace_id: String,
     pub source: String,
@@ -116,6 +139,7 @@ impl PlatformLogEntryDraft {
             target_type: String::new(),
             target_id: String::new(),
             status: LogStatus::Failed,
+            level: PlatformLogLevel::Error,
             client_ip,
             trace_id: String::new(),
             source: String::new(),
@@ -163,11 +187,21 @@ impl PlatformLogEntryDraft {
 
     pub fn status(mut self, status: LogStatus) -> Self {
         self.status = status;
+        self.level = match status {
+            LogStatus::Success => PlatformLogLevel::Info,
+            LogStatus::Failed => PlatformLogLevel::Error,
+        };
         self
     }
 
     pub fn set_success(mut self) -> Self {
         self.status = LogStatus::Success;
+        self.level = PlatformLogLevel::Info;
+        self
+    }
+
+    pub fn level(mut self, level: PlatformLogLevel) -> Self {
+        self.level = level;
         self
     }
 

@@ -3,3 +3,4 @@
 
 export * from './LogModule'
 export * from './LogStatus'
+export * from './PlatformLogLevel'

@@ -380,8 +380,6 @@ mod tests {
             compose_root_dir: None,
             stats_sample_interval_secs: None,
             stats_retention_hours: None,
-            system_metrics_sample_interval_secs: None,
-            system_metrics_retention_days: None,
             ..AgentConfig::default()
         };
 

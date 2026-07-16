@@ -1,5 +1,3 @@
-export type { HostSystemSummary } from '@/api/generated'
-
 export interface SystemAboutInfo {
   hostname: string
   osName: string
@@ -28,32 +26,6 @@ export interface SystemAboutInfo {
   defaultGateway: string
   dnsServers: string[]
   diskTotalBytes: number
-}
-
-export interface SystemHistoryPoint {
-  createdAt: number
-  loadAvg1: number
-  loadAvg5: number
-  loadAvg15: number
-  cpuPercent: number
-  memoryUsedBytes: number
-  memoryTotalBytes: number
-  memoryPercent: number
-  diskReadBytes: number
-  diskWriteBytes: number
-  networkRxBytes: number
-  networkTxBytes: number
-}
-
-export interface SystemCollectorStatus {
-  enabled: boolean
-}
-
-export interface AlertThresholds {
-  cpuWarning: number
-  cpuDanger: number
-  memoryWarning: number
-  memoryDanger: number
 }
 
 export interface DiskInfo {

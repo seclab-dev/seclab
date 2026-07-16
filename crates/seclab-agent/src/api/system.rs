@@ -7,7 +7,7 @@ use axum::{
     Json, Router,
     extract::{Path, State},
     response::{IntoResponse, Response},
-    routing::{delete, get, post, put},
+    routing::{get, post, put},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -17,18 +17,6 @@ use sysinfo::System;
 
 const DISK_MOUNT_ROOT: &str = "/mnt";
 const SYSTEM_MOUNTPOINTS: &[&str] = &["/", "/boot", "/boot/efi", "/usr", "/var"];
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SystemHistoryQuery {
-    pub hours: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CollectorStatusPayload {
-    pub enabled: bool,
-}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -239,53 +227,6 @@ pub async fn initialize_disk(
         .map_err(|err| crate::types::ApiError::Internal(err.to_string()))?
         .map_err(|err| crate::types::ApiError::BadRequest(err.to_string()))?;
     Ok(ApiResponse::ok("Disk initialized").into_response())
-}
-
-/// 返回系统监控历史记录，默认最近 7 天。
-pub async fn history(
-    State(state): State<Arc<AppState>>,
-    payload: Option<Json<SystemHistoryQuery>>,
-) -> ApiResult<Response> {
-    let rows = system_metrics::fetch_history(&state, payload.and_then(|value| value.0.hours))
-        .await
-        .map_err(|err| crate::types::ApiError::Internal(err.to_string()))?;
-    Ok(ApiResponse::success_with_raw("System metrics history loaded", Some(rows)).into_response())
-}
-
-/// 清空系统监控历史记录。
-pub async fn clear_history(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
-    let affected = system_metrics::clear_history(&state)
-        .await
-        .map_err(|err| crate::types::ApiError::Internal(err.to_string()))?;
-    let message = format!("Cleared {affected} system metrics records");
-    Ok(ApiResponse::ok(&message).into_response())
-}
-
-/// 返回系统监控采集开关状态。
-pub async fn collector_status(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
-    let enabled = state.system_metrics_enabled().await;
-    let status = system_metrics::CollectorStatus { enabled };
-    Ok(
-        ApiResponse::success_with_raw("System metrics collector status loaded", Some(status))
-            .into_response(),
-    )
-}
-
-/// 更新系统监控采集开关状态。
-pub async fn set_collector_status(
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<CollectorStatusPayload>,
-) -> ApiResult<Response> {
-    system_metrics::set_collector_enabled(&state, payload.enabled)
-        .await
-        .map_err(|err| crate::types::ApiError::Internal(err.to_string()))?;
-    let status = system_metrics::CollectorStatus {
-        enabled: payload.enabled,
-    };
-    Ok(
-        ApiResponse::success_with_raw("System metrics collector status updated", Some(status))
-            .into_response(),
-    )
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -704,28 +645,6 @@ pub async fn detect_firewall() -> ApiResult<Response> {
     )
 }
 
-/// 返回系统监控告警阈值配置。
-pub async fn alert_thresholds(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
-    let thresholds = system_metrics::fetch_alert_thresholds(&state.metadata_db)
-        .await
-        .map_err(|err| crate::types::ApiError::Internal(err.to_string()))?;
-    Ok(ApiResponse::success_with_raw("Alert thresholds loaded", Some(thresholds)).into_response())
-}
-
-/// 更新系统监控告警阈值配置。
-pub async fn set_alert_thresholds_handler(
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<system_metrics::AlertThresholds>,
-) -> ApiResult<Response> {
-    system_metrics::set_alert_thresholds(&state.metadata_db, &payload)
-        .await
-        .map_err(|err| crate::types::ApiError::Internal(err.to_string()))?;
-    let thresholds = system_metrics::fetch_alert_thresholds(&state.metadata_db)
-        .await
-        .map_err(|err| crate::types::ApiError::Internal(err.to_string()))?;
-    Ok(ApiResponse::success_with_raw("Alert thresholds updated", Some(thresholds)).into_response())
-}
-
 /// 构建系统信息相关路由集合。
 pub fn system_router() -> Router<Arc<AppState>> {
     Router::new()
@@ -746,12 +665,6 @@ pub fn system_router() -> Router<Arc<AppState>> {
             post(format_partition),
         )
         .route("/disks/{disk}/initialize", post(initialize_disk))
-        .route("/history", post(history))
-        .route("/history", delete(clear_history))
-        .route("/collector/status", get(collector_status))
-        .route("/collector/status", put(set_collector_status))
-        .route("/alert/thresholds", get(alert_thresholds))
-        .route("/alert/thresholds", put(set_alert_thresholds_handler))
         .route("/seclab-url", put(set_seclab_url))
 }
 

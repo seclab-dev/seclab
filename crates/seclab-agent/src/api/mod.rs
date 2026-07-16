@@ -7,6 +7,7 @@ pub mod runtime_logs;
 pub mod scheduled_tasks;
 pub mod suite_workloads;
 pub mod system;
+pub mod system_monitoring;
 pub mod tasks;
 pub mod upgrade;
 pub mod websocket;

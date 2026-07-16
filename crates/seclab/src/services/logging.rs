@@ -1,6 +1,6 @@
 //! 平台日志服务：记录操作日志并写入数据库。
 
-use crate::models::logging::{LogModule, LogStatus, PlatformLog};
+use crate::models::logging::{LogModule, LogStatus, PlatformLog, PlatformLogLevel};
 use crate::state::DbPool;
 use crate::types::{ApiError, new_uuid_v7};
 use axum::http::HeaderMap;
@@ -142,6 +142,12 @@ impl PlatformLogEntry {
         self
     }
 
+    /// 设置操作影响级别。
+    pub fn level(mut self, level: PlatformLogLevel) -> Self {
+        self.inner = self.inner.level(level);
+        self
+    }
+
     /// 设置状态为成功
     pub fn set_success(mut self) -> Self {
         self.inner = self.inner.set_success();
@@ -202,9 +208,9 @@ async fn record_log(pool: &DbPool, args: PlatformLogEntry) -> Result<(), ApiErro
     let result = sqlx::query(
         r#"
     INSERT INTO platform_logs (
-        user_id, username, module, event, target_type, target_id, status, client_ip,
+        user_id, username, module, event, target_type, target_id, status, level, client_ip,
         trace_id, source, request_path, method, metadata
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     "#,
     )
     .bind(args.inner.user_id)
@@ -214,6 +220,7 @@ async fn record_log(pool: &DbPool, args: PlatformLogEntry) -> Result<(), ApiErro
     .bind(&args.inner.target_type)
     .bind(&args.inner.target_id)
     .bind(status)
+    .bind(args.inner.level.as_str())
     .bind(&client_ip)
     .bind(&args.inner.trace_id)
     .bind(&args.inner.source)
@@ -359,7 +366,7 @@ pub async fn fetch_platform_logs(
     let data_query = format!(
         r#"
             SELECT 
-                id, user_id, username, module, event, target_type, target_id, timestamp, status, client_ip,
+                id, user_id, username, module, event, target_type, target_id, timestamp, status, level, client_ip,
                 trace_id, source, request_path, method, metadata
             FROM platform_logs
             {where_clause}

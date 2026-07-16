@@ -15,5 +15,6 @@ pub mod scripts;
 pub mod seclab;
 pub mod security;
 pub mod suites;
+pub mod system_monitoring;
 pub mod task_scheduler;
 pub mod upgrades;

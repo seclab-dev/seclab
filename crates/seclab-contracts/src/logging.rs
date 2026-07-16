@@ -6,7 +6,7 @@ use serde_json::Value as JsonValue;
 use sqlx::FromRow;
 use ts_rs::TS;
 
-use crate::telemetry::LogModule;
+use crate::telemetry::{LogModule, PlatformLogLevel};
 
 /// 平台日志记录。
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize, TS)]
@@ -24,6 +24,7 @@ pub struct PlatformLog {
     #[ts(type = "number")]
     pub timestamp: DateTime<Utc>,
     pub status: String,
+    pub level: PlatformLogLevel,
     pub client_ip: String,
     pub trace_id: String,
     pub source: String,

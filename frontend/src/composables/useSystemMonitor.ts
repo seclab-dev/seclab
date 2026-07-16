@@ -1,285 +1,265 @@
 /**
  * @file useSystemMonitor.ts
- * @description 系统监控数据管理 composable。
- *
- * 封装系统摘要/历史数据的拉取与定时刷新、采集器开关、时间范围切换、
- * 告警阈值管理，以及所有派生数据（速率计算、标签、指标数组）的计算。
+ * @description 系统监控页面状态、latest-request-wins 与非重叠轮询。
  */
 
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { systemApi } from '@/api/modules/system'
-import type { HostSystemSummary, SystemHistoryPoint, SystemAboutInfo } from '@/api/interface/system'
-import { resolveThroughputUnit } from '@/utils/units'
+import type { SystemMonitoringOverview, SystemMonitoringSeriesPage } from '@/api/generated'
+import { systemMonitoringApi, type SystemMonitoringRange } from '@/api/modules/systemMonitoring'
 import { useNodeStore } from '@/stores/node'
+import { resolveThroughputUnit } from '@/utils/units'
 
-/** 时间范围预设。 */
-export type TimeRange = '1h' | '6h' | '24h' | '3d' | '7d'
+const OVERVIEW_REFRESH_MS = 5_000
+const SERIES_REFRESH_MS = 60_000
 
-/** 时间范围到小时数的映射。 */
-const TIME_RANGE_HOURS: Record<TimeRange, number> = {
-  '1h': 1,
-  '6h': 6,
-  '24h': 24,
-  '3d': 72,
-  '7d': 168,
+interface DataRequestState {
+  loading: boolean
+  refreshing: boolean
+  error: string
+  warning: string
+  loadedAt: Date | null
 }
 
-/** 告警阈值配置。 */
-export interface AlertThresholds {
-  cpuWarning: number
-  cpuDanger: number
-  memoryWarning: number
-  memoryDanger: number
-}
+const initialRequestState = (): DataRequestState => ({
+  loading: false,
+  refreshing: false,
+  error: '',
+  warning: '',
+  loadedAt: null,
+})
 
-const DEFAULT_THRESHOLDS: AlertThresholds = {
-  cpuWarning: 80,
-  cpuDanger: 95,
-  memoryWarning: 80,
-  memoryDanger: 95,
-}
+/** 将服务端 UTC 时间按当前 locale 展示。 */
+export const formatMonitoringTime = (value: string | null) =>
+  value ? new Date(value).toLocaleString() : ''
 
-/** 采样间隔（毫秒），与后端 5 分钟对齐。 */
-const SAMPLE_INTERVAL_MS = 300_000
-
-/**
- * 格式化 Unix 时间戳为可读时间字符串。
- */
-export const formatTime = (timestamp: number) => {
-  const time = new Date(timestamp * 1000)
-  const y = time.getFullYear()
-  const m = String(time.getMonth() + 1).padStart(2, '0')
-  const d = String(time.getDate()).padStart(2, '0')
-  const hh = String(time.getHours()).padStart(2, '0')
-  const mm = String(time.getMinutes()).padStart(2, '0')
-  const ss = String(time.getSeconds()).padStart(2, '0')
-  return `${y}-${m}-${d} ${hh}:${mm}:${ss}`
-}
-
-/**
- * 将累计字节序列转换为速率序列（字节/秒）。
- */
-export const buildRates = (
-  items: SystemHistoryPoint[],
-  selector: (point: SystemHistoryPoint) => number,
-): number[] => {
-  const values: number[] = []
-  for (let i = 0; i < items.length; i += 1) {
-    if (i === 0) {
-      values.push(0)
-      continue
-    }
-    const prev = items[i - 1]
-    const current = items[i]
-    if (!prev || !current) {
-      values.push(0)
-      continue
-    }
-    const delta = Math.max(0, selector(current) - selector(prev))
-    const seconds = Math.max(1, current.createdAt - prev.createdAt)
-    values.push(delta / seconds)
-  }
-  return values
-}
-
-/**
- * 系统监控数据管理 composable。
- */
+/** 系统监控数据管理。 */
 export function useSystemMonitor() {
   const { t } = useI18n()
   const nodeStore = useNodeStore()
-  const systemClient = computed(() => systemApi.forNode(nodeStore.currentNodeId))
+  const overview = ref<SystemMonitoringOverview | null>(null)
+  const series = ref<SystemMonitoringSeriesPage | null>(null)
+  const overviewState = ref<DataRequestState>(initialRequestState())
+  const seriesState = ref<DataRequestState>(initialRequestState())
+  const timeRange = ref<SystemMonitoringRange>('24h')
+  const manualRefreshing = ref(false)
 
-  // === 状态 ===
-  const loading = ref(false)
-  const switchingCollector = ref(false)
-  const errorText = ref('')
-  const updatedAtText = ref('--')
-  const summary = ref<HostSystemSummary | null>(null)
-  const aboutInfo = ref<SystemAboutInfo | null>(null)
-  const points = ref<SystemHistoryPoint[]>([])
-  const collectorEnabled = ref(false)
-  const timeRange = ref<TimeRange>('24h')
-  const thresholds = ref<AlertThresholds>({ ...DEFAULT_THRESHOLDS })
+  let overviewSequence = 0
+  let seriesSequence = 0
+  let overviewInFlight = false
+  let seriesInFlight = false
+  let overviewPending = false
+  let seriesPending = false
+  let overviewTimer: number | null = null
+  let seriesTimer: number | null = null
+  let mounted = false
 
-  let refreshTimer: number | null = null
+  const currentNodeId = () => nodeStore.currentNodeId || 'local'
+  const resolveMessage = (error: unknown) =>
+    error instanceof Error && error.message ? error.message : t('app.systemMonitor.fetchFailed')
 
-  // === 派生数据 ===
-  const labels = computed(() => points.value.map((item) => formatTime(item.createdAt)))
-  const load1 = computed(() => points.value.map((item) => item.loadAvg1))
-  const load5 = computed(() => points.value.map((item) => item.loadAvg5))
-  const load15 = computed(() => points.value.map((item) => item.loadAvg15))
-  const cpu = computed(() => points.value.map((item) => Number(item.cpuPercent.toFixed(2))))
-  const memory = computed(() => points.value.map((item) => Number(item.memoryPercent.toFixed(2))))
-  const diskRead = computed(() => buildRates(points.value, (item) => item.diskReadBytes))
-  const diskWrite = computed(() => buildRates(points.value, (item) => item.diskWriteBytes))
-  const netRx = computed(() => buildRates(points.value, (item) => item.networkRxBytes))
-  const netTx = computed(() => buildRates(points.value, (item) => item.networkTxBytes))
-
-  const diskScale = computed(() => resolveThroughputUnit([...diskRead.value, ...diskWrite.value]))
-  const netScale = computed(() => resolveThroughputUnit([...netRx.value, ...netTx.value]))
-
-  // === 操作 ===
-
-  /** 拉取系统摘要与历史数据。 */
-  const fetchData = async () => {
-    loading.value = true
-    errorText.value = ''
-    try {
-      const hours = TIME_RANGE_HOURS[timeRange.value]
-      const [summaryRes, historyRes] = await Promise.all([
-        systemClient.value.fetchSummary(),
-        systemClient.value.fetchHistory({ hours }),
-      ])
-      if (!summaryRes.success) {
-        throw new Error(summaryRes.message || t('app.systemMonitor.fetchFailed'))
-      }
-      if (!historyRes.success) {
-        throw new Error(historyRes.message || t('app.systemMonitor.fetchFailed'))
-      }
-      summary.value = summaryRes.data ?? null
-      points.value = historyRes.data ?? []
-      if (summary.value?.collectedAt) {
-        updatedAtText.value = formatTime(summary.value.collectedAt)
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : t('app.systemMonitor.fetchFailed')
-      errorText.value = message
-    } finally {
-      loading.value = false
-    }
-  }
-
-  /** 拉取主机基础信息。 */
-  const fetchAbout = async () => {
-    try {
-      const res = await systemClient.value.fetchAbout()
-      if (res.success && res.data) {
-        aboutInfo.value = res.data
-      }
-    } catch {
-      // 主机信息获取失败不阻塞主流程
-    }
-  }
-
-  /** 拉取采集器开关状态。 */
-  const loadCollectorStatus = async () => {
-    const res = await systemClient.value.fetchCollectorStatus()
-    if (!res.success || !res.data) {
-      throw new Error(res.message || t('app.systemMonitor.fetchFailed'))
-    }
-    collectorEnabled.value = Boolean(res.data.enabled)
-  }
-
-  /** 切换采集器启停。 */
-  const toggleCollector = async () => {
-    switchingCollector.value = true
-    errorText.value = ''
-    try {
-      const next = !collectorEnabled.value
-      const res = await systemClient.value.setCollectorStatus(next)
-      if (!res.success || !res.data) {
-        throw new Error(res.message || t('app.systemMonitor.toggleCollectorFailed'))
-      }
-      collectorEnabled.value = Boolean(res.data.enabled)
-    } catch (error) {
-      const message =
-        error instanceof Error ? error.message : t('app.systemMonitor.toggleCollectorFailed')
-      errorText.value = message
-    } finally {
-      switchingCollector.value = false
-    }
-  }
-
-  /** 清空历史数据。 */
-  const clearHistory = async () => {
-    const res = await systemClient.value.clearHistory()
-    if (!res.success) {
-      errorText.value = res.message || t('app.systemMonitor.clearFailed')
+  /** 获取实时概览；并发调用合并为最多一次后续刷新。 */
+  const refreshOverview = async () => {
+    if (overviewInFlight) {
+      overviewPending = true
       return
     }
-    points.value = []
-  }
-
-  /** 拉取告警阈值。 */
-  const fetchThresholds = async () => {
-    try {
-      const res = await systemClient.value.fetchAlertThresholds()
-      if (res.success && res.data) {
-        thresholds.value = res.data
-      }
-    } catch {
-      // 阈值获取失败使用默认值
+    overviewInFlight = true
+    const nodeId = currentNodeId()
+    const sequence = ++overviewSequence
+    const hasData = overview.value !== null
+    overviewState.value = {
+      ...overviewState.value,
+      loading: !hasData,
+      refreshing: hasData,
+      error: hasData ? overviewState.value.error : '',
+      warning: '',
     }
-  }
-
-  /** 保存告警阈值。 */
-  const saveThresholds = async (newThresholds: AlertThresholds) => {
     try {
-      const res = await systemClient.value.setAlertThresholds(newThresholds)
-      if (res.success && res.data) {
-        thresholds.value = res.data
+      const response = await systemMonitoringApi.fetchOverview(nodeId)
+      if (!response.success || !response.data) {
+        throw new Error(response.message || t('app.systemMonitor.fetchFailed'))
+      }
+      if (sequence !== overviewSequence || nodeId !== currentNodeId()) return
+      overview.value = response.data
+      overviewState.value = {
+        loading: false,
+        refreshing: false,
+        error: '',
+        warning: '',
+        loadedAt: new Date(),
       }
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : t('app.systemMonitor.saveThresholdsFailed')
-      errorText.value = message
+      if (sequence !== overviewSequence || nodeId !== currentNodeId()) return
+      const message = resolveMessage(error)
+      overviewState.value = {
+        ...overviewState.value,
+        loading: false,
+        refreshing: false,
+        error: overview.value ? '' : message,
+        warning: overview.value ? message : '',
+      }
+    } finally {
+      overviewInFlight = false
+      if (overviewPending && mounted) {
+        overviewPending = false
+        void refreshOverview()
+      }
     }
   }
 
-  /** 启动定时刷新。 */
-  const startAutoRefresh = () => {
-    stopAutoRefresh()
-    refreshTimer = window.setInterval(() => {
-      void fetchData()
-    }, SAMPLE_INTERVAL_MS)
-  }
-
-  /** 停止定时刷新。 */
-  const stopAutoRefresh = () => {
-    if (refreshTimer !== null) {
-      window.clearInterval(refreshTimer)
-      refreshTimer = null
+  /** 获取历史趋势；节点和范围均参与响应提交校验。 */
+  const refreshSeries = async () => {
+    if (seriesInFlight) {
+      seriesPending = true
+      return
+    }
+    seriesInFlight = true
+    const nodeId = currentNodeId()
+    const range = timeRange.value
+    const sequence = ++seriesSequence
+    const hasData = series.value !== null
+    seriesState.value = {
+      ...seriesState.value,
+      loading: !hasData,
+      refreshing: hasData,
+      error: hasData ? seriesState.value.error : '',
+      warning: '',
+    }
+    try {
+      const response = await systemMonitoringApi.fetchSeries(nodeId, range)
+      if (!response.success || !response.data) {
+        throw new Error(response.message || t('app.systemMonitor.fetchFailed'))
+      }
+      if (sequence !== seriesSequence || nodeId !== currentNodeId() || range !== timeRange.value) {
+        return
+      }
+      series.value = response.data
+      seriesState.value = {
+        loading: false,
+        refreshing: false,
+        error: '',
+        warning: '',
+        loadedAt: new Date(),
+      }
+    } catch (error) {
+      if (sequence !== seriesSequence || nodeId !== currentNodeId() || range !== timeRange.value) {
+        return
+      }
+      const message = resolveMessage(error)
+      seriesState.value = {
+        ...seriesState.value,
+        loading: false,
+        refreshing: false,
+        error: series.value ? '' : message,
+        warning: series.value ? message : '',
+      }
+    } finally {
+      seriesInFlight = false
+      if (seriesPending && mounted) {
+        seriesPending = false
+        void refreshSeries()
+      }
     }
   }
 
-  // 时间范围变化时重新拉取数据
+  /** 刷新两类数据，不改变手动刷新按钮状态。 */
+  const refreshAllData = () => Promise.all([refreshOverview(), refreshSeries()])
+
+  /** 手动刷新两类数据，重复操作会合并而不会重叠。 */
+  const refreshAll = async () => {
+    if (manualRefreshing.value) return
+    manualRefreshing.value = true
+    try {
+      await refreshAllData()
+    } finally {
+      manualRefreshing.value = false
+    }
+  }
+
+  const scheduleOverview = async () => {
+    await refreshOverview()
+    if (mounted) overviewTimer = window.setTimeout(scheduleOverview, OVERVIEW_REFRESH_MS)
+  }
+
+  const scheduleSeries = async () => {
+    await refreshSeries()
+    if (mounted) seriesTimer = window.setTimeout(scheduleSeries, SERIES_REFRESH_MS)
+  }
+
+  const resetForNode = () => {
+    overviewSequence += 1
+    seriesSequence += 1
+    overviewPending = false
+    seriesPending = false
+    overview.value = null
+    series.value = null
+    overviewState.value = initialRequestState()
+    seriesState.value = initialRequestState()
+    void refreshAllData()
+  }
+
+  watch(
+    () => nodeStore.currentNodeId,
+    () => resetForNode(),
+  )
+
   watch(timeRange, () => {
-    void fetchData()
+    seriesSequence += 1
+    seriesPending = false
+    void refreshSeries()
   })
 
-  // 生命周期
   onMounted(() => {
-    void loadCollectorStatus()
-      .then(fetchData)
-      .catch((error: unknown) => {
-        const message = error instanceof Error ? error.message : t('app.systemMonitor.fetchFailed')
-        errorText.value = message
-        void fetchData()
-      })
-    void fetchAbout()
-    void fetchThresholds()
-    startAutoRefresh()
+    mounted = true
+    void scheduleOverview()
+    void scheduleSeries()
   })
 
   onUnmounted(() => {
-    stopAutoRefresh()
+    mounted = false
+    overviewSequence += 1
+    seriesSequence += 1
+    if (overviewTimer !== null) window.clearTimeout(overviewTimer)
+    if (seriesTimer !== null) window.clearTimeout(seriesTimer)
   })
 
+  const points = computed(() => series.value?.points ?? [])
+  const labels = computed(() => points.value.map((point) => formatMonitoringTime(point.sampledAt)))
+  const metric = <K extends keyof (typeof points.value)[number]['metrics']>(key: K) =>
+    computed(() => points.value.map((point) => point.metrics[key]))
+  const load1 = metric('loadAverage1m')
+  const load5 = metric('loadAverage5m')
+  const load15 = metric('loadAverage15m')
+  const cpu = metric('cpuPercent')
+  const memory = metric('memoryPercent')
+  const diskRead = metric('diskReadBytesPerSecond')
+  const diskWrite = metric('diskWriteBytesPerSecond')
+  const netRx = metric('networkReceiveBytesPerSecond')
+  const netTx = metric('networkTransmitBytesPerSecond')
+  const numericValues = (values: Array<number | null>) =>
+    values.filter((value): value is number => value !== null)
+  const diskScale = computed(() =>
+    resolveThroughputUnit(numericValues([...diskRead.value, ...diskWrite.value])),
+  )
+  const netScale = computed(() =>
+    resolveThroughputUnit(numericValues([...netRx.value, ...netTx.value])),
+  )
+  const busy = computed(
+    () =>
+      overviewState.value.loading ||
+      overviewState.value.refreshing ||
+      seriesState.value.loading ||
+      seriesState.value.refreshing,
+  )
+
   return {
-    // 状态
-    loading,
-    switchingCollector,
-    errorText,
-    updatedAtText,
-    summary,
-    aboutInfo,
-    points,
-    collectorEnabled,
+    overview,
+    series,
+    overviewState,
+    seriesState,
     timeRange,
-    thresholds,
-    // 派生数据
+    points,
     labels,
     load1,
     load5,
@@ -292,11 +272,10 @@ export function useSystemMonitor() {
     netTx,
     diskScale,
     netScale,
-    // 操作
-    fetchData,
-    fetchAbout,
-    toggleCollector,
-    clearHistory,
-    saveThresholds,
+    busy,
+    manualRefreshing,
+    refreshOverview,
+    refreshSeries,
+    refreshAll,
   }
 }

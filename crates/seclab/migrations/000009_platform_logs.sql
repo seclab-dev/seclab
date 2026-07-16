@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS platform_logs (
     target_id TEXT NOT NULL,
     timestamp TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     status TEXT NOT NULL,
+    level TEXT NOT NULL DEFAULT 'INFO' CHECK (level IN ('INFO', 'WARNING', 'ERROR')),
     client_ip TEXT NOT NULL,
     trace_id TEXT NOT NULL,
     source TEXT NOT NULL DEFAULT 'seclab',
@@ -21,6 +22,7 @@ CREATE INDEX IF NOT EXISTS idx_platform_logs_timestamp ON platform_logs (timesta
 CREATE INDEX IF NOT EXISTS idx_platform_logs_module_event ON platform_logs (module, event);
 CREATE INDEX IF NOT EXISTS idx_platform_logs_user_id ON platform_logs (user_id);
 CREATE INDEX IF NOT EXISTS idx_platform_logs_trace_id ON platform_logs (trace_id);
+CREATE INDEX IF NOT EXISTS idx_platform_logs_level_timestamp ON platform_logs (level, timestamp DESC);
 
 CREATE TABLE IF NOT EXISTS notification_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

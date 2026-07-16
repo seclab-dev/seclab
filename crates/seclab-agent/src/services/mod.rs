@@ -9,6 +9,7 @@ pub mod process_manager;
 pub mod runtime_logs;
 pub mod settings;
 pub mod system_metrics;
+pub mod system_monitoring;
 pub mod task_scheduler;
 pub mod upgrade;
 pub mod websocket;

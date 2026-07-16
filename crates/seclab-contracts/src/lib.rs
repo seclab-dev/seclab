@@ -3,6 +3,7 @@
 pub mod api;
 pub mod auth;
 pub mod logging;
+pub mod monitoring;
 pub mod notification;
 pub mod process;
 pub mod runtime_logs;
