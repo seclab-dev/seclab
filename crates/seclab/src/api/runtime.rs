@@ -745,6 +745,88 @@ pub async fn report_task_runs(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReportScriptRunsPayload {
+    pub agent_id: String,
+    pub session_id: String,
+    pub reports: Vec<seclab_contracts::scripts::AgentScriptRunReport>,
+}
+
+/// 接收脚本运行可靠上报，并逐条校验运行与当前节点会话的归属。
+pub async fn report_script_runs(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(payload): Json<ReportScriptRunsPayload>,
+) -> ApiResult<impl IntoResponse> {
+    let session =
+        crate::models::node_sessions::get_session_by_id(&state.metadata_db, &payload.session_id)
+            .await
+            .map_err(|error| ApiError::internal(format!("failed to query session: {error}")))?
+            .ok_or_else(|| {
+                ApiError::bad_request(ErrorCode::BadRequest, "runtime session not found")
+            })?;
+    if session.status != "active" || session.agent_id != payload.agent_id {
+        return Err(ApiError::bad_request(
+            ErrorCode::BadRequest,
+            "runtime identity mismatch",
+        ));
+    }
+    if payload.reports.is_empty() || payload.reports.len() > 100 {
+        return Err(ApiError::bad_request(
+            ErrorCode::BadRequest,
+            "script run report must contain 1 to 100 items",
+        ));
+    }
+
+    for report in &payload.reports {
+        crate::models::scripts::save_report(&state.metadata_db, &payload.agent_id, report).await?;
+        if let Some(run) =
+            crate::models::scripts::claim_terminal_audit(&state.metadata_db, &report.run_id).await?
+            && let Ok(client_ip) = run.client_ip.parse()
+        {
+            let failed = matches!(run.status.as_str(), "failed" | "timed_out");
+            PlatformLogEntry::new(&run.actor_name, "script_run_completed", client_ip)
+                .user_id(run.actor_user_id)
+                .module(LogModule::System)
+                .target_type("script")
+                .target_id(&run.script_id)
+                .trace_id(&run.trace_id)
+                .status(if failed {
+                    LogStatus::Failed
+                } else {
+                    LogStatus::Success
+                })
+                .level(if failed {
+                    PlatformLogLevel::Error
+                } else {
+                    PlatformLogLevel::Warning
+                })
+                .metadata(json!({
+                    "runId": run.run_id,
+                    "scriptName": run.script_name,
+                    "revision": run.script_revision,
+                    "nodeId": run.node_id,
+                    "result": run.status,
+                    "errorCode": run.error_code,
+                }))
+                .finish(&state.metadata_db);
+        }
+    }
+
+    PlatformLogEntry::new("runtime-agent", "runtime_report_script_runs", addr.ip())
+        .module(LogModule::System)
+        .target_type("session")
+        .target_id(&payload.session_id)
+        .metadata(json!({
+            "agent_id": payload.agent_id,
+            "runs_count": payload.reports.len(),
+        }))
+        .set_success()
+        .finish(&state.metadata_db);
+    Ok(ApiResponse::ok("Report received"))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TasksSnapshotParams {
     pub session_id: String,
     pub agent_id: String,
@@ -787,6 +869,7 @@ pub fn runtime_router() -> Router<Arc<AppState>> {
         .route("/terminal-tickets/consume", post(consume_terminal_ticket))
         .route("/rotate-certificate", post(rotate_certificate))
         .route("/scheduled-tasks/runs/report", post(report_task_runs))
+        .route("/script-runs/report", post(report_script_runs))
         .route("/scheduled-tasks/snapshot", get(get_tasks_snapshot))
         .route(
             "/upgrades/artifacts/{version}/{component}/{target_triple}/download",

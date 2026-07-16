@@ -84,20 +84,86 @@ CREATE TABLE scheduled_task_run_outputs (
     FOREIGN KEY(run_id) REFERENCES scheduled_task_runs(run_id) ON DELETE CASCADE
 );
 
--- 脚本库：保存用户维护的可复用脚本内容和基础说明。
+-- 脚本库：保存 Master 管理的脚本正文、修订、资源归属和可信变更用户。
 CREATE TABLE scripts (
     script_id TEXT PRIMARY KEY,
-    title TEXT NOT NULL,
-    description TEXT,
-    content TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    name TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 80),
+    name_key TEXT NOT NULL,
+    description TEXT CHECK(description IS NULL OR length(description) <= 500),
+    language TEXT NOT NULL DEFAULT 'shell' CHECK(language = 'shell'),
+    content TEXT NOT NULL CHECK(length(CAST(content AS BLOB)) BETWEEN 1 AND 262144),
+    content_size_bytes INTEGER NOT NULL CHECK(content_size_bytes BETWEEN 1 AND 262144),
+    source_sha256 TEXT NOT NULL CHECK(length(source_sha256) = 64),
+    default_timeout_seconds INTEGER NOT NULL DEFAULT 300 CHECK(default_timeout_seconds BETWEEN 1 AND 86400),
+    revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0),
+    ownership_kind TEXT NOT NULL DEFAULT 'custom' CHECK(ownership_kind IN ('custom', 'compose', 'suite', 'system')),
+    owner_id TEXT,
+    owner_name TEXT,
+    manager_path TEXT,
+    created_by_user_id INTEGER NOT NULL,
+    created_by_name TEXT NOT NULL,
+    updated_by_user_id INTEGER NOT NULL,
+    updated_by_name TEXT NOT NULL,
+    deleted_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 
-CREATE TRIGGER set_scripts_updated_at
-AFTER UPDATE ON scripts FOR EACH ROW
-BEGIN
-    UPDATE scripts
-       SET updated_at = (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-     WHERE script_id = OLD.script_id;
-END;
+CREATE UNIQUE INDEX idx_scripts_active_name
+    ON scripts(name_key) WHERE deleted_at IS NULL;
+CREATE INDEX idx_scripts_public_list
+    ON scripts(ownership_kind, deleted_at, updated_at DESC, script_id);
+
+-- 脚本运行：保存 Master 接受的幂等请求、确定脚本快照、节点和可信用户上下文。
+CREATE TABLE script_runs (
+    run_id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    script_id TEXT NOT NULL,
+    script_name TEXT NOT NULL,
+    script_revision INTEGER NOT NULL CHECK(script_revision > 0),
+    source_sha256 TEXT NOT NULL CHECK(length(source_sha256) = 64),
+    source_content TEXT NOT NULL CHECK(length(CAST(source_content AS BLOB)) BETWEEN 1 AND 262144),
+    timeout_seconds INTEGER NOT NULL CHECK(timeout_seconds BETWEEN 1 AND 86400),
+    node_id TEXT NOT NULL,
+    node_name TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('queued', 'starting', 'running', 'cancelling', 'succeeded', 'failed', 'timed_out', 'cancelled')),
+    phase TEXT,
+    queued_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    exit_code INTEGER,
+    error_code TEXT,
+    error_summary TEXT,
+    output_size_bytes INTEGER NOT NULL DEFAULT 0 CHECK(output_size_bytes BETWEEN 0 AND 262144),
+    output_truncated INTEGER NOT NULL DEFAULT 0 CHECK(output_truncated IN (0, 1)),
+    overlap_guard TEXT,
+    actor_user_id INTEGER NOT NULL,
+    actor_name TEXT NOT NULL,
+    client_ip TEXT NOT NULL,
+    trace_id TEXT NOT NULL,
+    terminal_logged_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(script_id) REFERENCES scripts(script_id)
+);
+
+CREATE INDEX idx_script_runs_history
+    ON script_runs(queued_at DESC, run_id DESC);
+CREATE INDEX idx_script_runs_script
+    ON script_runs(script_id, queued_at DESC, run_id DESC);
+CREATE INDEX idx_script_runs_active
+    ON script_runs(status, updated_at) WHERE status IN ('queued', 'starting', 'running', 'cancelling');
+CREATE UNIQUE INDEX idx_script_runs_overlap_guard
+    ON script_runs(overlap_guard)
+    WHERE overlap_guard IS NOT NULL AND status IN ('queued', 'starting', 'running', 'cancelling');
+
+-- 脚本运行输出：按到达顺序保存 stdout/stderr 有界文本块。
+CREATE TABLE script_run_output_chunks (
+    run_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL CHECK(sequence >= 0),
+    stream TEXT NOT NULL CHECK(stream IN ('stdout', 'stderr')),
+    content TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+    PRIMARY KEY(run_id, sequence),
+    FOREIGN KEY(run_id) REFERENCES script_runs(run_id) ON DELETE CASCADE
+);

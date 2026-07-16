@@ -18,6 +18,7 @@ pub mod node_state_machine;
 pub mod node_target_guard;
 pub mod runtime_logs;
 pub mod runtime_metrics;
+pub mod script_runs;
 pub mod static_handler;
 
 pub mod task_scheduler;

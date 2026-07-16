@@ -21,6 +21,10 @@ use seclab_contracts::{
         ScheduledTaskOperation, ScheduledTaskRun, ScheduledTaskRunOutput, ScheduledTaskRunPage,
         UpdateScheduledTaskRequest, UpdateScheduledTaskStateRequest,
     },
+    scripts::{
+        CreateScriptRequest, CreateScriptRunRequest, ScriptDetail, ScriptListPage, ScriptRun,
+        ScriptRunOutputPage, ScriptRunPage, UpdateScriptRequest,
+    },
     seclab::{SeclabNetworkConfig, SeclabNetworkUpdateResult},
     telemetry::{LogModule, LogStatus},
     terminal::{TerminalAccess, TerminalClientMessage, TerminalServerMessage},
@@ -97,6 +101,14 @@ fn export_contract_bindings() {
     export_type::<ScheduledTaskRunOutput>(&cfg);
     export_type::<ScheduledTaskOperation>(&cfg);
     export_type::<ScheduledTaskBatch>(&cfg);
+    export_type::<ScriptListPage>(&cfg);
+    export_type::<ScriptDetail>(&cfg);
+    export_type::<CreateScriptRequest>(&cfg);
+    export_type::<UpdateScriptRequest>(&cfg);
+    export_type::<CreateScriptRunRequest>(&cfg);
+    export_type::<ScriptRun>(&cfg);
+    export_type::<ScriptRunPage>(&cfg);
+    export_type::<ScriptRunOutputPage>(&cfg);
     export_type::<TerminalAccess>(&cfg);
     export_type::<TerminalClientMessage>(&cfg);
     export_type::<TerminalServerMessage>(&cfg);

@@ -635,6 +635,36 @@ async fn report_task_run_to_controller(
     Ok(())
 }
 
+/// 将脚本运行 outbox 批量上报给 Master，成功响应即作为确认。
+async fn report_script_runs_to_controller(
+    client: &reqwest::Client,
+    session: &RuntimeSessionState,
+    reports: Vec<seclab_contracts::scripts::AgentScriptRunReport>,
+) -> anyhow::Result<()> {
+    let payload = serde_json::json!({
+        "agentId": session.agent_id,
+        "sessionId": session.session_id,
+        "reports": reports,
+    });
+    let response = client
+        .post(format!(
+            "{}/api/v1/runtime/script-runs/report",
+            session.seclab_url.trim_end_matches('/')
+        ))
+        .json(&payload)
+        .send()
+        .await?
+        .error_for_status()?;
+    let body = response.json::<ApiResponse<()>>().await?;
+    if !body.success {
+        return Err(anyhow::anyhow!(
+            "controller returned failure: {}",
+            body.message
+        ));
+    }
+    Ok(())
+}
+
 async fn pull_and_sync_tasks(
     pool: &DbPool,
     client: &reqwest::Client,
@@ -722,6 +752,9 @@ async fn maintain_runtime_session(
     let mut task_report_ticker = tokio::time::interval(std::time::Duration::from_secs(2));
     task_report_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    let mut script_report_ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+    script_report_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         tokio::select! {
             _ = pull_sync_ticker.tick() => {
@@ -737,6 +770,19 @@ async fn maintain_runtime_session(
                             models::scheduled_tasks::mark_outbox_attempt(pool, &item.run_id).await?;
                             tracing::warn!(%error, run_id = %item.run_id, "failed to report scheduled task run; durable retry retained");
                             break;
+                        }
+                    }
+                }
+            }
+            _ = script_report_ticker.tick() => {
+                let reports = models::script_runs::pending_reports(pool, 20).await?;
+                if !reports.is_empty() {
+                    let run_ids = reports.iter().map(|report| report.run_id.clone()).collect::<Vec<_>>();
+                    match report_script_runs_to_controller(&client, &session, reports).await {
+                        Ok(()) => models::script_runs::acknowledge(pool, &run_ids).await?,
+                        Err(error) => {
+                            models::script_runs::mark_attempt(pool, &run_ids).await?;
+                            tracing::warn!(%error, "failed to report script runs; durable retry retained");
                         }
                     }
                 }

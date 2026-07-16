@@ -9,6 +9,7 @@ pub mod notification;
 pub mod process;
 pub mod runtime_logs;
 pub mod scheduled_tasks;
+pub mod scripts;
 pub mod seclab;
 pub mod telemetry;
 pub mod terminal;

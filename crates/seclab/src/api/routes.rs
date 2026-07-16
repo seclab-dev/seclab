@@ -57,6 +57,7 @@ pub fn state_api_router(app_state: Arc<AppState>) -> Router<Arc<AppState>> {
         )
         .nest("/upgrades", upgrades::upgrades_router())
         .nest("/scripts", scripts::scripts_router())
+        .nest("/script-runs", scripts::script_runs_router())
         .nest("/security", security::security_router())
         .nest("/suites", suites::suites_router())
         .nest("/suite-instances", suites::suite_instances_router())
@@ -105,6 +106,7 @@ pub async fn create_router() -> Result<(Router, crate::state::DbPool)> {
     crate::services::upgrades::spawn_upgrade_scheduler(Arc::clone(&app_state));
     crate::services::node_read_model::spawn_local_node_monitor(Arc::clone(&app_state));
     crate::services::task_sync::spawn_sync_queue_worker(Arc::clone(&app_state));
+    crate::services::script_runs::spawn_worker(Arc::clone(&app_state));
     crate::services::file_task_audit::spawn_reconciler(Arc::clone(&app_state));
 
     // 配置 CORS：允许所有来源、常用方法

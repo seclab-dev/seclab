@@ -1,8 +1,8 @@
 //! 路由注册：挂载所有 API 子路由并拼装主路由器。
 
 use super::api::{
-    docker, fs, host_terminal, process, runtime_logs, scheduled_tasks, suite_workloads, system,
-    system_monitoring, tasks, upgrade, websocket,
+    docker, fs, host_terminal, process, runtime_logs, scheduled_tasks, script_runs,
+    suite_workloads, system, system_monitoring, upgrade, websocket,
 };
 use crate::db;
 use crate::state::DbPool;
@@ -38,8 +38,8 @@ pub fn state_api_router() -> Router<Arc<AppState>> {
             "/system-monitoring",
             system_monitoring::system_monitoring_router(),
         )
-        .nest("/tasks", tasks::task_router())
         .nest("/scheduled-tasks", scheduled_tasks::scheduled_task_router())
+        .nest("/script-runs", script_runs::script_run_router())
         .nest("/upgrade", upgrade::upgrade_router())
         .nest("/websocket", websocket::websocket_router())
         .merge(process::process_router())
@@ -94,6 +94,9 @@ pub async fn create_router() -> Result<(Router, DbPool)> {
         .map_err(anyhow::Error::msg)?;
     process_manager.spawn_samplers(Arc::clone(&app_state));
     task_scheduler::spawn_scheduler(Arc::clone(&app_state));
+    crate::services::script_runs::recover(&app_state)
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to recover script runs: {error:?}"))?;
 
     // 配置 CORS：允许所有来源、常用方法
     let cors = CorsLayer::new()

@@ -101,6 +101,12 @@ fn rebuild_scoped_proxy_path(path_with_query: &str, node_id: &str) -> String {
 
 fn ensure_proxy_path_allowed(path_with_query: &str) -> ApiResult<()> {
     let path = path_with_query.split('?').next().unwrap_or(path_with_query);
+    if path == "/api/v1/agent/script-runs" || path.starts_with("/api/v1/agent/script-runs/") {
+        return Err(ApiError::forbidden(
+            ErrorCode::AuthForbidden,
+            "script runs must use the script library semantic API",
+        ));
+    }
     if path == "/api/v1/agent/fs"
         || path.starts_with("/api/v1/agent/fs/")
         || path == "/api/v1/agent/files"
@@ -593,5 +599,11 @@ mod tests {
         assert!(ensure_proxy_path_allowed("/api/v1/agent/processes/list").is_err());
         assert!(ensure_proxy_path_allowed("/api/v1/agent/network-connections/list").is_err());
         assert!(ensure_proxy_path_allowed("/api/v1/agent/process/abc/terminate").is_err());
+    }
+
+    #[test]
+    fn semantic_script_run_api_cannot_bypass_master_gateway() {
+        assert!(ensure_proxy_path_allowed("/api/v1/agent/script-runs").is_err());
+        assert!(ensure_proxy_path_allowed("/api/v1/agent/script-runs/run-1/cancel").is_err());
     }
 }

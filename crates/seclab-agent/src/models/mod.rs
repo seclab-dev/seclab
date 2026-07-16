@@ -3,3 +3,4 @@
 pub mod docker;
 pub mod identity;
 pub mod scheduled_tasks;
+pub mod script_runs;

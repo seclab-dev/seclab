@@ -427,8 +427,7 @@ fn apply_operation_context(
 }
 
 fn is_long_running_request(path: &str) -> bool {
-    path.contains("/agent/tasks/execute")
-        || path.contains("/agent/docker/install")
+    path.contains("/agent/docker/install")
         || path.contains("/agent/docker/suites/install")
         || path.contains("/agent/docker/daemon/settings")
         || path.contains("/agent/docker/system/prune")

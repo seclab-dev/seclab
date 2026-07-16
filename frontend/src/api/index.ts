@@ -31,9 +31,7 @@ class HttpClient {
         const locale = localStorage.getItem('seclab_locale') === 'en' ? 'en-US' : 'zh-CN'
         config.headers.set('Accept-Language', locale)
         if (config.url) {
-          if (config.url.includes('/agent/tasks/execute')) {
-            config.timeout = 300000
-          } else if (
+          if (
             config.url.includes('/nodes/deploy') ||
             config.url.includes('/nodes/precheck') ||
             config.url.includes('/upgrade') ||

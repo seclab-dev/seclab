@@ -12,6 +12,7 @@ pub mod host_terminal;
 pub mod pcap;
 pub mod process_manager;
 pub mod runtime_logs;
+pub mod script_runs;
 pub mod settings;
 pub mod system_metrics;
 pub mod system_monitoring;
