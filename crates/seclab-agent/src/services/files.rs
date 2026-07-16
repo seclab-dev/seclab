@@ -1,14 +1,14 @@
 //! 文件管理同步领域：路径校验、元数据、分页、文本读取与原子写入。
 
-use crate::{config, state::DbPool, types::ApiError};
+use crate::{config, services::file_path_coordinator, state::DbPool, types::ApiError};
 use axum::http::StatusCode;
 use chrono::{DateTime, SecondsFormat, Utc};
-use once_cell::sync::Lazy;
 use seclab_contracts::{
     api::ErrorCode,
     files::{
-        FileCapabilities, FileContent, FileEntryCounts, FileEntryDetail, FileEntryKind,
+        FileCapabilities, FileDocument, FileEntryCounts, FileEntryDetail, FileEntryKind,
         FileEntrySummary, FileHome, FileListPage, FileManagement, FileManagementKind,
+        FileSaveDurability, FileSaveResult,
     },
 };
 use sqlx::Row;
@@ -20,15 +20,13 @@ use std::{
     path::{Component, Path, PathBuf},
     time::SystemTime,
 };
-use tokio::{io::AsyncWriteExt, sync::Mutex};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
 /// 文本读取与保存的最大 UTF-8 字节数。
 pub const MAX_TEXT_BYTES: u64 = 4 * 1024 * 1024;
 pub const DEFAULT_PAGE_SIZE: u32 = 50;
 pub const MAX_PAGE_SIZE: u32 = 500;
-
-static CONTENT_WRITE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 /// 文件列表排序字段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,35 +190,61 @@ pub async fn detail(pool: &DbPool, path: &Path) -> Result<FileEntryDetail, ApiEr
 }
 
 /// 读取有限大小的 UTF-8 普通文件，符号链接会解析到最终目标。
-pub async fn read_content(path: &Path) -> Result<FileContent, ApiError> {
-    let metadata = tokio::fs::metadata(path)
+pub async fn read_content(path: &Path) -> Result<FileDocument, ApiError> {
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|error| map_io_error(error, "open text file"))?;
+    let initial_metadata = file
+        .metadata()
         .await
         .map_err(|error| map_io_error(error, "read file metadata"))?;
-    ensure_regular_file(&metadata)?;
-    if metadata.len() > MAX_TEXT_BYTES {
+    ensure_regular_file(&initial_metadata)?;
+    if initial_metadata.len() > MAX_TEXT_BYTES {
         return Err(ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
             ErrorCode::FileContentTooLarge,
             "text file exceeds the 4 MiB editor limit",
         ));
     }
-    let bytes = tokio::fs::read(path)
+    let mut bytes = Vec::with_capacity(initial_metadata.len() as usize);
+    (&mut file)
+        .take(MAX_TEXT_BYTES + 1)
+        .read_to_end(&mut bytes)
         .await
         .map_err(|error| map_io_error(error, "read file"))?;
+    if bytes.len() as u64 > MAX_TEXT_BYTES {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            ErrorCode::FileContentTooLarge,
+            "text file exceeds the 4 MiB editor limit",
+        ));
+    }
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|error| map_io_error(error, "recheck file metadata"))?;
+    if revision(&metadata) != revision(&initial_metadata) {
+        return Err(ApiError::conflict(
+            ErrorCode::FileChanged,
+            "file changed while it was being read",
+        ));
+    }
     let content = String::from_utf8(bytes).map_err(|_| {
         ApiError::new(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            StatusCode::UNPROCESSABLE_ENTITY,
             ErrorCode::FileTypeUnsupported,
             "file content is not UTF-8 text",
         )
     })?;
-    Ok(FileContent {
+    Ok(FileDocument {
         path: path.to_string_lossy().into_owned(),
         size_bytes: metadata.len(),
         revision: revision(&metadata),
         modified_at: metadata.modified().ok().and_then(timestamp),
         content,
         encoding: "utf8".to_string(),
+        loaded_at: now_timestamp(),
+        capabilities: capabilities_from_metadata(FileEntryKind::File, &metadata),
     })
 }
 
@@ -293,12 +317,12 @@ pub async fn create_directory(
 
 /// 使用同目录临时文件和 revision 校验原子更新文本内容。
 pub async fn update_content(
+    pool: &DbPool,
     path: &Path,
     content: &str,
     expected_revision: &str,
-) -> Result<FileContent, ApiError> {
+) -> Result<FileSaveResult, ApiError> {
     ensure_text_size(content)?;
-    let _guard = CONTENT_WRITE_LOCK.lock().await;
     let target = if tokio::fs::symlink_metadata(path)
         .await
         .map(|metadata| metadata.file_type().is_symlink())
@@ -310,10 +334,13 @@ pub async fn update_content(
     } else {
         path.to_path_buf()
     };
+    let _path_reservation =
+        file_path_coordinator::reserve(pool, vec![target.clone()], None).await?;
     let metadata = tokio::fs::metadata(&target)
         .await
         .map_err(|error| map_io_error(error, "read file metadata"))?;
     ensure_regular_file(&metadata)?;
+    ensure_single_link(&metadata)?;
     if revision(&metadata) != expected_revision {
         return Err(ApiError::conflict(
             ErrorCode::FileChanged,
@@ -328,10 +355,11 @@ pub async fn update_content(
     if result.is_err() {
         let _ = tokio::fs::remove_file(&temporary).await;
     }
-    result?;
-    let mut response = read_content(&target).await?;
-    response.path = path.to_string_lossy().into_owned();
-    Ok(response)
+    let (committed_metadata, durability) = result?;
+    Ok(FileSaveResult {
+        document: document_from_content(path, content, &committed_metadata),
+        durability,
+    })
 }
 
 async fn write_temporary(
@@ -339,23 +367,28 @@ async fn write_temporary(
     target: &Path,
     metadata: &std::fs::Metadata,
     content: &str,
-) -> Result<(), ApiError> {
+) -> Result<(std::fs::Metadata, FileSaveDurability), ApiError> {
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(temporary)
         .await
         .map_err(|error| map_io_error(error, "create temporary file"))?;
-    tokio::fs::set_permissions(temporary, metadata.permissions())
-        .await
-        .map_err(|error| map_io_error(error, "set temporary file permissions"))?;
-    preserve_owner(temporary, metadata.uid(), metadata.gid())?;
     file.write_all(content.as_bytes())
         .await
         .map_err(|error| map_io_error(error, "write temporary file"))?;
+    preserve_owner(temporary, metadata.uid(), metadata.gid())?;
+    tokio::fs::set_permissions(temporary, metadata.permissions())
+        .await
+        .map_err(|error| metadata_preservation_error(error, "preserve file mode"))?;
+    preserve_extended_attributes(target, temporary).await?;
     file.sync_all()
         .await
         .map_err(|error| map_io_error(error, "sync temporary file"))?;
+    let committed_metadata = file
+        .metadata()
+        .await
+        .map_err(|error| map_io_error(error, "read temporary file metadata"))?;
     let current = tokio::fs::metadata(target)
         .await
         .map_err(|error| map_io_error(error, "recheck file metadata"))?;
@@ -365,10 +398,25 @@ async fn write_temporary(
             "file changed while it was being saved",
         ));
     }
+    ensure_single_link(&current)?;
     tokio::fs::rename(temporary, target)
         .await
         .map_err(|error| map_io_error(error, "commit file update"))?;
-    sync_directory(target.parent().unwrap_or(Path::new("/"))).await
+    let durability = save_durability(
+        sync_directory(target.parent().unwrap_or(Path::new("/"))).await,
+        target,
+    );
+    Ok((committed_metadata, durability))
+}
+
+fn save_durability(directory_sync: Result<(), ApiError>, target: &Path) -> FileSaveDurability {
+    match directory_sync {
+        Ok(()) => FileSaveDurability::Durable,
+        Err(error) => {
+            tracing::warn!(%error, path = %target.display(), "file saved but parent directory sync failed");
+            FileSaveDurability::Uncertain
+        }
+    }
 }
 
 fn preserve_owner(path: &Path, uid: u32, gid: u32) -> Result<(), ApiError> {
@@ -379,11 +427,33 @@ fn preserve_owner(path: &Path, uid: u32, gid: u32) -> Result<(), ApiError> {
     if result == 0 {
         Ok(())
     } else {
-        Err(map_io_error(
+        Err(metadata_preservation_error(
             io::Error::last_os_error(),
             "preserve file owner",
         ))
     }
+}
+
+/// 完整复制目标文件的扩展属性，包括 ACL 与安全标签。
+async fn preserve_extended_attributes(source: &Path, target: &Path) -> Result<(), ApiError> {
+    let source = source.to_path_buf();
+    let target = target.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let names = xattr::list(&source)
+            .map_err(|error| metadata_preservation_error(error, "list file metadata"))?;
+        for name in names {
+            let Some(value) = xattr::get(&source, &name)
+                .map_err(|error| metadata_preservation_error(error, "read file metadata"))?
+            else {
+                continue;
+            };
+            xattr::set(&target, &name, &value)
+                .map_err(|error| metadata_preservation_error(error, "write file metadata"))?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| ApiError::internal("file metadata task failed"))?
 }
 
 async fn sync_directory(path: &Path) -> Result<(), ApiError> {
@@ -416,6 +486,45 @@ fn ensure_regular_file(metadata: &std::fs::Metadata) -> Result<(), ApiError> {
     ))
 }
 
+fn ensure_single_link(metadata: &std::fs::Metadata) -> Result<(), ApiError> {
+    if metadata.nlink() == 1 {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        ErrorCode::FileHardLinkUnsupported,
+        "editing hard-linked files is not supported",
+    ))
+}
+
+fn metadata_preservation_error(error: io::Error, operation: &'static str) -> ApiError {
+    if error.kind() == io::ErrorKind::PermissionDenied {
+        return ApiError::forbidden(
+            ErrorCode::FilePermissionDenied,
+            "target filesystem denied metadata preservation",
+        );
+    }
+    tracing::warn!(%error, operation, "file metadata preservation failed");
+    ApiError::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        ErrorCode::FileMetadataPreservationFailed,
+        "file metadata could not be preserved safely",
+    )
+}
+
+fn document_from_content(path: &Path, content: &str, metadata: &std::fs::Metadata) -> FileDocument {
+    FileDocument {
+        path: path.to_string_lossy().into_owned(),
+        content: content.to_string(),
+        encoding: "utf8".to_string(),
+        size_bytes: metadata.len(),
+        revision: revision(metadata),
+        modified_at: metadata.modified().ok().and_then(timestamp),
+        loaded_at: now_timestamp(),
+        capabilities: capabilities_from_metadata(FileEntryKind::File, metadata),
+    }
+}
+
 fn summary_from_metadata(
     path: &Path,
     name: String,
@@ -432,7 +541,7 @@ fn summary_from_metadata(
         created_at: metadata.created().ok().and_then(timestamp),
         revision: revision(metadata),
         management: management_for(path, roots),
-        capabilities: capabilities_for(kind),
+        capabilities: capabilities_from_metadata(kind, metadata),
     }
 }
 
@@ -490,6 +599,17 @@ fn capabilities_for(kind: FileEntryKind) -> FileCapabilities {
             ..FileCapabilities::default()
         },
     }
+}
+
+fn capabilities_from_metadata(
+    kind: FileEntryKind,
+    metadata: &std::fs::Metadata,
+) -> FileCapabilities {
+    let mut capabilities = capabilities_for(kind);
+    if kind == FileEntryKind::File && metadata.nlink() != 1 {
+        capabilities.can_write = false;
+    }
+    capabilities
 }
 
 async fn management_roots(pool: &DbPool) -> Result<Vec<ManagementRoot>, ApiError> {
@@ -600,6 +720,10 @@ fn timestamp(value: SystemTime) -> Option<String> {
     Some(value.to_rfc3339_opts(SecondsFormat::Millis, true))
 }
 
+fn now_timestamp() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
 fn invalid_path(message: &'static str) -> ApiError {
     ApiError::bad_request(ErrorCode::FileInvalidPath, message)
 }
@@ -636,6 +760,7 @@ pub fn map_io_error(error: io::Error, operation: &'static str) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     struct TestDirectory(PathBuf);
 
@@ -766,13 +891,14 @@ mod tests {
 
     #[tokio::test]
     async fn atomic_update_rejects_stale_revision_without_overwriting() {
+        let pool = crate::test_support::setup_test_db().await;
         let root = TestDirectory::new("revision").await;
         let path = root.0.join("document.txt");
         tokio::fs::write(&path, b"first").await.unwrap();
         let stale_revision = revision(&tokio::fs::metadata(&path).await.unwrap());
         tokio::fs::write(&path, b"external-change").await.unwrap();
 
-        let error = update_content(&path, "editor-change", &stale_revision)
+        let error = update_content(&pool, &path, "editor-change", &stale_revision)
             .await
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::FileChanged);
@@ -791,5 +917,126 @@ mod tests {
             })
             .count();
         assert_eq!(temporary_count, 0);
+    }
+
+    #[tokio::test]
+    async fn atomic_update_rejects_hard_linked_files() {
+        let pool = crate::test_support::setup_test_db().await;
+        let root = TestDirectory::new("hard-link").await;
+        let path = root.0.join("document.txt");
+        let linked_path = root.0.join("linked.txt");
+        tokio::fs::write(&path, b"original").await.unwrap();
+        tokio::fs::hard_link(&path, &linked_path).await.unwrap();
+        let current_revision = revision(&tokio::fs::metadata(&path).await.unwrap());
+
+        let error = update_content(&pool, &path, "replacement", &current_revision)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::FileHardLinkUnsupported);
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), "original");
+        assert_eq!(tokio::fs::metadata(&linked_path).await.unwrap().nlink(), 2);
+        assert!(!read_content(&path).await.unwrap().capabilities.can_write);
+    }
+
+    #[tokio::test]
+    async fn atomic_update_preserves_mode_and_extended_attributes() {
+        let pool = crate::test_support::setup_test_db().await;
+        let root = TestDirectory::new("metadata").await;
+        let path = root.0.join("document.txt");
+        tokio::fs::write(&path, b"original").await.unwrap();
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o6750))
+            .await
+            .unwrap();
+        xattr::set(&path, "user.seclab-test", b"preserved").unwrap();
+        let metadata = tokio::fs::metadata(&path).await.unwrap();
+        let current_revision = revision(&metadata);
+
+        let result = update_content(&pool, &path, "replacement", &current_revision)
+            .await
+            .unwrap();
+
+        let updated = tokio::fs::metadata(&path).await.unwrap();
+        assert_eq!(updated.mode() & 0o7777, 0o6750);
+        assert_eq!(updated.uid(), metadata.uid());
+        assert_eq!(updated.gid(), metadata.gid());
+        assert_eq!(
+            xattr::get(&path, "user.seclab-test").unwrap().unwrap(),
+            b"preserved"
+        );
+        assert_eq!(result.document.content, "replacement");
+    }
+
+    #[tokio::test]
+    async fn text_read_enforces_utf8_and_four_mebibyte_limit() {
+        let root = TestDirectory::new("text-boundaries").await;
+        let path = root.0.join("document.txt");
+        tokio::fs::write(&path, vec![b'a'; MAX_TEXT_BYTES as usize])
+            .await
+            .unwrap();
+        assert_eq!(
+            read_content(&path).await.unwrap().size_bytes,
+            MAX_TEXT_BYTES
+        );
+
+        tokio::fs::write(&path, vec![b'a'; MAX_TEXT_BYTES as usize + 1])
+            .await
+            .unwrap();
+        assert_eq!(
+            read_content(&path).await.unwrap_err().code,
+            ErrorCode::FileContentTooLarge
+        );
+
+        tokio::fs::write(&path, [0xff, 0xfe]).await.unwrap();
+        let error = read_content(&path).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::FileTypeUnsupported);
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn symlink_edit_updates_target_without_replacing_link() {
+        let pool = crate::test_support::setup_test_db().await;
+        let root = TestDirectory::new("symlink-edit").await;
+        let target = root.0.join("target.txt");
+        let link = root.0.join("link.txt");
+        tokio::fs::write(&target, b"original").await.unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let document = read_content(&link).await.unwrap();
+
+        let result = update_content(&pool, &link, "replacement", &document.revision)
+            .await
+            .unwrap();
+
+        assert!(
+            tokio::fs::symlink_metadata(&link)
+                .await
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&target).await.unwrap(),
+            "replacement"
+        );
+        assert_eq!(result.document.path, link.to_string_lossy());
+    }
+
+    #[test]
+    fn post_commit_directory_sync_failure_is_a_warning() {
+        let durability = save_durability(
+            Err(ApiError::internal("injected directory sync failure")),
+            Path::new("/tmp/document.txt"),
+        );
+        assert_eq!(durability, FileSaveDurability::Uncertain);
+    }
+
+    #[test]
+    fn unsupported_metadata_copy_has_stable_error() {
+        let error = metadata_preservation_error(
+            io::Error::from_raw_os_error(libc::ENOTSUP),
+            "injected metadata copy",
+        );
+        assert_eq!(error.code, ErrorCode::FileMetadataPreservationFailed);
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 }

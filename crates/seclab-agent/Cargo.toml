@@ -29,6 +29,7 @@ uuid = { workspace = true, features = ["v4", "v7"] }
 chrono = { workspace = true, features = ["serde"] }
 cron = { workspace = true }
 libc = { workspace = true }
+xattr = { workspace = true }
 once_cell = "1.18"
 futures-util = { workspace = true }
 ring = { workspace = true }

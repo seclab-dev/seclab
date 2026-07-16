@@ -1,3 +1,5 @@
+export type { FileDocument, FileSaveResult, UpdateFileContentRequest } from '@/api/generated'
+
 /** 文件条目类型。 */
 export type FileEntryKind = 'file' | 'directory' | 'symlink' | 'other'
 
@@ -49,15 +51,6 @@ export interface FileListPage {
   total: number
   counts: FileEntryCounts
   loadedAt: string
-}
-
-export interface FileContent {
-  path: string
-  content: string
-  encoding: 'utf8'
-  sizeBytes: number
-  revision: string
-  modifiedAt?: string
 }
 
 export interface HomeResponse {

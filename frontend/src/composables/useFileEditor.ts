@@ -1,92 +1,236 @@
 /**
  * @file useFileEditor.ts
- * @description 封装固定节点上的文件编辑器加载、乐观并发保存和最新请求状态。
+ * @description 固定节点文件编辑器的加载、刷新、冲突保护和可靠保存状态机。
  */
-import { computed, type Ref } from 'vue'
+import type { Ref } from 'vue'
 import { fsApi } from '@/api/modules/fs'
 import { useNotificationStore } from '@/stores/notification'
 import { useI18n } from 'vue-i18n'
+import type { FileDocument } from '@/api/generated'
+
+export type EditorLoadState =
+  | 'idle'
+  | 'initialLoading'
+  | 'ready'
+  | 'refreshing'
+  | 'initialError'
+  | 'stale'
+
+export type EditorSaveState = 'idle' | 'saving' | 'reconciling' | 'conflict' | 'failed'
 
 export interface EditorTab {
   path: string
   name: string
+  documentKey: string
   content: string
   originalContent: string
   revision: string
   isDirty: boolean
   fileSize: number
-  isLoaded: boolean
-  isLoading: boolean
-  isSaving: boolean
-  requestSequence: number
-  error?: string
+  loadedAt?: string
+  capabilities?: FileDocument['capabilities']
+  loadState: EditorLoadState
+  saveState: EditorSaveState
+  durability?: 'durable' | 'uncertain'
+  loadSequence: number
+  saveSequence: number
+  loadError?: string
+  refreshWarning?: string
+  saveError?: string
 }
 
+interface LoadOptions {
+  discardLocalChanges?: boolean
+}
+
+/** 提供单个固定节点上的文件编辑状态操作。 */
 export function useFileEditor(nodeId: Readonly<Ref<string>>) {
   const notificationStore = useNotificationStore()
   const { t } = useI18n()
-  const fsClient = computed(() => fsApi.forNode(nodeId.value))
 
-  const loadFileContent = async (tab: EditorTab) => {
-    const requestSequence = ++tab.requestSequence
+  /** 将服务端文档事实写入标签，同时保留保存期间产生的新输入。 */
+  const applyDocument = (tab: EditorTab, document: FileDocument, savedSnapshot?: string) => {
+    const baseline = savedSnapshot ?? document.content
+    if (savedSnapshot === undefined) {
+      tab.content = document.content
+    }
+    tab.originalContent = baseline
+    tab.revision = document.revision
+    tab.fileSize = document.sizeBytes
+    tab.loadedAt = document.loadedAt
+    tab.capabilities = document.capabilities
+    tab.isDirty = tab.content !== baseline
+    tab.loadState = 'ready'
+    tab.loadError = undefined
+    tab.refreshWarning = undefined
+  }
+
+  /** 加载或刷新文件；刷新失败时保留已加载内容。 */
+  const loadFileContent = async (tab: EditorTab, options: LoadOptions = {}) => {
+    if (tab.saveState === 'saving' || tab.saveState === 'reconciling') return false
+    if (tab.isDirty && !options.discardLocalChanges) return false
+
+    const wasLoaded = ['ready', 'refreshing', 'stale'].includes(tab.loadState)
+    const requestSequence = ++tab.loadSequence
     const requestNodeId = nodeId.value
-    tab.isLoading = true
-    tab.error = ''
+    const requestPath = tab.path
+    tab.loadState = wasLoaded ? 'refreshing' : 'initialLoading'
+    tab.loadError = undefined
+    tab.refreshWarning = undefined
+
     try {
-      const res = await fsApi.forNode(requestNodeId).readFile(tab.path)
-      if (requestSequence !== tab.requestSequence || requestNodeId !== nodeId.value) return
-      if (!res.success || !res.data) {
-        tab.error = res.message || t('app.fileEditor.loadError')
-      } else {
-        tab.content = res.data.content
-        tab.originalContent = res.data.content
-        tab.revision = res.data.revision
-        tab.fileSize = res.data.sizeBytes
-        tab.isLoaded = true
-        tab.isDirty = false
+      const response = await fsApi.forNode(requestNodeId).readFile(requestPath)
+      if (
+        requestSequence !== tab.loadSequence ||
+        requestNodeId !== nodeId.value ||
+        requestPath !== tab.path
+      ) {
+        return false
       }
+      if (!response.success || !response.data) {
+        const message = response.message || t('app.fileEditor.loadError')
+        if (wasLoaded) {
+          tab.loadState = 'stale'
+          tab.refreshWarning = message
+          notificationStore.warning(t('app.fileEditor.refreshFailed', { message }))
+        } else {
+          tab.loadState = 'initialError'
+          tab.loadError = message
+        }
+        return false
+      }
+      applyDocument(tab, response.data)
+      tab.saveState = 'idle'
+      tab.saveError = undefined
+      tab.durability = undefined
+      return true
     } catch (error) {
-      if (requestSequence !== tab.requestSequence || requestNodeId !== nodeId.value) return
-      tab.error = error instanceof Error ? error.message : t('app.fileEditor.loadError')
-    } finally {
-      if (requestSequence === tab.requestSequence && requestNodeId === nodeId.value) {
-        tab.isLoading = false
+      if (
+        requestSequence !== tab.loadSequence ||
+        requestNodeId !== nodeId.value ||
+        requestPath !== tab.path
+      ) {
+        return false
       }
+      const message = error instanceof Error ? error.message : t('app.fileEditor.loadError')
+      if (wasLoaded) {
+        tab.loadState = 'stale'
+        tab.refreshWarning = message
+        notificationStore.warning(t('app.fileEditor.refreshFailed', { message }))
+      } else {
+        tab.loadState = 'initialError'
+        tab.loadError = message
+      }
+      return false
     }
   }
 
-  const saveFileContent = async (tab: EditorTab) => {
-    if (!tab.isDirty || tab.isLoading || tab.isSaving) return false
-
-    const contentToSave = tab.content
-    tab.isSaving = true
+  /** 核对结果不明确的保存请求，避免已提交保存被误报为失败。 */
+  const reconcileSave = async (
+    tab: EditorTab,
+    requestNodeId: string,
+    requestPath: string,
+    requestSequence: number,
+    savedSnapshot: string,
+  ) => {
+    tab.saveState = 'reconciling'
     try {
-      const res = await fsClient.value.writeFile({
-        path: tab.path,
-        content: contentToSave,
-        expectedRevision: tab.revision,
-      })
-      if (!res.success || !res.data) {
-        notificationStore.error(
-          t('app.fileEditor.saveFailed', { message: res.message || t('app.common.unknownError') }),
-        )
+      const response = await fsApi.forNode(requestNodeId).readFile(requestPath)
+      if (
+        requestSequence !== tab.saveSequence ||
+        requestNodeId !== nodeId.value ||
+        requestPath !== tab.path
+      ) {
         return false
       }
-      tab.originalContent = contentToSave
-      tab.fileSize = res.data.sizeBytes
-      tab.revision = res.data.revision
-      tab.isDirty = tab.content !== contentToSave
-      notificationStore.success(t('app.fileEditor.saveSuccess'))
-      return true
-    } catch (error) {
-      notificationStore.error(
-        t('app.fileEditor.saveFailed', {
-          message: error instanceof Error ? error.message : t('app.common.unknownError'),
-        }),
-      )
+      if (response.success && response.data?.content === savedSnapshot) {
+        applyDocument(tab, response.data, savedSnapshot)
+        tab.saveState = 'idle'
+        tab.saveError = undefined
+        notificationStore.success(t('app.fileEditor.saveReconciled'))
+        return true
+      }
+    } catch {
+      // 核对失败保持本地缓冲和旧 revision，后续重试仍受乐观锁保护。
+    }
+    if (requestSequence === tab.saveSequence) {
+      tab.saveState = 'failed'
+      tab.saveError = t('app.fileEditor.saveOutcomeUnknown')
+      notificationStore.warning(tab.saveError)
+    }
+    return false
+  }
+
+  /** 判断错误是否可能发生在服务端已经提交保存之后。 */
+  const isAmbiguousFailure = (code: number, errorCode?: string) =>
+    code < 0 ||
+    code >= 500 ||
+    ['AGENT_TIMEOUT', 'AGENT_UNAVAILABLE', 'AGENT_REQUEST_FAILED'].includes(errorCode ?? '')
+
+  /** 使用内容快照和 expectedRevision 原子保存文件。 */
+  const saveFileContent = async (tab: EditorTab) => {
+    if (
+      !tab.isDirty ||
+      tab.loadState === 'initialLoading' ||
+      tab.loadState === 'refreshing' ||
+      tab.saveState === 'saving' ||
+      tab.saveState === 'reconciling' ||
+      tab.saveState === 'conflict' ||
+      tab.capabilities?.canWrite === false
+    ) {
       return false
-    } finally {
-      tab.isSaving = false
+    }
+
+    const savedSnapshot = tab.content
+    const requestRevision = tab.revision
+    const requestNodeId = nodeId.value
+    const requestPath = tab.path
+    const requestSequence = ++tab.saveSequence
+    tab.saveState = 'saving'
+    tab.saveError = undefined
+
+    try {
+      const response = await fsApi.forNode(requestNodeId).writeFile({
+        path: requestPath,
+        content: savedSnapshot,
+        expectedRevision: requestRevision,
+      })
+      if (
+        requestSequence !== tab.saveSequence ||
+        requestNodeId !== nodeId.value ||
+        requestPath !== tab.path
+      ) {
+        return false
+      }
+      if (!response.success || !response.data) {
+        const message = response.message || t('app.common.unknownError')
+        if (response.errorCode === 'FILE_CHANGED') {
+          tab.saveState = 'conflict'
+          tab.saveError = message
+          notificationStore.warning(t('app.fileEditor.conflictDetected'))
+          return false
+        }
+        if (isAmbiguousFailure(response.code, response.errorCode)) {
+          return reconcileSave(tab, requestNodeId, requestPath, requestSequence, savedSnapshot)
+        }
+        tab.saveState = 'failed'
+        tab.saveError = message
+        notificationStore.error(t('app.fileEditor.saveFailed', { message }))
+        return false
+      }
+
+      applyDocument(tab, response.data.document, savedSnapshot)
+      tab.saveState = 'idle'
+      tab.saveError = undefined
+      tab.durability = response.data.durability
+      if (response.data.durability === 'uncertain') {
+        notificationStore.warning(t('app.fileEditor.durabilityUncertain'))
+      } else {
+        notificationStore.success(t('app.fileEditor.saveSuccess'))
+      }
+      return true
+    } catch {
+      return reconcileSave(tab, requestNodeId, requestPath, requestSequence, savedSnapshot)
     }
   }
 

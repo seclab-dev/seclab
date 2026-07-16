@@ -1,7 +1,10 @@
 //! 文件传输服务：持久化分块上传、Range 下载元数据与原子提交。
 
 use crate::{
-    services::files::{map_io_error, normalize_absolute_path, revision},
+    services::{
+        file_path_coordinator,
+        files::{map_io_error, normalize_absolute_path, revision},
+    },
     state::DbPool,
     types::{ApiError, ApiResult},
 };
@@ -60,6 +63,11 @@ pub async fn create(
         ));
     }
     let id = Uuid::now_v7().to_string();
+    let _path_reservation = if request.direction == FileTransferDirection::Upload {
+        Some(file_path_coordinator::reserve(pool, vec![path.clone()], None).await?)
+    } else {
+        None
+    };
     let expires_at = now_seconds() + RETENTION_SECONDS;
     let (status, size_bytes, transferred_bytes, revision_value, temporary_path) =
         match request.direction {
@@ -261,6 +269,8 @@ pub async fn complete_upload(pool: &DbPool, transfer_id: &str) -> ApiResult<File
         }
     }
     let target = PathBuf::from(&transfer.path);
+    let _path_reservation =
+        file_path_coordinator::reserve(pool, vec![target.clone()], Some(transfer_id)).await?;
     if tokio::fs::symlink_metadata(&target).await.is_ok() {
         mark_failed(pool, transfer_id, "upload target already exists").await?;
         let _ = tokio::fs::remove_file(&temporary).await;
@@ -652,6 +662,23 @@ mod tests {
     #[test]
     fn chunk_limit_is_eight_mebibytes() {
         assert_eq!(MAX_CHUNK_BYTES, 8 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn synchronous_path_reservation_blocks_upload_creation() {
+        let pool = crate::test_support::setup_test_db().await;
+        let root = TestDirectory::new("sync-reservation").await;
+        let target = root.0.join("payload.bin");
+        let _reservation = file_path_coordinator::reserve(&pool, vec![target.clone()], None)
+            .await
+            .unwrap();
+
+        let error = create(&pool, "local", actor(), upload_request(&target, 4))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::FileOperationConflict);
+        assert!(!target.exists());
     }
 
     #[tokio::test]

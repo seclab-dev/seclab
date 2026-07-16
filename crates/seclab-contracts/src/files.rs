@@ -108,17 +108,41 @@ pub struct FileListPage {
     pub loaded_at: String,
 }
 
-/// UTF-8 文本文件内容及乐观并发版本。
+/// UTF-8 文本文档及乐观并发版本。
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "files/", optional_fields)]
-pub struct FileContent {
+pub struct FileDocument {
     pub path: String,
     pub content: String,
+    #[ts(type = "\"utf8\"")]
     pub encoding: String,
     pub size_bytes: u64,
     pub revision: String,
     pub modified_at: Option<String>,
+    pub loaded_at: String,
+    #[ts(inline)]
+    pub capabilities: FileCapabilities,
+}
+
+/// 文件保存提交后的持久性状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "files/")]
+pub enum FileSaveDurability {
+    Durable,
+    Uncertain,
+}
+
+/// 原子文件保存结果。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "files/")]
+pub struct FileSaveResult {
+    #[ts(inline)]
+    pub document: FileDocument,
+    #[ts(inline)]
+    pub durability: FileSaveDurability,
 }
 
 /// Agent 有效主目录。

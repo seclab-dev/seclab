@@ -128,8 +128,8 @@ async fn detail(
 
 async fn read_content(Query(query): Query<PathQuery>) -> ApiResult<Response> {
     let path = files::normalize_absolute_path(&query.path)?;
-    let content = files::read_content(&path).await?;
-    Ok(ApiResponse::success_with_raw("File content loaded", Some(content)).into_response())
+    let document = files::read_content(&path).await?;
+    Ok(ApiResponse::success_with_raw("File content loaded", Some(document)).into_response())
 }
 
 async fn create_file(
@@ -149,14 +149,20 @@ async fn create_file(
 }
 
 async fn update_content(
+    State(state): State<Arc<AppState>>,
     context: FileOperationContext,
     Json(request): Json<UpdateFileContentRequest>,
 ) -> ApiResult<Response> {
     let _ = (&context.actor_name, &context.client_ip, &context.trace_id);
     let path = files::normalize_absolute_path(&request.path)?;
-    let content =
-        files::update_content(&path, &request.content, &request.expected_revision).await?;
-    Ok(ApiResponse::success_with_raw("File content updated", Some(content)).into_response())
+    let result = files::update_content(
+        &state.metadata_db,
+        &path,
+        &request.content,
+        &request.expected_revision,
+    )
+    .await?;
+    Ok(ApiResponse::success_with_raw("File content updated", Some(result)).into_response())
 }
 
 async fn create_directory(

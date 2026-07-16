@@ -3,6 +3,7 @@
 use seclab_contracts::{
     api::{ApiResponse, ErrorCode},
     auth::{AuthBody, AuthSession, AuthUser},
+    files::{FileDocument, FileSaveResult, UpdateFileContentRequest},
     logging::{PlatformLog, PlatformLogList, PlatformLogQuery},
     monitoring::{SystemMonitoringOverview, SystemMonitoringSeriesPage, SystemMonitoringSettings},
     notification::{
@@ -26,8 +27,7 @@ fn export_type<T: TS + 'static>(cfg: &Config) {
     T::export_all(cfg).expect("failed to export TypeScript binding");
 }
 
-#[test]
-fn export_contract_bindings() {
+fn export_config() -> Config {
     let mut cfg = Config::from_env();
     if std::env::var_os("TS_RS_EXPORT_DIR").is_none() {
         cfg = cfg.with_out_dir(
@@ -35,12 +35,26 @@ fn export_contract_bindings() {
                 .join("../../target/ts-rs-bindings/seclab-contracts-test"),
         );
     }
+    cfg
+}
+
+#[test]
+fn export_error_code_binding() {
+    export_type::<ErrorCode>(&export_config());
+}
+
+#[test]
+fn export_contract_bindings() {
+    let cfg = export_config();
 
     export_type::<ErrorCode>(&cfg);
     export_type::<ApiResponse<Dummy>>(&cfg);
     export_type::<AuthUser>(&cfg);
     export_type::<AuthSession>(&cfg);
     export_type::<AuthBody>(&cfg);
+    export_type::<FileDocument>(&cfg);
+    export_type::<FileSaveResult>(&cfg);
+    export_type::<UpdateFileContentRequest>(&cfg);
     export_type::<SeclabNetworkConfig>(&cfg);
     export_type::<SeclabNetworkUpdateResult>(&cfg);
     export_type::<LogStatus>(&cfg);

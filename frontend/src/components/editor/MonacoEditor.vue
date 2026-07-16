@@ -2,7 +2,7 @@
 /**
  * @file MonacoEditor.vue
  * @description SecLab 平台 Monaco Editor 封装组件。
- * 提供语法高亮、SDL 主题适配、语言自动检测、大文件只读保护等能力。
+ * 提供语法高亮、SDL 主题适配、语言自动检测和多文档模型隔离能力。
  * 严格遵循 SDL 设计规范。
  */
 
@@ -18,9 +18,6 @@ import {
 
 setupMonacoWorkers()
 
-/** 文件大小阈值（10MB），超过此值自动进入只读模式 */
-const LARGE_FILE_THRESHOLD = 10 * 1024 * 1024
-
 interface Props {
   /** 传递到 Monaco 可聚焦输入区的字段 ID */
   id?: string
@@ -32,6 +29,8 @@ interface Props {
   language?: string
   /** 文件路径，用于自动推断语言 */
   filePath?: string
+  /** 多文档模式下稳定且唯一的文档键 */
+  documentKey?: string
   /** 是否只读 */
   readOnly?: boolean
   /** 字号 */
@@ -40,8 +39,6 @@ interface Props {
   wordWrap?: boolean
   /** 是否显示 minimap */
   minimap?: boolean
-  /** 原始文件字节数，用于大文件只读保护 */
-  fileSize?: number
   /** 传递到 Monaco 可聚焦编辑区的可访问名称 */
   ariaLabel?: string
   /** 传递到 Monaco 可聚焦编辑区的可访问名称元素 ID */
@@ -54,19 +51,19 @@ const props = withDefaults(defineProps<Props>(), {
   modelValue: '',
   language: '',
   filePath: '',
+  documentKey: '',
   readOnly: false,
   fontSize: 13,
   wordWrap: true,
   minimap: true,
-  fileSize: 0,
   ariaLabel: '',
   ariaLabelledby: '',
 })
 
 const emit = defineEmits<{
   (e: 'update:modelValue', value: string): void
-  (e: 'save'): void
-  (e: 'change', value: string): void
+  (e: 'save', documentKey: string): void
+  (e: 'change', value: string, documentKey: string): void
 }>()
 
 const { t } = useI18n()
@@ -74,10 +71,16 @@ const containerRef = ref<HTMLDivElement | null>(null)
 const editorInstance = shallowRef<monaco.editor.IStandaloneCodeEditor | null>(null)
 let resizeObserver: ResizeObserver | null = null
 let themesRegistered = false
+let activeDocumentKey = ''
+let standaloneModel: monaco.editor.ITextModel | null = null
+let syncingModel = false
 
-/** 大文件自动只读 */
-const isLargeFile = computed(() => props.fileSize > LARGE_FILE_THRESHOLD)
-const effectiveReadOnly = computed(() => props.readOnly || isLargeFile.value)
+interface ManagedDocument {
+  model: monaco.editor.ITextModel
+  viewState: monaco.editor.ICodeEditorViewState | null
+}
+
+const managedDocuments = new Map<string, ManagedDocument>()
 
 /** 将字段标识同步到 Monaco 当前渲染模式下的真实交互控件。 */
 function syncInteractiveAttributes() {
@@ -203,6 +206,55 @@ function ensureThemesRegistered() {
   themesRegistered = true
 }
 
+/** 返回或创建独立 Monaco 文档模型。 */
+function getOrCreateDocument(documentKey: string) {
+  const existing = managedDocuments.get(documentKey)
+  if (existing) return existing
+  const uri = monaco.Uri.from({
+    scheme: 'seclab-file',
+    path: `/${encodeURIComponent(documentKey)}`,
+  })
+  const document = {
+    model: monaco.editor.createModel(props.modelValue, resolvedLanguage.value, uri),
+    viewState: null,
+  }
+  managedDocuments.set(documentKey, document)
+  return document
+}
+
+/** 切换文档时保存并恢复光标、选择区和滚动位置。 */
+function switchDocument(documentKey: string) {
+  const editor = editorInstance.value
+  if (!editor || !documentKey || activeDocumentKey === documentKey) return
+
+  const activeDocument = managedDocuments.get(activeDocumentKey)
+  if (activeDocument) activeDocument.viewState = editor.saveViewState()
+
+  const nextDocument = getOrCreateDocument(documentKey)
+  syncingModel = true
+  if (nextDocument.model.getValue() !== props.modelValue) {
+    nextDocument.model.setValue(props.modelValue)
+  }
+  monaco.editor.setModelLanguage(nextDocument.model, resolvedLanguage.value)
+  editor.setModel(nextDocument.model)
+  activeDocumentKey = documentKey
+  if (nextDocument.viewState) editor.restoreViewState(nextDocument.viewState)
+  syncingModel = false
+  syncInteractiveAttributes()
+}
+
+/** 释放已关闭标签对应的 Monaco model。 */
+function disposeDocument(documentKey: string) {
+  const document = managedDocuments.get(documentKey)
+  if (!document) return
+  if (activeDocumentKey === documentKey) {
+    editorInstance.value?.setModel(null)
+    activeDocumentKey = ''
+  }
+  document.model.dispose()
+  managedDocuments.delete(documentKey)
+}
+
 /** 初始化编辑器实例 */
 function createEditor() {
   if (!containerRef.value) return
@@ -211,11 +263,15 @@ function createEditor() {
 
   const currentTheme = isLightTheme() ? SDL_THEME_LIGHT : SDL_THEME_DARK
 
+  const initialDocument = props.documentKey ? getOrCreateDocument(props.documentKey) : null
+  standaloneModel = initialDocument
+    ? null
+    : monaco.editor.createModel(props.modelValue, resolvedLanguage.value)
+  activeDocumentKey = props.documentKey
   const editor = monaco.editor.create(containerRef.value, {
-    value: props.modelValue,
-    language: resolvedLanguage.value,
+    model: initialDocument?.model ?? standaloneModel,
     theme: currentTheme,
-    readOnly: effectiveReadOnly.value,
+    readOnly: props.readOnly,
     fontSize: props.fontSize,
     fontFamily: 'var(--sdl-font-mono)',
     lineHeight: 1.6,
@@ -243,14 +299,15 @@ function createEditor() {
 
   // 注册 Ctrl+S 保存快捷键
   editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
-    emit('save')
+    emit('save', activeDocumentKey)
   })
 
   // 内容变更回调
   editor.onDidChangeModelContent(() => {
+    if (syncingModel) return
     const value = editor.getValue()
     emit('update:modelValue', value)
-    emit('change', value)
+    emit('change', value, activeDocumentKey)
   })
 
   editorInstance.value = editor
@@ -267,6 +324,11 @@ function createEditor() {
 
 // --- 响应式 prop 同步 ---
 
+watch(
+  () => props.documentKey,
+  (documentKey) => switchDocument(documentKey),
+)
+
 /** 外部 modelValue 变更 → 同步到编辑器（避免自身触发的循环） */
 watch(
   () => props.modelValue,
@@ -274,7 +336,9 @@ watch(
     const editor = editorInstance.value
     if (!editor) return
     if (editor.getValue() !== newVal) {
+      syncingModel = true
       editor.setValue(newVal)
+      syncingModel = false
     }
   },
 )
@@ -295,9 +359,12 @@ watch(resolvedLanguage, (lang) => {
 })
 
 /** readOnly 变更 */
-watch(effectiveReadOnly, (val) => {
-  editorInstance.value?.updateOptions({ readOnly: val })
-})
+watch(
+  () => props.readOnly,
+  (val) => {
+    editorInstance.value?.updateOptions({ readOnly: val })
+  },
+)
 
 /** fontSize 变更 */
 watch(
@@ -353,8 +420,14 @@ onUnmounted(() => {
   themeObserver = null
   resizeObserver?.disconnect()
   resizeObserver = null
+  editorInstance.value?.setModel(null)
   editorInstance.value?.dispose()
   editorInstance.value = null
+  standaloneModel?.dispose()
+  standaloneModel = null
+  managedDocuments.forEach((document) => document.model.dispose())
+  managedDocuments.clear()
+  activeDocumentKey = ''
 })
 
 /**
@@ -367,15 +440,18 @@ defineExpose({
   layout: () => editorInstance.value?.layout(),
   /** 聚焦编辑器 */
   focus: () => editorInstance.value?.focus(),
+  /** 释放已关闭标签对应的文档模型 */
+  disposeDocument,
 })
 </script>
 
 <template>
-  <div class="monaco-editor-wrapper" data-ui="monaco-editor" data-native-context-menu>
-    <div v-if="isLargeFile" class="large-file-hint" data-ui="large-file-warning">
-      <span class="hint-icon">⚠</span>
-      <span>{{ t('app.fileEditor.largeFileReadonly') }}</span>
-    </div>
+  <div
+    class="monaco-editor-wrapper"
+    data-ui="monaco-editor"
+    data-slot="editor"
+    data-native-context-menu
+  >
     <div ref="containerRef" class="monaco-container" />
   </div>
 </template>
@@ -394,21 +470,5 @@ defineExpose({
   flex: 1;
   min-height: 0;
   overflow: hidden;
-}
-
-.large-file-hint {
-  display: flex;
-  align-items: center;
-  gap: var(--sdl-space-2);
-  padding: var(--sdl-space-1) var(--sdl-space-3);
-  background: var(--sdl-warning-soft);
-  color: var(--sdl-warning);
-  font-size: var(--sdl-font-caption);
-  border-bottom: 1px solid var(--sdl-border-subtle);
-  flex-shrink: 0;
-}
-
-.hint-icon {
-  font-size: 14px;
 }
 </style>

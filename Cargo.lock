@@ -3615,6 +3615,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+ "xattr",
 ]
 
 [[package]]

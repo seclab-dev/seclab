@@ -2,12 +2,14 @@ import http from '@/api'
 import type {
   CreateFileOperationTaskRequest,
   CreateFileTransferRequest,
-  FileContent,
+  FileDocument,
   FileListPage,
   FileOperationTask,
+  FileSaveResult,
   FileTransfer,
   FsEntry,
   HomeResponse,
+  UpdateFileContentRequest,
 } from '../interface/fs'
 
 const nodePath = (nodeId: string, path: string) =>
@@ -29,11 +31,11 @@ const createScopedFsApi = (nodeId: string) => ({
     }),
   home: () => http.get<HomeResponse>(nodePath(nodeId, 'files/home')),
   detail: (path: string) => http.get<FsEntry>(nodePath(nodeId, 'file/detail'), { path }),
-  readFile: (path: string) => http.get<FileContent>(nodePath(nodeId, 'file/content'), { path }),
+  readFile: (path: string) => http.get<FileDocument>(nodePath(nodeId, 'file/content'), { path }),
   createFile: (payload: { path: string; content?: string }) =>
     http.post<FsEntry>(nodePath(nodeId, 'files'), payload),
-  writeFile: (payload: { path: string; content: string; expectedRevision: string }) =>
-    http.put<FileContent>(nodePath(nodeId, 'file/content'), payload),
+  writeFile: (payload: UpdateFileContentRequest) =>
+    http.put<FileSaveResult>(nodePath(nodeId, 'file/content'), payload),
   mkdir: (payload: { path: string; recursive: boolean }) =>
     http.post<FsEntry>(nodePath(nodeId, 'directories'), payload),
   createTask: (payload: CreateFileOperationTaskRequest) =>

@@ -58,6 +58,7 @@ cookie = { version = "0.18" }
 clap = { version = "4" }
 dotenvy = { version = "0.15" }
 libc = "0.2"
+xattr = "1.6.1"
 
 [profile.dev]
 incremental = true

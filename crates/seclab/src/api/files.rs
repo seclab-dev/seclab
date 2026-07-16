@@ -27,8 +27,9 @@ use seclab_contracts::{
     api::ErrorCode,
     files::{
         CreateDirectoryRequest, CreateFileOperationTaskRequest, CreateFileRequest,
-        CreateFileTransferRequest, FileContent, FileEntryDetail, FileHome, FileListPage,
-        FileOperationTask, FileTransfer, UpdateFileContentRequest,
+        CreateFileTransferRequest, FileDocument, FileEntryDetail, FileHome, FileListPage,
+        FileOperationTask, FileSaveDurability, FileSaveResult, FileTransfer,
+        UpdateFileContentRequest,
     },
 };
 use serde::Deserialize;
@@ -163,7 +164,7 @@ async fn read_content(
 ) -> ApiResult<Response> {
     let (client, _) = node_client(&state, &node_id).await?;
     let path = agent_query_path("/content", &[("path", query.path)])?;
-    let data: FileContent = client.get_domain(&path).await?;
+    let data: FileDocument = client.get_domain(&path).await?;
     Ok(ApiResponse::success_with_raw("File content loaded", Some(data)).into_response())
 }
 
@@ -187,6 +188,7 @@ async fn create_file(
             method: "POST",
             target: &target,
             high_impact: false,
+            durability: None,
         },
         &result,
     );
@@ -204,12 +206,13 @@ async fn update_content(
     let (client, _) = node_client(&state, &node_id).await?;
     let context = operation_context(&admin, &headers)?;
     let result = client
-        .put_domain_with_operation_context::<FileContent, _>(
+        .put_domain_with_operation_context::<FileSaveResult, _>(
             &format!("{AGENT_BASE_PATH}/content"),
             &request,
             &context,
         )
         .await;
+    let durability = result.as_ref().ok().map(|save| save.durability);
     record_sync_operation(
         &state,
         &admin,
@@ -219,7 +222,8 @@ async fn update_content(
             event: "file_content_update",
             method: "PUT",
             target: &target,
-            high_impact: false,
+            high_impact: durability == Some(FileSaveDurability::Uncertain),
+            durability,
         },
         &result,
     );
@@ -246,6 +250,7 @@ async fn create_directory(
             method: "POST",
             target: &target,
             high_impact: false,
+            durability: None,
         },
         &result,
     );
@@ -282,6 +287,7 @@ async fn create_task(
             method: "POST",
             target: log_target,
             high_impact: request.operation == seclab_contracts::files::FileOperation::Remove,
+            durability: None,
         },
         &result,
     );
@@ -620,6 +626,7 @@ struct SyncOperationLog<'a> {
     method: &'a str,
     target: &'a str,
     high_impact: bool,
+    durability: Option<FileSaveDurability>,
 }
 
 fn record_sync_operation<T>(
@@ -654,7 +661,7 @@ fn record_sync_operation<T>(
         .user_id(admin.id).module(LogModule::File).target_type("file").target_id(log.target)
         .trace_id(&logging::resolve_trace_id(headers)).source("seclab_api")
         .request(log.method, "/api/v1/node/{node_id}/files")
-        .metadata(json!({ "nodeId": node_id, "result": if result.is_ok() { "success" } else { "failed" }, "errorCode": error_code }))
+        .metadata(json!({ "nodeId": node_id, "result": if result.is_ok() { "success" } else { "failed" }, "errorCode": error_code, "durability": log.durability }))
         .status(status).level(level).finish(&state.metadata_db);
 }
 

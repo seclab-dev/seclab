@@ -1,9 +1,9 @@
 <script setup lang="ts">
 /**
  * @file FileEditorView.vue
- * @description 单窗口多标签文件编辑器。集成 Monaco Editor，支持多文件同时编辑、快捷键保存、脏标记提示等。
+ * @description 固定节点上的可靠多标签文件编辑器。
  */
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import MonacoEditor from '@/components/editor/MonacoEditor.vue'
 import { useFileEditor, type EditorTab } from '@/composables/useFileEditor'
@@ -30,12 +30,68 @@ const tabs = ref<EditorTab[]>([])
 const activePath = ref('')
 const isWrap = ref(false)
 const fontSize = ref(14)
+const editorRef = ref<{ disposeDocument: (documentKey: string) => void } | null>(null)
 
 const confirmDialogVisible = ref(false)
-const tabToClose = ref<string>('')
+const pendingPath = ref('')
+const confirmationKind = ref<'close' | 'reload'>('close')
 
 const activeTab = computed(() => tabs.value.find((t) => t.path === activePath.value))
 const dirtyTabs = computed(() => tabs.value.filter((tab) => tab.isDirty))
+const editorScopeId = computed(() => props.windowId || 'default')
+const editorPanelId = computed(() => `file-editor-${editorScopeId.value}-panel`)
+const editorInputId = computed(() => `file-editor-${editorScopeId.value}-content`)
+const confirmationTitle = computed(() =>
+  confirmationKind.value === 'close'
+    ? t('app.fileEditor.closeUnsavedTitle')
+    : t('app.fileEditor.reloadUnsavedTitle'),
+)
+const confirmationMessage = computed(() =>
+  confirmationKind.value === 'close'
+    ? t('app.fileEditor.closeUnsavedMessage')
+    : t('app.fileEditor.reloadUnsavedMessage'),
+)
+const confirmationLabel = computed(() =>
+  confirmationKind.value === 'close'
+    ? t('app.fileEditor.closeDirectly')
+    : t('app.fileEditor.reloadDirectly'),
+)
+
+const tabDomId = (tab: EditorTab) =>
+  `file-editor-${editorScopeId.value}-tab-${Math.max(0, tabs.value.indexOf(tab))}`
+
+const isLoadBusy = (tab: EditorTab) =>
+  tab.loadState === 'initialLoading' || tab.loadState === 'refreshing'
+
+const isSaveBusy = (tab: EditorTab) => tab.saveState === 'saving' || tab.saveState === 'reconciling'
+
+const statusType = (tab: EditorTab) => {
+  if (
+    tab.saveState === 'conflict' ||
+    tab.saveState === 'failed' ||
+    tab.loadState === 'initialError'
+  ) {
+    return 'danger' as const
+  }
+  if (tab.isDirty || tab.loadState === 'stale' || tab.durability === 'uncertain') {
+    return 'warning' as const
+  }
+  if (isLoadBusy(tab) || isSaveBusy(tab)) return 'info' as const
+  return 'success' as const
+}
+
+const statusLabel = (tab: EditorTab) => {
+  if (tab.saveState === 'saving') return t('app.fileEditor.saving')
+  if (tab.saveState === 'reconciling') return t('app.fileEditor.reconciling')
+  if (tab.saveState === 'conflict') return t('app.fileEditor.conflict')
+  if (tab.saveState === 'failed') return t('app.fileEditor.saveFailedShort')
+  if (tab.loadState === 'initialLoading') return t('app.fileEditor.loading')
+  if (tab.loadState === 'refreshing') return t('app.fileEditor.refreshing')
+  if (tab.loadState === 'initialError') return t('app.fileEditor.loadFailedShort')
+  if (tab.loadState === 'stale') return t('app.fileEditor.stale')
+  if (tab.durability === 'uncertain') return t('app.fileEditor.durabilityWarning')
+  return tab.isDirty ? t('app.fileEditor.unsaved') : t('app.fileEditor.saved')
+}
 
 const openTab = async (path: string) => {
   if (!path) return
@@ -49,15 +105,16 @@ const openTab = async (path: string) => {
   const newTab: EditorTab = {
     path,
     name,
+    documentKey: `${targetNodeId.value}:${path}`,
     content: '',
     originalContent: '',
     revision: '',
     isDirty: false,
     fileSize: 0,
-    isLoaded: false,
-    isLoading: true,
-    isSaving: false,
-    requestSequence: 0,
+    loadState: 'idle',
+    saveState: 'idle',
+    loadSequence: 0,
+    saveSequence: 0,
   }
   tabs.value.push(newTab)
   activePath.value = path
@@ -73,7 +130,8 @@ const closeTab = (path: string) => {
   if (!tab) return
 
   if (tab.isDirty) {
-    tabToClose.value = path
+    pendingPath.value = path
+    confirmationKind.value = 'close'
     confirmDialogVisible.value = true
     return
   }
@@ -85,6 +143,7 @@ const performClose = (path: string) => {
   const index = tabs.value.findIndex((t) => t.path === path)
   if (index === -1) return
 
+  editorRef.value?.disposeDocument(tabs.value[index].documentKey)
   tabs.value.splice(index, 1)
 
   if (activePath.value === path) {
@@ -96,21 +155,35 @@ const performClose = (path: string) => {
   }
 }
 
-const handleConfirmClose = () => {
-  if (tabToClose.value) {
-    performClose(tabToClose.value)
+const handleConfirm = async () => {
+  const path = pendingPath.value
+  const kind = confirmationKind.value
+  confirmDialogVisible.value = false
+  pendingPath.value = ''
+  if (!path) return
+  if (kind === 'close') {
+    performClose(path)
+    return
   }
-  confirmDialogVisible.value = false
-  tabToClose.value = ''
+  const tab = tabs.value.find((item) => item.path === path)
+  if (tab) await loadFileContent(tab, { discardLocalChanges: true })
 }
 
-const handleCancelClose = () => {
+const handleCancelConfirmation = () => {
   confirmDialogVisible.value = false
-  tabToClose.value = ''
+  pendingPath.value = ''
 }
 
-const handleContentChange = (tab: EditorTab) => {
+const handleContentChange = (content: string, documentKey: string) => {
+  const tab = tabs.value.find((item) => item.documentKey === documentKey)
+  if (!tab) return
+  tab.content = content
   tab.isDirty = tab.content !== tab.originalContent
+  tab.durability = undefined
+  if (tab.saveState === 'failed') {
+    tab.saveState = 'idle'
+    tab.saveError = undefined
+  }
 }
 
 const handleSave = async (tab?: EditorTab) => {
@@ -119,14 +192,41 @@ const handleSave = async (tab?: EditorTab) => {
   await saveFileContent(targetTab)
 }
 
+const handleSaveByDocumentKey = async (documentKey: string) => {
+  const tab = tabs.value.find((item) => item.documentKey === documentKey)
+  if (tab) await handleSave(tab)
+}
+
 const reloadTab = async (tab?: EditorTab) => {
   const targetTab = tab || activeTab.value
-  if (!targetTab) return
-  await loadFileContent(targetTab)
+  if (!targetTab || isSaveBusy(targetTab)) return
+  if (targetTab.isDirty) {
+    pendingPath.value = targetTab.path
+    confirmationKind.value = 'reload'
+    confirmDialogVisible.value = true
+    return
+  }
+  await loadFileContent(targetTab, { discardLocalChanges: true })
 }
 
 const adjustFont = (delta: number) => {
   fontSize.value = Math.min(24, Math.max(10, fontSize.value + delta))
+}
+
+const handleTabKeydown = async (event: KeyboardEvent, tab: EditorTab) => {
+  const currentIndex = tabs.value.indexOf(tab)
+  if (currentIndex < 0) return
+  let nextIndex = currentIndex
+  if (event.key === 'ArrowLeft')
+    nextIndex = (currentIndex - 1 + tabs.value.length) % tabs.value.length
+  else if (event.key === 'ArrowRight') nextIndex = (currentIndex + 1) % tabs.value.length
+  else if (event.key === 'Home') nextIndex = 0
+  else if (event.key === 'End') nextIndex = tabs.value.length - 1
+  else return
+  event.preventDefault()
+  activePath.value = tabs.value[nextIndex].path
+  await nextTick()
+  document.getElementById(tabDomId(tabs.value[nextIndex]))?.focus()
 }
 
 watch(
@@ -165,30 +265,57 @@ watch(
     :data-node-id="targetNodeId"
   >
     <!-- Tab 栏 -->
-    <div class="tabs-header" v-if="tabs.length > 0" data-ui="editor-tabs">
+    <div
+      v-if="tabs.length > 0"
+      class="tabs-header"
+      data-ui="editor-tabs"
+      data-slot="tabs"
+      role="tablist"
+      :aria-label="t('app.fileEditor.openFiles')"
+    >
       <div
         v-for="tab in tabs"
         :key="tab.path"
         class="editor-tab"
         :class="{ 'is-active': activePath === tab.path }"
-        @click="activePath = tab.path"
       >
-        <span class="tab-status" :class="{ 'is-dirty': tab.isDirty }"></span>
-        <span class="tab-name" :title="tab.path">{{ tab.name }}</span>
-        <span class="tab-close" @click.stop="closeTab(tab.path)">
+        <button
+          :id="tabDomId(tab)"
+          type="button"
+          class="tab-select"
+          role="tab"
+          :aria-selected="activePath === tab.path"
+          :aria-controls="editorPanelId"
+          :tabindex="activePath === tab.path ? 0 : -1"
+          @click="activePath = tab.path"
+          @keydown="handleTabKeydown($event, tab)"
+        >
+          <span class="tab-status" :class="{ 'is-dirty': tab.isDirty }" aria-hidden="true"></span>
+          <span class="tab-name" :title="tab.path">{{ tab.name }}</span>
+        </button>
+        <button
+          type="button"
+          class="tab-close"
+          :aria-label="t('app.fileEditor.closeTab', { name: tab.name })"
+          @click.stop="closeTab(tab.path)"
+        >
           <SecLabIcon name="error" :size="14" />
-        </span>
+        </button>
       </div>
     </div>
 
     <!-- 工具栏 -->
-    <div class="editor-toolbar" data-ui="editor-toolbar">
-      <div class="toolbar-left">
+    <div class="editor-toolbar" data-ui="editor-toolbar" data-slot="toolbar">
+      <div class="toolbar-left" data-slot="path">
         <span v-if="activeTab" class="current-path">{{ activeTab.path }}</span>
       </div>
-      <div class="toolbar-right">
-        <SecLabTag v-if="activeTab" :type="activeTab.isDirty ? 'warning' : 'success'">
-          {{ activeTab.isDirty ? t('app.fileEditor.unsaved') : t('app.fileEditor.saved') }}
+      <div class="toolbar-right" data-slot="actions">
+        <SecLabTag
+          v-if="activeTab"
+          :type="statusType(activeTab)"
+          :title="activeTab.refreshWarning || activeTab.saveError"
+        >
+          {{ statusLabel(activeTab) }}
         </SecLabTag>
         <SecLabSwitch
           v-model="isWrap"
@@ -198,16 +325,25 @@ watch(
         <SecLabButton size="small" @click="adjustFont(-1)">A-</SecLabButton>
         <SecLabButton
           size="small"
-          :disabled="!activeTab || activeTab.isLoading"
-          @click="() => reloadTab()"
+          data-ui="editor-reload"
+          :disabled="!activeTab || isLoadBusy(activeTab) || isSaveBusy(activeTab)"
+          @click="reloadTab()"
         >
           {{ t('app.fileEditor.reload') }}
         </SecLabButton>
         <SecLabButton
           type="primary"
           size="small"
-          :disabled="!activeTab || !activeTab.isDirty || activeTab.isLoading || activeTab.isSaving"
-          @click="() => handleSave()"
+          data-ui="editor-save"
+          :disabled="
+            !activeTab ||
+            !activeTab.isDirty ||
+            isLoadBusy(activeTab) ||
+            isSaveBusy(activeTab) ||
+            activeTab.saveState === 'conflict' ||
+            activeTab.capabilities?.canWrite === false
+          "
+          @click="handleSave()"
         >
           {{ t('app.fileEditor.save') }}
         </SecLabButton>
@@ -215,26 +351,35 @@ watch(
     </div>
 
     <!-- 编辑器主体 -->
-    <div class="editor-body" data-ui="editor-area">
+    <div
+      :id="editorPanelId"
+      class="editor-body"
+      data-ui="editor-area"
+      data-slot="content"
+      role="tabpanel"
+      :aria-labelledby="activeTab ? tabDomId(activeTab) : undefined"
+    >
       <template v-if="activeTab">
-        <div v-if="activeTab.isLoading" class="state-overlay">
+        <div v-if="activeTab.loadState === 'initialLoading'" class="state-overlay">
           {{ t('app.fileEditor.loading') }}
         </div>
-        <div v-else-if="activeTab.error" class="state-overlay error">
-          {{ activeTab.error }}
-        </div>
-        <div v-else-if="!activeTab.isLoaded" class="state-overlay">
-          {{ t('app.fileEditor.previewUnsupported') }}
+        <div v-else-if="activeTab.loadState === 'initialError'" class="state-overlay error">
+          {{ activeTab.loadError }}
         </div>
         <MonacoEditor
           v-else
-          v-model="activeTab.content"
+          ref="editorRef"
+          :model-value="activeTab.content"
+          :document-key="activeTab.documentKey"
           :file-path="activeTab.path"
-          :file-size="activeTab.fileSize"
+          :read-only="activeTab.capabilities?.canWrite === false"
           :word-wrap="isWrap"
           :font-size="fontSize"
-          @change="handleContentChange(activeTab)"
-          @save="handleSave(activeTab)"
+          :id="editorInputId"
+          name="fileContent"
+          :aria-label="t('app.fileEditor.editorLabel', { path: activeTab.path })"
+          @change="handleContentChange"
+          @save="handleSaveByDocumentKey"
         />
       </template>
       <div v-else class="empty-state">
@@ -246,14 +391,20 @@ watch(
     <!-- 关闭确认对话框 -->
     <SecLabDialog
       :visible="confirmDialogVisible"
-      :title="t('app.fileEditor.closeUnsavedTitle')"
-      @close="handleCancelClose"
+      :title="confirmationTitle"
+      data-ui="editor-confirmation"
+      @close="handleCancelConfirmation"
     >
-      <div style="padding: 20px 0">{{ t('app.fileEditor.closeUnsavedMessage') }}</div>
-      <div style="display: flex; justify-content: flex-end; gap: 12px; margin-top: 20px">
-        <SecLabButton @click="handleCancelClose">{{ t('confirmation.cancel') }}</SecLabButton>
-        <SecLabButton type="danger" @click="handleConfirmClose">
-          {{ t('app.fileEditor.closeDirectly') }}
+      <div class="confirmation-message" data-slot="message">{{ confirmationMessage }}</div>
+      <div class="confirmation-actions" data-slot="actions">
+        <SecLabButton @click="handleCancelConfirmation">{{
+          t('confirmation.cancel')
+        }}</SecLabButton>
+        <SecLabButton
+          :type="confirmationKind === 'close' ? 'danger' : 'primary'"
+          @click="handleConfirm"
+        >
+          {{ confirmationLabel }}
         </SecLabButton>
       </div>
     </SecLabDialog>
@@ -263,6 +414,7 @@ watch(
 <style scoped>
 .file-editor-app {
   height: 100%;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   background: var(--sdl-bg-base);
@@ -298,6 +450,23 @@ watch(
   color: var(--sdl-text-secondary);
   font-size: var(--sdl-font-body-sm);
   transition: all 0.2s ease;
+}
+
+.tab-select {
+  all: unset;
+  display: flex;
+  align-items: center;
+  gap: var(--sdl-space-2);
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  cursor: pointer;
+}
+
+.tab-select:focus-visible,
+.tab-close:focus-visible {
+  outline: 2px solid var(--sdl-primary);
+  outline-offset: -2px;
 }
 
 .editor-tab:hover {
@@ -338,6 +507,10 @@ watch(
   height: 18px;
   border-radius: var(--sdl-radius-sm);
   color: var(--sdl-text-muted);
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
   opacity: 0;
   transition:
     opacity 0.2s,
@@ -432,5 +605,16 @@ watch(
 
 .empty-icon {
   opacity: 0.5;
+}
+
+.confirmation-message {
+  padding: var(--sdl-space-5) 0;
+}
+
+.confirmation-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--sdl-space-3);
+  margin-top: var(--sdl-space-5);
 }
 </style>

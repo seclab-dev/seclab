@@ -1,7 +1,10 @@
 //! 文件后台任务：持久化、幂等、路径互斥、取消和可回滚执行。
 
 use crate::{
-    services::files::{map_io_error, normalize_absolute_path, revision},
+    services::{
+        file_path_coordinator,
+        files::{map_io_error, normalize_absolute_path, revision},
+    },
     state::DbPool,
     types::{ApiError, ApiResult},
 };
@@ -119,6 +122,11 @@ pub async fn create(
         });
     }
     ensure_no_internal_overlap(&normalized)?;
+    let reservation_paths = normalized
+        .iter()
+        .flat_map(|item| std::iter::once(item.source.clone()).chain(item.target.clone()))
+        .collect();
+    let _path_reservation = file_path_coordinator::reserve(pool, reservation_paths, None).await?;
     ensure_no_active_overlap(pool, &normalized).await?;
 
     let task_id = Uuid::now_v7().to_string();
@@ -1213,6 +1221,40 @@ mod tests {
             },
         ];
         assert!(ensure_no_internal_overlap(&items).is_err());
+    }
+
+    #[tokio::test]
+    async fn synchronous_path_reservation_blocks_task_submission() {
+        let pool = crate::test_support::setup_test_db().await;
+        let root = TestDirectory::new("sync-reservation").await;
+        let source = root.0.join("source.txt");
+        tokio::fs::write(&source, b"content").await.unwrap();
+        let _reservation = file_path_coordinator::reserve(&pool, vec![source.clone()], None)
+            .await
+            .unwrap();
+
+        let error = create(
+            &pool,
+            "local",
+            actor(),
+            CreateFileOperationTaskRequest {
+                operation: FileOperation::Remove,
+                items: vec![FileOperationItemRequest {
+                    path: source.to_string_lossy().into_owned(),
+                    expected_revision: None,
+                    target_path: None,
+                }],
+                target_directory: None,
+                recursive: false,
+                overwrite: false,
+                idempotency_key: format!("reserved-{}", Uuid::now_v7()),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::FileOperationConflict);
+        assert!(source.exists());
     }
 
     #[tokio::test]
