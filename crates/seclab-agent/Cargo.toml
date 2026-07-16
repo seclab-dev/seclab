@@ -27,6 +27,7 @@ semver = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true, features = ["v4", "v7"] }
 chrono = { workspace = true, features = ["serde"] }
+chrono-tz = { workspace = true }
 cron = { workspace = true }
 libc = { workspace = true }
 xattr = { workspace = true }

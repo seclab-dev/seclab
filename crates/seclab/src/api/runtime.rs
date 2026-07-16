@@ -1,6 +1,6 @@
 //! runtime API：节点 enrollment、register、heartbeat 与 deregister。
 
-use crate::models::logging::LogModule;
+use crate::models::logging::{LogModule, LogStatus, PlatformLogLevel};
 use crate::services::logging::PlatformLogEntry;
 use crate::services::node_runtime;
 use crate::services::runtime_metrics;
@@ -642,11 +642,11 @@ pub async fn download_upgrade_artifact(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReportTaskRunsPayload {
     pub agent_id: String,
     pub session_id: String,
-    pub runs: Vec<crate::services::task_sync::AgentTaskRunReportDto>,
+    pub runs: Vec<seclab_contracts::scheduled_tasks::AgentScheduledTaskRunReport>,
 }
 
 pub async fn report_task_runs(
@@ -682,10 +682,60 @@ pub async fn report_task_runs(
         ));
     }
 
-    // 调用同步层保存上报记录
-    crate::services::task_sync::save_reported_task_runs(&state, &payload.agent_id, payload.runs)
-        .await
-        .map_err(|err| ApiError::internal(format!("failed to save reported task runs: {err}")))?;
+    if payload.runs.is_empty() || payload.runs.len() > 100 {
+        return Err(ApiError::bad_request(
+            seclab_contracts::api::ErrorCode::BadRequest,
+            "scheduled task run report must contain 1 to 100 items",
+        ));
+    }
+    for report in &payload.runs {
+        crate::models::task_scheduler::save_run_report(
+            &state.metadata_db,
+            &payload.agent_id,
+            report,
+        )
+        .await?;
+        if let Some(audit) = crate::models::task_scheduler::claim_run_terminal_audit(
+            &state.metadata_db,
+            &report.run.run_id,
+        )
+        .await?
+            && let Ok(client_ip) = audit.client_ip.parse()
+        {
+            let failed = matches!(
+                audit.status,
+                seclab_contracts::scheduled_tasks::ScheduledTaskRunStatus::Failed
+                    | seclab_contracts::scheduled_tasks::ScheduledTaskRunStatus::TimedOut
+            );
+            let target_name =
+                crate::models::task_scheduler::get_task(&state.metadata_db, &audit.task_id)
+                    .await?
+                    .map(|task| task.name);
+            PlatformLogEntry::new(&audit.actor_name, "scheduled_task_run_completed", client_ip)
+                .user_id(audit.actor_user_id)
+                .module(LogModule::System)
+                .target_type("scheduled_task")
+                .target_id(&audit.task_id)
+                .trace_id(&audit.trace_id)
+                .status(if failed {
+                    LogStatus::Failed
+                } else {
+                    LogStatus::Success
+                })
+                .level(if failed {
+                    PlatformLogLevel::Error
+                } else {
+                    PlatformLogLevel::Info
+                })
+                .metadata(json!({
+                    "runId": audit.run_id,
+                    "targetName": target_name,
+                    "result": format!("{:?}", audit.status).to_lowercase(),
+                    "errorCode": audit.error_code,
+                }))
+                .finish(&state.metadata_db);
+        }
+    }
 
     platform_log = platform_log.set_success();
     platform_log.finish(&state.metadata_db);
@@ -694,23 +744,10 @@ pub async fn report_task_runs(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TasksSnapshotParams {
     pub session_id: String,
     pub agent_id: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TaskSnapshotItem {
-    pub controller_task_id: i64,
-    pub revision: i64,
-    pub name: String,
-    pub command: String,
-    pub cron_expr: String,
-    pub enabled: bool,
-    pub timeout_secs: i64,
-    pub no_overlap: bool,
 }
 
 pub async fn get_tasks_snapshot(
@@ -734,24 +771,8 @@ pub async fn get_tasks_snapshot(
         ));
     }
 
-    let tasks =
-        crate::models::task_scheduler::list_tasks(&state.metadata_db, Some(&params.agent_id))
-            .await
-            .map_err(|err| ApiError::internal(format!("failed to query tasks: {err}")))?;
-
-    let snapshot: Vec<TaskSnapshotItem> = tasks
-        .into_iter()
-        .map(|t| TaskSnapshotItem {
-            controller_task_id: t.id,
-            revision: t.revision,
-            name: t.name,
-            command: t.command,
-            cron_expr: t.cron_expr,
-            enabled: t.enabled,
-            timeout_secs: t.timeout_secs,
-            no_overlap: t.no_overlap,
-        })
-        .collect();
+    let snapshot =
+        crate::models::task_scheduler::snapshot(&state.metadata_db, &params.agent_id).await?;
 
     Ok(ApiResponse::success_with_raw("Snapshot generated", snapshot).into_response())
 }
@@ -765,8 +786,8 @@ pub fn runtime_router() -> Router<Arc<AppState>> {
         .route("/deregister", post(deregister))
         .route("/terminal-tickets/consume", post(consume_terminal_ticket))
         .route("/rotate-certificate", post(rotate_certificate))
-        .route("/tasks/runs/report", post(report_task_runs))
-        .route("/tasks/snapshot", get(get_tasks_snapshot))
+        .route("/scheduled-tasks/runs/report", post(report_task_runs))
+        .route("/scheduled-tasks/snapshot", get(get_tasks_snapshot))
         .route(
             "/upgrades/artifacts/{version}/{component}/{target_triple}/download",
             get(download_upgrade_artifact),

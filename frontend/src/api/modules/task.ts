@@ -1,69 +1,105 @@
+/**
+ * @file task.ts
+ * @description 计划任务稳定领域 API；不再包含旧字段归一化与强制同步入口。
+ */
+
+import type { AxiosRequestConfig } from 'axios'
 import http from '@/api'
-import type { ApiResponse } from '@/api/interface'
-import type { TaskItem, TaskRun, UpsertTaskPayload } from '@/api/interface/task'
+import type {
+  CreateScheduledTaskBatchRequest,
+  CreateScheduledTaskMigrationRequest,
+  CreateScheduledTaskRequest,
+  ScheduledTaskBatch,
+  ScheduledTaskDetail,
+  ScheduledTaskListPage,
+  ScheduledTaskOperation,
+  ScheduledTaskRun,
+  ScheduledTaskRunOutput,
+  ScheduledTaskRunPage,
+  UpdateScheduledTaskRequest,
+  UpdateScheduledTaskStateRequest,
+} from '@/api/generated/scheduled-tasks'
+import type { ScheduledTaskListQuery, ScheduledTaskMutationResponse } from '@/api/interface/task'
 
-interface RawTaskItem extends Omit<TaskItem, 'nodeId'> {
-  nodeId?: string
-}
-
-interface RawTaskRun extends Omit<TaskRun, 'nodeId'> {
-  nodeId?: string
-}
-
-const normalizeTaskItem = (item: RawTaskItem): TaskItem => ({
-  ...item,
-  nodeId: item.nodeId ?? item.agentId,
-})
-
-const normalizeTaskRun = (item: RawTaskRun): TaskRun => ({
-  ...item,
-  nodeId: item.nodeId ?? item.agentId,
-})
-
-const normalizeResponse = <TRaw, TData>(
-  response: ApiResponse<TRaw>,
-  transform: (data: TRaw) => TData,
-): ApiResponse<TData> => {
-  if (response.data === undefined || response.data === null) {
-    return {
-      ...response,
-      data: undefined,
-    }
-  }
-  return {
-    ...response,
-    data: transform(response.data),
-  }
-}
+const requestConfig = (signal?: AbortSignal): AxiosRequestConfig => ({ signal })
 
 export const taskApi = {
-  list: async (nodeId?: string) => {
-    const response = await http.get<RawTaskItem[]>('/tasks', nodeId ? { nodeId } : undefined)
-    return normalizeResponse(response, (data) => data.map(normalizeTaskItem))
+  list: (query: ScheduledTaskListQuery = {}, signal?: AbortSignal) => {
+    return http.get<ScheduledTaskListPage>('/scheduled-tasks', query, requestConfig(signal))
   },
-  create: async (payload: UpsertTaskPayload) => {
-    const response = await http.post<RawTaskItem>('/tasks', payload)
-    return normalizeResponse(response, normalizeTaskItem)
+  detail: (taskId: string, signal?: AbortSignal) => {
+    return http.get<ScheduledTaskDetail>(
+      `/scheduled-tasks/${taskId}`,
+      undefined,
+      requestConfig(signal),
+    )
   },
-  update: async (id: number, payload: UpsertTaskPayload) => {
-    const response = await http.put<RawTaskItem>(`/tasks/${id}`, payload)
-    return normalizeResponse(response, normalizeTaskItem)
+  create: (payload: CreateScheduledTaskRequest) => {
+    return http.post<ScheduledTaskMutationResponse>('/scheduled-tasks', payload)
   },
-  remove: (id: number) => {
-    return http.delete<null>(`/tasks/${id}`)
+  update: (taskId: string, payload: UpdateScheduledTaskRequest) => {
+    return http.patch<ScheduledTaskMutationResponse>(`/scheduled-tasks/${taskId}`, payload)
   },
-  toggle: async (id: number, enabled: boolean) => {
-    const response = await http.post<RawTaskItem>(`/tasks/${id}/toggle`, { enabled })
-    return normalizeResponse(response, normalizeTaskItem)
+  updateState: (taskId: string, payload: UpdateScheduledTaskStateRequest) => {
+    return http.patch<ScheduledTaskMutationResponse>(`/scheduled-tasks/${taskId}/state`, payload)
   },
-  run: (id: number) => {
-    return http.post<null>(`/tasks/${id}/run`)
+  remove: (taskId: string) => {
+    return http.delete<ScheduledTaskOperation>(`/scheduled-tasks/${taskId}`)
   },
-  sync: (id: number, force = false) => {
-    return http.post<null>(`/tasks/${id}/sync`, undefined, { params: { force } })
+  startRun: (taskId: string) => {
+    return http.post<ScheduledTaskRun>(`/scheduled-tasks/${taskId}/runs`)
   },
-  runs: async (id: number, limit = 50) => {
-    const response = await http.get<RawTaskRun[]>(`/tasks/${id}/runs`, { limit })
-    return normalizeResponse(response, (data) => data.map(normalizeTaskRun))
+  listRuns: (taskId: string, page = 1, pageSize = 50, signal?: AbortSignal) => {
+    return http.get<ScheduledTaskRunPage>(
+      `/scheduled-tasks/${taskId}/runs`,
+      { page, pageSize },
+      requestConfig(signal),
+    )
+  },
+  runDetail: (taskId: string, runId: string, signal?: AbortSignal) => {
+    return http.get<ScheduledTaskRun>(
+      `/scheduled-tasks/${taskId}/runs/${runId}`,
+      undefined,
+      requestConfig(signal),
+    )
+  },
+  runOutput: (
+    taskId: string,
+    runId: string,
+    offsetBytes = 0,
+    limitBytes = 65_536,
+    signal?: AbortSignal,
+  ) => {
+    return http.get<ScheduledTaskRunOutput>(
+      `/scheduled-tasks/${taskId}/runs/${runId}/output`,
+      { offsetBytes, limitBytes },
+      requestConfig(signal),
+    )
+  },
+  cancelRun: (taskId: string, runId: string) => {
+    return http.post<ScheduledTaskRun>(`/scheduled-tasks/${taskId}/runs/${runId}/cancel`)
+  },
+  migrate: (taskId: string, payload: CreateScheduledTaskMigrationRequest) => {
+    return http.post<ScheduledTaskOperation>(`/scheduled-tasks/${taskId}/migrations`, payload)
+  },
+  operation: (operationId: string, signal?: AbortSignal) => {
+    return http.get<ScheduledTaskOperation>(
+      `/scheduled-task-operations/${operationId}`,
+      undefined,
+      requestConfig(signal),
+    )
+  },
+  cancelOperation: (operationId: string) => {
+    return http.post<ScheduledTaskOperation>(`/scheduled-task-operations/${operationId}/cancel`)
+  },
+  createBatch: (payload: CreateScheduledTaskBatchRequest) => {
+    return http.post<ScheduledTaskBatch>('/scheduled-task-batches', payload)
+  },
+  batch: (batchId: string, signal?: AbortSignal) => {
+    return http.get<ScheduledTaskBatch>(
+      `/scheduled-task-batches/${batchId}`,
+      undefined,
+      requestConfig(signal),
+    )
   },
 }

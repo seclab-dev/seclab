@@ -606,8 +606,9 @@ async fn establish_runtime_session(pool: &DbPool) -> anyhow::Result<RuntimeSessi
 async fn report_task_run_to_controller(
     client: &reqwest::Client,
     session: &RuntimeSessionState,
-    report: models::scheduled_tasks::TaskRunReportPayload,
+    mut report: seclab_contracts::scheduled_tasks::AgentScheduledTaskRunReport,
 ) -> anyhow::Result<()> {
+    report.run.node_id.clone_from(&session.agent_id);
     let payload = serde_json::json!({
         "agentId": session.agent_id,
         "sessionId": session.session_id,
@@ -615,7 +616,7 @@ async fn report_task_run_to_controller(
     });
 
     let url = format!(
-        "{}/api/v1/runtime/tasks/runs/report",
+        "{}/api/v1/runtime/scheduled-tasks/runs/report",
         session.seclab_url.trim_end_matches('/')
     );
     let response = client
@@ -634,34 +635,20 @@ async fn report_task_run_to_controller(
     Ok(())
 }
 
-#[derive(Debug, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AgentTaskSnapshotItem {
-    controller_task_id: i64,
-    revision: i64,
-    name: String,
-    command: String,
-    cron_expr: String,
-    enabled: bool,
-    timeout_secs: i64,
-    no_overlap: bool,
-}
-
 async fn pull_and_sync_tasks(
     pool: &DbPool,
     client: &reqwest::Client,
     session: &RuntimeSessionState,
 ) -> anyhow::Result<()> {
-    use chrono::Utc;
     let url = format!(
-        "{}/api/v1/runtime/tasks/snapshot?agentId={}&sessionId={}",
+        "{}/api/v1/runtime/scheduled-tasks/snapshot?agentId={}&sessionId={}",
         session.seclab_url.trim_end_matches('/'),
         session.agent_id,
         session.session_id
     );
     let resp = client.get(url).send().await?.error_for_status()?;
     let payload = resp
-        .json::<ApiResponse<Vec<AgentTaskSnapshotItem>>>()
+        .json::<ApiResponse<Vec<seclab_contracts::scheduled_tasks::AgentScheduledTaskDefinition>>>()
         .await?;
     if !payload.success {
         return Err(anyhow::anyhow!(
@@ -672,71 +659,37 @@ async fn pull_and_sync_tasks(
     let remote_tasks = payload.data.unwrap_or_default();
 
     let local_tasks = models::scheduled_tasks::list_all_tasks(pool).await?;
-    let mut local_map: std::collections::HashMap<i64, models::scheduled_tasks::AgentScheduledTask> =
-        local_tasks
-            .into_iter()
-            .map(|t| (t.controller_task_id, t))
-            .collect();
+    let mut local_map: std::collections::HashMap<
+        String,
+        models::scheduled_tasks::AgentScheduledTask,
+    > = local_tasks
+        .into_iter()
+        .map(|task| (task.task_id.clone(), task))
+        .collect();
 
     for remote in remote_tasks {
-        let upsert_needed = if let Some(local) = local_map.remove(&remote.controller_task_id) {
+        let upsert_needed = if let Some(local) = local_map.remove(&remote.task_id) {
             local.revision != remote.revision
         } else {
             true
         };
 
-        if upsert_needed {
-            let next_run_at = if remote.enabled {
-                match models::scheduled_tasks::compute_next_run_at(
-                    &remote.cron_expr,
-                    Utc::now().timestamp(),
-                ) {
-                    Ok(next) => next,
-                    Err(err) => {
-                        tracing::warn!(
-                            "Failed to compute next run for remote task {}: {:?}",
-                            remote.controller_task_id,
-                            err
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-
-            let payload = models::scheduled_tasks::UpsertTaskPayload {
-                controller_task_id: remote.controller_task_id,
-                revision: remote.revision,
-                name: remote.name,
-                command: remote.command,
-                cron_expr: remote.cron_expr,
-                enabled: remote.enabled,
-                timeout_secs: remote.timeout_secs,
-                no_overlap: remote.no_overlap,
-                force: Some(true),
-            };
-
-            if let Err(err) =
-                models::scheduled_tasks::upsert_task(pool, &payload, next_run_at).await
-            {
-                tracing::warn!(
-                    "Failed to align remote task {}: {:?}",
-                    payload.controller_task_id,
-                    err
-                );
-            }
+        if upsert_needed
+            && let Err(error) = models::scheduled_tasks::upsert_task(pool, &remote).await
+        {
+            tracing::warn!(
+                task_id = %remote.task_id,
+                %error,
+                "failed to align scheduled task from Master snapshot"
+            );
         }
     }
 
-    // 清理本地多余的任务
-    for (controller_task_id, _) in local_map {
-        if let Err(err) = models::scheduled_tasks::delete_task(pool, controller_task_id).await {
-            tracing::warn!(
-                "Failed to clean up obsolete local task {}: {:?}",
-                controller_task_id,
-                err
-            );
+    for (task_id, _) in local_map {
+        if let Err(error) =
+            models::scheduled_tasks::delete_task_for_reconciliation(pool, &task_id).await
+        {
+            tracing::warn!(%task_id, %error, "failed to clean up obsolete scheduled task");
         }
     }
 
@@ -766,7 +719,8 @@ async fn maintain_runtime_session(
     // 消费首次 tick
     pull_sync_ticker.tick().await;
 
-    let mut task_run_rx = models::scheduled_tasks::take_task_run_receiver().await;
+    let mut task_report_ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+    task_report_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
@@ -775,15 +729,16 @@ async fn maintain_runtime_session(
                     tracing::warn!("Scheduled pull-based sync failed: {:?}", err);
                 }
             }
-            Some(report) = async {
-                if let Some(ref mut rx) = task_run_rx {
-                    rx.recv().await
-                } else {
-                    futures_util::future::pending().await
-                }
-            } => {
-                if let Err(err) = report_task_run_to_controller(&client, &session, report).await {
-                    tracing::warn!("Failed to report task run: {:?}", err);
+            _ = task_report_ticker.tick() => {
+                for item in models::scheduled_tasks::list_outbox(pool, 20).await? {
+                    match report_task_run_to_controller(&client, &session, item.report).await {
+                        Ok(()) => models::scheduled_tasks::acknowledge_outbox(pool, &item.run_id).await?,
+                        Err(error) => {
+                            models::scheduled_tasks::mark_outbox_attempt(pool, &item.run_id).await?;
+                            tracing::warn!(%error, run_id = %item.run_id, "failed to report scheduled task run; durable retry retained");
+                            break;
+                        }
+                    }
                 }
             }
             _ = ticker.tick() => {

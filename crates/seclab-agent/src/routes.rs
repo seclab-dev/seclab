@@ -38,10 +38,8 @@ pub fn state_api_router() -> Router<Arc<AppState>> {
             "/system-monitoring",
             system_monitoring::system_monitoring_router(),
         )
-        .nest(
-            "/tasks",
-            tasks::task_router().merge(scheduled_tasks::scheduled_task_router()),
-        )
+        .nest("/tasks", tasks::task_router())
+        .nest("/scheduled-tasks", scheduled_tasks::scheduled_task_router())
         .nest("/upgrade", upgrade::upgrade_router())
         .nest("/websocket", websocket::websocket_router())
         .merge(process::process_router())

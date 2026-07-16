@@ -15,6 +15,12 @@ use seclab_contracts::{
         ProcessListPage, ProcessSignalResult,
     },
     runtime_logs::{RuntimeLogFile, RuntimeLogLine, RuntimeLogQuery, RuntimeLogQueryResult},
+    scheduled_tasks::{
+        CreateScheduledTaskBatchRequest, CreateScheduledTaskMigrationRequest,
+        CreateScheduledTaskRequest, ScheduledTaskBatch, ScheduledTaskDetail, ScheduledTaskListPage,
+        ScheduledTaskOperation, ScheduledTaskRun, ScheduledTaskRunOutput, ScheduledTaskRunPage,
+        UpdateScheduledTaskRequest, UpdateScheduledTaskStateRequest,
+    },
     seclab::{SeclabNetworkConfig, SeclabNetworkUpdateResult},
     telemetry::{LogModule, LogStatus},
     terminal::{TerminalAccess, TerminalClientMessage, TerminalServerMessage},
@@ -79,6 +85,18 @@ fn export_contract_bindings() {
     export_type::<RuntimeLogQuery>(&cfg);
     export_type::<RuntimeLogLine>(&cfg);
     export_type::<RuntimeLogQueryResult>(&cfg);
+    export_type::<ScheduledTaskListPage>(&cfg);
+    export_type::<ScheduledTaskDetail>(&cfg);
+    export_type::<CreateScheduledTaskRequest>(&cfg);
+    export_type::<UpdateScheduledTaskRequest>(&cfg);
+    export_type::<UpdateScheduledTaskStateRequest>(&cfg);
+    export_type::<CreateScheduledTaskMigrationRequest>(&cfg);
+    export_type::<CreateScheduledTaskBatchRequest>(&cfg);
+    export_type::<ScheduledTaskRun>(&cfg);
+    export_type::<ScheduledTaskRunPage>(&cfg);
+    export_type::<ScheduledTaskRunOutput>(&cfg);
+    export_type::<ScheduledTaskOperation>(&cfg);
+    export_type::<ScheduledTaskBatch>(&cfg);
     export_type::<TerminalAccess>(&cfg);
     export_type::<TerminalClientMessage>(&cfg);
     export_type::<TerminalServerMessage>(&cfg);

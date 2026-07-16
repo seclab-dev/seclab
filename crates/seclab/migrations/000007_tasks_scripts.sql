@@ -1,62 +1,91 @@
--- 定时任务、任务运行记录与脚本库。
-CREATE TABLE IF NOT EXISTS scheduled_tasks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    description TEXT, -- 任务说明，用于展示用途和运行风险。
-    agent_id TEXT NOT NULL,
-    command TEXT NOT NULL,
+-- 计划任务定义：保存 Master 管理的任务配置、资源归属和部署读模型。
+CREATE TABLE scheduled_tasks (
+    task_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 80),
+    name_key TEXT NOT NULL,
+    description TEXT CHECK(description IS NULL OR length(description) <= 500),
+    node_id TEXT NOT NULL,
+    command TEXT NOT NULL CHECK(length(command) BETWEEN 1 AND 65536),
     cron_expr TEXT NOT NULL,
-    trigger_type TEXT NOT NULL DEFAULT 'cron', -- 触发类型，预留手动、一次性和事件触发任务。
-    enabled INTEGER NOT NULL DEFAULT 1,
-    timeout_secs INTEGER NOT NULL DEFAULT 60,
-    no_overlap INTEGER NOT NULL DEFAULT 1,
-    last_run_at INTEGER,
-    next_run_at INTEGER,
-    sync_status TEXT NOT NULL DEFAULT 'pending',
-    sync_error TEXT,
-    synced_at TEXT,
-    revision INTEGER NOT NULL DEFAULT 1,
-    metadata TEXT NOT NULL DEFAULT '{}', -- 任务调度、展示和扩展执行策略的结构化配置。
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    time_zone TEXT NOT NULL DEFAULT 'Asia/Shanghai',
+    desired_state TEXT NOT NULL CHECK(desired_state IN ('enabled', 'disabled')),
+    timeout_seconds INTEGER NOT NULL CHECK(timeout_seconds BETWEEN 1 AND 86400),
+    prevent_overlap INTEGER NOT NULL CHECK(prevent_overlap IN (0, 1)),
+    ownership_kind TEXT NOT NULL CHECK(ownership_kind IN ('custom', 'compose', 'suite', 'system')),
+    owner_id TEXT,
+    owner_name TEXT,
+    manager_path TEXT,
+    revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0),
+    deployment_status TEXT NOT NULL CHECK(deployment_status IN (
+        'pending', 'applying', 'ready', 'waiting_for_node', 'failed', 'deleting', 'migrating'
+    )),
+    deployment_error_summary TEXT,
+    last_synced_at TEXT,
+    next_run_status TEXT NOT NULL CHECK(next_run_status IN (
+        'scheduled', 'disabled', 'not_deployed', 'unavailable'
+    )),
+    next_run_at TEXT,
+    last_run_id TEXT,
+    deleted_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(node_id, name_key)
 );
 
-CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_agent_id ON scheduled_tasks(agent_id);
-CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_enabled_next_run ON scheduled_tasks(enabled, next_run_at);
-CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_sync_status ON scheduled_tasks(sync_status);
+CREATE INDEX idx_scheduled_tasks_custom_list
+    ON scheduled_tasks(ownership_kind, deleted_at, node_id, updated_at DESC, task_id);
+CREATE INDEX idx_scheduled_tasks_deployment
+    ON scheduled_tasks(deployment_status, updated_at, task_id);
 
-CREATE TRIGGER IF NOT EXISTS set_scheduled_tasks_updated_at
-AFTER UPDATE ON scheduled_tasks FOR EACH ROW
-BEGIN
-    UPDATE scheduled_tasks
-       SET updated_at = (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-     WHERE id = OLD.id;
-END;
-
-CREATE TABLE IF NOT EXISTS task_runs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id INTEGER NOT NULL,
-    agent_id TEXT NOT NULL,
-    triggered_at INTEGER NOT NULL,
-    started_at INTEGER,
-    finished_at INTEGER,
-    status TEXT NOT NULL,
+-- 计划任务运行记录：保存每次触发的生命周期、可信操作人上下文和输出摘要。
+CREATE TABLE scheduled_task_runs (
+    run_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    trigger_source TEXT NOT NULL CHECK(trigger_source IN ('schedule', 'manual', 'batch')),
+    status TEXT NOT NULL CHECK(status IN (
+        'queued', 'starting', 'running', 'cancelling', 'succeeded', 'failed', 'timed_out', 'cancelled'
+    )),
+    phase TEXT,
+    queued_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
     exit_code INTEGER,
-    log_excerpt TEXT,
-    error_message TEXT,
-    run_id TEXT,
-    trigger_source TEXT NOT NULL DEFAULT 'scheduler', -- 运行来源，例如调度器、手动触发或 Agent 回传。
-    stdout TEXT, -- Agent 执行标准输出，长文本可按业务策略截断或归档。
-    stderr TEXT, -- Agent 执行标准错误，长文本可按业务策略截断或归档。
-    metadata TEXT NOT NULL DEFAULT '{}', -- 执行上下文、节点回传和展示扩展信息。
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    FOREIGN KEY (task_id) REFERENCES scheduled_tasks(id) ON DELETE CASCADE
+    error_code TEXT,
+    error_summary TEXT,
+    output_size_bytes INTEGER NOT NULL DEFAULT 0 CHECK(output_size_bytes >= 0),
+    output_truncated INTEGER NOT NULL DEFAULT 0 CHECK(output_truncated IN (0, 1)),
+    overlap_guard TEXT,
+    actor_user_id INTEGER,
+    actor_name TEXT,
+    client_ip TEXT,
+    trace_id TEXT,
+    terminal_logged_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(task_id) REFERENCES scheduled_tasks(task_id) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_task_runs_task_id_created_at ON task_runs(task_id, created_at DESC);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_task_runs_run_id ON task_runs(run_id);
+CREATE INDEX idx_scheduled_task_runs_task
+    ON scheduled_task_runs(task_id, queued_at DESC, run_id DESC);
+CREATE INDEX idx_scheduled_task_runs_active
+    ON scheduled_task_runs(status, updated_at) WHERE status IN ('queued', 'starting', 'running', 'cancelling');
+CREATE UNIQUE INDEX idx_scheduled_task_runs_overlap_guard
+    ON scheduled_task_runs(overlap_guard)
+    WHERE overlap_guard IS NOT NULL AND status IN ('queued', 'starting', 'running', 'cancelling');
 
-CREATE TABLE IF NOT EXISTS scripts (
+-- 计划任务运行输出：保存 Master 可分页读取的有界命令输出。
+CREATE TABLE scheduled_task_run_outputs (
+    run_id TEXT PRIMARY KEY,
+    content BLOB NOT NULL,
+    size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0 AND size_bytes <= 262144),
+    truncated INTEGER NOT NULL CHECK(truncated IN (0, 1)),
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(run_id) REFERENCES scheduled_task_runs(run_id) ON DELETE CASCADE
+);
+
+-- 脚本库：保存用户维护的可复用脚本内容和基础说明。
+CREATE TABLE scripts (
     script_id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     description TEXT,
@@ -65,7 +94,7 @@ CREATE TABLE IF NOT EXISTS scripts (
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
-CREATE TRIGGER IF NOT EXISTS set_scripts_updated_at
+CREATE TRIGGER set_scripts_updated_at
 AFTER UPDATE ON scripts FOR EACH ROW
 BEGIN
     UPDATE scripts

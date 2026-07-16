@@ -4,7 +4,8 @@ import { useI18n } from 'vue-i18n'
 export type CronMode = 'simple' | 'advanced'
 export type SimpleCronType = 'every_minutes' | 'hourly' | 'daily' | 'weekly'
 
-export function useCronBuilder(initialExpr: string = '0 */5 * * * *') {
+/** 构建严格的五段分钟级 Cron，不接受或生成秒字段。 */
+export function useCronBuilder(initialExpr: string = '*/5 * * * *') {
   const { t } = useI18n()
 
   const cronMode = ref<CronMode>('simple')
@@ -34,8 +35,7 @@ export function useCronBuilder(initialExpr: string = '0 */5 * * * *') {
   }
 
   const parseSimpleCron = (expr: string) => {
-    const rawParts = expr.trim().split(/\s+/)
-    const parts = rawParts.length === 6 && rawParts[0] === '0' ? rawParts.slice(1) : rawParts
+    const parts = expr.trim().split(/\s+/)
     if (parts.length !== 5) return null
     const min = parts[0] ?? ''
     const hour = parts[1] ?? ''
@@ -108,10 +108,10 @@ export function useCronBuilder(initialExpr: string = '0 */5 * * * *') {
     const weekday = clampInt(simpleCron.weekday, 0, 6)
     const intervalMin = clampInt(simpleCron.intervalMinutes, 1, 59)
 
-    if (simpleCron.type === 'every_minutes') return `0 */${intervalMin} * * * *`
-    if (simpleCron.type === 'hourly') return `0 ${min} * * * *`
-    if (simpleCron.type === 'daily') return `0 ${min} ${hour} * * *`
-    return `0 ${min} ${hour} * * ${weekday}`
+    if (simpleCron.type === 'every_minutes') return `*/${intervalMin} * * * *`
+    if (simpleCron.type === 'hourly') return `${min} * * * *`
+    if (simpleCron.type === 'daily') return `${min} ${hour} * * *`
+    return `${min} ${hour} * * ${weekday}`
   })
 
   const cronSummary = computed(() => {
@@ -119,13 +119,13 @@ export function useCronBuilder(initialExpr: string = '0 */5 * * * *') {
     const hour = clampInt(simpleCron.hour, 0, 23)
     const intervalMin = clampInt(simpleCron.intervalMinutes, 1, 59)
     if (simpleCron.type === 'every_minutes') {
-      return t('app.taskScheduler.form.summary.everyMinutes', { n: intervalMin, sec: 0 })
+      return t('app.taskScheduler.form.summary.everyMinutes', { n: intervalMin })
     }
     if (simpleCron.type === 'hourly') {
-      return t('app.taskScheduler.form.summary.hourly', { min, sec: 0 })
+      return t('app.taskScheduler.form.summary.hourly', { min })
     }
     if (simpleCron.type === 'daily') {
-      return t('app.taskScheduler.form.summary.daily', { hour, min, sec: 0 })
+      return t('app.taskScheduler.form.summary.daily', { hour, min })
     }
     return t('app.taskScheduler.form.summary.weekly', {
       weekday:
@@ -133,7 +133,6 @@ export function useCronBuilder(initialExpr: string = '0 */5 * * * *') {
         simpleCron.weekday,
       hour,
       min,
-      sec: 0,
     })
   })
 
@@ -163,7 +162,7 @@ export function useCronBuilder(initialExpr: string = '0 */5 * * * *') {
 
   const resetCron = () => {
     cronMode.value = 'simple'
-    advancedCronExpr.value = '0 */5 * * * *'
+    advancedCronExpr.value = '*/5 * * * *'
     simpleCron.type = 'every_minutes'
     simpleCron.intervalMinutes = 5
     simpleCron.minute = 0

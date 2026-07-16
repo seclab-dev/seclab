@@ -16,6 +16,7 @@ serde_yaml = { workspace = true }
 semver = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
+chrono-tz = { workspace = true }
 axum = { workspace = true, features = ["multipart", "json", "tracing", "ws"] }
 axum-server = { workspace = true, features = ["tls-rustls"] }
 axum-extra = { workspace = true, features = ["typed-header", "cookie"] }

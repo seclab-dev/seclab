@@ -1,45 +1,26 @@
-export interface TaskItem {
-  id: number
-  name: string
-  nodeId: string
-  agentId: string
-  command: string
-  cronExpr: string
-  enabled: boolean
-  timeoutSecs: number
-  noOverlap: boolean
-  lastRunAt?: number
-  nextRunAt?: number
-  createdAt: string
-  updatedAt: string
-  syncStatus: string
-  syncError?: string
-  syncedAt?: string
-  revision: number
-  lastStatus?: string
+/**
+ * @file task.ts
+ * @description 计划任务前端查询参数与复合响应类型。
+ */
+
+import type { ScheduledTaskOperation, ScheduledTaskSummary } from '@/api/generated/scheduled-tasks'
+
+export type * from '@/api/generated/scheduled-tasks'
+
+/** 服务端任务列表查询。 */
+export interface ScheduledTaskListQuery {
+  nodeId?: string
+  keyword?: string
+  enabled?: boolean
+  deploymentStatus?: string
+  page?: number
+  pageSize?: number
+  sortBy?: 'name' | 'nextRunAt' | 'updatedAt'
+  sortOrder?: 'asc' | 'desc'
 }
 
-export interface TaskRun {
-  id: number
-  taskId: number
-  nodeId: string
-  agentId: string
-  triggeredAt: number
-  startedAt?: number
-  finishedAt?: number
-  status: string
-  exitCode?: number
-  logExcerpt?: string
-  errorMessage?: string
-  createdAt: string
-}
-
-export interface UpsertTaskPayload {
-  name: string
-  nodeId: string
-  command: string
-  cronExpr: string
-  enabled: boolean
-  timeoutSecs: number
-  noOverlap: boolean
+/** 创建、编辑和启停共同返回的任务与后台操作。 */
+export interface ScheduledTaskMutationResponse {
+  task: ScheduledTaskSummary
+  operation: ScheduledTaskOperation
 }

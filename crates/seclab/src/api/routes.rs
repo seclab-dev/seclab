@@ -46,7 +46,15 @@ pub fn state_api_router(app_state: Arc<AppState>) -> Router<Arc<AppState>> {
         .nest("/notifications", notifications::notifications_router())
         .nest("/apps", apps::apps_router())
         .nest("/desktop", desktop_apps::desktop_apps_router())
-        .nest("/tasks", task_scheduler::task_scheduler_router())
+        .nest("/scheduled-tasks", task_scheduler::scheduled_tasks_router())
+        .nest(
+            "/scheduled-task-operations",
+            task_scheduler::scheduled_task_operations_router(),
+        )
+        .nest(
+            "/scheduled-task-batches",
+            task_scheduler::scheduled_task_batches_router(),
+        )
         .nest("/upgrades", upgrades::upgrades_router())
         .nest("/scripts", scripts::scripts_router())
         .nest("/security", security::security_router())
