@@ -11,9 +11,8 @@ use seclab_contracts::{
         NotificationList, NotificationQuery, NotificationRecord,
     },
     process::{
-        NetworkConnection, NetworkSnapshot, NetworkSummary, ProcessItem, ProcessManagerActiveView,
-        ProcessManagerClientMessage, ProcessManagerError, ProcessManagerServerMessage,
-        ProcessManagerSignalRequest, ProcessSnapshot, SignalResult,
+        NetworkConnectionListPage, ProcessActionRequest, ProcessForceKillConfirmation,
+        ProcessListPage, ProcessSignalResult,
     },
     runtime_logs::{RuntimeLogFile, RuntimeLogLine, RuntimeLogQuery, RuntimeLogQueryResult},
     seclab::{SeclabNetworkConfig, SeclabNetworkUpdateResult},
@@ -71,17 +70,11 @@ fn export_contract_bindings() {
     export_type::<NotificationQuery>(&cfg);
     export_type::<NotificationBatchDeletePayload>(&cfg);
     export_type::<NotificationList>(&cfg);
-    export_type::<ProcessItem>(&cfg);
-    export_type::<ProcessManagerSignalRequest>(&cfg);
-    export_type::<ProcessManagerActiveView>(&cfg);
-    export_type::<ProcessManagerClientMessage>(&cfg);
-    export_type::<ProcessSnapshot>(&cfg);
-    export_type::<NetworkConnection>(&cfg);
-    export_type::<NetworkSummary>(&cfg);
-    export_type::<NetworkSnapshot>(&cfg);
-    export_type::<SignalResult>(&cfg);
-    export_type::<ProcessManagerError>(&cfg);
-    export_type::<ProcessManagerServerMessage>(&cfg);
+    export_type::<ProcessListPage>(&cfg);
+    export_type::<NetworkConnectionListPage>(&cfg);
+    export_type::<ProcessActionRequest>(&cfg);
+    export_type::<ProcessForceKillConfirmation>(&cfg);
+    export_type::<ProcessSignalResult>(&cfg);
     export_type::<RuntimeLogFile>(&cfg);
     export_type::<RuntimeLogQuery>(&cfg);
     export_type::<RuntimeLogLine>(&cfg);

@@ -147,6 +147,16 @@ const en = {
       FILE_TRANSFER_EXPIRED: 'The file transfer has expired. Start a new transfer.',
       FILE_CHECKSUM_MISMATCH: 'The uploaded file checksum does not match.',
       FILE_STORAGE_EXHAUSTED: 'The target filesystem does not have enough free space.',
+      PROCESS_INVALID_ID: 'The process identity is invalid. Refresh the list and try again.',
+      PROCESS_NOT_FOUND: 'The process has exited or no longer exists.',
+      PROCESS_CHANGED: 'The process identity changed before the signal was delivered.',
+      PROCESS_OPERATION_CONFLICT: 'A signal operation is already being submitted for this process.',
+      PROCESS_PERMISSION_DENIED: 'The kernel denied signal delivery to this process.',
+      PROCESS_CONFIRMATION_REQUIRED: 'Force killing a process requires a second confirmation.',
+      PROCESS_CONFIRMATION_INVALID: 'The force-kill confirmation expired or is invalid.',
+      PROCESS_SIGNAL_UNAVAILABLE: 'Safe process signaling is unavailable on this kernel.',
+      PROCESS_SAMPLER_UNAVAILABLE: 'Process sampling is temporarily unavailable.',
+      NETWORK_SAMPLER_UNAVAILABLE: 'Network connection sampling is temporarily unavailable.',
     },
     upgrades: {
       invalidFormat: 'Invalid package format. Only .tar.gz or .tgz files are supported.',
@@ -1258,6 +1268,7 @@ const en = {
         Auth: 'Auth',
         Docker: 'Docker',
         File: 'Files',
+        Process: 'Processes',
       },
       events: {
         file_create: 'File Created',
@@ -1271,6 +1282,8 @@ const en = {
         file_transfer_failed: 'File Transfer Failed',
         file_transfer_cancelled: 'File Transfer Cancelled',
         file_transfer_expired: 'File Transfer Expired',
+        process_signal_terminate: 'Process Termination Signal Delivered',
+        process_signal_force_kill: 'Process Force-Kill Signal Delivered',
         user_login: 'User Login',
         user_logout: 'User Logout',
         node_precheck: 'Node Precheck',
@@ -1803,14 +1816,24 @@ const en = {
       },
       messages: {
         killFailed: 'Failed to terminate process',
-        killSuccess: 'Sent {signal} signal to process {pid}',
-        realtimeDisconnected: 'Real-time connection not ready',
+        signalDelivered: 'Delivered {signal} signal to process {pid}',
+        outcomeUnknown:
+          'The submission connection was interrupted; delivery to process {pid} is not yet known',
+        loadFailed: 'Failed to load process data',
+        stale: 'Refresh failed. The last successful data is still shown.',
+        partial: 'Some process or connection details are unavailable; coverage is partial.',
       },
       confirmTerminate: 'Confirm sending {signal} signal to process {pid}?',
-      guardActive:
-        'Process Manager real-time connection is still running. Please close this window first.',
+      confirmForceKill: 'This will irreversibly force kill process {pid}. Continue?',
+      forceKillTitle: 'Confirm Force Kill Again',
+      forceKillAction: 'Force Kill',
+      guardBusy: 'A process signal is being submitted. Wait for the result.',
       guardOpen: 'Process Manager is still open. Please close this window first.',
       process: {
+        actions: {
+          exit: 'Exit',
+          end: 'End',
+        },
         filters: {
           allStatuses: 'All Statuses',
         },
@@ -1819,11 +1842,13 @@ const en = {
           sleeping: 'Sleeping',
           stopped: 'Stopped',
           idle: 'Idle',
-          waiting: 'Waiting',
-          locked: 'Locked',
+          uninterruptible: 'Uninterruptible',
           zombie: 'Zombie',
+          dead: 'Dead',
+          unknown: 'Unknown',
         },
         empty: 'No process data',
+        filteredEmpty: 'No processes match the current filters',
         columns: {
           name: 'Name',
           threads: 'Threads',
@@ -1837,6 +1862,7 @@ const en = {
       network: {
         searchPlaceholder: 'Search by protocol/address/process',
         empty: 'No network connections',
+        filteredEmpty: 'No network connections match the current filters',
         summary: {
           total: 'Total Connections',
           protocol: 'Protocol Distribution',

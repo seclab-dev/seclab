@@ -1,263 +1,185 @@
-//! 进程管理 WebSocket API：实时推送进程与网络连接快照。
+//! 进程与网络观察内部 HTTP API，仅供 Master 语义网关调用。
 
-use crate::services::process_manager;
+use crate::{
+    services::process_manager::{ProcessManagerRuntime, SignalActorContext},
+    state::AppState,
+    types::{ApiError, ApiResponse, ApiResult},
+};
 use axum::{
-    extract::{
-        WebSocketUpgrade,
-        ws::{Message, WebSocket},
+    Json, Router,
+    extract::{Path, Query, State},
+    http::{HeaderMap, HeaderName, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use seclab_contracts::{
+    api::ErrorCode,
+    process::{
+        NetworkConnectionListQuery, ProcessActionRequest, ProcessListQuery, ProcessSignal,
+        ProcessSignalDeliveryStatus, ProcessSignalResult,
     },
-    response::IntoResponse,
 };
-use futures_util::{SinkExt, StreamExt};
-use seclab_contracts::process::{
-    NetworkSnapshot, ProcessManagerActiveView, ProcessManagerClientMessage, ProcessManagerError,
-    ProcessManagerServerMessage, ProcessSnapshot, SignalResult,
-};
-use tokio::{
-    sync::mpsc,
-    task::JoinHandle,
-    time::{self, Duration, MissedTickBehavior},
-};
-use tracing::{debug, info, warn};
+use std::sync::Arc;
 
-const PROCESS_INTERVAL: Duration = Duration::from_secs(3);
-const NETWORK_INTERVAL: Duration = Duration::from_secs(3);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const ACTOR_KIND_HEADER: HeaderName = HeaderName::from_static("x-seclab-actor-kind");
+const ACTOR_NAME_HEADER: HeaderName = HeaderName::from_static("x-seclab-actor-name");
+const CLIENT_IP_HEADER: HeaderName = HeaderName::from_static("x-seclab-client-ip");
+const TRACE_ID_HEADER: HeaderName = HeaderName::from_static("x-seclab-trace-id");
 
-/// 进程管理 WebSocket 升级入口。
-pub async fn process_manager_websocket_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
-    ws.on_upgrade(handle_socket)
+/// 注册进程与网络内部领域路由。
+pub fn process_router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/processes/list", get(list_processes))
+        .route("/network-connections/list", get(list_network_connections))
+        .route("/process/{process_id}/terminate", post(terminate))
+        .route("/process/{process_id}/force-kill", post(force_kill))
 }
 
-async fn handle_socket(socket: WebSocket) {
-    info!("New process manager WebSocket client connected.");
-
-    let (mut sender, mut receiver) = socket.split();
-    let (tx, mut rx) = mpsc::channel::<ProcessManagerServerMessage>(64);
-
-    let mut send_task = tokio::spawn(async move {
-        while let Some(message) = rx.recv().await {
-            if let Ok(payload) = serde_json::to_string(&message)
-                && sender.send(Message::Text(payload.into())).await.is_err()
-            {
-                warn!("Failed to send process manager WebSocket message.");
-                break;
-            }
-        }
-    });
-
-    let mut active_view = ProcessManagerActiveView::Process;
-    send_active_snapshot(tx.clone(), active_view).await;
-
-    let mut process_ticker = time::interval(PROCESS_INTERVAL);
-    let mut network_ticker = time::interval(NETWORK_INTERVAL);
-    let mut heartbeat_ticker = time::interval(HEARTBEAT_INTERVAL);
-    process_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    network_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    process_ticker.tick().await;
-    network_ticker.tick().await;
-    let mut worker_tasks: Vec<JoinHandle<()>> = Vec::new();
-
-    loop {
-        tokio::select! {
-            _ = process_ticker.tick(), if active_view == ProcessManagerActiveView::Process => {
-                send_process_snapshot(tx.clone()).await;
-            }
-            _ = network_ticker.tick(), if active_view == ProcessManagerActiveView::Network => {
-                send_network_snapshot(tx.clone()).await;
-            }
-            _ = heartbeat_ticker.tick() => {
-                if tx.send(ProcessManagerServerMessage::Heartbeat).await.is_err() {
-                    break;
-                }
-            }
-            message = receiver.next() => {
-                match message {
-                    Some(Ok(Message::Text(text))) => {
-                        if let Some(next_view) =
-                            handle_client_message(&text, tx.clone(), &mut worker_tasks).await
-                        {
-                            active_view = next_view;
-                        }
-                    }
-                    Some(Ok(Message::Close(_))) | None => {
-                        debug!("Process manager WebSocket client disconnected.");
-                        break;
-                    }
-                    Some(Err(err)) => {
-                        warn!("Process manager WebSocket receive error: {}", err);
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            _ = &mut send_task => {
-                break;
-            }
-        }
-
-        worker_tasks.retain(|task| !task.is_finished());
-    }
-
-    for task in worker_tasks {
-        task.abort();
-    }
-    send_task.abort();
-    info!("Process manager WebSocket client connection closed.");
+async fn list_processes(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ProcessListQuery>,
+) -> ApiResult<Response> {
+    let page = state.process_manager.list_processes(query).await?;
+    Ok(ApiResponse::success_with_raw("Process list loaded", Some(page)).into_response())
 }
 
-async fn handle_client_message(
-    text: &str,
-    tx: mpsc::Sender<ProcessManagerServerMessage>,
-    worker_tasks: &mut Vec<JoinHandle<()>>,
-) -> Option<ProcessManagerActiveView> {
-    match serde_json::from_str::<ProcessManagerClientMessage>(text) {
-        Ok(ProcessManagerClientMessage::SetActiveView(view)) => {
-            send_active_snapshot(tx, view).await;
-            Some(view)
-        }
-        Ok(ProcessManagerClientMessage::SendSignal(payload)) => {
-            let task = tokio::spawn(async move {
-                let request_id = payload.request_id;
-                let pid = payload.pid;
-                let signal = payload.signal;
-                let sampled_at = now_timestamp();
-                let signal_for_task = signal.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    process_manager::send_signal(pid, &signal_for_task)
-                })
-                .await;
-
-                match result {
-                    Ok(Ok(execution)) => {
-                        let response = SignalResult {
-                            request_id,
-                            pid: execution.pid,
-                            signal: execution.signal,
-                            success: execution.success,
-                            process_existed: execution.process_existed,
-                            message: execution.message,
-                            sampled_at,
-                        };
-                        let _ = tx
-                            .send(ProcessManagerServerMessage::SignalResult(response))
-                            .await;
-                        send_process_snapshot(tx).await;
-                    }
-                    Ok(Err(message)) => {
-                        let _ = tx
-                            .send(ProcessManagerServerMessage::Error(ProcessManagerError {
-                                request_id: Some(request_id),
-                                message,
-                            }))
-                            .await;
-                    }
-                    Err(err) => {
-                        let _ = tx
-                            .send(ProcessManagerServerMessage::Error(ProcessManagerError {
-                                request_id: Some(request_id),
-                                message: err.to_string(),
-                            }))
-                            .await;
-                    }
-                }
-            });
-            worker_tasks.push(task);
-            None
-        }
-        Err(err) => {
-            let _ = tx
-                .send(ProcessManagerServerMessage::Error(ProcessManagerError {
-                    request_id: None,
-                    message: format!("failed to parse client message: {err}"),
-                }))
-                .await;
-            None
-        }
-    }
+async fn list_network_connections(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<NetworkConnectionListQuery>,
+) -> ApiResult<Response> {
+    let page = state
+        .process_manager
+        .list_network_connections(query)
+        .await?;
+    Ok(ApiResponse::success_with_raw("Network connection list loaded", Some(page)).into_response())
 }
 
-async fn send_active_snapshot(
-    tx: mpsc::Sender<ProcessManagerServerMessage>,
-    active_view: ProcessManagerActiveView,
-) {
-    match active_view {
-        ProcessManagerActiveView::Process => send_process_snapshot(tx).await,
-        ProcessManagerActiveView::Network => send_network_snapshot(tx).await,
+async fn terminate(
+    State(state): State<Arc<AppState>>,
+    Path(process_id): Path<String>,
+    headers: HeaderMap,
+    Json(payload): Json<ProcessActionRequest>,
+) -> ApiResult<Response> {
+    if payload.confirmation_token.is_some() {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            ErrorCode::ValidationFailed,
+            "terminate does not accept a confirmation token",
+        ));
     }
+    deliver(
+        &state.process_manager,
+        &state,
+        &process_id,
+        ProcessSignal::Term,
+        &payload,
+        &headers,
+    )
+    .await
 }
 
-async fn send_process_snapshot(tx: mpsc::Sender<ProcessManagerServerMessage>) {
-    let result = tokio::task::spawn_blocking(process_manager::collect_processes).await;
-    match result {
-        Ok(Ok(processes)) => {
-            let _ = tx
-                .send(ProcessManagerServerMessage::ProcessSnapshot(
-                    ProcessSnapshot {
-                        processes,
-                        sampled_at: now_timestamp(),
-                    },
-                ))
-                .await;
-        }
-        Ok(Err(message)) => {
-            let _ = tx
-                .send(ProcessManagerServerMessage::Error(ProcessManagerError {
-                    request_id: None,
-                    message,
-                }))
-                .await;
-        }
-        Err(err) => {
-            let _ = tx
-                .send(ProcessManagerServerMessage::Error(ProcessManagerError {
-                    request_id: None,
-                    message: err.to_string(),
-                }))
-                .await;
-        }
+async fn force_kill(
+    State(state): State<Arc<AppState>>,
+    Path(process_id): Path<String>,
+    headers: HeaderMap,
+    Json(payload): Json<ProcessActionRequest>,
+) -> ApiResult<Response> {
+    if payload
+        .confirmation_token
+        .as_deref()
+        .is_none_or(str::is_empty)
+    {
+        return Err(ApiError::new(
+            StatusCode::PRECONDITION_REQUIRED,
+            ErrorCode::ProcessConfirmationRequired,
+            "force-kill confirmation is required",
+        ));
     }
+    deliver(
+        &state.process_manager,
+        &state,
+        &process_id,
+        ProcessSignal::Kill,
+        &payload,
+        &headers,
+    )
+    .await
 }
 
-async fn send_network_snapshot(tx: mpsc::Sender<ProcessManagerServerMessage>) {
-    let result = tokio::task::spawn_blocking(|| {
-        let connections = process_manager::collect_network_connections()?;
-        let summary = process_manager::summarize_network_connections(&connections);
-        Ok::<_, String>((connections, summary))
+async fn deliver(
+    runtime: &ProcessManagerRuntime,
+    state: &AppState,
+    process_id: &str,
+    signal: ProcessSignal,
+    payload: &ProcessActionRequest,
+    headers: &HeaderMap,
+) -> ApiResult<Response> {
+    let actor = trusted_actor(headers)?;
+    let result = runtime
+        .deliver_signal(
+            &state.metadata_db,
+            process_id,
+            signal,
+            &payload.idempotency_key,
+            &actor,
+        )
+        .await?;
+    Ok(signal_response(result))
+}
+
+fn signal_response(result: ProcessSignalResult) -> Response {
+    let status = if result.status == ProcessSignalDeliveryStatus::OutcomeUnknown {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    let mut response =
+        ApiResponse::success_with_raw("Process signal processed", Some(result)).into_response();
+    *response.status_mut() = status;
+    response
+}
+
+fn trusted_actor(headers: &HeaderMap) -> ApiResult<SignalActorContext> {
+    let value = |name: &HeaderName| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    };
+    if value(&ACTOR_KIND_HEADER).as_deref() != Some("user") {
+        return Err(ApiError::forbidden(
+            ErrorCode::AuthForbidden,
+            "trusted operation context is required",
+        ));
+    }
+    Ok(SignalActorContext {
+        actor_name: value(&ACTOR_NAME_HEADER).ok_or_else(|| {
+            ApiError::forbidden(ErrorCode::AuthForbidden, "trusted actor name is required")
+        })?,
+        client_ip: value(&CLIENT_IP_HEADER).ok_or_else(|| {
+            ApiError::forbidden(ErrorCode::AuthForbidden, "trusted client IP is required")
+        })?,
+        trace_id: value(&TRACE_ID_HEADER).ok_or_else(|| {
+            ApiError::forbidden(ErrorCode::AuthForbidden, "trusted trace ID is required")
+        })?,
     })
-    .await;
-
-    match result {
-        Ok(Ok((connections, summary))) => {
-            let _ = tx
-                .send(ProcessManagerServerMessage::NetworkSnapshot(
-                    NetworkSnapshot {
-                        connections,
-                        summary,
-                        sampled_at: now_timestamp(),
-                    },
-                ))
-                .await;
-        }
-        Ok(Err(message)) => {
-            let _ = tx
-                .send(ProcessManagerServerMessage::Error(ProcessManagerError {
-                    request_id: None,
-                    message,
-                }))
-                .await;
-        }
-        Err(err) => {
-            let _ = tx
-                .send(ProcessManagerServerMessage::Error(ProcessManagerError {
-                    request_id: None,
-                    message: err.to_string(),
-                }))
-                .await;
-        }
-    }
 }
 
-fn now_timestamp() -> i64 {
-    chrono::Utc::now().timestamp()
+#[cfg(test)]
+mod tests {
+    use super::trusted_actor;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn mutations_require_complete_trusted_context() {
+        assert!(trusted_actor(&HeaderMap::new()).is_err());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-seclab-actor-kind", HeaderValue::from_static("user"));
+        headers.insert("x-seclab-actor-name", HeaderValue::from_static("admin"));
+        headers.insert("x-seclab-client-ip", HeaderValue::from_static("192.0.2.1"));
+        headers.insert("x-seclab-trace-id", HeaderValue::from_static("trace-1"));
+        assert!(trusted_actor(&headers).is_ok());
+    }
 }

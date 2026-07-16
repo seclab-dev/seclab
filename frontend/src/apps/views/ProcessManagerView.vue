@@ -1,18 +1,24 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import type { NetworkConnection, NetworkSummary, ProcessItem } from '@/api/interface/process'
+import type { ProcessSignalResult } from '@/api/generated'
+import type { NetworkConnectionSummary, ProcessSummary } from '@/api/modules/process'
 import { useNotificationStore } from '@/stores/notification'
 import { useConfirmationModalStore } from '@/stores/confirmation-modal'
 import { useWindowManagerStore } from '@/stores/window-manager'
-import { useProcessManagerWs } from '@/composables/useProcessManagerWs'
+import { useNodeStore } from '@/stores/node'
+import { useProcessManager } from '@/composables/useProcessManager'
 import {
+  SecLabAlert,
   SecLabButton,
   SecLabCard,
+  SecLabEmpty,
   SecLabInput,
+  SecLabLoading,
+  SecLabPagination,
   SecLabSelect,
   SecLabTable,
-  SecLabLoading,
+  SecLabTag,
 } from '@/components/ui'
 import type { SecLabTableColumn } from '@/components/ui/SecLabTable.vue'
 
@@ -24,154 +30,252 @@ const props = defineProps<{
 
 type ActiveTab = 'process' | 'network'
 type ProcessSortKey = 'pid' | 'cpuPercent' | 'memoryPercent' | 'connectionCount'
-type ProcessStatusKey =
-  | 'running'
-  | 'sleeping'
-  | 'stopped'
-  | 'idle'
-  | 'waiting'
-  | 'locked'
-  | 'zombie'
+type ProcessState = ProcessSummary['state']
+type NetworkDisplayRow = NetworkConnectionSummary & {
+  localAddress: string
+  remoteAddress: string
+  pid: string
+  processName: string
+}
 
-const PROCESS_STATUS_OPTIONS: ProcessStatusKey[] = [
+const PROCESS_STATUS_OPTIONS: ProcessState[] = [
   'running',
   'sleeping',
   'stopped',
   'idle',
-  'waiting',
-  'locked',
+  'uninterruptible',
   'zombie',
+  'dead',
+  'unknown',
 ]
 
 const { t } = useI18n()
 const notificationStore = useNotificationStore()
 const confirmationModal = useConfirmationModalStore()
 const windowStore = useWindowManagerStore()
-const processManagerWs = useProcessManagerWs()
+const nodeStore = useNodeStore()
+const targetNodeId =
+  typeof props.payload?.nodeId === 'string'
+    ? props.payload.nodeId
+    : nodeStore.currentNodeId || 'local'
+const processManager = useProcessManager(targetNodeId)
 
 const activeTab = ref<ActiveTab>('process')
 const networkKeyword = ref('')
-const processStatus = ref('ALL')
-const networkState = ref('ALL')
-const processSortKey = ref<ProcessSortKey>('pid')
-const processSortDesc = ref(false)
+const processStatus = ref<string>('ALL')
+const networkState = ref<string>('ALL')
+let networkSearchTimer: ReturnType<typeof setTimeout> | undefined
 
-const processRows = computed<ProcessItem[]>(() => processManagerWs.processRows.value)
-const networkRows = computed<NetworkConnection[]>(() => processManagerWs.networkRows.value)
-const networkSummary = computed<NetworkSummary | null>(() => processManagerWs.networkSummary.value)
-const loadingProcess = computed(
-  () => !processManagerWs.processLoaded.value && processManagerWs.connecting.value,
+const processRows = computed(() => processManager.processPage.value?.entries ?? [])
+const availableProcessStatuses = computed(() => {
+  const counts = processManager.processPage.value?.counts
+  if (!counts) return []
+  return PROCESS_STATUS_OPTIONS.filter((status) => (counts[status] ?? 0) > 0)
+})
+const networkRows = computed<NetworkDisplayRow[]>(() =>
+  (processManager.networkPage.value?.entries ?? []).map((entry) => ({
+    ...entry,
+    localAddress: formatEndpoint(entry.localEndpoint),
+    remoteAddress: entry.remoteEndpoint ? formatEndpoint(entry.remoteEndpoint) : '--',
+    pid: entry.owners.map((owner) => owner.pid).join(', ') || '--',
+    processName: entry.owners.map((owner) => owner.processName).join(', ') || '--',
+  })),
 )
-const loadingNetwork = computed(
-  () => !processManagerWs.networkLoaded.value && processManagerWs.connecting.value,
+const processTotalPages = computed(() =>
+  Math.max(
+    1,
+    Math.ceil(
+      (processManager.processPage.value?.total ?? 0) / processManager.processQuery.pageSize,
+    ),
+  ),
 )
-const processManagerActive = computed(
-  () => processManagerWs.connected.value || processManagerWs.connecting.value,
+const networkTotalPages = computed(() =>
+  Math.max(
+    1,
+    Math.ceil(
+      (processManager.networkPage.value?.total ?? 0) / processManager.networkQuery.pageSize,
+    ),
+  ),
 )
+const loadingProcess = computed(() => processManager.processPhase.value === 'initialLoading')
+const loadingNetwork = computed(() => processManager.networkPhase.value === 'initialLoading')
+const operationBusy = computed(() => processManager.pendingProcessIds.value.size > 0)
 
 watch(
-  processManagerActive,
-  (active) => {
+  operationBusy,
+  (busy) => {
     if (!props.windowId) return
     windowStore.updateWindowRuntimeState(props.windowId, {
-      activeSession: active,
+      activeSession: false,
+      busy,
       allowsNodeSwitch: false,
-      blockLevel: active ? 'active' : 'open',
-      blockReason: active ? t('app.processManager.guardActive') : t('app.processManager.guardOpen'),
+      blockLevel: busy ? 'busy' : 'open',
+      blockReason: busy ? t('app.processManager.guardBusy') : t('app.processManager.guardOpen'),
     })
   },
   { immediate: true },
 )
 
-const networkStateOptions = computed(() => {
-  const states = new Set<string>()
-  for (const item of networkRows.value) {
-    states.add(item.state)
+watch(processStatus, (status) => {
+  processManager.processQuery.status = status === 'ALL' ? undefined : (status as ProcessState)
+  processManager.processQuery.page = 1
+})
+
+watch(
+  () => processManager.processPage.value?.counts,
+  (counts) => {
+    if (!counts || processStatus.value === 'ALL') return
+    if ((counts[processStatus.value] ?? 0) === 0) processStatus.value = 'ALL'
+  },
+)
+
+watch(networkState, (state) => {
+  processManager.networkQuery.state =
+    state === 'ALL' ? undefined : (state as NetworkConnectionSummary['state'])
+  processManager.networkQuery.page = 1
+})
+
+watch(networkKeyword, (keyword) => {
+  if (networkSearchTimer) clearTimeout(networkSearchTimer)
+  networkSearchTimer = setTimeout(() => {
+    processManager.networkQuery.query = keyword.trim() || undefined
+    processManager.networkQuery.page = 1
+  }, 250)
+})
+
+watch(
+  activeTab,
+  (tab) => {
+    processManager.setActiveView(tab)
+  },
+  { immediate: true },
+)
+
+const networkStateOptions = computed(() => [
+  'ALL',
+  ...Object.keys(processManager.networkPage.value?.byState ?? {}).sort(),
+])
+
+const networkSummary = computed(() => {
+  const page = processManager.networkPage.value
+  return {
+    total: page?.availableTotal ?? 0,
+    tcp: (page?.byProtocol.tcp ?? 0) + (page?.byProtocol.tcp6 ?? 0),
+    udp: (page?.byProtocol.udp ?? 0) + (page?.byProtocol.udp6 ?? 0),
   }
-  return ['ALL', ...Array.from(states).sort()]
 })
 
-const filteredProcessRows = computed(() => {
-  const rows = processRows.value.filter((item) => {
-    return processStatus.value === 'ALL' || item.status === processStatus.value
-  })
+const formatEndpoint = (endpoint: { address: string; port: number }) => {
+  const address = endpoint.address.includes(':') ? `[${endpoint.address}]` : endpoint.address
+  return `${address}:${endpoint.port}`
+}
 
-  rows.sort((a, b) => {
-    const left = a[processSortKey.value]
-    const right = b[processSortKey.value]
-    const diff = Number(right) - Number(left)
-    return processSortDesc.value ? diff : -diff
-  })
-  return rows
-})
+const formatNetworkState = (state: string) =>
+  state.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toUpperCase()
 
-const filteredNetworkRows = computed(() => {
-  const keyword = networkKeyword.value.trim().toLowerCase()
-  return networkRows.value.filter((item) => {
-    if (networkState.value !== 'ALL' && item.state !== networkState.value) return false
-    if (!keyword) return true
-    return (
-      item.protocol.toLowerCase().includes(keyword) ||
-      item.localAddress.toLowerCase().includes(keyword) ||
-      item.remoteAddress.toLowerCase().includes(keyword) ||
-      item.processName?.toLowerCase().includes(keyword) ||
-      String(item.pid ?? '').includes(keyword)
-    )
-  })
-})
+const formatPercent = (value?: number) => (value == null ? '--' : `${value.toFixed(2)}%`)
 
-const formatPercent = (value: number) => `${value.toFixed(2)}%`
-
-const formatStartTime = (timestamp: number) => {
-  if (!timestamp) return '--'
-  const date = new Date(timestamp * 1000)
+const formatStartTime = (value?: string) => {
+  if (!value) return '--'
+  const date = new Date(value)
   if (Number.isNaN(date.getTime())) return '--'
-  const y = date.getFullYear()
-  const m = String(date.getMonth() + 1).padStart(2, '0')
-  const d = String(date.getDate()).padStart(2, '0')
-  const hh = String(date.getHours()).padStart(2, '0')
-  const mm = String(date.getMinutes()).padStart(2, '0')
-  const ss = String(date.getSeconds()).padStart(2, '0')
-  return `${y}-${m}-${d} ${hh}:${mm}:${ss}`
+  return date.toLocaleString()
 }
 
 const setProcessSort = (key: ProcessSortKey) => {
-  if (processSortKey.value === key) {
-    processSortDesc.value = !processSortDesc.value
-    return
+  if (processManager.processQuery.sortBy === key) {
+    processManager.processQuery.sortOrder =
+      processManager.processQuery.sortOrder === 'asc' ? 'desc' : 'asc'
+  } else {
+    processManager.processQuery.sortBy = key
+    processManager.processQuery.sortOrder = 'desc'
   }
-  processSortKey.value = key
-  processSortDesc.value = true
+  processManager.processQuery.page = 1
 }
 
 const processSortIndicator = (key: ProcessSortKey) => {
-  if (processSortKey.value !== key) return ''
-  return processSortDesc.value ? ' ↓' : ' ↑'
+  if (processManager.processQuery.sortBy !== key) return ''
+  return processManager.processQuery.sortOrder === 'desc' ? ' ↓' : ' ↑'
 }
 
-const formatProcessStatus = (status: string) => {
-  if ((PROCESS_STATUS_OPTIONS as string[]).includes(status)) {
-    return t(`app.processManager.process.statuses.${status}`)
+const processAriaSort = (key: ProcessSortKey) => {
+  if (processManager.processQuery.sortBy !== key) return 'none'
+  return processManager.processQuery.sortOrder === 'desc' ? 'descending' : 'ascending'
+}
+
+const formatProcessStatus = (status: ProcessState) =>
+  t(`app.processManager.process.statuses.${status}`)
+
+const formatSignalAction = (signal: 'TERM' | 'KILL' | 'term' | 'kill') =>
+  signal.toUpperCase() === 'TERM'
+    ? t('app.processManager.process.actions.exit')
+    : t('app.processManager.process.actions.end')
+
+const statusTagType = (status: ProcessState) => {
+  if (status === 'running') return 'success'
+  if (status === 'zombie' || status === 'dead') return 'danger'
+  if (status === 'uninterruptible' || status === 'stopped') return 'warning'
+  return 'default'
+}
+
+const notifySignalResult = (result: ProcessSignalResult) => {
+  if (result.status === 'outcomeUnknown') {
+    notificationStore.warning(
+      t('app.processManager.messages.outcomeUnknown', { pid: result.pid ?? '--' }),
+    )
+    return
   }
-  return t('app.processManager.process.statuses.sleeping')
+  notificationStore.success(
+    t('app.processManager.messages.signalDelivered', {
+      pid: result.pid ?? '--',
+      signal: formatSignalAction(result.signal),
+    }),
+  )
 }
 
-const terminateProcess = async (pid: number, signal: 'TERM' | 'KILL') => {
+const terminateProcess = async (process: ProcessSummary, signal: 'TERM' | 'KILL') => {
+  if (processManager.pendingProcessIds.value.has(process.processId)) return
+  const actionLabel = formatSignalAction(signal)
   const confirmed = await confirmationModal.showConfirmation(
-    t('app.processManager.confirmTerminate', {
-      pid,
-      signal,
-    }),
+    t('app.processManager.confirmTerminate', { pid: process.pid, signal: actionLabel }),
     t('app.processManager.title'),
-    signal,
+    actionLabel,
     t('app.nodes.deploy.cancel'),
   )
   if (!confirmed) return
-  const requestId = processManagerWs.sendSignal(pid, signal)
-  if (!requestId) {
-    notificationStore.error(t('app.processManager.messages.realtimeDisconnected'))
+  try {
+    if (signal === 'TERM') {
+      const result = await processManager.terminate(process.processId)
+      if (result) notifySignalResult(result)
+      return
+    }
+    const confirmation = await processManager.createForceKillConfirmation(process.processId)
+    const irreversibleConfirmed = await confirmationModal.showConfirmation(
+      t('app.processManager.confirmForceKill', { pid: process.pid }),
+      t('app.processManager.forceKillTitle'),
+      t('app.processManager.forceKillAction'),
+      t('app.nodes.deploy.cancel'),
+    )
+    if (!irreversibleConfirmed) return
+    const result = await processManager.forceKill(process.processId, confirmation.confirmationToken)
+    if (result) notifySignalResult(result)
+  } catch (error) {
+    notificationStore.error(
+      error instanceof Error ? error.message : t('app.processManager.messages.killFailed'),
+    )
   }
 }
+
+const processEmptyText = computed(() =>
+  (processManager.processPage.value?.availableTotal ?? 0) === 0
+    ? t('app.processManager.process.empty')
+    : t('app.processManager.process.filteredEmpty'),
+)
+const networkEmptyText = computed(() =>
+  (processManager.networkPage.value?.availableTotal ?? 0) === 0
+    ? t('app.processManager.network.empty')
+    : t('app.processManager.network.filteredEmpty'),
+)
 
 const processColumns = computed<SecLabTableColumn[]>(() => [
   { prop: 'pid', label: 'PID', width: 80, align: 'center', headerSlot: 'header-pid' },
@@ -183,12 +287,12 @@ const processColumns = computed<SecLabTableColumn[]>(() => [
     width: 80,
     align: 'center',
   },
-  { prop: 'user', label: t('app.processManager.process.columns.user'), width: 100 },
+  { prop: 'userName', label: t('app.processManager.process.columns.user'), width: 100 },
   {
     prop: 'cpuPercent',
     label: 'CPU',
     width: 100,
-    align: 'right',
+    align: 'center',
     slot: 'cpu',
     headerSlot: 'header-cpu',
   },
@@ -196,7 +300,7 @@ const processColumns = computed<SecLabTableColumn[]>(() => [
     prop: 'memoryPercent',
     label: 'MEM',
     width: 100,
-    align: 'right',
+    align: 'center',
     slot: 'mem',
     headerSlot: 'header-mem',
   },
@@ -208,16 +312,18 @@ const processColumns = computed<SecLabTableColumn[]>(() => [
     headerSlot: 'header-connections',
   },
   {
-    prop: 'status',
+    prop: 'state',
     label: t('app.processManager.process.columns.status'),
-    width: 100,
+    width: 110,
     slot: 'status',
+    align: 'center',
   },
   {
-    prop: 'startTime',
+    prop: 'startedAt',
     label: t('app.processManager.process.columns.startTime'),
     width: 180,
     slot: 'startTime',
+    align: 'center',
   },
   {
     label: t('app.processManager.process.columns.actions'),
@@ -229,81 +335,63 @@ const processColumns = computed<SecLabTableColumn[]>(() => [
 ])
 
 const networkColumns = computed<SecLabTableColumn[]>(() => [
-  { prop: 'protocol', label: t('app.processManager.network.columns.protocol'), width: 80 },
+  {
+    prop: 'protocol',
+    label: t('app.processManager.network.columns.protocol'),
+    width: 80,
+    align: 'center',
+  },
   {
     prop: 'localAddress',
     label: t('app.processManager.network.columns.localAddress'),
     minWidth: 200,
+    align: 'center',
   },
   {
     prop: 'remoteAddress',
     label: t('app.processManager.network.columns.remoteAddress'),
     minWidth: 200,
+    align: 'center',
   },
-  { prop: 'state', label: t('app.processManager.network.columns.state'), width: 120 },
-  { prop: 'pid', label: 'PID', width: 80, align: 'center' },
+  {
+    prop: 'state',
+    label: t('app.processManager.network.columns.state'),
+    width: 120,
+    slot: 'state',
+    align: 'center',
+  },
+  { prop: 'pid', label: 'PID', width: 100, align: 'center' },
   {
     prop: 'processName',
     label: t('app.processManager.network.columns.processName'),
     minWidth: 150,
   },
 ])
-
-watch(
-  activeTab,
-  (tab) => {
-    processManagerWs.setActiveView(tab)
-  },
-  { immediate: true },
-)
-
-watch(
-  () => processManagerWs.lastSignalResult.value,
-  (result) => {
-    if (!result) return
-    if (result.success) {
-      notificationStore.success(
-        t('app.processManager.messages.killSuccess', { pid: result.pid, signal: result.signal }),
-      )
-      return
-    }
-    notificationStore.error(result.message || t('app.processManager.messages.killFailed'))
-  },
-)
-
-watch(
-  () => processManagerWs.lastProtocolError.value,
-  (message) => {
-    if (message) {
-      notificationStore.error(message)
-    }
-  },
-)
-
-watch(
-  () => processManagerWs.lastError.value,
-  (message) => {
-    if (message) {
-      notificationStore.error(message)
-    }
-  },
-)
 </script>
 
 <template>
-  <div class="process-manager" data-seclab-app="process-manager">
-    <SecLabCard shadow="never" class="header-card">
+  <div
+    class="process-manager"
+    data-seclab-app="process-manager"
+    data-page="process-manager"
+    data-ui="process-manager"
+  >
+    <SecLabCard shadow="never" class="header-card" data-slot="header-card">
       <div class="header" data-slot="header">
         <div v-if="activeTab === 'process'" class="filters">
-          <span class="filter-label">{{ t('app.processManager.process.columns.status') }}:</span>
+          <label class="filter-label" for="process-status-filter">
+            {{ t('app.processManager.process.columns.status') }}:
+          </label>
           <SecLabSelect
+            id="process-status-filter"
             v-model="processStatus"
+            name="processStatus"
             class="status-select"
             :options="[
               { label: t('app.processManager.process.filters.allStatuses'), value: 'ALL' },
-              ...PROCESS_STATUS_OPTIONS.map((s) => ({
-                label: t(`app.processManager.process.statuses.${s}`),
-                value: s,
+              ...availableProcessStatuses.map((status) => ({
+                label: t(`app.processManager.process.statuses.${status}`),
+                value: status,
               })),
             ]"
           />
@@ -311,27 +399,32 @@ watch(
         <div v-else class="network-summary">
           <div class="summary-metric">
             <span class="summary-label">{{ t('app.processManager.network.summary.total') }}</span>
-            <strong class="summary-value">{{ networkSummary?.total ?? 0 }}</strong>
+            <strong class="summary-value">{{ networkSummary.total }}</strong>
           </div>
           <div class="summary-metric">
             <span class="summary-label">{{
               t('app.processManager.network.summary.protocol')
             }}</span>
             <strong class="summary-value">
-              TCP: {{ networkSummary?.byProtocol?.TCP ?? 0 }} · UDP:
-              {{ (networkSummary?.byProtocol?.UDP ?? 0) + (networkSummary?.byProtocol?.UDP6 ?? 0) }}
+              TCP: {{ networkSummary.tcp }} · UDP: {{ networkSummary.udp }}
             </strong>
           </div>
         </div>
-        <div class="tabs">
+        <div class="tabs" role="tablist" :aria-label="t('app.processManager.title')">
           <SecLabButton
+            role="tab"
+            :aria-selected="activeTab === 'process'"
             :type="activeTab === 'process' ? 'primary' : 'secondary'"
+            data-slot="process-tab"
             @click="activeTab = 'process'"
           >
             {{ t('app.processManager.tabs.process') }}
           </SecLabButton>
           <SecLabButton
+            role="tab"
+            :aria-selected="activeTab === 'network'"
             :type="activeTab === 'network' ? 'primary' : 'secondary'"
+            data-slot="network-tab"
             @click="activeTab = 'network'"
           >
             {{ t('app.processManager.tabs.network') }}
@@ -340,100 +433,179 @@ watch(
       </div>
     </SecLabCard>
 
-    <div v-if="activeTab === 'process'" class="content-wrapper">
+    <SecLabAlert
+      v-if="activeTab === 'process' && processManager.processPhase.value === 'initialError'"
+      type="error"
+      :title="processManager.processError.value || t('app.processManager.messages.loadFailed')"
+      show-icon
+      data-ui="process-initial-error"
+    />
+    <SecLabAlert
+      v-else-if="activeTab === 'process' && processManager.processPhase.value === 'stale'"
+      type="warning"
+      :title="t('app.processManager.messages.stale')"
+      :description="processManager.processError.value || undefined"
+      show-icon
+      data-ui="process-stale-warning"
+    />
+    <SecLabAlert
+      v-else-if="activeTab === 'process' && processManager.processPartial.value"
+      type="warning"
+      :title="t('app.processManager.messages.partial')"
+      show-icon
+      data-ui="process-partial-warning"
+    />
+    <SecLabAlert
+      v-if="activeTab === 'network' && processManager.networkPhase.value === 'initialError'"
+      type="error"
+      :title="processManager.networkError.value || t('app.processManager.messages.loadFailed')"
+      show-icon
+      data-ui="network-initial-error"
+    />
+    <SecLabAlert
+      v-else-if="activeTab === 'network' && processManager.networkPhase.value === 'stale'"
+      type="warning"
+      :title="t('app.processManager.messages.stale')"
+      :description="processManager.networkError.value || undefined"
+      show-icon
+      data-ui="network-stale-warning"
+    />
+    <SecLabAlert
+      v-else-if="activeTab === 'network' && processManager.networkPartial.value"
+      type="warning"
+      :title="t('app.processManager.messages.partial')"
+      show-icon
+      data-ui="network-partial-warning"
+    />
+
+    <div v-if="activeTab === 'process'" class="content-wrapper" data-slot="process-panel">
       <SecLabCard shadow="never" class="table-card" full-height>
-        <SecLabTable :data="filteredProcessRows" :columns="processColumns" border>
+        <SecLabTable :data="processRows" :columns="processColumns" border data-ui="process-table">
           <template #header-pid>
-            <div class="sortable-header" @click="setProcessSort('pid')">
+            <button
+              class="sortable-header"
+              type="button"
+              :aria-sort="processAriaSort('pid')"
+              @click="setProcessSort('pid')"
+            >
               PID{{ processSortIndicator('pid') }}
-            </div>
+            </button>
           </template>
           <template #header-cpu>
-            <div class="sortable-header" @click="setProcessSort('cpuPercent')">
+            <button
+              class="sortable-header"
+              type="button"
+              :aria-sort="processAriaSort('cpuPercent')"
+              @click="setProcessSort('cpuPercent')"
+            >
               CPU{{ processSortIndicator('cpuPercent') }}
-            </div>
+            </button>
           </template>
           <template #header-mem>
-            <div class="sortable-header" @click="setProcessSort('memoryPercent')">
+            <button
+              class="sortable-header"
+              type="button"
+              :aria-sort="processAriaSort('memoryPercent')"
+              @click="setProcessSort('memoryPercent')"
+            >
               MEM{{ processSortIndicator('memoryPercent') }}
-            </div>
+            </button>
           </template>
           <template #header-connections>
-            <div class="sortable-header" @click="setProcessSort('connectionCount')">
+            <button
+              class="sortable-header"
+              type="button"
+              :aria-sort="processAriaSort('connectionCount')"
+              @click="setProcessSort('connectionCount')"
+            >
               {{ t('app.processManager.process.columns.connections')
               }}{{ processSortIndicator('connectionCount') }}
-            </div>
+            </button>
           </template>
-
-          <template #cpu="{ row }">
-            {{ formatPercent(row.cpuPercent) }}
-          </template>
-          <template #mem="{ row }">
-            {{ formatPercent(row.memoryPercent) }}
-          </template>
+          <template #cpu="{ row }">{{ formatPercent(row.cpuPercent) }}</template>
+          <template #mem="{ row }">{{ formatPercent(row.memoryPercent) }}</template>
           <template #status="{ row }">
-            <span class="status-tag" :class="row.status">
-              {{ formatProcessStatus(row.status) }}
-            </span>
+            <SecLabTag :type="statusTagType(row.state)">{{
+              formatProcessStatus(row.state)
+            }}</SecLabTag>
           </template>
-          <template #startTime="{ row }">
-            {{ formatStartTime(row.startTime) }}
-          </template>
+          <template #startTime="{ row }">{{ formatStartTime(row.startedAt) }}</template>
           <template #actions="{ row }">
             <div class="action-buttons">
               <SecLabButton
                 type="danger"
                 size="small"
-                :disabled="!processManagerWs.connected.value"
-                @click="terminateProcess(row.pid, 'TERM')"
+                :disabled="
+                  !row.capabilities.canTerminate ||
+                  processManager.pendingProcessIds.value.has(row.processId)
+                "
+                @click="terminateProcess(row, 'TERM')"
+                >{{ t('app.processManager.process.actions.exit') }}</SecLabButton
               >
-                TERM
-              </SecLabButton>
               <SecLabButton
                 type="danger"
                 size="small"
                 plain
-                :disabled="!processManagerWs.connected.value"
-                @click="terminateProcess(row.pid, 'KILL')"
+                :disabled="
+                  !row.capabilities.canForceKill ||
+                  processManager.pendingProcessIds.value.has(row.processId)
+                "
+                @click="terminateProcess(row, 'KILL')"
+                >{{ t('app.processManager.process.actions.end') }}</SecLabButton
               >
-                KILL
-              </SecLabButton>
             </div>
           </template>
-          <template #empty>
-            <div class="empty-placeholder">
-              {{ t('app.processManager.process.empty') }}
-            </div>
-          </template>
+          <template #empty><SecLabEmpty :description="processEmptyText" /></template>
         </SecLabTable>
       </SecLabCard>
+      <div class="pagination-bar" data-slot="process-pagination">
+        <SecLabPagination
+          :current-page="processManager.processQuery.page"
+          :total-pages="processTotalPages"
+          @page-change="(page) => (processManager.processQuery.page = page)"
+        />
+      </div>
     </div>
 
-    <div v-else class="content-wrapper">
+    <div v-else class="content-wrapper" data-slot="network-panel">
       <SecLabCard shadow="never" class="toolbar-card">
         <div class="toolbar">
           <SecLabInput
+            id="network-search"
             v-model="networkKeyword"
+            name="networkSearch"
             class="search-input"
             :placeholder="t('app.processManager.network.searchPlaceholder')"
+            :aria-label="t('app.processManager.network.searchPlaceholder')"
           />
           <SecLabSelect
+            id="network-state-filter"
             v-model="networkState"
+            name="networkState"
             class="state-select"
-            :options="networkStateOptions.map((s) => ({ label: s, value: s }))"
+            :aria-label="t('app.processManager.network.columns.state')"
+            :options="
+              networkStateOptions.map((state) => ({
+                label: formatNetworkState(state),
+                value: state,
+              }))
+            "
           />
         </div>
       </SecLabCard>
-
       <SecLabCard shadow="never" class="table-card" full-height>
-        <SecLabTable :data="filteredNetworkRows" :columns="networkColumns" border>
-          <template #empty>
-            <div class="empty-placeholder">
-              {{ t('app.processManager.network.empty') }}
-            </div>
-          </template>
+        <SecLabTable :data="networkRows" :columns="networkColumns" border data-ui="network-table">
+          <template #state="{ row }">{{ formatNetworkState(row.state) }}</template>
+          <template #empty><SecLabEmpty :description="networkEmptyText" /></template>
         </SecLabTable>
       </SecLabCard>
+      <div class="pagination-bar" data-slot="network-pagination">
+        <SecLabPagination
+          :current-page="processManager.networkQuery.page"
+          :total-pages="networkTotalPages"
+          @page-change="(page) => (processManager.networkQuery.page = page)"
+        />
+      </div>
     </div>
 
     <SecLabLoading :loading="activeTab === 'process' ? loadingProcess : loadingNetwork" cover />
@@ -453,20 +625,39 @@ watch(
   box-sizing: border-box;
 }
 
-.header-card {
+.header-card,
+.toolbar-card,
+.pagination-bar {
   flex-shrink: 0;
 }
 
-.header {
+.header,
+.toolbar {
   display: flex;
   justify-content: space-between;
   align-items: center;
   gap: var(--sdl-space-3);
 }
 
-.tabs {
+.tabs,
+.filters,
+.network-summary,
+.summary-metric,
+.action-buttons {
   display: flex;
+  align-items: center;
+}
+
+.tabs,
+.filters,
+.summary-metric,
+.action-buttons {
   gap: var(--sdl-space-2);
+}
+
+.action-buttons {
+  width: 100%;
+  justify-content: center;
 }
 
 .content-wrapper {
@@ -478,52 +669,34 @@ watch(
 }
 
 .network-summary {
-  display: flex;
-  align-items: center;
   gap: var(--sdl-space-4);
   min-width: 0;
 }
 
 .summary-metric {
-  display: flex;
   align-items: baseline;
-  gap: var(--sdl-space-2);
   min-width: 0;
+}
+
+.summary-label,
+.filter-label {
+  color: var(--sdl-text-muted);
+  white-space: nowrap;
 }
 
 .summary-label {
   font-size: var(--sdl-font-caption);
-  color: var(--sdl-text-muted);
-  white-space: nowrap;
+}
+
+.filter-label {
+  font-size: var(--sdl-font-body-sm);
+  color: var(--sdl-text-secondary);
 }
 
 .summary-value {
   font-size: var(--sdl-font-body);
   color: var(--sdl-text-primary);
   font-weight: 700;
-  white-space: nowrap;
-}
-
-.toolbar-card {
-  flex-shrink: 0;
-}
-
-.toolbar {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: var(--sdl-space-3);
-}
-
-.filters {
-  display: flex;
-  align-items: center;
-  gap: var(--sdl-space-2);
-}
-
-.filter-label {
-  font-size: var(--sdl-font-body-sm);
-  color: var(--sdl-text-secondary);
   white-space: nowrap;
 }
 
@@ -536,7 +709,7 @@ watch(
 }
 
 .state-select {
-  width: 180px;
+  width: 160px;
 }
 
 .table-card {
@@ -546,49 +719,28 @@ watch(
 }
 
 .sortable-header {
+  appearance: none;
+  border: 0;
+  padding: 0;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
   width: 100%;
   height: 100%;
+  color: inherit;
+  background: transparent;
+  font: inherit;
 }
 
-.sortable-header:hover {
+.sortable-header:hover,
+.sortable-header:focus-visible {
   color: var(--sdl-primary);
 }
 
-.status-tag {
-  font-size: var(--sdl-font-caption);
-  padding: 2px 8px;
-  border-radius: var(--sdl-radius-sm);
-  background: var(--sdl-bg-muted);
-  color: var(--sdl-text-secondary);
-}
-
-.status-tag.running {
-  background: var(--sdl-success-soft);
-  color: var(--sdl-success);
-}
-
-.status-tag.zombie {
-  background: var(--sdl-danger-soft);
-  color: var(--sdl-danger);
-}
-
-.action-buttons {
+.pagination-bar {
   display: flex;
   justify-content: center;
-  gap: var(--sdl-space-2);
-}
-
-.empty-placeholder {
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  height: 200px;
-  color: var(--sdl-text-muted);
-  font-size: var(--sdl-font-body-sm);
 }
 
 @media (max-width: 1024px) {

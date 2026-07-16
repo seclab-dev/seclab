@@ -117,6 +117,19 @@ fn ensure_proxy_path_allowed(path_with_query: &str) -> ApiResult<()> {
             "system monitoring must use the node semantic gateway",
         ));
     }
+    if path == "/api/v1/agent/websocket/process-manager/ws"
+        || path == "/api/v1/agent/processes"
+        || path.starts_with("/api/v1/agent/processes/")
+        || path == "/api/v1/agent/network-connections"
+        || path.starts_with("/api/v1/agent/network-connections/")
+        || path == "/api/v1/agent/process"
+        || path.starts_with("/api/v1/agent/process/")
+    {
+        return Err(ApiError::forbidden(
+            ErrorCode::AuthForbidden,
+            "process operations must use the node semantic gateway",
+        ));
+    }
     Ok(())
 }
 
@@ -572,5 +585,13 @@ mod tests {
         assert!(ensure_proxy_path_allowed("/api/v1/agent/fs/ls?path=/").is_err());
         assert!(ensure_proxy_path_allowed("/api/v1/agent/files/list?path=/").is_err());
         assert!(ensure_proxy_path_allowed("/api/v1/agent/system/about").is_ok());
+    }
+
+    #[test]
+    fn semantic_process_api_cannot_bypass_master_gateway() {
+        assert!(ensure_proxy_path_allowed("/api/v1/agent/websocket/process-manager/ws").is_err());
+        assert!(ensure_proxy_path_allowed("/api/v1/agent/processes/list").is_err());
+        assert!(ensure_proxy_path_allowed("/api/v1/agent/network-connections/list").is_err());
+        assert!(ensure_proxy_path_allowed("/api/v1/agent/process/abc/terminate").is_err());
     }
 }

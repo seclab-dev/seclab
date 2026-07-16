@@ -1,7 +1,7 @@
 //! 路由注册：挂载所有 API 子路由并拼装主路由器。
 
 use super::api::{
-    docker, fs, host_terminal, runtime_logs, scheduled_tasks, suite_workloads, system,
+    docker, fs, host_terminal, process, runtime_logs, scheduled_tasks, suite_workloads, system,
     system_monitoring, tasks, upgrade, websocket,
 };
 use crate::db;
@@ -44,6 +44,7 @@ pub fn state_api_router() -> Router<Arc<AppState>> {
         )
         .nest("/upgrade", upgrade::upgrade_router())
         .nest("/websocket", websocket::websocket_router())
+        .merge(process::process_router())
         .nest(
             "/suite-workloads",
             suite_workloads::suite_workloads_router(),
@@ -58,8 +59,10 @@ pub async fn create_router() -> Result<(Router, DbPool)> {
     tracing::info!("Database connection pool established successfully.");
     let system_monitoring =
         Arc::new(monitoring_service::SystemMonitoringRuntime::load(&pool).await?);
+    let process_manager = Arc::new(crate::services::process_manager::ProcessManagerRuntime::new());
     docker_project_tasks::initialize(&pool).await?;
     crate::services::file_tasks::initialize(&pool).await?;
+    crate::services::process_manager::initialize_signal_operations(&pool).await?;
 
     // 初始化 Docker 客户端，连接失败时仅记录日志
     let (docker, docker_status) = AppState::init_docker_state().await;
@@ -72,6 +75,7 @@ pub async fn create_router() -> Result<(Router, DbPool)> {
         docker: tokio::sync::RwLock::new(docker),
         docker_status: tokio::sync::RwLock::new(docker_status),
         system_monitoring: Arc::clone(&system_monitoring),
+        process_manager: Arc::clone(&process_manager),
         metadata_db: pool,
         websocket_sender,
         running_task_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
@@ -82,6 +86,15 @@ pub async fn create_router() -> Result<(Router, DbPool)> {
     docker_project_tasks::spawn_retention_worker(app_state.metadata_db.clone());
     crate::services::file_transfers::spawn_retention_worker(app_state.metadata_db.clone());
     monitoring_service::spawn_sampler(app_state.metadata_db.clone(), system_monitoring);
+    process_manager
+        .refresh_process_snapshot(&app_state)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    process_manager
+        .refresh_network_snapshot()
+        .await
+        .map_err(anyhow::Error::msg)?;
+    process_manager.spawn_samplers(Arc::clone(&app_state));
     task_scheduler::spawn_scheduler(Arc::clone(&app_state));
 
     // 配置 CORS：允许所有来源、常用方法

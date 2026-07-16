@@ -1,5 +1,6 @@
 //! 应用状态：共享依赖（数据库、Docker 客户端等）聚合。
 
+use crate::services::process_manager::ProcessManagerRuntime;
 use crate::services::system_monitoring::SystemMonitoringRuntime;
 use crate::services::websocket;
 use crate::types::{ApiError, ApiResult};
@@ -26,6 +27,7 @@ pub struct AppState {
     pub docker: RwLock<Option<Arc<Docker>>>,
     pub docker_status: RwLock<DockerServiceStatus>,
     pub system_monitoring: Arc<SystemMonitoringRuntime>,
+    pub process_manager: Arc<ProcessManagerRuntime>,
     pub metadata_db: DbPool,
     pub websocket_sender: tokio::sync::broadcast::Sender<websocket::WebsocketEvent>,
     pub running_task_ids: tokio::sync::Mutex<std::collections::HashSet<i64>>,

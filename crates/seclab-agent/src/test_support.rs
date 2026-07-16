@@ -1,6 +1,8 @@
 //! 测试支持：测试夹具与辅助方法。
 
-use crate::services::{system_monitoring::SystemMonitoringRuntime, websocket};
+use crate::services::{
+    process_manager::ProcessManagerRuntime, system_monitoring::SystemMonitoringRuntime, websocket,
+};
 use crate::state::AppState;
 use crate::state::DbPool;
 use seclab_contracts::types::DockerServiceStatus;
@@ -34,6 +36,7 @@ pub async fn setup_test_state() -> AppState {
         docker: RwLock::new(None),
         docker_status: RwLock::new(DockerServiceStatus::NotInstalled),
         system_monitoring: std::sync::Arc::new(system_monitoring),
+        process_manager: std::sync::Arc::new(ProcessManagerRuntime::new()),
         metadata_db,
         websocket_sender: websocket::create_channel(),
         running_task_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),

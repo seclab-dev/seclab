@@ -1,8 +1,6 @@
 //! WebSocket API：与前端建立双向通信入口。
 
-use crate::api::{
-    docker::context::DockerOperationContext, process::process_manager_websocket_handler,
-};
+use crate::api::docker::context::DockerOperationContext;
 use crate::services::websocket_messages::{
     ClientWsMessage, ContainerTerminalClientMessage, ContainerTerminalClosePayload,
     ContainerTerminalErrorPayload, ContainerTerminalExitPayload, ContainerTerminalInputPayload,
@@ -44,10 +42,6 @@ use tracing::{debug, error, info, warn};
 pub fn websocket_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/events/ws", get(websocket_handler))
-        .route(
-            "/process-manager/ws",
-            get(process_manager_websocket_handler),
-        )
         .route("/terminal/ws", get(terminal_websocket_handler))
 }
 

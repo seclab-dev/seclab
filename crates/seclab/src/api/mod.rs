@@ -10,6 +10,7 @@ pub mod node_proxy;
 pub mod nodes;
 pub mod notifications;
 pub mod platform;
+pub mod process;
 pub mod routes;
 pub mod runtime;
 pub mod scripts;

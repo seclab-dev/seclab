@@ -1,8 +1,8 @@
 //! 路由注册：挂载所有 API 子路由并拼装主路由器。
 
 use super::{
-    apps, auth, desktop_apps, docker, files, nodes, notifications, platform, runtime, scripts,
-    seclab, security, suites, system_monitoring, task_scheduler, terminal, upgrades,
+    apps, auth, desktop_apps, docker, files, nodes, notifications, platform, process, runtime,
+    scripts, seclab, security, suites, system_monitoring, task_scheduler, terminal, upgrades,
 };
 use crate::api::node_proxy;
 use crate::db::init_db_pool;
@@ -39,6 +39,7 @@ pub fn state_api_router(app_state: Arc<AppState>) -> Router<Arc<AppState>> {
         .nest("/node", system_monitoring::system_monitoring_router())
         .nest("/node", terminal::terminal_router())
         .nest("/node", files::file_router())
+        .nest("/node", process::process_router())
         .nest("/agent", node_proxy::agent_router())
         .nest("/seclab", seclab::seclab_router())
         .nest("/docker", docker::docker_router())
