@@ -21,5 +21,6 @@ pub mod static_handler;
 
 pub mod task_scheduler;
 pub mod task_sync;
+pub mod terminal_ticket;
 pub mod upgrades;
 pub mod user_service;

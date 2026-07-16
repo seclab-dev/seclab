@@ -58,9 +58,4 @@ const createScopedSystemApi = (nodeId?: string) => ({
 
 export const systemApi = Object.assign(createScopedSystemApi(), {
   forNode: createScopedSystemApi,
-  getTerminalWsPath: (nodeId?: string): string => {
-    return nodeId && nodeId !== 'local'
-      ? `/node/${encodeURIComponent(nodeId)}/agent/websocket/host-terminal/ws`
-      : '/agent/websocket/host-terminal/ws'
-  },
 })

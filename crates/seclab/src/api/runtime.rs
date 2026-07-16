@@ -14,6 +14,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use seclab_contracts::api::ErrorCode;
+use seclab_contracts::terminal::{TerminalTicketConsumeRequest, TerminalTicketConsumeResponse};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -96,6 +98,32 @@ pub struct DeregisterPayload {
     pub agent_id: String,
     pub session_id: String,
     pub reason: Option<String>,
+}
+
+/// 由 Agent 原子消费 Master 签发的一次性终端票据。
+async fn consume_terminal_ticket(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<TerminalTicketConsumeRequest>,
+) -> ApiResult<Response> {
+    let context = state
+        .terminal_tickets
+        .consume(&payload.ticket, &payload.node_id)
+        .ok_or_else(|| {
+            ApiError::forbidden(
+                ErrorCode::AuthForbidden,
+                "terminal ticket is invalid or expired",
+            )
+        })?;
+    Ok(ApiResponse::success_with_raw(
+        "Terminal ticket consumed",
+        Some(TerminalTicketConsumeResponse {
+            actor_name: context.actor_name,
+            client_ip: context.client_ip,
+            trace_id: context.trace_id,
+            node_id: context.node_id,
+        }),
+    )
+    .into_response())
 }
 
 /// Runtime 回连探针：用于部署预检验证目标节点能访问主控入口，不产生运行时状态。
@@ -735,6 +763,7 @@ pub fn runtime_router() -> Router<Arc<AppState>> {
         .route("/register", post(register))
         .route("/heartbeat", post(heartbeat))
         .route("/deregister", post(deregister))
+        .route("/terminal-tickets/consume", post(consume_terminal_ticket))
         .route("/rotate-certificate", post(rotate_certificate))
         .route("/tasks/runs/report", post(report_task_runs))
         .route("/tasks/snapshot", get(get_tasks_snapshot))

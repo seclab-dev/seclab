@@ -1,8 +1,8 @@
 //! 路由注册：挂载所有 API 子路由并拼装主路由器。
 
 use super::api::{
-    docker, fs, runtime_logs, scheduled_tasks, suite_workloads, system, system_monitoring, tasks,
-    upgrade, websocket,
+    docker, fs, host_terminal, runtime_logs, scheduled_tasks, suite_workloads, system,
+    system_monitoring, tasks, upgrade, websocket,
 };
 use crate::db;
 use crate::state::DbPool;
@@ -31,6 +31,7 @@ pub fn state_api_router() -> Router<Arc<AppState>> {
     Router::new()
         .nest("/docker", docker::docker_router())
         .nest("/fs", fs::fs_router())
+        .nest("/terminal", host_terminal::host_terminal_router())
         .nest("/runtime-logs", runtime_logs::runtime_log_router())
         .nest("/system", system::system_router())
         .nest(

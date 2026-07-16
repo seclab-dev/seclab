@@ -17,6 +17,7 @@ use seclab_contracts::{
     runtime_logs::{RuntimeLogFile, RuntimeLogLine, RuntimeLogQuery, RuntimeLogQueryResult},
     seclab::{SeclabNetworkConfig, SeclabNetworkUpdateResult},
     telemetry::{LogModule, LogStatus},
+    terminal::{TerminalAccess, TerminalClientMessage, TerminalServerMessage},
 };
 use std::path::Path;
 use ts_rs::{Config, Dummy, TS};
@@ -71,4 +72,7 @@ fn export_contract_bindings() {
     export_type::<RuntimeLogQuery>(&cfg);
     export_type::<RuntimeLogLine>(&cfg);
     export_type::<RuntimeLogQueryResult>(&cfg);
+    export_type::<TerminalAccess>(&cfg);
+    export_type::<TerminalClientMessage>(&cfg);
+    export_type::<TerminalServerMessage>(&cfg);
 }

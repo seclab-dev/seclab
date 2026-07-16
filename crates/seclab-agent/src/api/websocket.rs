@@ -4,10 +4,11 @@ use crate::api::{
     docker::context::DockerOperationContext, process::process_manager_websocket_handler,
 };
 use crate::services::websocket_messages::{
-    ClientWsMessage, LogPayload, MessagePayload, ServerWsMessage, TerminalClientWsMessage,
-    TerminalClosePayload, TerminalErrorPayload, TerminalExitPayload, TerminalInputPayload,
-    TerminalOutputPayload, TerminalResizePayload, TerminalServerWsMessage, TerminalStartPayload,
-    TerminalStartedPayload,
+    ClientWsMessage, ContainerTerminalClientMessage, ContainerTerminalClosePayload,
+    ContainerTerminalErrorPayload, ContainerTerminalExitPayload, ContainerTerminalInputPayload,
+    ContainerTerminalOutputPayload, ContainerTerminalResizePayload, ContainerTerminalServerMessage,
+    ContainerTerminalStartPayload, ContainerTerminalStartedPayload, LogPayload, MessagePayload,
+    ServerWsMessage,
 };
 use crate::state::AppState;
 use crate::types::ApiError;
@@ -48,7 +49,6 @@ pub fn websocket_router() -> Router<Arc<AppState>> {
             get(process_manager_websocket_handler),
         )
         .route("/terminal/ws", get(terminal_websocket_handler))
-        .route("/host-terminal/ws", get(host_terminal_websocket_handler))
 }
 
 /// WebSocket 升级入口
@@ -284,7 +284,7 @@ async fn handle_terminal_socket(
     info!("New terminal WebSocket client connected.");
 
     let (mut sender, mut receiver) = socket.split();
-    let (tx, mut rx) = mpsc::channel::<TerminalServerWsMessage>(200);
+    let (tx, mut rx) = mpsc::channel::<ContainerTerminalServerMessage>(200);
     let (cleanup_tx, mut cleanup_rx) = mpsc::channel::<String>(64);
     let mut sessions: TerminalSessionMap = HashMap::new();
 
@@ -306,8 +306,8 @@ async fn handle_terminal_socket(
             res = receiver.next() => {
                 match res {
                     Some(Ok(Message::Text(text))) => {
-                        match serde_json::from_str::<TerminalClientWsMessage>(&text) {
-                            Ok(TerminalClientWsMessage::TerminalStart(payload)) => {
+                        match serde_json::from_str::<ContainerTerminalClientMessage>(&text) {
+                            Ok(ContainerTerminalClientMessage::TerminalStart(payload)) => {
                                 let _ = handle_terminal_start(
                                     payload,
                                     state.clone(),
@@ -318,18 +318,18 @@ async fn handle_terminal_socket(
                                 )
                                 .await;
                             }
-                            Ok(TerminalClientWsMessage::TerminalInput(payload)) => {
+                            Ok(ContainerTerminalClientMessage::TerminalInput(payload)) => {
                                 let _ = handle_terminal_input(payload, tx.clone(), &sessions).await;
                             }
-                            Ok(TerminalClientWsMessage::TerminalResize(payload)) => {
+                            Ok(ContainerTerminalClientMessage::TerminalResize(payload)) => {
                                 let _ = handle_terminal_resize(payload, state.clone(), tx.clone(), &sessions).await;
                             }
-                            Ok(TerminalClientWsMessage::TerminalClose(payload)) => {
+                            Ok(ContainerTerminalClientMessage::TerminalClose(payload)) => {
                                 let _ = handle_terminal_close(payload, tx.clone(), &mut sessions).await;
                             }
                             Err(err) => {
                                 let _ = tx
-                                    .send(TerminalServerWsMessage::TerminalError(TerminalErrorPayload {
+                                    .send(ContainerTerminalServerMessage::TerminalError(ContainerTerminalErrorPayload {
                                         message: format!("failed to parse terminal message: {err}"),
                                     }))
                                     .await;
@@ -370,10 +370,10 @@ async fn handle_terminal_socket(
 }
 
 async fn handle_terminal_start(
-    payload: TerminalStartPayload,
+    payload: ContainerTerminalStartPayload,
     state: Arc<AppState>,
     context: &DockerOperationContext,
-    tx: mpsc::Sender<TerminalServerWsMessage>,
+    tx: mpsc::Sender<ContainerTerminalServerMessage>,
     cleanup_tx: mpsc::Sender<String>,
     sessions: &mut TerminalSessionMap,
 ) -> Result<(), ()> {
@@ -398,8 +398,8 @@ async fn handle_terminal_start(
                 )
                 .await;
             let _ = tx
-                .send(TerminalServerWsMessage::TerminalError(
-                    TerminalErrorPayload { message },
+                .send(ContainerTerminalServerMessage::TerminalError(
+                    ContainerTerminalErrorPayload { message },
                 ))
                 .await;
             return Err(());
@@ -426,8 +426,8 @@ async fn handle_terminal_start(
                 )
                 .await;
             let _ = tx
-                .send(TerminalServerWsMessage::TerminalError(
-                    TerminalErrorPayload { message },
+                .send(ContainerTerminalServerMessage::TerminalError(
+                    ContainerTerminalErrorPayload { message },
                 ))
                 .await;
             return Err(());
@@ -458,8 +458,8 @@ async fn handle_terminal_start(
             )
             .await;
         let _ = tx
-            .send(TerminalServerWsMessage::TerminalError(
-                TerminalErrorPayload { message },
+            .send(ContainerTerminalServerMessage::TerminalError(
+                ContainerTerminalErrorPayload { message },
             ))
             .await;
         return Err(());
@@ -522,8 +522,8 @@ async fn handle_terminal_start(
                 )
                 .await;
             let _ = tx
-                .send(TerminalServerWsMessage::TerminalError(
-                    TerminalErrorPayload { message },
+                .send(ContainerTerminalServerMessage::TerminalError(
+                    ContainerTerminalErrorPayload { message },
                 ))
                 .await;
             return Err(());
@@ -544,8 +544,8 @@ async fn handle_terminal_start(
         .await;
 
     let _ = tx
-        .send(TerminalServerWsMessage::TerminalStarted(
-            TerminalStartedPayload {
+        .send(ContainerTerminalServerMessage::TerminalStarted(
+            ContainerTerminalStartedPayload {
                 session_id,
                 shell: actual_shell.to_string(),
             },
@@ -561,7 +561,7 @@ async fn create_terminal_session(
     shell: &str,
     cols: u16,
     rows: u16,
-    tx: mpsc::Sender<TerminalServerWsMessage>,
+    tx: mpsc::Sender<ContainerTerminalServerMessage>,
     cleanup_tx: mpsc::Sender<String>,
 ) -> Result<(TerminalSession, &'static str), bollard::errors::Error> {
     let shell_cmd = if shell == "sh" {
@@ -623,8 +623,8 @@ async fn create_terminal_session(
                     let data = String::from_utf8_lossy(log.as_ref()).to_string();
                     if !data.is_empty()
                         && output_tx
-                            .send(TerminalServerWsMessage::TerminalOutput(
-                                TerminalOutputPayload {
+                            .send(ContainerTerminalServerMessage::TerminalOutput(
+                                ContainerTerminalOutputPayload {
                                     session_id: output_exec_id.clone(),
                                     data,
                                 },
@@ -637,8 +637,8 @@ async fn create_terminal_session(
                 }
                 Err(err) => {
                     let _ = output_tx
-                        .send(TerminalServerWsMessage::TerminalError(
-                            TerminalErrorPayload {
+                        .send(ContainerTerminalServerMessage::TerminalError(
+                            ContainerTerminalErrorPayload {
                                 message: format!("failed to read terminal output: {err}"),
                             },
                         ))
@@ -654,10 +654,12 @@ async fn create_terminal_session(
             .ok()
             .and_then(|v| v.exit_code);
         let _ = output_tx
-            .send(TerminalServerWsMessage::TerminalExit(TerminalExitPayload {
-                session_id: output_exec_id.clone(),
-                exit_code,
-            }))
+            .send(ContainerTerminalServerMessage::TerminalExit(
+                ContainerTerminalExitPayload {
+                    session_id: output_exec_id.clone(),
+                    exit_code,
+                },
+            ))
             .await;
         let _ = output_cleanup_tx.send(output_exec_id).await;
     });
@@ -673,14 +675,14 @@ async fn create_terminal_session(
 }
 
 async fn handle_terminal_input(
-    payload: TerminalInputPayload,
-    tx: mpsc::Sender<TerminalServerWsMessage>,
+    payload: ContainerTerminalInputPayload,
+    tx: mpsc::Sender<ContainerTerminalServerMessage>,
     sessions: &TerminalSessionMap,
 ) -> Result<(), ()> {
     let Some(session) = sessions.get(&payload.session_id) else {
         let _ = tx
-            .send(TerminalServerWsMessage::TerminalError(
-                TerminalErrorPayload {
+            .send(ContainerTerminalServerMessage::TerminalError(
+                ContainerTerminalErrorPayload {
                     message: "terminal session does not exist".to_string(),
                 },
             ))
@@ -691,8 +693,8 @@ async fn handle_terminal_input(
     let mut writer = session.input.lock().await;
     if let Err(err) = writer.write_all(payload.data.as_bytes()).await {
         let _ = tx
-            .send(TerminalServerWsMessage::TerminalError(
-                TerminalErrorPayload {
+            .send(ContainerTerminalServerMessage::TerminalError(
+                ContainerTerminalErrorPayload {
                     message: format!("failed to write terminal input: {err}"),
                 },
             ))
@@ -704,15 +706,15 @@ async fn handle_terminal_input(
 }
 
 async fn handle_terminal_resize(
-    payload: TerminalResizePayload,
+    payload: ContainerTerminalResizePayload,
     state: Arc<AppState>,
-    tx: mpsc::Sender<TerminalServerWsMessage>,
+    tx: mpsc::Sender<ContainerTerminalServerMessage>,
     sessions: &TerminalSessionMap,
 ) -> Result<(), ()> {
     let Some(session) = sessions.get(&payload.session_id) else {
         let _ = tx
-            .send(TerminalServerWsMessage::TerminalError(
-                TerminalErrorPayload {
+            .send(ContainerTerminalServerMessage::TerminalError(
+                ContainerTerminalErrorPayload {
                     message: "terminal session does not exist".to_string(),
                 },
             ))
@@ -724,8 +726,8 @@ async fn handle_terminal_resize(
         Ok(client) => client,
         Err(err) => {
             let _ = tx
-                .send(TerminalServerWsMessage::TerminalError(
-                    TerminalErrorPayload {
+                .send(ContainerTerminalServerMessage::TerminalError(
+                    ContainerTerminalErrorPayload {
                         message: format!("failed to connect Docker: {err:?}"),
                     },
                 ))
@@ -745,8 +747,8 @@ async fn handle_terminal_resize(
         .await
     {
         let _ = tx
-            .send(TerminalServerWsMessage::TerminalError(
-                TerminalErrorPayload {
+            .send(ContainerTerminalServerMessage::TerminalError(
+                ContainerTerminalErrorPayload {
                     message: format!("failed to resize terminal: {err}"),
                 },
             ))
@@ -758,8 +760,8 @@ async fn handle_terminal_resize(
 }
 
 async fn handle_terminal_close(
-    payload: TerminalClosePayload,
-    tx: mpsc::Sender<TerminalServerWsMessage>,
+    payload: ContainerTerminalClosePayload,
+    tx: mpsc::Sender<ContainerTerminalServerMessage>,
     sessions: &mut TerminalSessionMap,
 ) -> Result<(), ()> {
     let Some(session) = sessions.remove(&payload.session_id) else {
@@ -768,10 +770,12 @@ async fn handle_terminal_close(
 
     session.output_task.abort();
     let _ = tx
-        .send(TerminalServerWsMessage::TerminalExit(TerminalExitPayload {
-            session_id: payload.session_id,
-            exit_code: None,
-        }))
+        .send(ContainerTerminalServerMessage::TerminalExit(
+            ContainerTerminalExitPayload {
+                session_id: payload.session_id,
+                exit_code: None,
+            },
+        ))
         .await;
     Ok(())
 }
@@ -799,420 +803,4 @@ fn format_log_output(log: LogOutput) -> Option<String> {
         }
     }
     Some(line.trim().to_string())
-}
-
-/// 宿主机 PTY 终端 WebSocket 升级入口。
-pub async fn host_terminal_websocket_handler(
-    State(_state): State<Arc<AppState>>,
-    ws: WebSocketUpgrade,
-) -> impl IntoResponse {
-    ws.on_upgrade(handle_host_terminal_socket)
-}
-
-/// 处理宿主机 PTY 终端 WebSocket 连接
-async fn handle_host_terminal_socket(socket: WebSocket) {
-    info!("New host terminal WebSocket client connected.");
-
-    let (mut sender, mut receiver) = socket.split();
-    let (tx, mut rx) = mpsc::channel::<TerminalServerWsMessage>(200);
-    let mut active_tx = Some(tx);
-    let (cleanup_tx, mut cleanup_rx) = mpsc::channel::<String>(64);
-
-    #[cfg(unix)]
-    let sessions: Arc<Mutex<HashMap<String, host_pty::HostTerminalSession>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-
-    let send_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if let Ok(payload) = serde_json::to_string(&msg)
-                && sender.send(Message::Text(payload.into())).await.is_err()
-            {
-                warn!("Failed to send host terminal message to WebSocket client.");
-                break;
-            }
-        }
-        // 优雅向客户端发送 WebSocket 关闭帧以完成关闭握手
-        let _ = sender.send(Message::Close(None)).await;
-    });
-
-    loop {
-        tokio::select! {
-            res = receiver.next() => {
-                match res {
-                    Some(Ok(Message::Text(text))) => {
-                        match serde_json::from_str::<TerminalClientWsMessage>(&text) {
-                            Ok(TerminalClientWsMessage::TerminalStart(payload)) => {
-                                #[cfg(unix)]
-                                {
-                                    if let Some(ref tx_ref) = active_tx {
-                                        let tx_clone = tx_ref.clone();
-                                        let cleanup_tx_clone = cleanup_tx.clone();
-                                        let sessions_clone = sessions.clone();
-                                        tokio::spawn(async move {
-                                            match host_pty::handle_host_terminal_start(
-                                                payload.cols,
-                                                payload.rows,
-                                                tx_clone.clone(),
-                                                cleanup_tx_clone,
-                                                &sessions_clone,
-                                            )
-                                            .await
-                                            {
-                                                Ok(session_id) => {
-                                                    let _ = tx_clone
-                                                        .send(TerminalServerWsMessage::TerminalStarted(TerminalStartedPayload {
-                                                            session_id,
-                                                            shell: "bash".to_string(),
-                                                        }))
-                                                        .await;
-                                                }
-                                                Err(err) => {
-                                                    let _ = tx_clone
-                                                        .send(TerminalServerWsMessage::TerminalError(TerminalErrorPayload {
-                                                            message: err,
-                                                        }))
-                                                        .await;
-                                                }
-                                            }
-                                        });
-                                    }
-                                }
-                                #[cfg(not(unix))]
-                                {
-                                    if let Some(ref tx_ref) = active_tx {
-                                        let _ = tx_ref.send(TerminalServerWsMessage::TerminalError(TerminalErrorPayload {
-                                            message: "Host terminal is only supported on Unix platforms".to_string(),
-                                        })).await;
-                                    }
-                                }
-                            }
-                            Ok(TerminalClientWsMessage::TerminalInput(payload)) => {
-                                #[cfg(unix)]
-                                {
-                                    let sessions_clone = sessions.clone();
-                                    tokio::spawn(async move {
-                                        let lock = sessions_clone.lock().await;
-                                        if let Some(session) = lock.get(&payload.session_id) {
-                                            let mut writer = session.writer.lock().await;
-                                            let _ = writer.write_all(payload.data.as_bytes()).await;
-                                            let _ = writer.flush().await;
-                                        }
-                                    });
-                                }
-                            }
-                            Ok(TerminalClientWsMessage::TerminalResize(payload)) => {
-                                #[cfg(unix)]
-                                {
-                                    let sessions_clone = sessions.clone();
-                                    tokio::spawn(async move {
-                                        let lock = sessions_clone.lock().await;
-                                        if let Some(session) = lock.get(&payload.session_id) {
-                                            let _ = host_pty::handle_host_terminal_resize(
-                                                session.master_fd,
-                                                payload.cols,
-                                                payload.rows,
-                                            )
-                                            .await;
-                                        }
-                                    });
-                                }
-                            }
-                            Ok(TerminalClientWsMessage::TerminalClose(payload)) => {
-                                #[cfg(unix)]
-                                {
-                                    let mut lock = sessions.lock().await;
-                                    if let Some(session) = lock.remove(&payload.session_id) {
-                                        session.output_task.abort();
-                                        unsafe {
-                                            libc::kill(session.child_pid, libc::SIGHUP);
-                                        }
-                                    }
-                                }
-                                if let Some(ref tx_ref) = active_tx {
-                                    let _ = tx_ref
-                                        .send(TerminalServerWsMessage::TerminalExit(TerminalExitPayload {
-                                            session_id: payload.session_id,
-                                            exit_code: Some(0),
-                                        }))
-                                        .await;
-                                }
-                            }
-                            Err(err) => {
-                                if let Some(ref tx_ref) = active_tx {
-                                    let _ = tx_ref
-                                        .send(TerminalServerWsMessage::TerminalError(TerminalErrorPayload {
-                                            message: format!("failed to parse terminal message: {err}"),
-                                        }))
-                                        .await;
-                                }
-                            }
-                        }
-                    }
-                    Some(Ok(Message::Close(_))) | None => {
-                        break;
-                    }
-                    Some(Err(err)) => {
-                        warn!("Host Terminal WebSocket receive error: {}", err);
-                        break;
-                    }
-                    _ => {}
-                }
-            },
-            maybe_session_id = cleanup_rx.recv() => {
-                if let Some(session_id) = maybe_session_id {
-                    #[cfg(unix)]
-                    {
-                        let mut lock = sessions.lock().await;
-                        if let Some(session) = lock.remove(&session_id) {
-                            session.output_task.abort();
-                        }
-                        // 若所有会话均已排空（代表终端进程均已退出），主动断开 WebSocket 连接
-                        if lock.is_empty() {
-                            active_tx = None;
-                        }
-                    }
-                } else {
-                    break;
-                }
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    {
-        let mut lock = sessions.lock().await;
-        for (_, session) in lock.drain() {
-            session.output_task.abort();
-            unsafe {
-                libc::kill(session.child_pid, libc::SIGHUP);
-            }
-        }
-    }
-
-    // 显式丢弃 active_tx 发送端，令 send_task 中的 rx 收到 None 并优雅退出，从而完美完成标准 WebSocket 关闭握手
-    drop(active_tx);
-    let _ = send_task.await;
-    info!("Host Terminal WebSocket client connection closed.");
-}
-
-#[cfg(unix)]
-mod host_pty {
-    use super::*;
-    use std::os::unix::io::{FromRawFd, RawFd};
-    use tokio::fs::File;
-    use tokio::io::AsyncReadExt;
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct Winsize {
-        ws_row: libc::c_ushort,
-        ws_col: libc::c_ushort,
-        ws_xpixel: libc::c_ushort,
-        ws_ypixel: libc::c_ushort,
-    }
-
-    fn open_pty() -> Result<(RawFd, RawFd), std::io::Error> {
-        unsafe {
-            let master_fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
-            if master_fd < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::grantpt(master_fd) < 0 {
-                libc::close(master_fd);
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::unlockpt(master_fd) < 0 {
-                libc::close(master_fd);
-                return Err(std::io::Error::last_os_error());
-            }
-            let slave_name = libc::ptsname(master_fd);
-            if slave_name.is_null() {
-                libc::close(master_fd);
-                return Err(std::io::Error::other("ptsname failed"));
-            }
-            let slave_fd = libc::open(slave_name, libc::O_RDWR | libc::O_NOCTTY);
-            if slave_fd < 0 {
-                libc::close(master_fd);
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok((master_fd, slave_fd))
-        }
-    }
-
-    pub struct HostTerminalSession {
-        pub master_fd: RawFd,
-        pub writer: Arc<Mutex<File>>,
-        pub output_task: JoinHandle<()>,
-        pub child_pid: libc::pid_t,
-    }
-
-    pub async fn handle_host_terminal_start(
-        cols: u16,
-        rows: u16,
-        tx: mpsc::Sender<TerminalServerWsMessage>,
-        cleanup_tx: mpsc::Sender<String>,
-        sessions: &Arc<Mutex<HashMap<String, HostTerminalSession>>>,
-    ) -> Result<String, String> {
-        let (master_fd, slave_fd) = open_pty().map_err(|e| format!("open pty failed: {e}"))?;
-
-        // 设置伪终端高宽初始大小
-        let ws = Winsize {
-            ws_row: rows,
-            ws_col: cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        unsafe {
-            libc::ioctl(master_fd, libc::TIOCSWINSZ as _, &ws);
-        }
-
-        // Fork 并派生 Shell 进程
-        let pid = unsafe { libc::fork() };
-        if pid < 0 {
-            unsafe {
-                libc::close(master_fd);
-                libc::close(slave_fd);
-            }
-            return Err("fork failed".to_string());
-        }
-
-        if pid == 0 {
-            // 子进程分支
-            unsafe {
-                libc::close(master_fd);
-                libc::setsid();
-                libc::dup2(slave_fd, 0);
-                libc::dup2(slave_fd, 1);
-                libc::dup2(slave_fd, 2);
-                libc::ioctl(0, libc::TIOCSCTTY as _, 0);
-                libc::close(slave_fd);
-
-                // 切换工作目录至用户家目录 (~)
-                if let Ok(home) = std::env::var("HOME") {
-                    if let Ok(home_cstr) = std::ffi::CString::new(home) {
-                        let _ = libc::chdir(home_cstr.as_ptr());
-                    }
-                } else {
-                    let _ = libc::chdir(c"/root".as_ptr());
-                }
-
-                // 强制将 TERM 环境变量设为 xterm-256color，支持完整彩色输出
-                std::env::set_var("TERM", "xterm-256color");
-
-                let shell = std::ffi::CString::new("/bin/bash").unwrap();
-                let arg_ptrs = [shell.as_ptr(), std::ptr::null()];
-                libc::execvp(shell.as_ptr(), arg_ptrs.as_ptr());
-                libc::_exit(127);
-            }
-        }
-
-        // 父进程分支
-        unsafe {
-            libc::close(slave_fd);
-        }
-
-        let session_id = uuid::Uuid::new_v4().to_string();
-        let master_file = unsafe { std::fs::File::from_raw_fd(master_fd) };
-        let async_master_reader = File::from_std(master_file.try_clone().unwrap());
-        let async_master_writer = File::from_std(master_file);
-
-        let writer = Arc::new(Mutex::new(async_master_writer));
-        let session_id_clone = session_id.clone();
-        let tx_clone = tx.clone();
-        let cleanup_tx_clone = cleanup_tx.clone();
-
-        // 异步循环从 PTY 读取子进程的输出，并送往 WebSocket
-        let output_task = tokio::spawn(async move {
-            let mut reader = async_master_reader;
-            let mut buf = [0u8; 4096];
-            loop {
-                match reader.read(&mut buf).await {
-                    Ok(0) => {
-                        // EOF, 子进程退出
-                        let _ = tx_clone
-                            .send(TerminalServerWsMessage::TerminalExit(TerminalExitPayload {
-                                session_id: session_id_clone.clone(),
-                                exit_code: Some(0),
-                            }))
-                            .await;
-                        let _ = cleanup_tx_clone.send(session_id_clone.clone()).await;
-                        break;
-                    }
-                    Ok(n) => {
-                        let text = String::from_utf8_lossy(&buf[..n]).to_string();
-                        if tx_clone
-                            .send(TerminalServerWsMessage::TerminalOutput(
-                                TerminalOutputPayload {
-                                    session_id: session_id_clone.clone(),
-                                    data: text,
-                                },
-                            ))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(_) => {
-                        let _ = cleanup_tx_clone.send(session_id_clone.clone()).await;
-                        break;
-                    }
-                }
-            }
-        });
-
-        // 启动一个阻塞线程监控子进程退出状态，以确保子进程退出时能立刻复位并回收资源，防止僵尸进程
-        let pid_wait = pid;
-        let cleanup_tx_wait = cleanup_tx.clone();
-        let session_id_wait = session_id.clone();
-        let tx_wait = tx.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut status = 0;
-            unsafe {
-                libc::waitpid(pid_wait, &mut status, 0);
-            }
-            // 子进程退出，触发 WebSocket 断开和会话清理
-            tokio::spawn(async move {
-                let _ = tx_wait
-                    .send(TerminalServerWsMessage::TerminalExit(TerminalExitPayload {
-                        session_id: session_id_wait.clone(),
-                        exit_code: Some(0),
-                    }))
-                    .await;
-                let _ = cleanup_tx_wait.send(session_id_wait).await;
-            });
-        });
-
-        let mut lock = sessions.lock().await;
-        lock.insert(
-            session_id.clone(),
-            HostTerminalSession {
-                master_fd,
-                writer,
-                output_task,
-                child_pid: pid,
-            },
-        );
-
-        Ok(session_id)
-    }
-
-    pub async fn handle_host_terminal_resize(
-        master_fd: RawFd,
-        cols: u16,
-        rows: u16,
-    ) -> Result<(), String> {
-        let ws = Winsize {
-            ws_row: rows,
-            ws_col: cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        unsafe {
-            if libc::ioctl(master_fd, libc::TIOCSWINSZ as _, &ws) < 0 {
-                return Err("resize ioctl failed".to_string());
-            }
-        }
-        Ok(())
-    }
 }

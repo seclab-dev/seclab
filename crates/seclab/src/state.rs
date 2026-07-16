@@ -31,4 +31,5 @@ pub struct AppState {
     pub deploy_sessions: Arc<std::sync::Mutex<HashMap<String, DeploySession>>>,
     pub local_node_resource: Arc<tokio::sync::Mutex<Option<serde_json::Value>>>,
     pub image_acquisition: crate::services::image_acquisition::ImageAcquisitionService,
+    pub terminal_tickets: Arc<crate::services::terminal_ticket::TerminalTicketStore>,
 }

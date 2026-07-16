@@ -2,6 +2,7 @@
 
 pub mod docker;
 pub mod fs;
+pub mod host_terminal;
 pub mod process;
 pub mod runtime_logs;
 pub mod scheduled_tasks;

@@ -2,7 +2,7 @@
 
 use super::{
     apps, auth, desktop_apps, docker, nodes, notifications, platform, runtime, scripts, seclab,
-    security, suites, system_monitoring, task_scheduler, upgrades,
+    security, suites, system_monitoring, task_scheduler, terminal, upgrades,
 };
 use crate::api::node_proxy;
 use crate::db::init_db_pool;
@@ -37,6 +37,7 @@ pub fn state_api_router(app_state: Arc<AppState>) -> Router<Arc<AppState>> {
         .nest("/nodes", nodes::nodes_router())
         .nest("/node", nodes::single_node_router())
         .nest("/node", system_monitoring::system_monitoring_router())
+        .nest("/node", terminal::terminal_router())
         .nest("/agent", node_proxy::agent_router())
         .nest("/seclab", seclab::seclab_router())
         .nest("/docker", docker::docker_router())
@@ -86,6 +87,9 @@ pub async fn create_router() -> Result<(Router, crate::state::DbPool)> {
         deploy_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         local_node_resource: Arc::new(tokio::sync::Mutex::new(None)),
         image_acquisition: crate::services::image_acquisition::ImageAcquisitionService::new(),
+        terminal_tickets: Arc::new(
+            crate::services::terminal_ticket::TerminalTicketStore::default(),
+        ),
     });
     crate::services::node_session_reaper::spawn_session_reaper(Arc::clone(&app_state));
     crate::services::upgrades::spawn_upgrade_scheduler(Arc::clone(&app_state));

@@ -9,6 +9,7 @@ pub mod process;
 pub mod runtime_logs;
 pub mod seclab;
 pub mod telemetry;
+pub mod terminal;
 pub mod types;
 
 use sqlx::SqlitePool;

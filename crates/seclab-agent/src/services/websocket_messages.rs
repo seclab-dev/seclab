@@ -19,15 +19,15 @@ pub enum ClientWsMessage {
 /// 客户端发往终端 WebSocket 通道的消息。
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "camelCase")]
-pub enum TerminalClientWsMessage {
+pub enum ContainerTerminalClientMessage {
     /// 启动一个容器终端会话。
-    TerminalStart(TerminalStartPayload),
+    TerminalStart(ContainerTerminalStartPayload),
     /// 向终端会话写入输入数据。
-    TerminalInput(TerminalInputPayload),
+    TerminalInput(ContainerTerminalInputPayload),
     /// 调整终端窗口大小。
-    TerminalResize(TerminalResizePayload),
+    TerminalResize(ContainerTerminalResizePayload),
     /// 关闭终端会话。
-    TerminalClose(TerminalClosePayload),
+    TerminalClose(ContainerTerminalClosePayload),
 }
 
 /// 包含日志数据，用于传输日志快照或追加日志行。
@@ -50,7 +50,7 @@ pub struct MessagePayload {
 
 /// 终端启动请求载荷。
 #[derive(Debug, Deserialize)]
-pub struct TerminalStartPayload {
+pub struct ContainerTerminalStartPayload {
     /// 目标容器 ID。
     pub container_id: String,
     /// 期望 shell：`bash` 或 `sh`。
@@ -63,7 +63,7 @@ pub struct TerminalStartPayload {
 
 /// 终端输入请求载荷。
 #[derive(Debug, Deserialize)]
-pub struct TerminalInputPayload {
+pub struct ContainerTerminalInputPayload {
     /// 终端会话 ID。
     pub session_id: String,
     /// 输入数据，原样转发到容器 stdin。
@@ -72,7 +72,7 @@ pub struct TerminalInputPayload {
 
 /// 终端尺寸变更请求载荷。
 #[derive(Debug, Deserialize)]
-pub struct TerminalResizePayload {
+pub struct ContainerTerminalResizePayload {
     /// 终端会话 ID。
     pub session_id: String,
     /// 终端列数。
@@ -83,7 +83,7 @@ pub struct TerminalResizePayload {
 
 /// 终端关闭请求载荷。
 #[derive(Debug, Deserialize)]
-pub struct TerminalClosePayload {
+pub struct ContainerTerminalClosePayload {
     /// 终端会话 ID。
     pub session_id: String,
 }
@@ -109,20 +109,20 @@ pub enum ServerWsMessage {
 /// 服务端发送到终端 WebSocket 通道的消息。
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", content = "payload", rename_all = "camelCase")]
-pub enum TerminalServerWsMessage {
+pub enum ContainerTerminalServerMessage {
     /// 终端会话启动成功。
-    TerminalStarted(TerminalStartedPayload),
+    TerminalStarted(ContainerTerminalStartedPayload),
     /// 终端实时输出。
-    TerminalOutput(TerminalOutputPayload),
+    TerminalOutput(ContainerTerminalOutputPayload),
     /// 终端会话结束。
-    TerminalExit(TerminalExitPayload),
+    TerminalExit(ContainerTerminalExitPayload),
     /// 终端会话错误。
-    TerminalError(TerminalErrorPayload),
+    TerminalError(ContainerTerminalErrorPayload),
 }
 
 /// 终端启动成功载荷。
 #[derive(Debug, Serialize)]
-pub struct TerminalStartedPayload {
+pub struct ContainerTerminalStartedPayload {
     /// 会话 ID。
     pub session_id: String,
     /// 实际使用的 shell（可能触发 fallback）。
@@ -131,7 +131,7 @@ pub struct TerminalStartedPayload {
 
 /// 终端输出载荷。
 #[derive(Debug, Serialize)]
-pub struct TerminalOutputPayload {
+pub struct ContainerTerminalOutputPayload {
     /// 会话 ID。
     pub session_id: String,
     /// 原始终端输出。
@@ -140,7 +140,7 @@ pub struct TerminalOutputPayload {
 
 /// 终端退出载荷。
 #[derive(Debug, Serialize)]
-pub struct TerminalExitPayload {
+pub struct ContainerTerminalExitPayload {
     /// 会话 ID。
     pub session_id: String,
     /// 退出码。
@@ -149,7 +149,7 @@ pub struct TerminalExitPayload {
 
 /// 终端错误载荷。
 #[derive(Debug, Serialize)]
-pub struct TerminalErrorPayload {
+pub struct ContainerTerminalErrorPayload {
     /// 错误消息。
     pub message: String,
 }

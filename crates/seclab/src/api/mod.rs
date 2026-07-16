@@ -17,4 +17,5 @@ pub mod security;
 pub mod suites;
 pub mod system_monitoring;
 pub mod task_scheduler;
+pub mod terminal;
 pub mod upgrades;

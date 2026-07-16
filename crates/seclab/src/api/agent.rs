@@ -144,6 +144,13 @@ pub async fn websocket_proxy_handler(
         .map(|pq| pq.as_str())
         .unwrap_or(uri.path())
         .to_string();
+    if path.ends_with("/websocket/host-terminal/ws") {
+        return ApiError::forbidden(
+            ErrorCode::AuthForbidden,
+            "host terminal must use the node terminal gateway",
+        )
+        .into_response();
+    }
 
     let node_name = resolve_node_name(&state, None).await;
     let headers = prepare_websocket_proxy_headers(&admin, &incoming_headers);
@@ -178,6 +185,13 @@ pub async fn websocket_proxy_handler_for_node(
         .map(|pq| pq.as_str())
         .unwrap_or(uri.path())
         .to_string();
+    if raw_path.ends_with("/websocket/host-terminal/ws") {
+        return ApiError::forbidden(
+            ErrorCode::AuthForbidden,
+            "host terminal must use the node terminal gateway",
+        )
+        .into_response();
+    }
     let path = rebuild_scoped_proxy_path(&raw_path, &node_id);
     let node_name = resolve_node_name(&state, Some(node_id.as_str())).await;
     let headers = prepare_websocket_proxy_headers(&admin, &incoming_headers);

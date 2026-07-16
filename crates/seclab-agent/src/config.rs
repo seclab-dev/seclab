@@ -3,6 +3,7 @@
 use serde::Deserialize;
 use std::env;
 use std::fs;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -34,6 +35,13 @@ pub struct AgentConfig {
     pub stats_retention_hours: Option<u64>,
     #[serde(default)]
     pub controller_compatibility: ControllerCompatibilityConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ControllerListenConfig {
+    host: String,
+    port: u16,
 }
 
 /// Agent 对主控版本与 runtime 协议的兼容要求。
@@ -132,6 +140,53 @@ pub fn config_path() -> PathBuf {
     } else {
         dev_base_dir().join("agent.toml")
     }
+}
+
+/// 读取本机主控的运行时监听配置并生成仅供本地 Agent 回连的 HTTPS 地址。
+pub fn local_controller_url() -> anyhow::Result<String> {
+    let path = controller_runtime_config_path();
+    let raw = fs::read_to_string(&path).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to read controller runtime config {}: {error}",
+            path.display()
+        )
+    })?;
+    local_controller_url_from_json(&raw)
+}
+
+fn controller_runtime_config_path() -> PathBuf {
+    if let Some(value) = env::var_os("SECLAB_RUNTIME_CONFIG") {
+        return PathBuf::from(value);
+    }
+    if let Some(value) = env::var_os("SECLAB_CONFIG_DIR") {
+        return PathBuf::from(value).join("runtime-listen.json");
+    }
+    if use_production_layout() {
+        production_home().join("config/runtime-listen.json")
+    } else {
+        dev_base_dir().join("runtime-listen.json")
+    }
+}
+
+fn local_controller_url_from_json(raw: &str) -> anyhow::Result<String> {
+    let config: ControllerListenConfig = serde_json::from_str(raw)
+        .map_err(|error| anyhow::anyhow!("invalid controller runtime config: {error}"))?;
+    if config.port == 0 {
+        anyhow::bail!("controller runtime port must be in range 1-65535");
+    }
+
+    let configured_host = config.host.trim().trim_matches(['[', ']']);
+    if configured_host.is_empty() {
+        anyhow::bail!("controller runtime host cannot be empty");
+    }
+    let callback_host = match configured_host {
+        "0.0.0.0" | "::" => "127.0.0.1".to_string(),
+        host => match host.parse::<IpAddr>() {
+            Ok(IpAddr::V6(_)) => format!("[{host}]"),
+            _ => host.to_string(),
+        },
+    };
+    Ok(format!("https://{callback_host}:{}", config.port))
 }
 
 /// 返回数据库数据目录路径。
@@ -270,5 +325,23 @@ mod tests {
 
         // 3. 无效 target url 应返回原样
         assert_eq!(rewrite_url(orig, "invalid-url"), orig);
+    }
+
+    #[test]
+    fn local_controller_url_uses_loopback_for_wildcard_listener() {
+        let url = local_controller_url_from_json(r#"{"host":"::","port":7310}"#).unwrap();
+        assert_eq!(url, "https://127.0.0.1:7310");
+    }
+
+    #[test]
+    fn local_controller_url_preserves_specific_ipv6_listener() {
+        let url = local_controller_url_from_json(r#"{"host":"2001:db8::10","port":9443}"#).unwrap();
+        assert_eq!(url, "https://[2001:db8::10]:9443");
+    }
+
+    #[test]
+    fn local_controller_url_rejects_invalid_runtime_config() {
+        assert!(local_controller_url_from_json(r#"{"host":"","port":7310}"#).is_err());
+        assert!(local_controller_url_from_json(r#"{"host":"::","port":0}"#).is_err());
     }
 }

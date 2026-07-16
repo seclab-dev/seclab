@@ -835,6 +835,7 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
       height?: number
       minWidth?: number
       minHeight?: number
+      i18nTitleKey?: string
     },
   ) {
     const instanceId = options?.instanceId ?? id
@@ -849,7 +850,8 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
     const minWidth = options?.minWidth ?? appConfig.minWidth
     const minHeight = options?.minHeight ?? appConfig.minHeight
     const i18nTitleKey =
-      options?.title || !appConfig.i18nTitleKey ? undefined : appConfig.i18nTitleKey
+      options?.i18nTitleKey ??
+      (options?.title || !appConfig.i18nTitleKey ? undefined : appConfig.i18nTitleKey)
     const contextMenuPolicy = appConfig.contextMenuPolicy ?? 'shell'
 
     if (windowInstance) {
@@ -955,22 +957,25 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
     if (id === 'terminal') {
       const timestamp = Date.now()
       const instanceId = `terminal-${timestamp}`
-      const existingTermCount = openWindows.value.filter((w) => w.id.startsWith('terminal-')).length
 
-      // 动态获取当前活跃节点名称，并将节点名称附加到终端会话窗口标题中
+      // 创建窗口时固定目标节点，窗口标题只表达应用身份。
       const nodeStore = useNodeStore()
       const targetNodeId = nodeStore.currentNodeId || 'local'
       const activeNode = nodeStore.nodes.find((n) => n.id === targetNodeId)
       const nodeName = targetNodeId === 'local' ? 'local' : activeNode?.name || targetNodeId
 
-      const terminalName = t('app.terminal.appName')
-      const sessionStr = t('app.terminal.sessionLabel', { count: existingTermCount + 1 })
-      const title = `${terminalName} - ${sessionStr} (${nodeName})`
-
-      openWindowWithPayload(id, undefined, {
-        instanceId,
-        title,
-      })
+      openWindowWithPayload(
+        id,
+        {
+          nodeId: targetNodeId,
+          nodeName,
+        },
+        {
+          instanceId,
+          title: t('app.terminal.appName'),
+          i18nTitleKey: 'app.terminal.appName',
+        },
+      )
     } else {
       const currentNodePayload =
         appConfig?.nodeScope === 'current-node'

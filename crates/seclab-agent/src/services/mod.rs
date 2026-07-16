@@ -4,6 +4,7 @@ pub mod docker_activity;
 pub mod docker_project_tasks;
 pub mod docker_projects;
 pub mod docker_stats;
+pub mod host_terminal;
 pub mod pcap;
 pub mod process_manager;
 pub mod runtime_logs;
