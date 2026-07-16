@@ -66,7 +66,7 @@ pub fn state_api_router(app_state: Arc<AppState>) -> Router<Arc<AppState>> {
 
 /// 创建路由
 pub async fn create_router() -> Result<(Router, crate::state::DbPool)> {
-    let db = init_db_pool().await;
+    let db = init_db_pool().await?;
     let db_for_shutdown = db.clone();
 
     tracing::info!("Database connection pool established successfully.");

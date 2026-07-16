@@ -17,7 +17,6 @@ use seclab_security::certs::AGENT_CA_CERT_PEM;
 use seclab_security::client::build_tls_client;
 use semver::Version;
 use shadow_rs::{formatcp, shadow};
-use std::io;
 use std::net::SocketAddr;
 use std::{fs, os::unix::fs::PermissionsExt};
 use tokio::{net::UnixListener, signal, sync::watch};
@@ -84,12 +83,7 @@ async fn main() {
     let (app, pools_for_shutdown) = match create_router().await {
         Ok(app) => app,
         Err(err) => {
-            let root_cause = err.root_cause();
-            if let Some(io_error) = root_cause.downcast_ref::<io::Error>() {
-                tracing::error!("Root cause is std::io::Error; kind: {:?}", io_error.kind());
-                std::process::exit(1);
-            }
-            tracing::error!("Unexpected startup error: {:?}", err);
+            tracing::error!("SecLab Agent startup failed: {err:#}");
             std::process::exit(1);
         }
     };

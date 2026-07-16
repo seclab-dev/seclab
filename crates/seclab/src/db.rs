@@ -2,14 +2,17 @@
 
 use crate::config;
 use crate::state::DbPool;
+use anyhow::{Context, Result};
+use sqlx::migrate::MigrateError;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+use std::path::Path;
 use std::str::FromStr;
 
 /// 初始化 `seclab` 服务的单一数据库连接池。
 ///
 /// 当前 `seclab` 服务采用单服务单库设计，所有核心业务、平台日志与通知历史
 /// 统一落在同一个 SQLite 文件中管理。
-pub async fn init_db_pool() -> DbPool {
+pub async fn init_db_pool() -> Result<DbPool> {
     let db_path = config::data_dir().join("seclab.db");
     create_pool(db_path.to_string_lossy().as_ref()).await
 }
@@ -26,25 +29,49 @@ pub async fn init_db_pool() -> DbPool {
 ///
 /// # 返回
 /// 一个初始化完成并已运行迁移的 `DbPool` (`sqlx::Pool<Sqlite>`)。
-async fn create_pool(path: &str) -> DbPool {
+async fn create_pool(path: &str) -> Result<DbPool> {
     // 创建目录
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        std::fs::create_dir_all(parent).unwrap();
+    if let Some(parent) = Path::new(path).parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Failed to create database directory '{}'.",
+                parent.display()
+            )
+        })?;
     }
 
     let url = format!("sqlite:{}", path);
 
     let pool = SqlitePoolOptions::new()
         .max_connections(1) // SQLite 在 WAL 模式下单连接性能已经很好
-        .connect_with(sqlite_options(&url))
+        .connect_with(sqlite_options(&url)?)
         .await
-        .unwrap();
+        .with_context(|| format!("Failed to open SecLab database at '{path}'."))?;
 
     tracing::info!("Running database migrations for {}...", path);
-    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .map_err(|error| anyhow::anyhow!(migration_failure_message(Path::new(path), &error)))?;
     tracing::info!("Database migrations for {} completed.", path);
 
-    pool
+    Ok(pool)
+}
+
+/// 将迁移错误转换为可操作的启动提示。
+fn migration_failure_message(path: &Path, error: &MigrateError) -> String {
+    let database = path.display();
+    match error {
+        MigrateError::VersionMissing(version) => format!(
+            "SecLab database migration history is incompatible with this build: database '{database}' contains removed migration version {version}. Back up the database, remove it, and restart SecLab to create a clean database."
+        ),
+        MigrateError::VersionMismatch(version) => format!(
+            "SecLab database migration history is incompatible with this build: migration version {version} in database '{database}' differs from the current migration file. Back up the database, remove it, and restart SecLab to create a clean database."
+        ),
+        _ => format!(
+            "Failed to migrate SecLab database '{database}': {error}. Check database permissions, available disk space, and migration files, then restart SecLab."
+        ),
+    }
 }
 
 /// 为 SQLite 连接提供一组优化的默认选项。
@@ -67,13 +94,41 @@ async fn create_pool(path: &str) -> DbPool {
 ///
 /// # 返回
 /// 一个配置好的 `SqliteConnectOptions` 实例。
-fn sqlite_options(path: &str) -> SqliteConnectOptions {
-    SqliteConnectOptions::from_str(&format!("sqlite:{path}"))
-        .unwrap()
+fn sqlite_options(path: &str) -> Result<SqliteConnectOptions> {
+    Ok(SqliteConnectOptions::from_str(&format!("sqlite:{path}"))
+        .with_context(|| format!("Invalid SQLite database path '{path}'."))?
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
         .foreign_keys(true)
         .auto_vacuum(sqlx::sqlite::SqliteAutoVacuum::Incremental)
-        .busy_timeout(std::time::Duration::from_secs(5))
+        .busy_timeout(std::time::Duration::from_secs(5)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migration_failure_explains_removed_version() {
+        let message = migration_failure_message(
+            Path::new("/var/lib/seclab/seclab.db"),
+            &MigrateError::VersionMissing(10),
+        );
+
+        assert!(message.contains("removed migration version 10"));
+        assert!(message.contains("Back up the database"));
+        assert!(message.contains("/var/lib/seclab/seclab.db"));
+    }
+
+    #[test]
+    fn migration_failure_explains_changed_version() {
+        let message = migration_failure_message(
+            Path::new("/var/lib/seclab/seclab.db"),
+            &MigrateError::VersionMismatch(2),
+        );
+
+        assert!(message.contains("migration version 2"));
+        assert!(message.contains("differs from the current migration file"));
+    }
 }

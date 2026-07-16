@@ -131,19 +131,16 @@ async fn main() {
         Ok(app) => app,
         Err(err) => {
             let root_cause = err.root_cause();
-            if let Some(io_error) = root_cause.downcast_ref::<io::Error>() {
-                if io_error.kind() == io::ErrorKind::PermissionDenied {
-                    tracing::error!(
-                        "Docker API call failed because the process does not have Docker permissions"
-                    );
-                    std::process::exit(1);
-                }
-                tracing::error!("Root cause is std::io::Error; kind: {:?}", io_error.kind());
-                std::process::exit(1);
-            } else {
-                tracing::error!("Unexpected startup error: {:?}", err);
+            if let Some(io_error) = root_cause.downcast_ref::<io::Error>()
+                && io_error.kind() == io::ErrorKind::PermissionDenied
+            {
+                tracing::error!(
+                    "Docker API call failed because the process does not have Docker permissions"
+                );
                 std::process::exit(1);
             }
+            tracing::error!("SecLab startup failed: {err:#}");
+            std::process::exit(1);
         }
     };
 

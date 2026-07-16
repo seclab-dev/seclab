@@ -52,7 +52,7 @@ pub fn state_api_router() -> Router<Arc<AppState>> {
 /// 创建路由
 pub async fn create_router() -> Result<(Router, DbPool)> {
     // 建立数据库连接池。
-    let pool = db::establish_connection().await;
+    let pool = db::establish_connection().await?;
     let pool_for_shutdown = pool.clone();
     tracing::info!("Database connection pool established successfully.");
     let system_monitoring =

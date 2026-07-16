@@ -2,6 +2,8 @@
 
 use crate::config;
 use crate::state::DbPool;
+use anyhow::{Context, Result};
+use sqlx::migrate::MigrateError;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use std::path::Path;
 use std::str::FromStr;
@@ -16,29 +18,50 @@ use std::str::FromStr;
 ///
 /// # 返回
 /// 一个初始化完成并已运行迁移的 `DbPool` (`sqlx::Pool<Sqlite>`)。
-pub async fn establish_connection() -> DbPool {
+pub async fn establish_connection() -> Result<DbPool> {
     let db_path = config::data_dir().join("agent.db");
 
     if let Some(parent) = Path::new(&db_path).parent() {
-        std::fs::create_dir_all(parent).expect("Error crating database directory");
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Failed to create Agent database directory '{}'.",
+                parent.display()
+            )
+        })?;
     }
 
     let database_url = format!("sqlite:{}", db_path.to_string_lossy());
 
     let pool = SqlitePoolOptions::new()
         .max_connections(1) // SQLite 在 WAL 模式下通常单连接性能最佳
-        .connect_with(sqlite_options(&database_url))
+        .connect_with(sqlite_options(&database_url)?)
         .await
-        .unwrap();
+        .with_context(|| format!("Failed to open Agent database at '{}'.", db_path.display()))?;
 
     tracing::info!("Running agent database migrations...");
     sqlx::migrate!("./migrations")
         .run(&pool)
         .await
-        .expect("Failed to run agent migrations");
+        .map_err(|error| anyhow::anyhow!(migration_failure_message(&db_path, &error)))?;
     tracing::info!("Agent database migrations completed...");
 
-    pool
+    Ok(pool)
+}
+
+/// 将迁移错误转换为可操作的启动提示。
+fn migration_failure_message(path: &Path, error: &MigrateError) -> String {
+    let database = path.display();
+    match error {
+        MigrateError::VersionMissing(version) => format!(
+            "Agent database migration history is incompatible with this build: database '{database}' contains removed migration version {version}. Back up the database, remove it, and restart SecLab Agent to create a clean database."
+        ),
+        MigrateError::VersionMismatch(version) => format!(
+            "Agent database migration history is incompatible with this build: migration version {version} in database '{database}' differs from the current migration file. Back up the database, remove it, and restart SecLab Agent to create a clean database."
+        ),
+        _ => format!(
+            "Failed to migrate Agent database '{database}': {error}. Check database permissions, available disk space, and migration files, then restart SecLab Agent."
+        ),
+    }
 }
 
 /// 为 SQLite 连接提供一组优化的默认选项。
@@ -61,13 +84,41 @@ pub async fn establish_connection() -> DbPool {
 ///
 /// # 返回
 /// 一个配置好的 `SqliteConnectOptions` 实例。
-fn sqlite_options(path: &str) -> SqliteConnectOptions {
-    SqliteConnectOptions::from_str(&format!("sqlite:{path}"))
-        .unwrap()
+fn sqlite_options(path: &str) -> Result<SqliteConnectOptions> {
+    Ok(SqliteConnectOptions::from_str(&format!("sqlite:{path}"))
+        .with_context(|| format!("Invalid Agent SQLite database path '{path}'."))?
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
         .foreign_keys(true)
         .auto_vacuum(sqlx::sqlite::SqliteAutoVacuum::Incremental)
-        .busy_timeout(std::time::Duration::from_secs(5))
+        .busy_timeout(std::time::Duration::from_secs(5)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migration_failure_explains_removed_version() {
+        let message = migration_failure_message(
+            Path::new("/var/lib/seclab/agent.db"),
+            &MigrateError::VersionMissing(10),
+        );
+
+        assert!(message.contains("removed migration version 10"));
+        assert!(message.contains("Back up the database"));
+        assert!(message.contains("/var/lib/seclab/agent.db"));
+    }
+
+    #[test]
+    fn migration_failure_explains_changed_version() {
+        let message = migration_failure_message(
+            Path::new("/var/lib/seclab/agent.db"),
+            &MigrateError::VersionMismatch(2),
+        );
+
+        assert!(message.contains("migration version 2"));
+        assert!(message.contains("differs from the current migration file"));
+    }
 }
