@@ -101,6 +101,16 @@ fn rebuild_scoped_proxy_path(path_with_query: &str, node_id: &str) -> String {
 
 fn ensure_proxy_path_allowed(path_with_query: &str) -> ApiResult<()> {
     let path = path_with_query.split('?').next().unwrap_or(path_with_query);
+    if path == "/api/v1/agent/fs"
+        || path.starts_with("/api/v1/agent/fs/")
+        || path == "/api/v1/agent/files"
+        || path.starts_with("/api/v1/agent/files/")
+    {
+        return Err(ApiError::forbidden(
+            ErrorCode::AuthForbidden,
+            "file operations must use the node semantic gateway",
+        ));
+    }
     if path.starts_with("/api/v1/agent/system-monitoring/") {
         return Err(ApiError::forbidden(
             ErrorCode::AuthForbidden,
@@ -554,6 +564,13 @@ mod tests {
     #[test]
     fn semantic_system_monitoring_cannot_bypass_master_gateway() {
         assert!(ensure_proxy_path_allowed("/api/v1/agent/system-monitoring/settings").is_err());
+        assert!(ensure_proxy_path_allowed("/api/v1/agent/system/about").is_ok());
+    }
+
+    #[test]
+    fn semantic_file_api_cannot_bypass_master_gateway() {
+        assert!(ensure_proxy_path_allowed("/api/v1/agent/fs/ls?path=/").is_err());
+        assert!(ensure_proxy_path_allowed("/api/v1/agent/files/list?path=/").is_err());
         assert!(ensure_proxy_path_allowed("/api/v1/agent/system/about").is_ok());
     }
 }

@@ -169,7 +169,7 @@ async fn main() {
             }
         };
 
-        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o777))
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
             .expect("Failed to set socket file permissions");
 
         tracing::info!(

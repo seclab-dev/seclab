@@ -89,6 +89,7 @@ pub enum LogModule {
     System,
     Auth,
     Docker,
+    File,
 }
 
 impl LogModule {
@@ -98,6 +99,7 @@ impl LogModule {
             LogModule::System => "System",
             LogModule::Auth => "Auth",
             LogModule::Docker => "Docker",
+            LogModule::File => "File",
         }
     }
 }

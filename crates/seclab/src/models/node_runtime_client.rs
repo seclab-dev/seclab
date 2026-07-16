@@ -20,6 +20,7 @@ use tokio_stream::StreamExt;
 const PROXY_CONNECT_TIMEOUT_SECS: u64 = 3;
 const PROXY_REQUEST_TIMEOUT_SECS: u64 = 20;
 const PROXY_LONG_RUNNING_REQUEST_TIMEOUT_SECS: u64 = 600;
+const PROXY_FILE_STREAM_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 
 #[derive(Debug, Deserialize)]
 struct RuntimeErrorResponse {
@@ -256,6 +257,60 @@ impl NodeRuntimeClient {
         decode_domain_response(path, response).await
     }
 
+    /// 携带可信用户上下文创建领域资源或后台任务。
+    pub async fn post_domain_with_operation_context<T: DeserializeOwned, B: Serialize>(
+        &self,
+        path: &str,
+        payload: &B,
+        context: &AgentOperationContext,
+    ) -> ApiResult<T> {
+        let response = apply_operation_context(
+            self.client.post(self.build_uri(path)),
+            "user",
+            &context.actor_name,
+            Some(&context.client_ip),
+            &context.trace_id,
+        )
+        .json(payload)
+        .send()
+        .await
+        .map_err(AgentClientError::from)?;
+        decode_domain_response(path, response).await
+    }
+
+    /// 携带可信用户上下文转发文件分块或下载流。
+    pub async fn forward_streaming_with_operation_context(
+        &self,
+        method: Method,
+        path: &str,
+        mut headers: HeaderMap,
+        body: Body,
+        context: &AgentOperationContext,
+    ) -> ApiResult<Response> {
+        for name in [
+            "x-seclab-actor-kind",
+            "x-seclab-actor-name",
+            "x-seclab-client-ip",
+            "x-seclab-trace-id",
+        ] {
+            headers.remove(name);
+        }
+        headers.insert(
+            "x-seclab-actor-kind",
+            header::HeaderValue::from_static("user"),
+        );
+        for (name, value) in [
+            ("x-seclab-actor-name", context.actor_name.as_str()),
+            ("x-seclab-client-ip", context.client_ip.as_str()),
+            ("x-seclab-trace-id", context.trace_id.as_str()),
+        ] {
+            if let Ok(value) = header::HeaderValue::from_str(value) {
+                headers.insert(name, value);
+            }
+        }
+        self.forward_streaming(method, path, headers, body).await
+    }
+
     /// 携带可信用户上下文删除领域资源。
     pub async fn delete_domain_with_operation_context<T: DeserializeOwned>(
         &self,
@@ -297,7 +352,9 @@ impl NodeRuntimeClient {
             .headers(headers)
             .body(reqwest_body);
 
-        if is_long_running_request(uri_path) {
+        if is_file_content_stream(uri_path) {
+            req_builder = req_builder.timeout(Duration::from_secs(PROXY_FILE_STREAM_TIMEOUT_SECS));
+        } else if is_long_running_request(uri_path) {
             req_builder =
                 req_builder.timeout(Duration::from_secs(PROXY_LONG_RUNNING_REQUEST_TIMEOUT_SECS));
         }
@@ -376,6 +433,12 @@ fn is_long_running_request(path: &str) -> bool {
         || path.contains("/agent/docker/daemon/settings")
         || path.contains("/agent/docker/system/prune")
         || is_suite_progress_stream(path)
+}
+
+fn is_file_content_stream(path: &str) -> bool {
+    path.split('?').next().is_some_and(|value| {
+        value.contains("/agent/files/transfer/") && value.ends_with("/content")
+    })
 }
 
 fn is_suite_progress_stream(path: &str) -> bool {
@@ -575,7 +638,7 @@ fn dedupe_vary(headers: &mut HeaderMap) {
 mod tests {
     use super::{
         NodeRuntimeClient, StatusCode, apply_operation_context, decode_json_body,
-        is_long_running_request,
+        is_file_content_stream, is_long_running_request,
     };
     use crate::models::node_identities::{NodeIdentityRecord, insert_node_identity};
     use crate::models::node_sessions::{NodeSessionRecord, insert_node_session};
@@ -635,6 +698,19 @@ mod tests {
     #[test]
     fn docker_system_prune_uses_long_timeout() {
         assert!(is_long_running_request("/api/v1/agent/docker/system/prune"));
+    }
+
+    #[test]
+    fn file_download_uses_streaming_timeout() {
+        assert!(is_file_content_stream(
+            "/api/v1/agent/files/transfer/transfer-1/content"
+        ));
+        assert!(is_file_content_stream(
+            "/api/v1/agent/files/transfer/transfer-1/content?download=true"
+        ));
+        assert!(!is_file_content_stream(
+            "/api/v1/agent/files/transfer/transfer-1/detail"
+        ));
     }
 
     #[tokio::test]

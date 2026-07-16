@@ -27,19 +27,30 @@ import { formatBytes } from '@/utils/units'
 import { formatDateTime } from '@/utils/time'
 import { useFileOperations } from '@/composables/useFileOperations'
 
-const { t } = useI18n()
-const notificationStore = useNotificationStore()
-const nodeStore = useNodeStore()
-const windowStore = useWindowManagerStore()
-const fsClient = computed(() => fsApi.forNode(nodeStore.currentNodeId))
-const { mkdir, removePath, renamePath, copyPath, downloadFile, uploadFile, writeFile } =
-  useFileOperations()
-
 const props = defineProps<{
   isMaximized?: boolean
   windowId?: string
   payload?: Record<string, unknown>
 }>()
+
+const { t } = useI18n()
+const notificationStore = useNotificationStore()
+const nodeStore = useNodeStore()
+const windowStore = useWindowManagerStore()
+const targetNodeId = ref(
+  typeof props.payload?.nodeId === 'string' ? props.payload.nodeId : nodeStore.currentNodeId,
+)
+const {
+  createFile,
+  mkdir,
+  removePath,
+  renamePath,
+  runPathTask,
+  downloadFile,
+  uploadFile,
+  resumeActiveTasks,
+  resumeActiveTransfers,
+} = useFileOperations(targetNodeId)
 
 const currentPath = ref('')
 const pathInput = ref('')
@@ -48,9 +59,14 @@ const entries = ref<FsEntry[]>([])
 const selectedEntry = ref<FsEntry | null>(null)
 const selectedPaths = ref<Set<string>>(new Set())
 const listLoading = ref(false)
+const listLoaded = ref(false)
+const listLoadedAt = ref('')
+const listRequestSequence = ref(0)
 const fileOperationCount = ref(0)
 const listError = ref('')
 const fileTableRef = ref<HTMLElement | null>(null)
+const totalEntries = ref(0)
+const entryCounts = ref({ fileCount: 0, directoryCount: 0, symlinkCount: 0, otherCount: 0 })
 
 /** 每页条数选项 */
 const pageSizeOptions = computed(() => [
@@ -76,7 +92,7 @@ const columns = computed<SecLabTableColumn[]>(() => [
   { label: t('app.fileManager.size'), width: 80, slot: 'size', align: 'center' },
 ])
 const sortState = ref<{
-  prop: 'name' | 'modified' | 'size'
+  prop: 'name' | 'modifiedAt' | 'sizeBytes'
   order: 'ascending' | 'descending'
 }>({
   prop: 'name',
@@ -106,55 +122,30 @@ const breadcrumbItems = computed(() => {
   ]
 })
 
-const sortedEntries = computed(() => {
-  const { prop, order } = sortState.value
-  const direction = order === 'ascending' ? 1 : -1
-  return [...entries.value].sort((a, b) => {
-    if (a.entryType !== b.entryType) {
-      return a.entryType === 'dir' ? -1 : 1
-    }
-    if (prop === 'modified') {
-      const left = a.modified || 0
-      const right = b.modified || 0
-      if (left === right) return a.name.localeCompare(b.name)
-      return (left - right) * direction
-    }
-    if (prop === 'size') {
-      const left = a.entryType === 'dir' ? -1 : a.size || 0
-      const right = b.entryType === 'dir' ? -1 : b.size || 0
-      if (left === right) return a.name.localeCompare(b.name)
-      return (left - right) * direction
-    }
-    return a.name.localeCompare(b.name) * direction
-  })
-})
+const sortedEntries = computed(() => entries.value)
 
 const totalPages = computed(() => {
-  const total = sortedEntries.value.length
-  return Math.max(1, Math.ceil(total / pageSize.value))
+  return Math.max(1, Math.ceil(totalEntries.value / pageSize.value))
 })
 
-const pagedEntries = computed(() => {
-  const start = (currentPage.value - 1) * pageSize.value
-  return sortedEntries.value.slice(start, start + pageSize.value)
-})
+const pagedEntries = computed(() => sortedEntries.value)
 
-const currentPageStats = computed(() => {
-  let dirs = 0
-  let files = 0
-  pagedEntries.value.forEach((entry) => {
-    if (entry.entryType === 'dir') {
-      dirs += 1
-    } else {
-      files += 1
-    }
-  })
-  return { dirs, files }
-})
+const currentPageStats = computed(() => ({
+  dirs: entryCounts.value.directoryCount,
+  files: entryCounts.value.fileCount,
+}))
 
 const fileManagerBusy = computed(() => listLoading.value || fileOperationCount.value > 0)
 
+const entryKindLabel = (kind: FsEntry['kind']) => {
+  if (kind === 'directory') return t('app.fileManager.dir')
+  if (kind === 'symlink') return t('app.fileManager.symlink')
+  if (kind === 'other') return t('app.fileManager.other')
+  return t('app.fileManager.file')
+}
+
 const runFileOperation = async <T,>(operation: () => Promise<T>) => {
+  if (fileOperationCount.value > 0) return undefined
   fileOperationCount.value += 1
   try {
     return await operation()
@@ -179,29 +170,57 @@ watch(
 
 const setPath = async (path: string) => {
   const normalized = path.trim() || '/'
+  const previousPath = currentPath.value
   currentPath.value = normalized
   pathInput.value = normalized
   selectedEntry.value = null
   currentPage.value = 1
-  await loadEntries(normalized)
+  const loaded = await loadEntries(normalized)
+  if (loaded === false && currentPath.value === normalized) {
+    currentPath.value = previousPath
+    pathInput.value = previousPath || '/'
+  }
 }
 
 const loadEntries = async (path: string) => {
+  const requestSequence = ++listRequestSequence.value
+  const requestNodeId = targetNodeId.value
   listLoading.value = true
   listError.value = ''
-  selectedPaths.value.clear()
   try {
-    const res = await fsClient.value.listEntries(path, false, showHidden.value)
+    const res = await fsApi.forNode(requestNodeId).listEntries({
+      path,
+      page: currentPage.value,
+      pageSize: pageSize.value,
+      sortBy: sortState.value.prop,
+      sortOrder: sortState.value.order,
+      showHidden: showHidden.value,
+    })
+    if (requestSequence !== listRequestSequence.value || requestNodeId !== targetNodeId.value)
+      return undefined
     if (!res.success) {
       listError.value = res.message || t('app.fileManager.fetchError')
-      entries.value = []
       notificationStore.error(`${t('app.fileManager.loadError')}: ${listError.value}`)
-      return
+      return false
     }
-    entries.value = res.data || []
-    currentPage.value = 1
+    if (!res.data) return false
+    entries.value = res.data.entries
+    totalEntries.value = res.data.total
+    entryCounts.value = res.data.counts
+    listLoadedAt.value = res.data.loadedAt
+    listLoaded.value = true
+    selectedPaths.value.clear()
+    return true
+  } catch (error) {
+    if (requestSequence !== listRequestSequence.value || requestNodeId !== targetNodeId.value)
+      return undefined
+    listError.value = error instanceof Error ? error.message : t('app.fileManager.fetchError')
+    notificationStore.error(`${t('app.fileManager.loadError')}: ${listError.value}`)
+    return false
   } finally {
-    listLoading.value = false
+    if (requestSequence === listRequestSequence.value && requestNodeId === targetNodeId.value) {
+      listLoading.value = false
+    }
   }
 }
 
@@ -219,13 +238,14 @@ const selectEntry = (entry: FsEntry, e?: MouseEvent) => {
 }
 
 const openEntry = async (entry: FsEntry) => {
-  if (entry.entryType === 'dir') {
+  if (!entry.capabilities.canOpen) return
+  if (entry.kind === 'directory') {
     await setPath(entry.path)
     return
   }
   windowStore.openWindowWithPayload(
     'file-editor',
-    { path: entry.path },
+    { path: entry.path, nodeId: targetNodeId.value },
     { title: t('app.fileEditor.appName') },
   )
 }
@@ -266,7 +286,9 @@ const applyPathInput = async () => {
 
 const initHome = async () => {
   await runFileOperation(async () => {
-    const res = await fsClient.value.home()
+    const requestNodeId = targetNodeId.value
+    const res = await fsApi.forNode(requestNodeId).home()
+    if (requestNodeId !== targetNodeId.value) return
     if (res.success && res.data?.path) {
       await setPath(res.data.path)
     } else {
@@ -276,13 +298,23 @@ const initHome = async () => {
 }
 
 watch(showHidden, () => {
+  currentPage.value = 1
   void refresh()
 })
 watch(pageSize, () => {
+  if (currentPage.value === 1) {
+    void refresh()
+    return
+  }
   currentPage.value = 1
 })
+watch(currentPage, () => void refresh())
 
-void initHome()
+void initHome().then(async () => {
+  const resumed = await runFileOperation(resumeActiveTasks)
+  if (resumed) await refresh()
+  await runFileOperation(resumeActiveTransfers)
+})
 
 // Selection features
 const isSelected = (path: string) => selectedPaths.value.has(path)
@@ -305,11 +337,15 @@ const isAllSelected = computed(() => {
 const handleBatchDelete = async () => {
   if (selectedPaths.value.size === 0) return
   await runFileOperation(async () => {
-    for (const p of Array.from(selectedPaths.value)) {
-      await removePath(p, true)
+    const success = await runPathTask(
+      'remove',
+      Array.from(selectedPaths.value).map((path) => ({ path })),
+      true,
+    )
+    if (success) {
+      selectedPaths.value.clear()
+      await refresh()
     }
-    selectedPaths.value.clear()
-    await refresh()
   })
 }
 
@@ -349,25 +385,22 @@ const confirmDialog = async () => {
       success = await mkdir(path)
     } else if (type === 'file') {
       const path = `${currentDisplayPath.value}/${inputName}`.replace(/\/\//g, '/')
-      success = await writeFile(path, '')
+      success = await createFile(path, '')
     } else if (type === 'batchMove' || type === 'batchCopy') {
       const targetDir = inputName.endsWith('/') ? inputName.slice(0, -1) : inputName
-      for (const p of Array.from(selectedPaths.value)) {
-        const name = p.split('/').pop()
-        const newPath = `${targetDir}/${name}`.replace(/\/\//g, '/')
-        if (type === 'batchMove') {
-          success = await renamePath(p, newPath)
-        } else {
-          success = await copyPath(p, newPath)
-        }
-      }
+      success = await runPathTask(
+        type === 'batchMove' ? 'move' : 'copy',
+        Array.from(selectedPaths.value).map((path) => ({ path })),
+        true,
+        targetDir,
+      )
       if (success) {
         selectedPaths.value.clear()
       }
     } else if (type === 'rename' && targetEntry) {
       const parent = targetEntry.path.substring(0, targetEntry.path.lastIndexOf('/'))
       const newPath = `${parent}/${inputName}`.replace(/\/\//g, '/')
-      success = await renamePath(targetEntry.path, newPath)
+      success = await renamePath(targetEntry.path, newPath, targetEntry.revision)
     }
 
     if (success) {
@@ -390,12 +423,13 @@ const onFileChange = async (e: Event) => {
   target.value = ''
 }
 const handleDownload = async (entry: FsEntry) => {
-  if (entry.entryType === 'dir') return
-  await runFileOperation(() => downloadFile(entry.path, entry.name))
+  if (!entry.capabilities.canDownload) return
+  await runFileOperation(() => downloadFile(entry.path, entry.name, entry.revision))
 }
 const handleDelete = async (entry: FsEntry) => {
+  if (!entry.capabilities.canRemove) return
   await runFileOperation(async () => {
-    const success = await removePath(entry.path, true)
+    const success = await removePath(entry.path, true, entry.revision)
     if (success) {
       selectedPaths.value.delete(entry.path)
       await refresh()
@@ -424,11 +458,20 @@ onUnmounted(() => document.removeEventListener('click', hideContextMenu))
 </script>
 
 <template>
-  <section class="file-manager" data-seclab-app="file-manager">
+  <section
+    class="file-manager"
+    data-page="file-manager"
+    data-seclab-app="file-manager"
+    :data-node-id="targetNodeId"
+    :data-loaded-at="listLoadedAt"
+  >
     <div class="toolbar" data-slot="header" data-ui="file-manager-toolbar">
       <div class="path-bar">
         <div class="sl-input-group">
           <SecLabInput
+            id="file-manager-path"
+            name="fileManagerPath"
+            data-ui="file-path-input"
             v-model="pathInput"
             class="path-input"
             :placeholder="t('app.fileManager.path')"
@@ -452,8 +495,15 @@ onUnmounted(() => document.removeEventListener('click', hideContextMenu))
         <SecLabButton type="secondary" @click="triggerUpload">{{
           t('app.fileManager.upload')
         }}</SecLabButton>
-        <input type="file" ref="fileInput" @change="onFileChange" style="display: none" />
-        <SecLabButton type="primary" @click="refresh">{{
+        <input
+          id="file-manager-upload"
+          ref="fileInput"
+          name="fileManagerUpload"
+          type="file"
+          style="display: none"
+          @change="onFileChange"
+        />
+        <SecLabButton type="primary" data-ui="file-refresh" @click="refresh">{{
           t('app.fileManager.refresh')
         }}</SecLabButton>
       </div>
@@ -520,7 +570,7 @@ onUnmounted(() => document.removeEventListener('click', hideContextMenu))
             >
               <SecLabIcon
                 class="entry-icon"
-                :name="row.entryType === 'dir' ? 'folder' : 'file'"
+                :name="row.kind === 'directory' ? 'folder' : 'file'"
                 :size="18"
               />
               <span class="entry-name-text">{{ row.name }}</span>
@@ -528,18 +578,18 @@ onUnmounted(() => document.removeEventListener('click', hideContextMenu))
           </template>
 
           <template #type="{ row }: { row: any }">
-            <SecLabTag :type="row.entryType === 'dir' ? 'success' : 'info'">
-              {{ row.entryType === 'dir' ? t('app.fileManager.dir') : t('app.fileManager.file') }}
+            <SecLabTag :type="row.kind === 'directory' ? 'success' : 'info'">
+              {{ entryKindLabel(row.kind) }}
             </SecLabTag>
           </template>
 
           <template #mtime="{ row }: { row: any }">
-            <span class="sl-text-secondary">{{ formatDateTime(row.modified) }}</span>
+            <span class="sl-text-secondary">{{ formatDateTime(row.modifiedAt) }}</span>
           </template>
 
           <template #size="{ row }: { row: any }">
             <span class="sl-text-secondary">
-              {{ row.entryType === 'dir' ? '-' : formatBytes(row.size) }}
+              {{ row.kind === 'directory' ? '-' : formatBytes(row.sizeBytes || 0) }}
             </span>
           </template>
 
@@ -555,7 +605,7 @@ onUnmounted(() => document.removeEventListener('click', hideContextMenu))
             t('app.fileManager.pageStats', {
               currentPage: currentPage,
               totalPages: totalPages,
-              total: sortedEntries.length,
+              total: totalEntries,
             })
           }}
         </div>
@@ -597,6 +647,7 @@ onUnmounted(() => document.removeEventListener('click', hideContextMenu))
         type="button"
         class="context-menu-btn"
         data-ui="file-open-btn"
+        :disabled="!contextMenu.entry?.capabilities.canOpen"
         @click="
           () => {
             contextMenu.entry && openEntry(contextMenu.entry)
@@ -610,6 +661,7 @@ onUnmounted(() => document.removeEventListener('click', hideContextMenu))
         type="button"
         class="context-menu-btn"
         data-ui="file-rename-btn"
+        :disabled="!contextMenu.entry?.capabilities.canRename"
         @click="
           () => {
             contextMenu.entry && openDialog('rename', contextMenu.entry)
@@ -620,7 +672,7 @@ onUnmounted(() => document.removeEventListener('click', hideContextMenu))
         {{ t('app.fileManager.rename') }}
       </button>
       <button
-        v-if="contextMenu.entry?.entryType !== 'dir'"
+        v-if="contextMenu.entry?.capabilities.canDownload"
         type="button"
         class="context-menu-btn"
         data-ui="file-download-btn"
@@ -650,6 +702,7 @@ onUnmounted(() => document.removeEventListener('click', hideContextMenu))
         type="button"
         class="context-menu-btn file-context-danger"
         data-ui="file-delete-btn"
+        :disabled="!contextMenu.entry?.capabilities.canRemove"
         @click="
           () => {
             contextMenu.entry && handleDelete(contextMenu.entry)
@@ -669,6 +722,8 @@ onUnmounted(() => document.removeEventListener('click', hideContextMenu))
     >
       <div style="padding-top: 10px">
         <SecLabInput
+          id="file-manager-dialog-input"
+          name="fileManagerDialogInput"
           v-model="dialogState.inputName"
           :placeholder="
             dialogState.type.startsWith('batch')
@@ -688,7 +743,11 @@ onUnmounted(() => document.removeEventListener('click', hideContextMenu))
       </template>
     </SecLabDialog>
 
-    <SecLabLoading :loading="listLoading" :text="t('app.fileManager.loading')" cover />
+    <SecLabLoading
+      :loading="listLoading && !listLoaded"
+      :text="t('app.fileManager.loading')"
+      cover
+    />
   </section>
 </template>
 

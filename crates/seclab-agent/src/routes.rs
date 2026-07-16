@@ -30,7 +30,7 @@ use tracing::info_span;
 pub fn state_api_router() -> Router<Arc<AppState>> {
     Router::new()
         .nest("/docker", docker::docker_router())
-        .nest("/fs", fs::fs_router())
+        .nest("/files", fs::fs_router())
         .nest("/terminal", host_terminal::host_terminal_router())
         .nest("/runtime-logs", runtime_logs::runtime_log_router())
         .nest("/system", system::system_router())
@@ -59,6 +59,7 @@ pub async fn create_router() -> Result<(Router, DbPool)> {
     let system_monitoring =
         Arc::new(monitoring_service::SystemMonitoringRuntime::load(&pool).await?);
     docker_project_tasks::initialize(&pool).await?;
+    crate::services::file_tasks::initialize(&pool).await?;
 
     // 初始化 Docker 客户端，连接失败时仅记录日志
     let (docker, docker_status) = AppState::init_docker_state().await;
@@ -79,6 +80,7 @@ pub async fn create_router() -> Result<(Router, DbPool)> {
     docker_stats::spawn_stats_collector(Arc::clone(&app_state));
     docker_activity::spawn_retention_worker(app_state.metadata_db.clone());
     docker_project_tasks::spawn_retention_worker(app_state.metadata_db.clone());
+    crate::services::file_transfers::spawn_retention_worker(app_state.metadata_db.clone());
     monitoring_service::spawn_sampler(app_state.metadata_db.clone(), system_monitoring);
     task_scheduler::spawn_scheduler(Arc::clone(&app_state));
 

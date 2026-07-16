@@ -13,6 +13,11 @@ export function handleAxiosError(error: AxiosError): ApiResponse<null> {
     message = i18n.global.t(messageKey)
   }
 
+  const errorCodeKey = errorCode ? `api.errors.${errorCode}` : ''
+  if (!message && errorCodeKey && i18n.global.te(errorCodeKey)) {
+    message = i18n.global.t(errorCodeKey)
+  }
+
   if (!message && responseData) {
     if (typeof responseData.message === 'string') {
       message = responseData.message

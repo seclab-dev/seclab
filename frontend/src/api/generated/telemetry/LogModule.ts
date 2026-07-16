@@ -3,4 +3,4 @@
 /**
  * 统一日志业务模块。
  */
-export type LogModule = "System" | "Auth" | "Docker";
+export type LogModule = "System" | "Auth" | "Docker" | "File";

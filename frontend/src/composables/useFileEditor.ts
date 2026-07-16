@@ -1,11 +1,10 @@
 /**
  * @file useFileEditor.ts
- * @description 封装文件编辑器加载/保存逻辑及状态管理。
+ * @description 封装固定节点上的文件编辑器加载、乐观并发保存和最新请求状态。
  */
-import { computed } from 'vue'
+import { computed, type Ref } from 'vue'
 import { fsApi } from '@/api/modules/fs'
 import { useNotificationStore } from '@/stores/notification'
-import { useNodeStore } from '@/stores/node'
 import { useI18n } from 'vue-i18n'
 
 export interface EditorTab {
@@ -13,70 +12,81 @@ export interface EditorTab {
   name: string
   content: string
   originalContent: string
+  revision: string
   isDirty: boolean
   fileSize: number
   isLoaded: boolean
   isLoading: boolean
+  isSaving: boolean
+  requestSequence: number
   error?: string
 }
 
-export function useFileEditor() {
-  const nodeStore = useNodeStore()
+export function useFileEditor(nodeId: Readonly<Ref<string>>) {
   const notificationStore = useNotificationStore()
   const { t } = useI18n()
-  const fsClient = computed(() => fsApi.forNode(nodeStore.currentNodeId))
+  const fsClient = computed(() => fsApi.forNode(nodeId.value))
 
   const loadFileContent = async (tab: EditorTab) => {
+    const requestSequence = ++tab.requestSequence
+    const requestNodeId = nodeId.value
     tab.isLoading = true
     tab.error = ''
     try {
-      const res = await fsClient.value.readFile(tab.path)
+      const res = await fsApi.forNode(requestNodeId).readFile(tab.path)
+      if (requestSequence !== tab.requestSequence || requestNodeId !== nodeId.value) return
       if (!res.success || !res.data) {
         tab.error = res.message || t('app.fileEditor.loadError')
-      } else if (!res.data.isText) {
-        tab.error = t('app.fileEditor.previewUnsupported')
       } else {
         tab.content = res.data.content
         tab.originalContent = res.data.content
+        tab.revision = res.data.revision
+        tab.fileSize = res.data.sizeBytes
         tab.isLoaded = true
-        // Try to estimate file size if not provided by ls
-        if (!tab.fileSize) {
-          tab.fileSize = new Blob([res.data.content]).size
-        }
+        tab.isDirty = false
       }
-    } catch (e: unknown) {
-      tab.error = (e instanceof Error ? e.message : String(e)) || t('app.fileEditor.loadError')
+    } catch (error) {
+      if (requestSequence !== tab.requestSequence || requestNodeId !== nodeId.value) return
+      tab.error = error instanceof Error ? error.message : t('app.fileEditor.loadError')
     } finally {
-      tab.isLoading = false
+      if (requestSequence === tab.requestSequence && requestNodeId === nodeId.value) {
+        tab.isLoading = false
+      }
     }
   }
 
   const saveFileContent = async (tab: EditorTab) => {
-    if (!tab.isDirty || tab.isLoading) return false
+    if (!tab.isDirty || tab.isLoading || tab.isSaving) return false
 
+    const contentToSave = tab.content
+    tab.isSaving = true
     try {
       const res = await fsClient.value.writeFile({
         path: tab.path,
-        content: tab.content,
-        overwrite: true,
+        content: contentToSave,
+        expectedRevision: tab.revision,
       })
-      if (!res.success) {
+      if (!res.success || !res.data) {
         notificationStore.error(
           t('app.fileEditor.saveFailed', { message: res.message || t('app.common.unknownError') }),
         )
         return false
       }
-      tab.originalContent = tab.content
-      tab.isDirty = false
+      tab.originalContent = contentToSave
+      tab.fileSize = res.data.sizeBytes
+      tab.revision = res.data.revision
+      tab.isDirty = tab.content !== contentToSave
       notificationStore.success(t('app.fileEditor.saveSuccess'))
       return true
-    } catch (e: unknown) {
+    } catch (error) {
       notificationStore.error(
         t('app.fileEditor.saveFailed', {
-          message: (e instanceof Error ? e.message : String(e)) || t('app.common.unknownError'),
+          message: error instanceof Error ? error.message : t('app.common.unknownError'),
         }),
       )
       return false
+    } finally {
+      tab.isSaving = false
     }
   }
 

@@ -1,8 +1,8 @@
 //! 路由注册：挂载所有 API 子路由并拼装主路由器。
 
 use super::{
-    apps, auth, desktop_apps, docker, nodes, notifications, platform, runtime, scripts, seclab,
-    security, suites, system_monitoring, task_scheduler, terminal, upgrades,
+    apps, auth, desktop_apps, docker, files, nodes, notifications, platform, runtime, scripts,
+    seclab, security, suites, system_monitoring, task_scheduler, terminal, upgrades,
 };
 use crate::api::node_proxy;
 use crate::db::init_db_pool;
@@ -38,6 +38,7 @@ pub fn state_api_router(app_state: Arc<AppState>) -> Router<Arc<AppState>> {
         .nest("/node", nodes::single_node_router())
         .nest("/node", system_monitoring::system_monitoring_router())
         .nest("/node", terminal::terminal_router())
+        .nest("/node", files::file_router())
         .nest("/agent", node_proxy::agent_router())
         .nest("/seclab", seclab::seclab_router())
         .nest("/docker", docker::docker_router())
@@ -95,6 +96,7 @@ pub async fn create_router() -> Result<(Router, crate::state::DbPool)> {
     crate::services::upgrades::spawn_upgrade_scheduler(Arc::clone(&app_state));
     crate::services::node_read_model::spawn_local_node_monitor(Arc::clone(&app_state));
     crate::services::task_sync::spawn_sync_queue_worker(Arc::clone(&app_state));
+    crate::services::file_task_audit::spawn_reconciler(Arc::clone(&app_state));
 
     // 配置 CORS：允许所有来源、常用方法
     let cors = CorsLayer::new()

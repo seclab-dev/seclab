@@ -1,62 +1,88 @@
 import http from '@/api'
-import type { FsEntry, HomeResponse, ReadResponse, UploadResult } from '../interface/fs'
+import type {
+  CreateFileOperationTaskRequest,
+  CreateFileTransferRequest,
+  FileContent,
+  FileListPage,
+  FileOperationTask,
+  FileTransfer,
+  FsEntry,
+  HomeResponse,
+} from '../interface/fs'
 
-const buildFsPath = (path: string, nodeId?: string) => {
-  if (!nodeId || nodeId === 'local') {
-    return path
-  }
-  return `/node/${encodeURIComponent(nodeId)}${path}`
-}
+const nodePath = (nodeId: string, path: string) =>
+  `/node/${encodeURIComponent(nodeId)}/${path.replace(/^\/+/, '')}`
 
-const createScopedFsApi = (nodeId?: string) => ({
-  listEntries: (path: string, recursive = false, showHidden = false) => {
-    return http.get<FsEntry[]>(buildFsPath('/agent/fs/ls', nodeId), { path, recursive, showHidden })
-  },
-  home: () => {
-    return http.get<HomeResponse>(buildFsPath('/agent/fs/home', nodeId))
-  },
-  readFile: (path: string) => {
-    return http.get<ReadResponse>(buildFsPath('/agent/fs/read', nodeId), { path })
-  },
-  writeFile: (payload: {
+/** 为固定节点创建文件管理 API，避免窗口跟随全局节点切换。 */
+const createScopedFsApi = (nodeId: string) => ({
+  listEntries: (params: {
     path: string
-    content: string
-    createIfMissing?: boolean
-    overwrite?: boolean
-  }) => {
-    return http.post<null>(buildFsPath('/agent/fs/write', nodeId), payload)
-  },
-  mkdir: (payload: { path: string; recursive?: boolean }) => {
-    return http.post<null>(buildFsPath('/agent/fs/mkdir', nodeId), payload)
-  },
-  removePath: (payload: { path: string; recursive?: boolean }) => {
-    return http.post<null>(buildFsPath('/agent/fs/remove', nodeId), payload)
-  },
-  renamePath: (payload: { from: string; to: string; overwrite?: boolean }) => {
-    return http.post<null>(buildFsPath('/agent/fs/rename', nodeId), payload)
-  },
-  copyPath: (payload: { from: string; to: string; overwrite?: boolean }) => {
-    return http.post<null>(buildFsPath('/agent/fs/copy', nodeId), payload)
-  },
-  uploadFile: (targetPath: string, data: FormData, overwrite = false) => {
-    return http.upload<UploadResult>(
-      `${buildFsPath('/agent/fs/upload', nodeId)}?path=${encodeURIComponent(targetPath)}`,
-      data,
+    page: number
+    pageSize: number
+    sortBy: 'name' | 'modifiedAt' | 'sizeBytes'
+    sortOrder: 'ascending' | 'descending'
+    showHidden: boolean
+  }) =>
+    http.get<FileListPage>(nodePath(nodeId, 'files/list'), {
+      ...params,
+      sortOrder: params.sortOrder === 'ascending' ? 'asc' : 'desc',
+    }),
+  home: () => http.get<HomeResponse>(nodePath(nodeId, 'files/home')),
+  detail: (path: string) => http.get<FsEntry>(nodePath(nodeId, 'file/detail'), { path }),
+  readFile: (path: string) => http.get<FileContent>(nodePath(nodeId, 'file/content'), { path }),
+  createFile: (payload: { path: string; content?: string }) =>
+    http.post<FsEntry>(nodePath(nodeId, 'files'), payload),
+  writeFile: (payload: { path: string; content: string; expectedRevision: string }) =>
+    http.put<FileContent>(nodePath(nodeId, 'file/content'), payload),
+  mkdir: (payload: { path: string; recursive: boolean }) =>
+    http.post<FsEntry>(nodePath(nodeId, 'directories'), payload),
+  createTask: (payload: CreateFileOperationTaskRequest) =>
+    http.post<FileOperationTask>(nodePath(nodeId, 'file-operation-tasks'), payload),
+  taskDetail: (taskId: string) =>
+    http.get<FileOperationTask>(
+      nodePath(nodeId, `file-operation-task/${encodeURIComponent(taskId)}/detail`),
+    ),
+  activeTasks: () => http.get<FileOperationTask[]>(nodePath(nodeId, 'file-operation-tasks/active')),
+  cancelTask: (taskId: string) =>
+    http.post<FileOperationTask>(
+      nodePath(nodeId, `file-operation-task/${encodeURIComponent(taskId)}/cancel`),
+    ),
+  createTransfer: (payload: CreateFileTransferRequest) =>
+    http.post<FileTransfer>(nodePath(nodeId, 'file-transfers'), payload),
+  transferDetail: (transferId: string) =>
+    http.get<FileTransfer>(
+      nodePath(nodeId, `file-transfer/${encodeURIComponent(transferId)}/detail`),
+    ),
+  activeTransfers: () => http.get<FileTransfer[]>(nodePath(nodeId, 'file-transfers/active')),
+  uploadChunk: (
+    transferId: string,
+    chunk: ArrayBuffer,
+    start: number,
+    end: number,
+    total: number,
+  ) =>
+    http.put<FileTransfer>(
+      nodePath(nodeId, `file-transfer/${encodeURIComponent(transferId)}/chunk`),
+      chunk,
       {
-        params: { overwrite },
-        headers: { 'Content-Type': 'multipart/form-data' },
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'Content-Range': `bytes ${start}-${end}/${total}`,
+        },
       },
-    )
-  },
-  downloadFile: (path: string) => {
-    return http.get<Blob>(
-      buildFsPath('/agent/fs/download', nodeId),
-      { path },
-      { responseType: 'blob' },
-    )
-  },
+    ),
+  completeTransfer: (transferId: string) =>
+    http.post<FileTransfer>(
+      nodePath(nodeId, `file-transfer/${encodeURIComponent(transferId)}/complete`),
+    ),
+  cancelTransfer: (transferId: string) =>
+    http.post<FileTransfer>(
+      nodePath(nodeId, `file-transfer/${encodeURIComponent(transferId)}/cancel`),
+    ),
+  downloadUrl: (transferId: string) =>
+    `/api/v1${nodePath(nodeId, `file-transfer/${encodeURIComponent(transferId)}/content`)}`,
 })
 
-export const fsApi = Object.assign(createScopedFsApi(), {
+export const fsApi = {
   forNode: createScopedFsApi,
-})
+}

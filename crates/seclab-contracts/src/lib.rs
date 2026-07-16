@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod files;
 pub mod logging;
 pub mod monitoring;
 pub mod notification;

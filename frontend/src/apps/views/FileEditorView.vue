@@ -8,6 +8,7 @@ import { useI18n } from 'vue-i18n'
 import MonacoEditor from '@/components/editor/MonacoEditor.vue'
 import { useFileEditor, type EditorTab } from '@/composables/useFileEditor'
 import { useWindowManagerStore } from '@/stores/window-manager'
+import { useNodeStore } from '@/stores/node'
 import { SecLabButton, SecLabTag, SecLabSwitch, SecLabDialog } from '@/components/ui'
 import SecLabIcon from '@/components/icons/SecLabIcon.vue'
 
@@ -15,12 +16,15 @@ const props = defineProps<{
   windowId?: string
   payload?: {
     path?: string
+    nodeId?: string
   }
 }>()
 
 const { t } = useI18n()
 const windowStore = useWindowManagerStore()
-const { loadFileContent, saveFileContent } = useFileEditor()
+const nodeStore = useNodeStore()
+const targetNodeId = ref(props.payload?.nodeId || nodeStore.currentNodeId)
+const { loadFileContent, saveFileContent } = useFileEditor(targetNodeId)
 
 const tabs = ref<EditorTab[]>([])
 const activePath = ref('')
@@ -47,10 +51,13 @@ const openTab = async (path: string) => {
     name,
     content: '',
     originalContent: '',
+    revision: '',
     isDirty: false,
     fileSize: 0,
     isLoaded: false,
     isLoading: true,
+    isSaving: false,
+    requestSequence: 0,
   }
   tabs.value.push(newTab)
   activePath.value = path
@@ -151,7 +158,12 @@ watch(
 </script>
 
 <template>
-  <div class="file-editor-app" data-seclab-app="file-editor">
+  <div
+    class="file-editor-app"
+    data-page="file-editor"
+    data-seclab-app="file-editor"
+    :data-node-id="targetNodeId"
+  >
     <!-- Tab 栏 -->
     <div class="tabs-header" v-if="tabs.length > 0" data-ui="editor-tabs">
       <div
@@ -194,7 +206,7 @@ watch(
         <SecLabButton
           type="primary"
           size="small"
-          :disabled="!activeTab || !activeTab.isDirty || activeTab.isLoading"
+          :disabled="!activeTab || !activeTab.isDirty || activeTab.isLoading || activeTab.isSaving"
           @click="() => handleSave()"
         >
           {{ t('app.fileEditor.save') }}
