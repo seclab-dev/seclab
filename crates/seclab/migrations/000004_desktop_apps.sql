@@ -72,8 +72,7 @@ VALUES
     ('firewall-manager', 'app.firewallManager.appName', '/images/apps/firewall-manager.png', 1024, 720, 860, 560, 0, 100),
     ('task-scheduler', 'app.taskScheduler.appName', '/images/apps/task-scheduler.png', 1024, 720, 860, 560, 0, 110),
     ('script-manager', 'app.scriptManager.appName', '/images/apps/script-manager.png', 1024, 720, 860, 560, 0, 120),
-    ('web-browser', 'app.webBrowser.appName', '/images/apps/web-browser.png', 960, 600, 400, 300, 0, 130),
-    ('operation-log', 'app.operationLog.appName', '/images/apps/platform-log.png', 1024, 720, 860, 560, 0, 140),
-    ('runtime-log', 'app.runtimeLog.appName', '/images/apps/runtime-log.png', 1024, 720, 860, 560, 0, 150),
-    ('notification-history', 'app.notificationHistory.appName', '/images/apps/notification-history.png', 1024, 720, 860, 560, 0, 160),
-    ('settings', 'app.settings.appName', '/images/apps/settings.png', 1024, 720, 860, 560, 0, 170);
+    ('operation-log', 'app.operationLog.appName', '/images/apps/platform-log.png', 1024, 720, 860, 560, 0, 130),
+    ('runtime-log', 'app.runtimeLog.appName', '/images/apps/runtime-log.png', 1024, 720, 860, 560, 0, 140),
+    ('notification-history', 'app.notificationHistory.appName', '/images/apps/notification-history.png', 1024, 720, 860, 560, 0, 150),
+    ('settings', 'app.settings.appName', '/images/apps/settings.png', 1024, 720, 860, 560, 0, 160);

@@ -273,7 +273,7 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
       const appId = item.appId as AppId
       let config = availableAppsState[appId]
       if (!config && item.sourceType === 'suite') {
-        const suiteWebApp = availableAppsState['suite-web-app'] ?? availableAppsState['web-browser']
+        const suiteWebApp = availableAppsState['suite-web-app']
         if (!suiteWebApp) return
         config = reactive({
           ...suiteWebApp,

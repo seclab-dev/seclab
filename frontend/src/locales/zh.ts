@@ -2545,15 +2545,6 @@ const zh: typeof en = {
         commError: '[错误] 执行通信失败: {error}',
       },
     },
-    webBrowser: {
-      appName: 'Web 浏览器',
-      placeholder: '请输入 URL 或虚拟地址进行沙箱访问...',
-      back: '后退',
-      forward: '前进',
-      refresh: '刷新页面',
-      welcome:
-        '欢迎使用 SecLab 安全沙箱浏览器。您可以在上方地址栏输入目标 IP 或域名进行测绘代理访问。',
-    },
     suiteWebApp: {
       appName: '套件应用',
       loading: '正在加载...',

@@ -2593,15 +2593,6 @@ const en = {
         commError: '[Error] Execution communication failed: {error}',
       },
     },
-    webBrowser: {
-      appName: 'Web Browser',
-      placeholder: 'Enter URL or virtual address for sandbox access...',
-      back: 'Go back',
-      forward: 'Go forward',
-      refresh: 'Refresh page',
-      welcome:
-        'Welcome to SecLab Secure Sandbox Browser. Enter a target IP or domain in the address bar for mapped proxy access.',
-    },
     suiteWebApp: {
       appName: 'Suite App',
       loading: 'Loading...',
