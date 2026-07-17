@@ -9,7 +9,7 @@ use crate::{
     },
     services::{
         file_task_audit::{self, NewFileTaskAudit, NewFileTransferAudit},
-        logging::{self, PlatformLogEntry},
+        logging::{self, OperationEventBuilder},
         node_state_machine,
     },
     state::AppState,
@@ -657,7 +657,7 @@ fn record_sync_operation<T>(
         (LogStatus::Success, PlatformLogLevel::Info)
     };
     let error_code = result.as_ref().err().map(|error| error.code.as_str());
-    PlatformLogEntry::new(&admin.username, log.event, client_ip)
+    OperationEventBuilder::new(&admin.username, log.event, client_ip)
         .user_id(admin.id).module(LogModule::File).target_type("file").target_id(log.target)
         .trace_id(&logging::resolve_trace_id(headers)).source("seclab_api")
         .request(log.method, "/api/v1/node/{node_id}/files")

@@ -8,7 +8,7 @@ use seclab_contracts::{
     },
     files::{FileDocument, FileSaveResult, UpdateFileContentRequest},
     firewall::{FirewallRuleDetail, FirewallRuleListPage},
-    logging::{PlatformLog, PlatformLogList, PlatformLogQuery},
+    logging::{OperationLogDetail, OperationLogPage, OperationLogQuery, OperationLogSummary},
     monitoring::{SystemMonitoringOverview, SystemMonitoringSeriesPage, SystemMonitoringSettings},
     notification::{
         NotificationBatchDeletePayload, NotificationCreatePayload, NotificationLevel,
@@ -18,7 +18,9 @@ use seclab_contracts::{
         NetworkConnectionListPage, ProcessActionRequest, ProcessForceKillConfirmation,
         ProcessListPage, ProcessSignalResult,
     },
-    runtime_logs::{RuntimeLogFile, RuntimeLogLine, RuntimeLogQuery, RuntimeLogQueryResult},
+    runtime_logs::{
+        RuntimeLogFile, RuntimeLogFileList, RuntimeLogLine, RuntimeLogQuery, RuntimeLogQueryResult,
+    },
     scheduled_tasks::{
         CreateScheduledTaskBatchRequest, CreateScheduledTaskMigrationRequest,
         CreateScheduledTaskRequest, ScheduledTaskBatch, ScheduledTaskDetail, ScheduledTaskListPage,
@@ -30,7 +32,6 @@ use seclab_contracts::{
         ScriptRunOutputPage, ScriptRunPage, UpdateScriptRequest,
     },
     seclab::{SeclabNetworkConfig, SeclabNetworkUpdateResult},
-    telemetry::{LogModule, LogStatus},
     terminal::{TerminalAccess, TerminalClientMessage, TerminalServerMessage},
 };
 use std::path::Path;
@@ -77,11 +78,10 @@ fn export_contract_bindings() {
     export_type::<FirewallRuleDetail>(&cfg);
     export_type::<SeclabNetworkConfig>(&cfg);
     export_type::<SeclabNetworkUpdateResult>(&cfg);
-    export_type::<LogStatus>(&cfg);
-    export_type::<LogModule>(&cfg);
-    export_type::<PlatformLog>(&cfg);
-    export_type::<PlatformLogQuery>(&cfg);
-    export_type::<PlatformLogList>(&cfg);
+    export_type::<OperationLogSummary>(&cfg);
+    export_type::<OperationLogDetail>(&cfg);
+    export_type::<OperationLogQuery>(&cfg);
+    export_type::<OperationLogPage>(&cfg);
     export_type::<SystemMonitoringOverview>(&cfg);
     export_type::<SystemMonitoringSeriesPage>(&cfg);
     export_type::<SystemMonitoringSettings>(&cfg);
@@ -97,6 +97,7 @@ fn export_contract_bindings() {
     export_type::<ProcessForceKillConfirmation>(&cfg);
     export_type::<ProcessSignalResult>(&cfg);
     export_type::<RuntimeLogFile>(&cfg);
+    export_type::<RuntimeLogFileList>(&cfg);
     export_type::<RuntimeLogQuery>(&cfg);
     export_type::<RuntimeLogLine>(&cfg);
     export_type::<RuntimeLogQueryResult>(&cfg);

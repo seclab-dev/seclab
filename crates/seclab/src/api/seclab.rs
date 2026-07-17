@@ -7,7 +7,7 @@ use crate::models::node_runtime_client::NodeRuntimeClient;
 use crate::models::node_sessions::get_active_session_by_node_id;
 use crate::runtime_config::{self, ListenConfig};
 use crate::services::logging;
-use crate::services::logging::PlatformLogEntry;
+use crate::services::logging::OperationEventBuilder;
 use crate::services::node_deploy::detect_lan_ip_sync;
 use crate::services::node_provisioning;
 use crate::services::runtime_metrics;
@@ -101,7 +101,7 @@ async fn update_network(
     let trace_id = logging::resolve_trace_id(&headers);
     let before = runtime_config::get_active_config();
     let base_platform_log =
-        PlatformLogEntry::new(&admin.username, "seclab_network_update", client_ip)
+        OperationEventBuilder::new(&admin.username, "seclab_network_update", client_ip)
             .module(LogModule::System)
             .target_type("seclab")
             .target_id("network")
@@ -133,7 +133,9 @@ async fn update_network(
     // A) 监听地址防篡改强校验（必须为 :: 或 0.0.0.0 或活跃网卡 IP）
     let active_ips = get_active_system_ips().await;
     if payload.host != "::" && payload.host != "0.0.0.0" && !active_ips.contains(&payload.host) {
-        let err = ApiError::BadRequest("检测到监听地址被篡改或绑定的网卡不可用".to_string());
+        let err = ApiError::BadRequest(
+            "The listen address is invalid or its network interface is unavailable".to_string(),
+        );
         base_platform_log
             .metadata(build_platform_log_metadata(
                 &before,
@@ -149,7 +151,7 @@ async fn update_network(
         let trimmed = ph.trim();
         if !trimmed.is_empty() {
             if trimmed.contains("://") || trimmed.contains('/') || trimmed.contains(':') {
-                let err = ApiError::BadRequest("默认访问地址格式错误，必须为合法的 IP 或域名，且不能包含 http://, https:// 等协议头或端口号".to_string());
+                let err = ApiError::BadRequest("The public host must be a valid IP address or domain without a scheme, path, or port".to_string());
                 base_platform_log
                     .metadata(build_platform_log_metadata(
                         &before,
@@ -171,7 +173,7 @@ async fn update_network(
 
             if duplicate_exists {
                 let err = ApiError::BadRequest(
-                    "默认访问地址不可与已存在的被纳管节点 SSH 通信地址重复".to_string(),
+                    "The public host must not duplicate an existing node SSH address".to_string(),
                 );
                 base_platform_log
                     .metadata(build_platform_log_metadata(
@@ -429,7 +431,7 @@ async fn record_node_seclab_url_sync_event(
     } else {
         crate::models::logging::LogStatus::Success
     };
-    PlatformLogEntry::new(context.username, "node_seclab_url_sync", context.client_ip)
+    OperationEventBuilder::new(context.username, "node_seclab_url_sync", context.client_ip)
         .module(LogModule::System)
         .target_type("node")
         .target_id(&record.node_id)
@@ -579,8 +581,8 @@ async fn get_network_interfaces(
 ) -> ApiResult<impl IntoResponse> {
     let interfaces = get_active_system_interfaces().await;
     let mut response = vec![
-        json!({ "name": "any_dual", "ip": "::", "label": "IPv6 & IPv4 双栈泛监听 (::)" }),
-        json!({ "name": "any_v4", "ip": "0.0.0.0", "label": "IPv4 泛监听 (0.0.0.0)" }),
+        json!({ "name": "any_dual", "ip": "::", "label": "IPv6 & IPv4 wildcard (::)" }),
+        json!({ "name": "any_v4", "ip": "0.0.0.0", "label": "IPv4 wildcard (0.0.0.0)" }),
     ];
     for (ifname, ip) in interfaces {
         if ip != "::1" && ip != "127.0.0.1" {

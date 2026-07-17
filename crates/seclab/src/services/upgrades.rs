@@ -1934,7 +1934,7 @@ async fn record_event(
         }
     }
 
-    crate::services::logging::PlatformLogEntry::new(
+    crate::services::logging::OperationEventBuilder::new(
         &username,
         &format!("upgrade_{}", event_type),
         client_ip,

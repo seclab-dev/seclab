@@ -11,6 +11,7 @@ pub mod file_tasks;
 pub mod file_transfers;
 pub mod files;
 pub mod host_terminal;
+pub mod operation_outbox;
 pub mod pcap;
 pub mod process_manager;
 pub mod runtime_logs;

@@ -1,13 +1,13 @@
 //! Docker API 聚合：容器、镜像、网络与统计子路由。
 
 use crate::models::docker;
-use crate::services::{docker_activity, docker_stats};
+use crate::services::docker_stats;
 use crate::state::AppState;
 use crate::types::{ApiResponse, ApiResult};
 
 use axum::{
     Router,
-    extract::{Json, State},
+    extract::State,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
@@ -168,15 +168,6 @@ pub async fn status(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
         docker_status,
     };
     Ok(ApiResponse::success_with_raw("Docker status loaded", Some(summary)).into_response())
-}
-
-/// 查询 Docker 操作日志。
-pub async fn activity_logs(
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<docker::DockerActivityLogQuery>,
-) -> ApiResult<Response> {
-    let page = docker_activity::query(&state.metadata_db, payload).await?;
-    Ok(ApiResponse::success_with_raw("Docker activity logs loaded", Some(page)).into_response())
 }
 
 /// 构建 Docker 子模块的路由集合。
@@ -343,7 +334,6 @@ pub fn docker_router() -> Router<Arc<AppState>> {
         )
         .route("/system/df", get(system::system_df))
         .route("/system/prune", post(system::system_prune))
-        .route("/activity-logs/query", post(activity_logs))
         .layer(axum::middleware::from_fn(context::operation_context_layer))
 }
 

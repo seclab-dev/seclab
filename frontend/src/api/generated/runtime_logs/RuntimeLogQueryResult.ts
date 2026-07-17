@@ -4,4 +4,4 @@ import type { RuntimeLogLine } from "./RuntimeLogLine";
 /**
  * 运行日志查询结果。
  */
-export type RuntimeLogQueryResult = { lines: Array<RuntimeLogLine>, nextCursor?: number, hasMore: boolean, };
+export type RuntimeLogQueryResult = { lines: Array<RuntimeLogLine>, nextCursor?: string, hasMore: boolean, scanTruncated: boolean, fileVersion: string, };

@@ -8,7 +8,7 @@ use crate::{
         scripts::{self, ScriptActor, ScriptListFilter, ScriptRunListFilter},
     },
     services::{
-        logging::{self, PlatformLogEntry},
+        logging::{self, OperationEventBuilder},
         node_read_model,
     },
     state::AppState,
@@ -105,12 +105,22 @@ async fn create(
 ) -> ApiResult<Response> {
     let actor = actor(&admin, &headers)?;
     let result = scripts::create(&state.metadata_db, &request, &actor).await;
+    let target_id = result
+        .as_ref()
+        .ok()
+        .map(|script| script.summary.script_id.as_str());
+    let target_name = result
+        .as_ref()
+        .ok()
+        .map(|script| script.summary.name.as_str());
     record_change(
         &state,
         &admin,
         &actor,
         "script_created",
         "POST",
+        target_id,
+        target_name,
         None,
         false,
         &result,
@@ -139,6 +149,8 @@ async fn update(
         "script_updated",
         "PATCH",
         Some(&script_id),
+        Some(request.name.as_str()),
+        None,
         false,
         &result,
     );
@@ -161,6 +173,8 @@ async fn remove(
         "script_removed",
         "DELETE",
         Some(&script_id),
+        None,
+        None,
         true,
         &result,
     );
@@ -206,6 +220,11 @@ async fn start_run(
         &actor,
     )
     .await;
+    let target_name = result
+        .as_ref()
+        .ok()
+        .map(|(run, _)| run.script_name.as_str());
+    let task_id = result.as_ref().ok().map(|(run, _)| run.run_id.as_str());
     record_change(
         &state,
         &admin,
@@ -213,6 +232,8 @@ async fn start_run(
         "script_run_submitted",
         "POST",
         Some(&script_id),
+        target_name,
+        task_id,
         true,
         &result,
     );
@@ -296,12 +317,16 @@ async fn cancel_run(
 ) -> ApiResult<Response> {
     let actor = actor(&admin, &headers)?;
     let result = scripts::request_cancel(&state.metadata_db, &run_id).await;
+    let target_id = result.as_ref().ok().map(|run| run.script_id.as_str());
+    let target_name = result.as_ref().ok().map(|run| run.script_name.as_str());
     record_change(
         &state,
         &admin,
         &actor,
         "script_run_cancel_requested",
         "POST",
+        target_id,
+        target_name,
         Some(&run_id),
         true,
         &result,
@@ -361,6 +386,8 @@ fn record_change<T>(
     event: &str,
     method: &str,
     target_id: Option<&str>,
+    target_name: Option<&str>,
+    task_id: Option<&str>,
     high_impact: bool,
     result: &ApiResult<T>,
 ) {
@@ -368,14 +395,22 @@ fn record_change<T>(
         return;
     };
     let failed = result.is_err();
-    PlatformLogEntry::new(&admin.username, event, ip)
-        .user_id(admin.id).module(LogModule::System).target_type("script")
-        .target_id(target_id.unwrap_or("new")).trace_id(&actor.trace_id)
+    let mut operation = OperationEventBuilder::new(&admin.username, event, ip)
+        .user_id(admin.id).module(LogModule::System).trace_id(&actor.trace_id)
         .request(method, "/api/v1/scripts")
         .status(if failed { LogStatus::Failed } else { LogStatus::Success })
         .level(if failed { PlatformLogLevel::Error } else if high_impact { PlatformLogLevel::Warning } else { PlatformLogLevel::Info })
-        .metadata(json!({"result": if failed {"failed"} else {"submitted"}, "errorCode": result.as_ref().err().map(|error| error.code.as_str())}))
-        .finish(&state.metadata_db);
+        .metadata(json!({"result": if failed {"failed"} else {"submitted"}, "errorCode": result.as_ref().err().map(|error| error.code.as_str())}));
+    if let Some(target_id) = target_id {
+        operation = operation.target_type("script").target_id(target_id);
+    }
+    if let Some(target_name) = target_name {
+        operation = operation.target_display_name(target_name);
+    }
+    if let Some(task_id) = task_id {
+        operation = operation.task_id(task_id);
+    }
+    operation.finish(&state.metadata_db);
 }
 
 fn validate_page(page: u32, page_size: u32) -> ApiResult<()> {

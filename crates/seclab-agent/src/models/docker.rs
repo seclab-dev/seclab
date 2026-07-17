@@ -1,7 +1,6 @@
 //! Docker 客户端模型：与 Docker daemon 通信封装。
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::HashMap;
 
 /// Docker 容器生命周期动作。
@@ -1054,70 +1053,4 @@ impl DockerActivityOutcome {
             Self::Failure => "failure",
         }
     }
-}
-
-/// Docker 操作日志发起者。
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DockerActivityActor {
-    pub kind: DockerActivityActorKind,
-    pub name: String,
-    pub client_ip: Option<String>,
-}
-
-/// Docker 操作的目标对象。
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DockerActivityTarget {
-    pub kind: String,
-    pub id: String,
-}
-
-/// Docker 操作日志列表项。
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DockerActivityLogItem {
-    pub id: i64,
-    pub occurred_at: i64,
-    pub actor: DockerActivityActor,
-    pub level: DockerActivityLevel,
-    pub outcome: DockerActivityOutcome,
-    pub event_code: String,
-    pub target: Option<DockerActivityTarget>,
-    pub message_params: Value,
-    pub error_message: Option<String>,
-    pub trace_id: Option<String>,
-}
-
-/// Docker 操作日志查询参数。
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DockerActivityLogQuery {
-    #[serde(default = "default_activity_log_page")]
-    pub page: u32,
-    #[serde(default = "default_activity_log_page_size")]
-    pub page_size: u32,
-    pub levels: Option<Vec<DockerActivityLevel>>,
-    pub actor_kinds: Option<Vec<DockerActivityActorKind>>,
-    pub start_at: Option<i64>,
-    pub end_at: Option<i64>,
-    pub keyword: Option<String>,
-}
-
-/// Docker 操作日志分页响应。
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DockerActivityLogPage {
-    pub total: i64,
-    pub page: u32,
-    pub page_size: u32,
-    pub items: Vec<DockerActivityLogItem>,
-}
-
-const fn default_activity_log_page() -> u32 {
-    1
-}
-
-const fn default_activity_log_page_size() -> u32 {
-    20
 }

@@ -6,7 +6,7 @@ use crate::{
         node_runtime_client::NodeRuntimeClient,
         task_scheduler::{self, ScheduledTaskOperationRow, ScheduledTaskRunRow},
     },
-    services::logging::PlatformLogEntry,
+    services::logging::OperationEventBuilder,
     state::AppState,
     types::{ApiError, ApiResult},
 };
@@ -549,7 +549,7 @@ fn record_terminal(
     };
     let failed = status == ScheduledTaskOperationStatus::Failed;
     let high_impact = matches!(operation.kind.as_str(), "remove" | "migrate");
-    PlatformLogEntry::new(&operation.actor_name, &format!("scheduled_task_{}_completed", operation.kind), client_ip)
+    OperationEventBuilder::new(&operation.actor_name, &format!("scheduled_task_{}_completed", operation.kind), client_ip)
         .user_id(operation.actor_user_id)
         .module(LogModule::System)
         .target_type("scheduled_task")

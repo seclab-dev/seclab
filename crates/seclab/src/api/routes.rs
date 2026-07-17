@@ -1,9 +1,9 @@
 //! 路由注册：挂载所有 API 子路由并拼装主路由器。
 
 use super::{
-    apps, auth, desktop_apps, disks, docker, files, firewall, nodes, notifications, platform,
-    process, runtime, scripts, seclab, security, suites, system_monitoring, task_scheduler,
-    terminal, upgrades,
+    apps, auth, desktop_apps, disks, docker, files, firewall, nodes, notifications, operation_logs,
+    process, runtime, runtime_logs, scripts, seclab, security, suites, system_monitoring,
+    task_scheduler, terminal, upgrades,
 };
 use crate::api::node_proxy;
 use crate::db::init_db_pool;
@@ -34,7 +34,8 @@ pub fn public_api_router() -> Router {
 /// 需要 state 的路由
 pub fn state_api_router(app_state: Arc<AppState>) -> Router<Arc<AppState>> {
     let protected = Router::new()
-        .nest("/platform", platform::platform_log_router())
+        .nest("/operation-logs", operation_logs::router())
+        .nest("/runtime-logs", runtime_logs::router())
         .nest("/nodes", nodes::nodes_router())
         .nest("/node", nodes::single_node_router())
         .nest("/node", system_monitoring::system_monitoring_router())
@@ -111,6 +112,8 @@ pub async fn create_router() -> Result<(Router, crate::state::DbPool)> {
     crate::services::task_sync::spawn_sync_queue_worker(Arc::clone(&app_state));
     crate::services::script_runs::spawn_worker(Arc::clone(&app_state));
     crate::services::file_task_audit::spawn_reconciler(Arc::clone(&app_state));
+    crate::services::logging::init_operation_log_writer(app_state.metadata_db.clone());
+    crate::services::logging::spawn_retention_worker(app_state.metadata_db.clone());
     disks::recover_operations(Arc::clone(&app_state)).await?;
 
     // 配置 CORS：允许所有来源、常用方法

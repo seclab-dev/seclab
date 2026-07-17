@@ -3,4 +3,4 @@
 /**
  * 运行日志文件摘要。
  */
-export type RuntimeLogFile = { service: string, nodeId: string | null, nodeName: string | null, fileName: string, sizeBytes: number, modifiedAt: string | null, };
+export type RuntimeLogFile = { service: string, nodeId?: string, nodeName?: string, fileId: string, fileVersion: string, fileName: string, sizeBytes: number, modifiedAt?: string, };

@@ -7,7 +7,7 @@ use crate::{
         node_runtime_client::NodeRuntimeClient,
     },
     services::{
-        logging::{self, PlatformLogEntry},
+        logging::{self, OperationEventBuilder},
         node_inventory::get_node_display_name,
     },
     state::AppState,
@@ -283,7 +283,7 @@ fn audit_control_message(
             session_id, shell, ..
         } => {
             *started = true;
-            PlatformLogEntry::new(&audit.username, "terminal_session_start", audit.client_ip)
+            OperationEventBuilder::new(&audit.username, "terminal_session_start", audit.client_ip)
                 .user_id(audit.user_id)
                 .module(LogModule::System)
                 .target_type("node")
@@ -376,7 +376,7 @@ fn record_start_failure(
     error_code: &str,
     error: &str,
 ) {
-    PlatformLogEntry::new(actor.username(), "terminal_session_start", client_ip)
+    OperationEventBuilder::new(actor.username(), "terminal_session_start", client_ip)
         .user_id(actor.id())
         .module(LogModule::System)
         .target_type("node")
@@ -414,7 +414,7 @@ fn record_end(
     level: PlatformLogLevel,
     status: LogStatus,
 ) {
-    PlatformLogEntry::new(&audit.username, "terminal_session_end", audit.client_ip)
+    OperationEventBuilder::new(&audit.username, "terminal_session_end", audit.client_ip)
         .user_id(audit.user_id)
         .module(LogModule::System)
         .target_type("node")

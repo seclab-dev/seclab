@@ -6,7 +6,7 @@ use crate::models::auth_sessions::{
 };
 use crate::models::logging::LogModule;
 use crate::models::user::User;
-use crate::services::logging::{self, PlatformLogEntry};
+use crate::services::logging::{self, OperationEventBuilder};
 use crate::state::AppState;
 use crate::types::{ApiError, ApiResponse, ApiResult, AuthError};
 use axum::{
@@ -80,7 +80,7 @@ pub async fn login(
     if let Some(remaining) = state.login_tracker.lockout_remaining_secs(&client_ip).await {
         return Ok(login_failure_response(
             StatusCode::TOO_MANY_REQUESTS,
-            "登录尝试过于频繁，请稍后再试",
+            "Too many login attempts. Please try again later.",
             "api.auth.loginLocked",
             true,
             true,
@@ -89,10 +89,8 @@ pub async fn login(
     }
 
     if payload.username.is_empty() || payload.password.is_empty() {
-        logging::platform_log_failure(&payload.username, "user_login", client_ip)
+        logging::operation_log_failure("anonymous", "user_login", client_ip)
             .module(LogModule::Auth)
-            .target_type("user")
-            .target_id(&payload.username)
             .trace_id(&trace_id)
             .source("seclab_api")
             .request("POST", "/api/v1/auth/login")
@@ -114,7 +112,7 @@ pub async fn login(
                     return Ok(login_failure_after_failure(
                         &state,
                         client_ip,
-                        "验证码错误，请重新输入",
+                        "The captcha is invalid. Please try again.",
                         "api.auth.captchaInvalid",
                     )
                     .await);
@@ -123,7 +121,7 @@ pub async fn login(
             _ => {
                 return Ok(login_failure_response(
                     StatusCode::UNAUTHORIZED,
-                    "请输入验证码",
+                    "Captcha is required.",
                     "api.auth.captchaRequired",
                     true,
                     false,
@@ -149,10 +147,8 @@ pub async fn login(
             _ => "DatabaseError",
         };
 
-        logging::platform_log_failure(&payload.username, "user_login", client_ip)
+        logging::operation_log_failure("anonymous", "user_login", client_ip)
             .module(LogModule::Auth)
-            .target_type("user")
-            .target_id(&payload.username)
             .trace_id(&trace_id)
             .source("seclab_api")
             .request("POST", "/api/v1/auth/login")
@@ -177,7 +173,7 @@ pub async fn login(
                 return Ok(login_failure_after_failure(
                     &state,
                     client_ip,
-                    "用户名或密码错误",
+                    "The username or password is incorrect.",
                     "api.auth.wrongCredentials",
                 )
                 .await);
@@ -187,10 +183,8 @@ pub async fn login(
     };
 
     if !user_record.is_active() {
-        logging::platform_log_failure(&payload.username, "user_login", client_ip)
+        logging::operation_log_failure("anonymous", "user_login", client_ip)
             .module(LogModule::Auth)
-            .target_type("user")
-            .target_id(&user_record.id.to_string())
             .user_id(user_record.id)
             .trace_id(&trace_id)
             .source("seclab_api")
@@ -206,10 +200,8 @@ pub async fn login(
     }
 
     let valid_password = verify(&payload.password, &user_record.password_hash).map_err(|err| {
-        logging::platform_log_failure(&payload.username, "user_login", client_ip)
+        logging::operation_log_failure("anonymous", "user_login", client_ip)
             .module(LogModule::Auth)
-            .target_type("user")
-            .target_id(&user_record.id.to_string())
             .user_id(user_record.id)
             .trace_id(&trace_id)
             .source("seclab_api")
@@ -234,10 +226,8 @@ pub async fn login(
     })?;
 
     if !valid_password {
-        logging::platform_log_failure(&payload.username, "user_login", client_ip)
+        logging::operation_log_failure("anonymous", "user_login", client_ip)
             .module(LogModule::Auth)
-            .target_type("user")
-            .target_id(&user_record.id.to_string())
             .user_id(user_record.id)
             .trace_id(&trace_id)
             .source("seclab_api")
@@ -255,7 +245,7 @@ pub async fn login(
         return Ok(login_failure_after_failure(
             &state,
             client_ip,
-            "用户名或密码错误",
+            "The username or password is incorrect.",
             "api.auth.wrongCredentials",
         )
         .await);
@@ -275,10 +265,8 @@ pub async fn login(
     .await
     .map_err(|err| ApiError::Internal(err.to_string()))?;
 
-    logging::platform_log_success(&payload.username, "user_login", client_ip)
+    logging::operation_log_success(&payload.username, "user_login", client_ip)
         .module(LogModule::Auth)
-        .target_type("user")
-        .target_id(&user_record.id.to_string())
         .user_id(user_record.id)
         .trace_id(&trace_id)
         .source("seclab_api")
@@ -367,10 +355,8 @@ pub async fn logout(
                 .as_ref()
                 .map(|value| value.username.as_str())
                 .unwrap_or("anonymous");
-            let mut platform_log = PlatformLogEntry::new(username, "user_logout", conn.ip())
+            let mut platform_log = OperationEventBuilder::new(username, "user_logout", conn.ip())
                 .module(LogModule::Auth)
-                .target_type("user")
-                .target_id(&session.user_id.to_string())
                 .trace_id(&trace_id)
                 .source("seclab_api")
                 .request("POST", "/api/v1/auth/logout")
@@ -435,7 +421,7 @@ async fn login_failure_after_failure(
     if let Some(remaining) = state.login_tracker.lockout_remaining_secs(&client_ip).await {
         return login_failure_response(
             StatusCode::TOO_MANY_REQUESTS,
-            "登录尝试过于频繁，请稍后再试",
+            "Too many login attempts. Please try again later.",
             "api.auth.loginLocked",
             true,
             true,
@@ -574,10 +560,8 @@ async fn get_active_admin_by_id(
 }
 
 fn log_logout_without_session(state: &AppState, client_ip: std::net::IpAddr, trace_id: &str) {
-    PlatformLogEntry::new("anonymous", "user_logout", client_ip)
+    OperationEventBuilder::new("anonymous", "user_logout", client_ip)
         .module(LogModule::Auth)
-        .target_type("user")
-        .target_id("anonymous")
         .trace_id(trace_id)
         .source("seclab_api")
         .request("POST", "/api/v1/auth/logout")

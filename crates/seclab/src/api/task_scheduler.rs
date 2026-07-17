@@ -8,7 +8,7 @@ use crate::{
         task_scheduler::{self, OperationActor, ScheduledTaskRow, TaskListFilter},
     },
     services::{
-        logging::{self, PlatformLogEntry},
+        logging::{self, OperationEventBuilder},
         task_scheduler as domain, task_sync,
     },
     state::AppState,
@@ -644,7 +644,7 @@ fn record_submit<T>(
         return;
     };
     let failed = result.is_err();
-    PlatformLogEntry::new(&admin.username, event, ip).user_id(admin.id).module(LogModule::System)
+    OperationEventBuilder::new(&admin.username, event, ip).user_id(admin.id).module(LogModule::System)
         .target_type("scheduled_task").target_id(task_id.unwrap_or("batch")).trace_id(&actor.trace_id)
         .request(method, "/api/v1/scheduled-tasks")
         .status(if failed { LogStatus::Failed } else { LogStatus::Success })

@@ -3,4 +3,4 @@
 /**
  * 运行日志查询参数。
  */
-export type RuntimeLogQuery = { service: string, nodeId?: string, fileName: string, level?: string, target?: string, keyword?: string, cursor?: number, limit: number, };
+export type RuntimeLogQuery = { service: string, nodeId?: string, fileId: string, fileName: string, level?: string, target?: string, keyword?: string, cursor?: string, limit: number, };

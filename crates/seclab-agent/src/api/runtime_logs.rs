@@ -17,7 +17,7 @@ pub fn runtime_log_router() -> Router<std::sync::Arc<crate::state::AppState>> {
 
 /// 查询当前 Agent 的运行日志文件列表。
 pub async fn runtime_log_files() -> ApiResult<Response> {
-    let files = runtime_logs::list_runtime_log_files().await?;
+    let files = runtime_logs::list_runtime_log_files(Some("agent")).await?;
     Ok(
         ApiResponse::success_with_raw("Agent runtime log files loaded", Some(files))
             .into_response(),

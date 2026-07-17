@@ -2,7 +2,7 @@
 
 use crate::models::NodeRuntimeClient;
 use crate::models::logging::LogModule;
-use crate::services::logging::PlatformLogEntry;
+use crate::services::logging::OperationEventBuilder;
 use crate::state::AppState;
 use anyhow::{Context, anyhow};
 use bollard::Docker;
@@ -364,19 +364,20 @@ impl ImageAcquisitionService {
         });
         if let Some(task) = self.get(task_id) {
             let (event, message_key) = image_log_descriptor(&task.status, task.source.as_ref());
-            let mut log = PlatformLogEntry::new("system", event, IpAddr::V4(Ipv4Addr::LOCALHOST))
-                .module(LogModule::Docker)
-                .target_type("docker_image")
-                .target_id(&task.image_ref)
-                .metadata(serde_json::json!({
-                    "message_key": message_key,
-                    "node_id": task.node_id,
-                    "image_ref": task.image_ref,
-                    "source": task.source,
-                    "stage": task.stage,
-                    "controller_error": task.controller_error,
-                    "registry_error": task.registry_error,
-                }));
+            let mut log =
+                OperationEventBuilder::new("system", event, IpAddr::V4(Ipv4Addr::LOCALHOST))
+                    .module(LogModule::Docker)
+                    .target_type("docker_image")
+                    .target_id(&task.image_ref)
+                    .metadata(serde_json::json!({
+                        "message_key": message_key,
+                        "node_id": task.node_id,
+                        "image_ref": task.image_ref,
+                        "source": task.source,
+                        "stage": task.stage,
+                        "controller_error": task.controller_error,
+                        "registry_error": task.registry_error,
+                    }));
             if task.status == ImageTaskStatus::Success {
                 log = log.set_success();
             }

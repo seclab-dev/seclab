@@ -8,8 +8,8 @@ use crate::db;
 use crate::state::DbPool;
 
 use crate::services::{
-    docker_activity, docker_project_tasks, docker_stats, system_monitoring as monitoring_service,
-    task_scheduler, websocket::create_channel,
+    docker_project_tasks, docker_stats, system_monitoring as monitoring_service, task_scheduler,
+    websocket::create_channel,
 };
 use crate::state::AppState;
 use anyhow::Result;
@@ -82,7 +82,6 @@ pub async fn create_router() -> Result<(Router, DbPool)> {
     });
 
     docker_stats::spawn_stats_collector(Arc::clone(&app_state));
-    docker_activity::spawn_retention_worker(app_state.metadata_db.clone());
     docker_project_tasks::spawn_retention_worker(app_state.metadata_db.clone());
     crate::services::file_transfers::spawn_retention_worker(app_state.metadata_db.clone());
     monitoring_service::spawn_sampler(app_state.metadata_db.clone(), system_monitoring);

@@ -352,6 +352,14 @@ struct RotateCertificateRequest {
     certificate_request: CertificateRequest,
 }
 
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OperationEventReportRequest {
+    agent_id: String,
+    session_id: String,
+    events: Vec<seclab_contracts::logging::AgentOperationEvent>,
+}
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct HeartbeatResponse {
@@ -755,8 +763,35 @@ async fn maintain_runtime_session(
     let mut script_report_ticker = tokio::time::interval(std::time::Duration::from_secs(2));
     script_report_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    let mut operation_event_ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+    operation_event_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         tokio::select! {
+            _ = operation_event_ticker.tick() => {
+                let events = services::operation_outbox::pending(pool, 100).await?;
+                if !events.is_empty() {
+                    let event_ids = events.iter().map(|event| event.event_id.clone()).collect::<Vec<_>>();
+                    let response = client.post(format!("{}/api/v1/runtime/operation-events/report", session.seclab_url.trim_end_matches('/')))
+                        .json(&OperationEventReportRequest { agent_id: session.agent_id.clone(), session_id: session.session_id.clone(), events }).send().await;
+                    match response {
+                        Ok(response) if response.status().is_success() => {
+                            let payload = response.json::<ApiResponse<seclab_contracts::logging::AgentOperationEventAck>>().await?;
+                            let accepted = payload.data.map(|value| value.accepted_event_ids).unwrap_or_default();
+                            services::operation_outbox::acknowledge(pool, &accepted).await?;
+                            let _ = services::operation_outbox::prune_delivered(pool).await?;
+                        }
+                        Ok(response) => {
+                            services::operation_outbox::mark_failed(pool, &event_ids).await?;
+                            tracing::warn!(status=%response.status(), "operation audit report rejected; durable retry retained");
+                        }
+                        Err(error) => {
+                            services::operation_outbox::mark_failed(pool, &event_ids).await?;
+                            tracing::warn!(%error, "operation audit report failed; durable retry retained");
+                        }
+                    }
+                }
+            }
             _ = pull_sync_ticker.tick() => {
                 if let Err(err) = pull_and_sync_tasks(pool, &client, &session).await {
                     tracing::warn!("Scheduled pull-based sync failed: {:?}", err);

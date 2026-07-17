@@ -8,7 +8,7 @@ use crate::{
         nodes::{self, NodeStatus},
     },
     services::{
-        logging::{self, PlatformLogEntry},
+        logging::{self, OperationEventBuilder},
         node_state_machine,
     },
     state::AppState,
@@ -612,7 +612,7 @@ fn record_signal_log(
     } else {
         (LogStatus::Success, PlatformLogLevel::Info)
     };
-    PlatformLogEntry::new(
+    OperationEventBuilder::new(
         &admin.username,
         match signal {
             ProcessSignal::Term => "process_signal_terminate",

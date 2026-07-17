@@ -1,7 +1,7 @@
 //! runtime API：节点 enrollment、register、heartbeat 与 deregister。
 
-use crate::models::logging::{LogModule, LogStatus, PlatformLogLevel};
-use crate::services::logging::PlatformLogEntry;
+use crate::models::logging::{LogModule, PlatformLogLevel};
+use crate::services::logging::OperationEventBuilder;
 use crate::services::node_runtime;
 use crate::services::runtime_metrics;
 use crate::state::AppState;
@@ -15,6 +15,7 @@ use axum::{
     routing::{get, post},
 };
 use seclab_contracts::api::ErrorCode;
+use seclab_contracts::logging::{AgentOperationEvent, AgentOperationEventAck};
 use seclab_contracts::terminal::{TerminalTicketConsumeRequest, TerminalTicketConsumeResponse};
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -98,6 +99,54 @@ pub struct DeregisterPayload {
     pub agent_id: String,
     pub session_id: String,
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OperationEventReportPayload {
+    agent_id: String,
+    session_id: String,
+    events: Vec<AgentOperationEvent>,
+}
+
+/// 接收 Agent 持久 outbox 上报，并以机器会话覆盖来源节点身份。
+async fn report_operation_events(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<OperationEventReportPayload>,
+) -> ApiResult<Response> {
+    if payload.events.is_empty() || payload.events.len() > 100 {
+        return Err(ApiError::bad_request(
+            ErrorCode::BadRequest,
+            "operation event batch must contain 1 to 100 events",
+        ));
+    }
+    let session =
+        crate::models::node_sessions::get_session_by_id(&state.metadata_db, &payload.session_id)
+            .await?
+            .filter(|session| session.status == "active" && session.agent_id == payload.agent_id)
+            .ok_or_else(|| {
+                ApiError::forbidden(ErrorCode::AuthForbidden, "runtime session is not active")
+            })?;
+    let node_name = crate::models::nodes::get_node_by_id(&state.metadata_db, &session.node_id)
+        .await?
+        .map(|node| node.name);
+    let mut accepted_event_ids = Vec::with_capacity(payload.events.len());
+    for event in payload.events {
+        let event_id = event.event_id.clone();
+        crate::services::logging::store_agent_event(
+            &state.metadata_db,
+            &session.node_id,
+            node_name.as_deref(),
+            event,
+        )
+        .await?;
+        accepted_event_ids.push(event_id);
+    }
+    Ok(ApiResponse::success_with_raw(
+        "Operation events accepted",
+        Some(AgentOperationEventAck { accepted_event_ids }),
+    )
+    .into_response())
 }
 
 /// 由 Agent 原子消费 Master 签发的一次性终端票据。
@@ -330,7 +379,7 @@ pub async fn enroll(
     Json(payload): Json<EnrollPayload>,
 ) -> ApiResult<impl IntoResponse> {
     let controller_compatibility = ensure_runtime_agent_compatible(payload.compatibility.as_ref())?;
-    let mut platform_log = PlatformLogEntry::new("runtime-agent", "runtime_enroll", addr.ip())
+    let mut platform_log = OperationEventBuilder::new("runtime-agent", "runtime_enroll", addr.ip())
         .module(LogModule::System)
         .target_type("node")
         .metadata(json!({ "advertise_addr": payload.node.advertise_addr.clone(), "listen_port": payload.node.listen_port }));
@@ -399,7 +448,7 @@ pub async fn register(
     Json(payload): Json<RegisterPayload>,
 ) -> ApiResult<impl IntoResponse> {
     let controller_compatibility = ensure_runtime_agent_compatible(payload.compatibility.as_ref())?;
-    let mut platform_log = PlatformLogEntry::new("runtime-agent", "runtime_register", addr.ip())
+    let mut platform_log = OperationEventBuilder::new("runtime-agent", "runtime_register", addr.ip())
         .module(LogModule::System)
         .target_type("agent")
         .target_id(&payload.agent_id)
@@ -456,20 +505,10 @@ pub async fn register(
 
 pub async fn heartbeat(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    ConnectInfo(_addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<HeartbeatPayload>,
 ) -> ApiResult<impl IntoResponse> {
     let controller_compatibility = ensure_runtime_agent_compatible(payload.compatibility.as_ref())?;
-    let mut platform_log = PlatformLogEntry::new("runtime-agent", "runtime_heartbeat", addr.ip())
-        .module(LogModule::System)
-        .target_type("session")
-        .target_id(&payload.session_id)
-        .metadata(json!({
-            "agent_id": payload.agent_id.clone(),
-            "sequence": payload.sequence,
-            "advertise_addr": payload.node.as_ref().and_then(|node| node.advertise_addr.clone()),
-            "listen_port": payload.node.as_ref().and_then(|node| node.listen_port),
-        }));
     let start = Instant::now();
     let result = node_runtime::heartbeat(
         &state.metadata_db,
@@ -485,14 +524,9 @@ pub async fn heartbeat(
         payload.resource,
     )
     .await;
-    let response = match result {
+    match result {
         Ok(result) => {
             runtime_metrics::record_heartbeat(true, result.sequence_ignored, start.elapsed());
-            platform_log = platform_log.set_success().metadata(json!({
-                "agent_id": payload.agent_id,
-                "sequence": payload.sequence,
-                "sequence_ignored": result.sequence_ignored
-            }));
             Ok(ApiResponse::success_with_raw(
                 "Heartbeat accepted",
                 Some(json!({
@@ -509,12 +543,9 @@ pub async fn heartbeat(
         }
         Err(err) => {
             runtime_metrics::record_heartbeat(false, false, start.elapsed());
-            platform_log = platform_log.metadata(json!({ "error": err }));
             Err(err)
         }
-    };
-    platform_log.finish(&state.metadata_db);
-    response
+    }
 }
 
 pub async fn deregister(
@@ -522,13 +553,14 @@ pub async fn deregister(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<DeregisterPayload>,
 ) -> ApiResult<impl IntoResponse> {
-    let mut platform_log = PlatformLogEntry::new("runtime-agent", "runtime_deregister", addr.ip())
-        .module(LogModule::System)
-        .target_type("session")
-        .target_id(&payload.session_id)
-        .metadata(
-            json!({ "agent_id": payload.agent_id.clone(), "reason": payload.reason.clone() }),
-        );
+    let mut platform_log =
+        OperationEventBuilder::new("runtime-agent", "runtime_deregister", addr.ip())
+            .module(LogModule::System)
+            .target_type("agent")
+            .target_id(&payload.agent_id)
+            .metadata(
+                json!({ "agent_id": payload.agent_id.clone(), "reason": payload.reason.clone() }),
+            );
     let result = node_runtime::deregister(
         &state.metadata_db,
         &payload.session_id,
@@ -560,10 +592,10 @@ pub async fn rotate_certificate(
     Json(payload): Json<RotateCertificatePayload>,
 ) -> ApiResult<impl IntoResponse> {
     let mut platform_log =
-        PlatformLogEntry::new("runtime-agent", "runtime_rotate_certificate", addr.ip())
+        OperationEventBuilder::new("runtime-agent", "runtime_rotate_certificate", addr.ip())
             .module(LogModule::System)
-            .target_type("session")
-            .target_id(&payload.session_id)
+            .target_type("agent")
+            .target_id(&payload.agent_id)
             .metadata(json!({
                 "agent_id": payload.agent_id.clone(),
                 "reason": payload.reason.clone()
@@ -651,19 +683,9 @@ pub struct ReportTaskRunsPayload {
 
 pub async fn report_task_runs(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    ConnectInfo(_addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<ReportTaskRunsPayload>,
 ) -> ApiResult<impl IntoResponse> {
-    let mut platform_log =
-        PlatformLogEntry::new("runtime-agent", "runtime_report_task_runs", addr.ip())
-            .module(LogModule::System)
-            .target_type("session")
-            .target_id(&payload.session_id)
-            .metadata(json!({
-                "agent_id": payload.agent_id.clone(),
-                "runs_count": payload.runs.len(),
-            }));
-
     // 校验 session 是否存在且处于活跃状态
     let session =
         crate::models::node_sessions::get_session_by_id(&state.metadata_db, &payload.session_id)
@@ -711,34 +733,42 @@ pub async fn report_task_runs(
                 crate::models::task_scheduler::get_task(&state.metadata_db, &audit.task_id)
                     .await?
                     .map(|task| task.name);
-            PlatformLogEntry::new(&audit.actor_name, "scheduled_task_run_completed", client_ip)
-                .user_id(audit.actor_user_id)
-                .module(LogModule::System)
-                .target_type("scheduled_task")
-                .target_id(&audit.task_id)
-                .trace_id(&audit.trace_id)
-                .status(if failed {
-                    LogStatus::Failed
-                } else {
-                    LogStatus::Success
-                })
-                .level(if failed {
-                    PlatformLogLevel::Error
-                } else {
-                    PlatformLogLevel::Info
-                })
-                .metadata(json!({
-                    "runId": audit.run_id,
-                    "targetName": target_name,
-                    "result": format!("{:?}", audit.status).to_lowercase(),
-                    "errorCode": audit.error_code,
-                }))
-                .finish(&state.metadata_db);
+            OperationEventBuilder::new(
+                &audit.actor_name,
+                "scheduled_task_run_completed",
+                client_ip,
+            )
+            .user_id(audit.actor_user_id)
+            .module(LogModule::System)
+            .target_type("scheduled_task")
+            .target_id(&audit.task_id)
+            .trace_id(&audit.trace_id)
+            .outcome(match audit.status {
+                seclab_contracts::scheduled_tasks::ScheduledTaskRunStatus::Failed => {
+                    seclab_contracts::logging::OperationOutcome::Failure
+                }
+                seclab_contracts::scheduled_tasks::ScheduledTaskRunStatus::TimedOut => {
+                    seclab_contracts::logging::OperationOutcome::TimedOut
+                }
+                seclab_contracts::scheduled_tasks::ScheduledTaskRunStatus::Cancelled => {
+                    seclab_contracts::logging::OperationOutcome::Canceled
+                }
+                _ => seclab_contracts::logging::OperationOutcome::Success,
+            })
+            .level(if failed {
+                PlatformLogLevel::Error
+            } else {
+                PlatformLogLevel::Info
+            })
+            .metadata(json!({
+                "runId": audit.run_id,
+                "targetName": target_name,
+                "result": format!("{:?}", audit.status).to_lowercase(),
+                "errorCode": audit.error_code,
+            }))
+            .finish(&state.metadata_db);
         }
     }
-
-    platform_log = platform_log.set_success();
-    platform_log.finish(&state.metadata_db);
 
     Ok(ApiResponse::ok("Report received"))
 }
@@ -754,7 +784,7 @@ pub struct ReportScriptRunsPayload {
 /// 接收脚本运行可靠上报，并逐条校验运行与当前节点会话的归属。
 pub async fn report_script_runs(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    ConnectInfo(_addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<ReportScriptRunsPayload>,
 ) -> ApiResult<impl IntoResponse> {
     let session =
@@ -784,16 +814,17 @@ pub async fn report_script_runs(
             && let Ok(client_ip) = run.client_ip.parse()
         {
             let failed = matches!(run.status.as_str(), "failed" | "timed_out");
-            PlatformLogEntry::new(&run.actor_name, "script_run_completed", client_ip)
+            OperationEventBuilder::new(&run.actor_name, "script_run_completed", client_ip)
                 .user_id(run.actor_user_id)
                 .module(LogModule::System)
                 .target_type("script")
                 .target_id(&run.script_id)
                 .trace_id(&run.trace_id)
-                .status(if failed {
-                    LogStatus::Failed
-                } else {
-                    LogStatus::Success
+                .outcome(match run.status.as_str() {
+                    "failed" => seclab_contracts::logging::OperationOutcome::Failure,
+                    "timed_out" => seclab_contracts::logging::OperationOutcome::TimedOut,
+                    "cancelled" => seclab_contracts::logging::OperationOutcome::Canceled,
+                    _ => seclab_contracts::logging::OperationOutcome::Success,
                 })
                 .level(if failed {
                     PlatformLogLevel::Error
@@ -812,16 +843,6 @@ pub async fn report_script_runs(
         }
     }
 
-    PlatformLogEntry::new("runtime-agent", "runtime_report_script_runs", addr.ip())
-        .module(LogModule::System)
-        .target_type("session")
-        .target_id(&payload.session_id)
-        .metadata(json!({
-            "agent_id": payload.agent_id,
-            "runs_count": payload.reports.len(),
-        }))
-        .set_success()
-        .finish(&state.metadata_db);
     Ok(ApiResponse::ok("Report received"))
 }
 
@@ -870,6 +891,7 @@ pub fn runtime_router() -> Router<Arc<AppState>> {
         .route("/rotate-certificate", post(rotate_certificate))
         .route("/scheduled-tasks/runs/report", post(report_task_runs))
         .route("/script-runs/report", post(report_script_runs))
+        .route("/operation-events/report", post(report_operation_events))
         .route("/scheduled-tasks/snapshot", get(get_tasks_snapshot))
         .route(
             "/upgrades/artifacts/{version}/{component}/{target_triple}/download",

@@ -268,12 +268,6 @@ const createScopedDockerApi = (nodeId?: string) => ({
       payload,
     )
   },
-  fetchDockerActivityLogs: (payload: docker.DockerActivityLogQuery) => {
-    return http.post<docker.DockerActivityLogPage>(
-      buildDockerPath('/agent/docker/activity-logs/query', nodeId),
-      payload,
-    )
-  },
   fetchResourceUsageHistory: (hours?: number) => {
     return http.post(
       buildDockerPath('/agent/docker/stats/history', nodeId),

@@ -12,7 +12,7 @@ use crate::models::suites::{
     fetch_instance_by_suite_and_node, insert_instance, list_suites, replace_instance_app_entries,
     suite_has_instances, update_instance_status, upsert_catalog_item,
 };
-use crate::services::logging::{self, PlatformLogEntry};
+use crate::services::logging::{self, OperationEventBuilder};
 use crate::state::AppState;
 use crate::types::{ApiError, ApiResponse, ApiResult, new_uuid_v7};
 use axum::body::Body;
@@ -220,8 +220,8 @@ fn extract_client_ip(headers: &HeaderMap, conn: SocketAddr) -> IpAddr {
 }
 
 /// 创建套件平台日志的基础记录。
-fn suite_platform_log(ctx: &SuiteAuditContext, event: &str) -> PlatformLogEntry {
-    PlatformLogEntry::new(&ctx.username, event, ctx.client_ip)
+fn suite_platform_log(ctx: &SuiteAuditContext, event: &str) -> OperationEventBuilder {
+    OperationEventBuilder::new(&ctx.username, event, ctx.client_ip)
         .module(LogModule::Docker)
         .source("seclab_api")
         .trace_id(&ctx.trace_id)

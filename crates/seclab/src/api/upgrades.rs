@@ -1,7 +1,7 @@
 //! 在线升级 API：发布版本同步、计划创建与计划状态查询。
 
 use crate::api::auth::AuthenticatedAdmin;
-use crate::services::logging::PlatformLogEntry;
+use crate::services::logging::OperationEventBuilder;
 use crate::services::upgrades::{self, UpgradePlanCreatePayload};
 use crate::state::AppState;
 use crate::types::{ApiResponse, ApiResult};
@@ -36,7 +36,7 @@ pub async fn upload_release(
     let release_res = upgrades::upload_release_package(&state.metadata_db, &mut multipart).await;
     match &release_res {
         Ok(release) => {
-            PlatformLogEntry::new(&admin.username, "upgrade_release_upload", conn.ip())
+            OperationEventBuilder::new(&admin.username, "upgrade_release_upload", conn.ip())
                 .module(crate::models::logging::LogModule::System)
                 .target_type("upgrade_release")
                 .target_id(&release.version)
@@ -49,7 +49,7 @@ pub async fn upload_release(
                 .finish(&state.metadata_db);
         }
         Err(err) => {
-            PlatformLogEntry::new(&admin.username, "upgrade_release_upload", conn.ip())
+            OperationEventBuilder::new(&admin.username, "upgrade_release_upload", conn.ip())
                 .module(crate::models::logging::LogModule::System)
                 .target_type("upgrade_release")
                 .status(crate::models::logging::LogStatus::Failed)
@@ -116,7 +116,7 @@ pub async fn delete_release(
     let res = upgrades::delete_release(&state.metadata_db, &version).await;
     match &res {
         Ok(_) => {
-            PlatformLogEntry::new(&admin.username, "upgrade_release_delete", conn.ip())
+            OperationEventBuilder::new(&admin.username, "upgrade_release_delete", conn.ip())
                 .module(crate::models::logging::LogModule::System)
                 .target_type("upgrade_release")
                 .target_id(&version)
@@ -127,7 +127,7 @@ pub async fn delete_release(
                 .finish(&state.metadata_db);
         }
         Err(err) => {
-            PlatformLogEntry::new(&admin.username, "upgrade_release_delete", conn.ip())
+            OperationEventBuilder::new(&admin.username, "upgrade_release_delete", conn.ip())
                 .module(crate::models::logging::LogModule::System)
                 .target_type("upgrade_release")
                 .target_id(&version)

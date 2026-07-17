@@ -21,7 +21,7 @@ use crate::{
         node_runtime_client::{AgentOperationContext, NodeRuntimeClient},
         nodes,
     },
-    services::logging::{self, PlatformLogEntry},
+    services::logging::{self, OperationEventBuilder},
     state::AppState,
     types::{ApiError, ApiResponse, ApiResult},
 };
@@ -297,7 +297,7 @@ fn record_operation<T>(
     } else {
         (LogStatus::Success, PlatformLogLevel::Info)
     };
-    PlatformLogEntry::new(&admin.username, event, client_ip)
+    OperationEventBuilder::new(&admin.username, event, client_ip)
         .user_id(admin.id)
         .module(LogModule::System)
         .target_type("node")

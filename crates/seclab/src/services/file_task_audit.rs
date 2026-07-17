@@ -2,10 +2,10 @@
 
 use crate::{
     models::{
-        logging::{LogModule, LogStatus, PlatformLogLevel},
+        logging::{LogModule, PlatformLogLevel},
         node_runtime_client::NodeRuntimeClient,
     },
-    services::logging::PlatformLogEntry,
+    services::logging::OperationEventBuilder,
     state::{AppState, DbPool},
     types::ApiResult,
 };
@@ -224,11 +224,6 @@ fn record_terminal(
         );
         return;
     };
-    let status = if task.status == FileTaskStatus::Failed {
-        LogStatus::Failed
-    } else {
-        LogStatus::Success
-    };
     let high_impact: bool = row.try_get("high_impact").unwrap_or(false);
     let level = if task.status == FileTaskStatus::Failed {
         PlatformLogLevel::Error
@@ -237,7 +232,7 @@ fn record_terminal(
     } else {
         PlatformLogLevel::Info
     };
-    PlatformLogEntry::new(
+    OperationEventBuilder::new(
         &row.try_get::<String, _>("actor_name")
             .unwrap_or_else(|_| "unknown".to_string()),
         &format!("file_task_{}", status_text(task.status)),
@@ -256,10 +251,15 @@ fn record_terminal(
         "result": status_text(task.status),
         "completedItemCount": task.completed_item_count,
         "failedItemCount": task.failed_item_count,
+        "targetPath": task.items.first().map(|item| item.target_path.as_deref().unwrap_or(&item.path)),
         "errorSummary": task.error_summary,
         "cleanupWarning": task.cleanup_warning,
     }))
-    .status(status)
+    .outcome(match task.status {
+        FileTaskStatus::Cancelled => seclab_contracts::logging::OperationOutcome::Canceled,
+        FileTaskStatus::Failed => seclab_contracts::logging::OperationOutcome::Failure,
+        _ => seclab_contracts::logging::OperationOutcome::Success,
+    })
     .level(level)
     .finish(&state.metadata_db);
 }
@@ -281,16 +281,12 @@ fn record_transfer_terminal(
         );
         return;
     };
-    let failed = matches!(
-        transfer.status,
-        FileTransferStatus::Failed | FileTransferStatus::Expired
-    );
     let level = match transfer.status {
         FileTransferStatus::Failed => PlatformLogLevel::Error,
         FileTransferStatus::Cancelled | FileTransferStatus::Expired => PlatformLogLevel::Warning,
         _ => PlatformLogLevel::Info,
     };
-    PlatformLogEntry::new(
+    OperationEventBuilder::new(
         &row.try_get::<String, _>("actor_name")
             .unwrap_or_else(|_| "unknown".to_string()),
         &format!("file_transfer_{}", transfer_status_text(transfer.status)),
@@ -312,10 +308,11 @@ fn record_transfer_terminal(
         "transferredBytes": transfer.transferred_bytes,
         "errorSummary": transfer.error_summary,
     }))
-    .status(if failed {
-        LogStatus::Failed
-    } else {
-        LogStatus::Success
+    .outcome(match transfer.status {
+        FileTransferStatus::Cancelled => seclab_contracts::logging::OperationOutcome::Canceled,
+        FileTransferStatus::Expired => seclab_contracts::logging::OperationOutcome::TimedOut,
+        FileTransferStatus::Failed => seclab_contracts::logging::OperationOutcome::Failure,
+        _ => seclab_contracts::logging::OperationOutcome::Success,
     })
     .level(level)
     .finish(&state.metadata_db);

@@ -6,7 +6,7 @@ use crate::{
         node_runtime_client::NodeRuntimeClient,
         scripts,
     },
-    services::logging::PlatformLogEntry,
+    services::logging::OperationEventBuilder,
     state::AppState,
     types::{ApiError, ApiResult},
 };
@@ -74,11 +74,13 @@ async fn record_terminal(state: &AppState, run_id: &str) -> ApiResult<()> {
         tracing::error!(%run_id, "trusted script run client IP is invalid");
         return Ok(());
     };
-    PlatformLogEntry::new(&run.actor_name, "script_run_completed", client_ip)
+    OperationEventBuilder::new(&run.actor_name, "script_run_completed", client_ip)
         .user_id(run.actor_user_id)
         .module(LogModule::System)
         .target_type("script")
         .target_id(&run.script_id)
+        .target_display_name(&run.script_name)
+        .task_id(&run.run_id)
         .trace_id(&run.trace_id)
         .status(LogStatus::Failed)
         .level(PlatformLogLevel::Error)

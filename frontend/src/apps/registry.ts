@@ -48,8 +48,8 @@ export const appRegistry = {
     nodeSwitchPolicy: 'block-while-open',
     contextMenuPolicy: 'app',
   },
-  'platform-log': {
-    component: markRaw(defineAsyncComponent(() => import('@/apps/views/PlatformLogView.vue'))),
+  'operation-log': {
+    component: markRaw(defineAsyncComponent(() => import('@/apps/views/OperationLogView.vue'))),
     title: '',
     i18nTitleKey: '',
     icon: '',
@@ -58,6 +58,18 @@ export const appRegistry = {
     defaultWidth: 0,
     defaultHeight: 0,
     nodeScope: 'global',
+    nodeSwitchPolicy: 'allow',
+  },
+  'runtime-log': {
+    component: markRaw(defineAsyncComponent(() => import('@/apps/views/RuntimeLogView.vue'))),
+    title: '',
+    i18nTitleKey: '',
+    icon: '',
+    minWidth: 0,
+    minHeight: 0,
+    defaultWidth: 0,
+    defaultHeight: 0,
+    nodeScope: 'explicit-node',
     nodeSwitchPolicy: 'allow',
   },
   'notification-history': {

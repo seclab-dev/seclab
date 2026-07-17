@@ -1,546 +1,1106 @@
-//! 平台日志服务：记录操作日志并写入数据库。
+//! 操作审计服务：事件归一化、best-effort 队列、查询与保留清理。
 
-use crate::models::logging::{LogModule, LogStatus, PlatformLog, PlatformLogLevel};
-use crate::state::DbPool;
-use crate::types::{ApiError, new_uuid_v7};
+use std::{collections::BTreeMap, net::IpAddr, sync::OnceLock};
+
 use axum::http::HeaderMap;
-use chrono::{DateTime, Utc};
-use seclab_contracts::api::ErrorCode;
-use seclab_contracts::logging::{PlatformLogList, PlatformLogQuery};
-use seclab_contracts::telemetry::PlatformLogEntryDraft;
-use serde_json::json;
-use sqlx::types::{Json, JsonValue};
-use std::net::IpAddr;
-use tracing::{error, info};
+use chrono::{DateTime, Duration, Utc};
+use seclab_contracts::logging::{
+    AgentOperationEvent, OperationActor, OperationActorKind, OperationImpact,
+    OperationLogCapabilities, OperationLogDetail, OperationLogPage, OperationLogQuery,
+    OperationLogSummary, OperationModule, OperationOrigin, OperationOriginKind, OperationOutcome,
+    OperationParameterValue, OperationTarget,
+};
+use serde_json::Value;
+use sqlx::{FromRow, QueryBuilder, Sqlite};
+use tokio::sync::mpsc;
+use tracing::{error, warn};
 
-/// 平台日志输入结构体（PlatformLogEntry）。
-///
-/// 该结构体在服务层充当数据传输对象（DTO），也是用于链式配置的 **构建者模式（Builder Pattern）** 的起点。
-///
-/// 它旨在收集所有必要的平台事件字段，并提供一个简洁的 `finish()` 方法，
-/// 通过非阻塞的后台任务将数据异步写入 `platform_logs` 数据库表。
-///
-/// # 核心职责
-/// 1.  封装一条待记录的平台事件的所有信息。
-/// 2.  提供链式方法，确保日志字段设置的安全性、可读性和灵活性。
-/// 3.  通过 `finish` 方法，将 I/O 操作卸载到后台，保证 API 响应速度。
-///
-/// # 字段说明 (与数据库表 platform_logs 对齐)
-/// * `user_id`: 操作用户的 ID。
-/// * `username`: 执行操作的用户名。
-/// * `module`: 所属业务模块 (LogModule)。
-/// * `event`: 平台事件名。
-/// * `target_type`: 操作目标类型 (例如：User, Container)。
-/// * `target_id`: 操作目标的唯一 ID 或名称。
-/// * `status`: 操作结果 (LogStatus::Success 或 LogStatus::Failed)。
-/// * `client_ip`: 客户端 IP 地址。
-/// * `metadata`: 存储详细上下文信息（JSONB）。
-///
-/// # 示例 (Example)
-///
-/// 记录一次**成功的**用户登录事件:
-/// ```rust
-/// use serde_json::json;
-/// use crate::db::DbPool;
-/// use std::net::IpAddr;
-///
-/// // 假设我们已经获取了用户UID、客户端IP和数据库连接池
-/// let user_id = "1";
-/// let client_ip: IpAddr = "192.168.1.1".parse().unwrap();
-/// let db_pool: &DbPool = &state.pool;
-///
-/// PlatformLogEntry::new("admin", "user_login", client_ip)
-///     .module(LogModule::Auth)
-///     .target_type("user")
-///     .target_id(user_id)
-///     .user_id(user_id)
-///     .metadata(json!({
-///         "message_key": "platformLog.auth.userLogin.success",
-///         "token_expiry_minutes": 43200
-///     }))
-///     .set_success()
-///     .finish(db_pool);
-/// ```
-#[derive(Debug)]
-pub struct PlatformLogEntry {
-    pub inner: PlatformLogEntryDraft,
-}
+use crate::{
+    models::logging::{LogModule, LogStatus, PlatformLogLevel},
+    state::DbPool,
+    types::{ApiError, new_uuid_v7},
+};
 
-impl PlatformLogEntry {
-    /// 启动平台日志记录的构建流程（Builder Pattern）。
-    ///
-    /// 此方法使用最少的参数构造一个半成品的日志记录实例，并设置合理的默认值。
-    /// 在调用 `finish` 写入数据库前，需要通过链式方法完善日志细节。
-    ///
-    /// # Parameters (参数)
-    /// * `username` - 执行操作的用户名。
-    /// * `event` - 平台事件名，例如 "user_login" 或 "docker_container_started"。
-    /// * `client_ip` - 发起请求的客户端 IP 地址。
-    ///
-    /// # Defaults (默认初始化值)
-    /// * `module`: `LogModule::System` (系统模块)。
-    /// * `target_type`: 空字符串 `""` (待补充)。
-    /// * `target_id`: 空字符串 `""` (待补充)。
-    /// * `status`: `LogStatus::Failed` (失败)，强制调用者在成功路径上显式设置状态。
-    /// * `user_id` 和 `metadata`: 均初始化为 `None`。
-    ///
-    /// # Returns (返回值)
-    /// 返回 `Self` (PlatformLogRecordArgs) 实例，可继续通过链式方法配置。
-    pub fn new(username: &str, event: &str, client_ip: IpAddr) -> Self {
-        Self {
-            inner: PlatformLogEntryDraft::new(username, event, client_ip)
-                .trace_id(&new_uuid_v7())
-                .source("seclab"),
-        }
+const QUEUE_CAPACITY: usize = 2_048;
+const MAX_ERROR_SUMMARY_BYTES: usize = 512;
+const RETENTION_DAYS: i64 = 180;
+static WRITER: OnceLock<mpsc::Sender<StoredOperationEvent>> = OnceLock::new();
+
+/// 初始化进程内唯一的操作日志写入队列。
+pub fn init_operation_log_writer(pool: DbPool) {
+    let (sender, mut receiver) = mpsc::channel::<StoredOperationEvent>(QUEUE_CAPACITY);
+    if WRITER.set(sender).is_err() {
+        return;
     }
-
-    /// 可选的 user_id 字段 (操作用户/目标用户的 UID)。
-    pub fn user_id(mut self, id: i64) -> Self {
-        self.inner = self.inner.user_id(id);
-        self
-    }
-
-    /// 设置所属模块。
-    pub fn module(mut self, module: LogModule) -> Self {
-        self.inner = self.inner.module(module);
-        self
-    }
-
-    /// 操作目标类型。
-    pub fn target_type(mut self, target_type: &str) -> Self {
-        self.inner = self.inner.target_type(target_type);
-        self
-    }
-
-    /// 操作目标的唯一 ID 或名称。
-    pub fn target_id(mut self, id: &str) -> Self {
-        self.inner = self.inner.target_id(id);
-        self
-    }
-
-    /// 请求 trace_id。
-    pub fn trace_id(mut self, trace_id: &str) -> Self {
-        self.inner = self.inner.trace_id(trace_id);
-        self
-    }
-
-    /// 日志来源。
-    pub fn source(mut self, source: &str) -> Self {
-        self.inner = self.inner.source(source);
-        self
-    }
-
-    /// 请求上下文（方法 + 路径）。
-    pub fn request(mut self, method: &str, request_path: &str) -> Self {
-        self.inner = self.inner.request(method, request_path);
-        self
-    }
-
-    /// 操作结果。
-    pub fn status(mut self, status: LogStatus) -> Self {
-        self.inner = self.inner.status(status);
-        self
-    }
-
-    /// 设置操作影响级别。
-    pub fn level(mut self, level: PlatformLogLevel) -> Self {
-        self.inner = self.inner.level(level);
-        self
-    }
-
-    /// 设置状态为成功
-    pub fn set_success(mut self) -> Self {
-        self.inner = self.inner.set_success();
-        self
-    }
-
-    /// 可选的 metadata 字段 (额外信息，如请求体、错误详情)。
-    pub fn metadata(mut self, data: JsonValue) -> Self {
-        self.inner = self.inner.metadata(data);
-        self
-    }
-
-    /// 将日志写入数据库。它会立即返回，不等待数据库操作完成。
-    pub fn finish(self, pool: &DbPool) {
-        platform_log_async(pool, self);
-    }
-}
-
-/// 在后台异步记录一条平台日志。
-///
-/// 该函数封装了 `tokio::spawn`、连接池克隆以及后台的错误日志记录，从而简化调用方的代码。
-fn platform_log_async(pool: &DbPool, args: PlatformLogEntry) {
-    let pool_clone = pool.clone();
-
-    // 提取关键信息用于外部日志，因为 args 的所有权将被移动
-    let module = args.inner.module.as_str();
-    let event = args.inner.event.clone();
-    let status_str = args.inner.status.as_str().to_string();
-    let ip = args.inner.client_ip;
-
-    // 立即启动后台任务，使用 tokio::spawn 实现非阻塞
     tokio::spawn(async move {
-        // 在实际执行前记录日志调用，便于调试
-        info!(
-            module,
-            event,
-            status = %status_str,
-            client_ip = %ip,
-            "Platform log write scheduled"
-        );
-
-        // 调用核心的记录函数
-        if let Err(e) = record_log(&pool_clone, args).await {
-            error!("Failed to record platform log in background: {:?}", e);
+        while let Some(mut event) = receiver.recv().await {
+            enrich_target_display_name(&pool, &mut event).await;
+            if let Err(err) = insert_event(&pool, &event).await {
+                error!(event_id = %event.event_id, error = %err, "Operation audit event write failed");
+            }
         }
     });
 }
 
-/// 核心日志记录函数，异步安全。
-///
-/// 此函数在业务逻辑的 tokio::spawn 块中调用，以避免阻塞主请求线程。
-async fn record_log(pool: &DbPool, args: PlatformLogEntry) -> Result<(), ApiError> {
-    let status = args.inner.status.as_str();
-    let client_ip = args.inner.client_ip.to_string();
-    let metadata_value = args.inner.metadata.unwrap_or_else(|| json!({}));
-    let metadata_json = Json(metadata_value);
-
-    let result = sqlx::query(
-        r#"
-    INSERT INTO platform_logs (
-        user_id, username, module, event, target_type, target_id, status, level, client_ip,
-        trace_id, source, request_path, method, metadata
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    "#,
-    )
-    .bind(args.inner.user_id)
-    .bind(&args.inner.username)
-    .bind(args.inner.module.as_str())
-    .bind(&args.inner.event)
-    .bind(&args.inner.target_type)
-    .bind(&args.inner.target_id)
-    .bind(status)
-    .bind(args.inner.level.as_str())
-    .bind(&client_ip)
-    .bind(&args.inner.trace_id)
-    .bind(&args.inner.source)
-    .bind(&args.inner.request_path)
-    .bind(&args.inner.method)
-    .bind(&metadata_json)
-    .execute(pool)
-    .await;
-
-    // 平台日志写入失败不应影响主业务流程，仅打印错误
-    if let Err(e) = result {
-        error!("Failed to record platform log: {:?}", e);
-    }
-
-    Ok(())
+/// 操作审计事件构建器。写入前会按注册策略收紧字段与敏感信息。
+#[derive(Debug)]
+pub struct OperationEventBuilder {
+    event: StoredOperationEvent,
+    raw_parameters: Option<Value>,
 }
 
-pub type LogPayload = PlatformLogQuery;
-
-/// 将前端传入的 Unix epoch milliseconds 转换为数据库使用的 UTC RFC3339 字符串。
-fn epoch_millis_to_rfc3339(value: i64) -> Result<String, ApiError> {
-    DateTime::<Utc>::from_timestamp_millis(value)
-        .map(|dt| dt.to_rfc3339())
-        .ok_or_else(|| ApiError::bad_request(ErrorCode::BadRequest, "invalid log time range"))
-}
-
-/// 平台日志成功日志快捷构建器。
-pub fn platform_log_success(username: &str, event: &str, client_ip: IpAddr) -> PlatformLogEntry {
-    PlatformLogEntry::new(username, event, client_ip).set_success()
-}
-
-/// 平台日志失败日志快捷构建器。
-pub fn platform_log_failure(username: &str, event: &str, client_ip: IpAddr) -> PlatformLogEntry {
-    PlatformLogEntry::new(username, event, client_ip).status(LogStatus::Failed)
-}
-
-/// 从请求头读取 trace id；如果缺失则生成新的 UUID。
-pub fn resolve_trace_id(headers: &HeaderMap) -> String {
-    headers
-        .get("x-trace-id")
-        .and_then(|v| v.to_str().ok())
-        .filter(|v| !v.trim().is_empty())
-        .map(|v| v.trim().to_string())
-        .unwrap_or_else(new_uuid_v7)
-}
-
-/// 从数据库获取平台日志列表，支持分页和按模块过滤。
-///
-/// # Arguments
-/// * `pool` - 数据库连接池。
-/// * `payload` - 包含分页和过滤参数的查询载荷。
-///
-/// # Returns
-/// 包含日志列表和分页信息的 `PlatformLogList`。
-pub async fn fetch_platform_logs(
-    pool: &DbPool,
-    payload: LogPayload,
-) -> Result<PlatformLogList, ApiError> {
-    let LogPayload {
-        page,
-        page_size,
-        modules,
-        events,
-        event_prefixes,
-        statuses,
-        start_at,
-        end_at,
-        keyword,
-    } = payload;
-
-    let offset = ((page.saturating_sub(1)) * page_size) as i64;
-    let limit = page_size as i64;
-
-    // 将过滤条件转换为具体 SQL 参数值
-    let module_filters: Vec<String> = modules
-        .as_ref()
-        .map(|modules| modules.iter().map(|m| m.as_str().to_string()).collect())
-        .unwrap_or_default();
-    let event_filters = events.unwrap_or_default();
-    let event_prefix_filters: Vec<String> = event_prefixes
-        .unwrap_or_default()
-        .into_iter()
-        .map(|prefix| format!("{prefix}%"))
-        .collect();
-    let status_filters = statuses.unwrap_or_default();
-    let start_time = start_at.map(epoch_millis_to_rfc3339).transpose()?;
-    let end_time = end_at.map(epoch_millis_to_rfc3339).transpose()?;
-    let keyword_filter = keyword.and_then(|v| {
-        let trimmed = v.trim().to_string();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(format!("%{trimmed}%"))
-        }
-    });
-
-    let mut conditions: Vec<String> = Vec::new();
-    if !module_filters.is_empty() {
-        conditions.push(format!(
-            "module IN ({})",
-            build_placeholders(module_filters.len())
-        ));
-    }
-    if !event_filters.is_empty() {
-        conditions.push(format!(
-            "event IN ({})",
-            build_placeholders(event_filters.len())
-        ));
-    }
-    if !event_prefix_filters.is_empty() {
-        let prefixes = (0..event_prefix_filters.len())
-            .map(|_| "event LIKE ?")
-            .collect::<Vec<_>>()
-            .join(" OR ");
-        conditions.push(format!("({prefixes})"));
-    }
-    if !status_filters.is_empty() {
-        conditions.push(format!(
-            "status IN ({})",
-            build_placeholders(status_filters.len())
-        ));
-    }
-    if start_time.is_some() {
-        conditions.push("timestamp >= ?".to_string());
-    }
-    if end_time.is_some() {
-        conditions.push("timestamp <= ?".to_string());
-    }
-    if keyword_filter.is_some() {
-        conditions.push(
-            "(username LIKE ? OR event LIKE ? OR target_id LIKE ? OR trace_id LIKE ? OR request_path LIKE ?)"
+impl OperationEventBuilder {
+    /// 创建默认失败事件，成功路径必须显式设置结果。
+    pub fn new(display_name: &str, event_code: &str, client_ip: IpAddr) -> Self {
+        let module = module_for_event(event_code);
+        Self {
+            event: StoredOperationEvent {
+                event_id: new_uuid_v7(),
+                occurred_at: Utc::now().to_rfc3339(),
+                module,
+                event_code: normalize_event_code(event_code),
+                actor_kind: if display_name == "anonymous" {
+                    "anonymous"
+                } else if display_name == "system" {
+                    "system"
+                } else if display_name == "runtime-agent" {
+                    "agent"
+                } else {
+                    "user"
+                }
                 .to_string(),
-        );
+                actor_user_id: None,
+                actor_display_name: truncate(display_name, 128),
+                origin_kind: "master".to_string(),
+                origin_node_id: None,
+                origin_node_name: None,
+                target_kind: None,
+                target_id: None,
+                target_display_name: None,
+                target_ownership: None,
+                outcome: OperationOutcome::Failure,
+                impact: OperationImpact::Error,
+                trace_id: new_uuid_v7(),
+                task_id: None,
+                client_ip: client_ip.to_string(),
+                request_method: None,
+                route_template: None,
+                parameters_json: "{}".to_string(),
+                error_code: None,
+                error_summary: None,
+            },
+            raw_parameters: None,
+        }
     }
 
-    let where_clause = if conditions.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", conditions.join(" AND "))
-    };
+    pub fn user_id(mut self, id: i64) -> Self {
+        self.event.actor_user_id = Some(id);
+        self
+    }
+    pub fn module(mut self, module: LogModule) -> Self {
+        self.event.module = match module {
+            LogModule::Auth => OperationModule::Auth,
+            LogModule::Docker => OperationModule::Docker,
+            LogModule::File => OperationModule::Files,
+            LogModule::Process => OperationModule::Processes,
+            LogModule::System => module_for_event(&self.event.event_code),
+        };
+        self
+    }
+    pub fn target_type(mut self, value: &str) -> Self {
+        self.event.target_kind = non_empty(value, 64);
+        self
+    }
+    pub fn target_id(mut self, value: &str) -> Self {
+        self.event.target_id = non_empty(value, 256);
+        self
+    }
+    pub fn target_display_name(mut self, value: &str) -> Self {
+        self.event.target_display_name = non_empty(value, 256);
+        self
+    }
+    pub fn task_id(mut self, value: &str) -> Self {
+        self.event.task_id = non_empty(value, 128);
+        self
+    }
+    pub fn trace_id(mut self, value: &str) -> Self {
+        if !value.trim().is_empty() {
+            self.event.trace_id = truncate(value.trim(), 128);
+        }
+        self
+    }
+    pub fn source(mut self, value: &str) -> Self {
+        if value == "agent" {
+            self.event.origin_kind = "agent".to_string();
+            self.event.actor_kind = "agent".to_string();
+        }
+        self
+    }
+    pub fn request(mut self, method: &str, route_template: &str) -> Self {
+        self.event.request_method = safe_method(method);
+        self.event.route_template = safe_route_template(route_template);
+        self
+    }
+    pub fn status(mut self, status: LogStatus) -> Self {
+        match status {
+            LogStatus::Success => self = self.set_success(),
+            LogStatus::Failed => {
+                self.event.outcome = OperationOutcome::Failure;
+                self.event.impact = OperationImpact::Error;
+            }
+        }
+        self
+    }
+    pub fn level(mut self, level: PlatformLogLevel) -> Self {
+        if !matches!(
+            self.event.outcome,
+            OperationOutcome::Failure | OperationOutcome::TimedOut
+        ) {
+            self.event.impact = match level {
+                PlatformLogLevel::Info => OperationImpact::Info,
+                PlatformLogLevel::Warning => OperationImpact::Warning,
+                PlatformLogLevel::Error => OperationImpact::Error,
+            };
+        }
+        self
+    }
+    pub fn set_success(mut self) -> Self {
+        self.event.outcome = OperationOutcome::Success;
+        self.event.impact = if is_high_impact(&self.event.event_code) {
+            OperationImpact::Warning
+        } else {
+            OperationImpact::Info
+        };
+        self
+    }
+    /// 设置完整终态；失败与超时始终归为错误影响。
+    pub fn outcome(mut self, outcome: OperationOutcome) -> Self {
+        self.event.outcome = outcome;
+        self.event.impact = match outcome {
+            OperationOutcome::Failure | OperationOutcome::TimedOut => OperationImpact::Error,
+            OperationOutcome::Partial => OperationImpact::Warning,
+            OperationOutcome::Canceled => OperationImpact::Info,
+            OperationOutcome::Success => {
+                if is_high_impact(&self.event.event_code) {
+                    OperationImpact::Warning
+                } else {
+                    OperationImpact::Info
+                }
+            }
+        };
+        self
+    }
+    pub fn metadata(mut self, data: Value) -> Self {
+        self.raw_parameters = Some(data);
+        self
+    }
 
-    let count_query = format!("SELECT COUNT(*) FROM platform_logs{where_clause}");
-    let data_query = format!(
-        r#"
-            SELECT 
-                id, user_id, username, module, event, target_type, target_id, timestamp, status, level, client_ip,
-                trace_id, source, request_path, method, metadata
-            FROM platform_logs
-            {where_clause}
-            ORDER BY timestamp DESC
-            LIMIT ? OFFSET ?
-        "#
-    );
+    /// 非阻塞提交到统一队列；队列不可用时只记录运行警告，不改变业务结果。
+    pub fn finish(mut self, _pool: &DbPool) {
+        let (parameters, error_code, error_summary) =
+            sanitize_parameters(self.raw_parameters.take());
+        self.event.parameters_json =
+            serde_json::to_string(&parameters).unwrap_or_else(|_| "{}".to_string());
+        normalize_operation_target(&mut self.event, &parameters);
+        self.event.error_code = error_code;
+        self.event.error_summary = error_summary;
+        match WRITER.get() {
+            Some(sender) if sender.try_send(self.event).is_ok() => {}
+            Some(_) => warn!("Operation audit queue is full; event was dropped"),
+            None => warn!("Operation audit queue is not initialized; event was dropped"),
+        }
+    }
+}
 
-    let mut count_query_builder = sqlx::query_scalar::<_, i64>(&count_query);
-    for filter in &module_filters {
-        count_query_builder = count_query_builder.bind(filter);
-    }
-    for filter in &event_filters {
-        count_query_builder = count_query_builder.bind(filter);
-    }
-    for filter in &event_prefix_filters {
-        count_query_builder = count_query_builder.bind(filter);
-    }
-    for filter in &status_filters {
-        count_query_builder = count_query_builder.bind(filter);
-    }
-    if let Some(start_time) = &start_time {
-        count_query_builder = count_query_builder.bind(start_time);
-    }
-    if let Some(end_time) = &end_time {
-        count_query_builder = count_query_builder.bind(end_time);
-    }
-    if let Some(keyword_filter) = &keyword_filter {
-        count_query_builder = count_query_builder
-            .bind(keyword_filter)
-            .bind(keyword_filter)
-            .bind(keyword_filter)
-            .bind(keyword_filter)
-            .bind(keyword_filter);
-    }
-    let total = count_query_builder.fetch_one(pool).await?;
+pub fn operation_log_success(
+    username: &str,
+    event: &str,
+    client_ip: IpAddr,
+) -> OperationEventBuilder {
+    OperationEventBuilder::new(username, event, client_ip).set_success()
+}
 
-    let mut data_query_builder = sqlx::query_as::<_, PlatformLog>(&data_query);
-    for filter in &module_filters {
-        data_query_builder = data_query_builder.bind(filter);
-    }
-    for filter in &event_filters {
-        data_query_builder = data_query_builder.bind(filter);
-    }
-    for filter in &event_prefix_filters {
-        data_query_builder = data_query_builder.bind(filter);
-    }
-    for filter in &status_filters {
-        data_query_builder = data_query_builder.bind(filter);
-    }
-    if let Some(start_time) = &start_time {
-        data_query_builder = data_query_builder.bind(start_time);
-    }
-    if let Some(end_time) = &end_time {
-        data_query_builder = data_query_builder.bind(end_time);
-    }
-    if let Some(keyword_filter) = &keyword_filter {
-        data_query_builder = data_query_builder
-            .bind(keyword_filter)
-            .bind(keyword_filter)
-            .bind(keyword_filter)
-            .bind(keyword_filter)
-            .bind(keyword_filter);
-    }
+pub fn operation_log_failure(
+    username: &str,
+    event: &str,
+    client_ip: IpAddr,
+) -> OperationEventBuilder {
+    OperationEventBuilder::new(username, event, client_ip)
+}
 
-    let logs: Vec<PlatformLog> = data_query_builder
-        .bind(limit)
-        .bind(offset)
+/// 外部请求不能指定可信 trace id；Master 始终生成本地 UUIDv7。
+pub fn resolve_trace_id(_headers: &HeaderMap) -> String {
+    new_uuid_v7()
+}
+
+/// 查询操作日志摘要。
+pub async fn query_operation_logs(
+    pool: &DbPool,
+    query: OperationLogQuery,
+) -> Result<OperationLogPage, ApiError> {
+    validate_query(&query)?;
+    let offset = i64::from((query.page - 1) * query.page_size);
+    let mut count = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM operation_logs");
+    push_filters(&mut count, &query);
+    let total = count.build_query_scalar::<i64>().fetch_one(pool).await?;
+
+    let mut rows = QueryBuilder::<Sqlite>::new("SELECT * FROM operation_logs");
+    push_filters(&mut rows, &query);
+    rows.push(" ORDER BY occurred_at DESC, event_id DESC LIMIT ")
+        .push_bind(i64::from(query.page_size))
+        .push(" OFFSET ")
+        .push_bind(offset);
+    let items = rows
+        .build_query_as::<OperationLogRow>()
         .fetch_all(pool)
-        .await?;
-
-    Ok(PlatformLogList {
+        .await?
+        .into_iter()
+        .map(OperationLogRow::into_summary)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(OperationLogPage {
         total,
-        page,
-        page_size,
-        logs,
+        page: query.page,
+        page_size: query.page_size,
+        items,
     })
 }
 
-fn build_placeholders(len: usize) -> String {
-    (0..len).map(|_| "?").collect::<Vec<_>>().join(", ")
+/// 按事件 ID 查询安全详情。
+pub async fn get_operation_log(
+    pool: &DbPool,
+    event_id: &str,
+) -> Result<Option<OperationLogDetail>, ApiError> {
+    let row =
+        sqlx::query_as::<_, OperationLogRow>("SELECT * FROM operation_logs WHERE event_id = ?")
+            .bind(event_id)
+            .fetch_optional(pool)
+            .await?;
+    row.map(OperationLogRow::into_detail).transpose()
+}
+
+/// 以机器认证得到的节点身份幂等接收 Agent 事件。
+pub async fn store_agent_event(
+    pool: &DbPool,
+    node_id: &str,
+    node_name: Option<&str>,
+    event: AgentOperationEvent,
+) -> Result<(), ApiError> {
+    let parameters = sanitize_parameter_map(event.parameters);
+    let mut stored = StoredOperationEvent {
+        event_id: truncate(&event.event_id, 128),
+        occurred_at: event.occurred_at,
+        module: event.module,
+        event_code: normalize_event_code(&event.event_code),
+        actor_kind: actor_kind_value(event.actor.kind).to_string(),
+        actor_user_id: event.actor.user_id,
+        actor_display_name: truncate(&event.actor.display_name, 128),
+        origin_kind: "agent".to_string(),
+        origin_node_id: Some(truncate(node_id, 128)),
+        origin_node_name: node_name.map(|v| truncate(v, 128)),
+        target_kind: event.target.as_ref().map(|v| truncate(&v.kind, 64)),
+        target_id: event.target.as_ref().map(|v| truncate(&v.id, 256)),
+        target_display_name: event
+            .target
+            .as_ref()
+            .and_then(|v| v.display_name.as_deref())
+            .map(|v| truncate(v, 256)),
+        target_ownership: event
+            .target
+            .as_ref()
+            .and_then(|v| v.ownership.as_deref())
+            .map(|v| truncate(v, 32)),
+        outcome: event.outcome,
+        impact: impact_for_outcome(event.outcome, event.impact),
+        trace_id: truncate(&event.trace_id, 128),
+        task_id: event.task_id.map(|v| truncate(&v, 128)),
+        client_ip: sanitize_reported_client_ip(event.client_ip.as_deref()).unwrap_or_default(),
+        request_method: None,
+        route_template: None,
+        parameters_json: serde_json::to_string(&parameters).unwrap_or_else(|_| "{}".to_string()),
+        error_code: event.error_code.map(|v| truncate(&v, 128)),
+        error_summary: event.error_summary.map(|v| redact_error(&v)),
+    };
+    normalize_operation_target(&mut stored, &parameters);
+    enrich_target_display_name(pool, &mut stored).await;
+    insert_event(pool, &stored).await
+}
+
+/// 分批删除超过 180 天的事件，避免长事务。
+pub async fn prune_expired_operation_logs(pool: &DbPool) -> Result<u64, ApiError> {
+    let cutoff = (Utc::now() - Duration::days(RETENTION_DAYS)).to_rfc3339();
+    let result = sqlx::query("DELETE FROM operation_logs WHERE event_id IN (SELECT event_id FROM operation_logs WHERE occurred_at < ? ORDER BY occurred_at LIMIT 1000)")
+        .bind(cutoff).execute(pool).await?;
+    Ok(result.rows_affected())
+}
+
+/// 每日分批执行 180 天保留清理。
+pub fn spawn_retention_worker(pool: DbPool) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(24 * 60 * 60));
+        loop {
+            interval.tick().await;
+            loop {
+                match prune_expired_operation_logs(&pool).await {
+                    Ok(1_000) => continue,
+                    Ok(_) => break,
+                    Err(error) => {
+                        error!(%error, "Operation log retention cleanup failed");
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[derive(Debug)]
+struct StoredOperationEvent {
+    event_id: String,
+    occurred_at: String,
+    module: OperationModule,
+    event_code: String,
+    actor_kind: String,
+    actor_user_id: Option<i64>,
+    actor_display_name: String,
+    origin_kind: String,
+    origin_node_id: Option<String>,
+    origin_node_name: Option<String>,
+    target_kind: Option<String>,
+    target_id: Option<String>,
+    target_display_name: Option<String>,
+    target_ownership: Option<String>,
+    outcome: OperationOutcome,
+    impact: OperationImpact,
+    trace_id: String,
+    task_id: Option<String>,
+    client_ip: String,
+    request_method: Option<String>,
+    route_template: Option<String>,
+    parameters_json: String,
+    error_code: Option<String>,
+    error_summary: Option<String>,
+}
+
+#[derive(Debug, FromRow)]
+struct OperationLogRow {
+    event_id: String,
+    occurred_at: String,
+    module: String,
+    event_code: String,
+    actor_kind: String,
+    actor_user_id: Option<i64>,
+    actor_display_name: String,
+    client_ip: String,
+    origin_kind: String,
+    origin_node_id: Option<String>,
+    origin_node_name: Option<String>,
+    target_kind: Option<String>,
+    target_id: Option<String>,
+    target_display_name: Option<String>,
+    target_ownership: Option<String>,
+    outcome: String,
+    impact: String,
+    trace_id: String,
+    task_id: Option<String>,
+    request_method: Option<String>,
+    route_template: Option<String>,
+    parameters_json: String,
+    error_code: Option<String>,
+    error_summary: Option<String>,
+}
+
+impl OperationLogRow {
+    fn into_summary(self) -> Result<OperationLogSummary, ApiError> {
+        let target = match (self.target_kind.clone(), self.target_id.clone()) {
+            (Some(kind), Some(id)) => Some(OperationTarget {
+                kind,
+                id,
+                display_name: self.target_display_name.clone(),
+                ownership: self.target_ownership.clone(),
+            }),
+            _ => None,
+        };
+        Ok(OperationLogSummary {
+            event_id: self.event_id,
+            occurred_at: self.occurred_at,
+            module: parse_module(&self.module)?,
+            event_code: self.event_code,
+            actor: OperationActor {
+                kind: parse_actor_kind(&self.actor_kind)?,
+                user_id: self.actor_user_id,
+                display_name: self.actor_display_name,
+            },
+            client_ip: non_empty(&self.client_ip, 64),
+            origin: OperationOrigin {
+                kind: parse_origin_kind(&self.origin_kind)?,
+                node_id: self.origin_node_id,
+                node_name: self.origin_node_name,
+            },
+            target,
+            outcome: parse_outcome(&self.outcome)?,
+            impact: parse_impact(&self.impact)?,
+            trace_id: self.trace_id,
+            task_id: self.task_id,
+            capabilities: OperationLogCapabilities {
+                can_view_details: true,
+            },
+        })
+    }
+    fn into_detail(self) -> Result<OperationLogDetail, ApiError> {
+        let request_method = self.request_method.clone();
+        let route_template = self.route_template.clone();
+        let error_code = self.error_code.clone();
+        let error_summary = self.error_summary.clone();
+        let parameters = serde_json::from_str(&self.parameters_json).unwrap_or_default();
+        Ok(OperationLogDetail {
+            summary: self.into_summary()?,
+            request_method,
+            route_template,
+            parameters,
+            error_code,
+            error_summary,
+        })
+    }
+}
+
+async fn insert_event(pool: &DbPool, event: &StoredOperationEvent) -> Result<(), ApiError> {
+    sqlx::query("INSERT OR IGNORE INTO operation_logs (event_id,occurred_at,module,event_code,actor_kind,actor_user_id,actor_display_name,origin_kind,origin_node_id,origin_node_name,target_kind,target_id,target_display_name,target_ownership,outcome,impact,trace_id,task_id,client_ip,request_method,route_template,parameters_json,error_code,error_summary) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        .bind(&event.event_id).bind(&event.occurred_at).bind(event.module.as_str()).bind(&event.event_code)
+        .bind(&event.actor_kind).bind(event.actor_user_id).bind(&event.actor_display_name).bind(&event.origin_kind)
+        .bind(&event.origin_node_id).bind(&event.origin_node_name).bind(&event.target_kind).bind(&event.target_id)
+        .bind(&event.target_display_name).bind(&event.target_ownership).bind(event.outcome.as_str()).bind(event.impact.as_str())
+        .bind(&event.trace_id).bind(&event.task_id).bind(&event.client_ip).bind(&event.request_method).bind(&event.route_template)
+        .bind(&event.parameters_json).bind(&event.error_code).bind(&event.error_summary).execute(pool).await?;
+    Ok(())
+}
+
+fn validate_query(query: &OperationLogQuery) -> Result<(), ApiError> {
+    if query.page == 0 || !matches!(query.page_size, 20 | 50 | 100) {
+        return Err(ApiError::BadRequest(
+            "invalid operation log pagination".to_string(),
+        ));
+    }
+    for count in [
+        query.modules.as_ref().map_or(0, Vec::len),
+        query.event_codes.as_ref().map_or(0, Vec::len),
+        query.outcomes.as_ref().map_or(0, Vec::len),
+        query.impacts.as_ref().map_or(0, Vec::len),
+        query.user_ids.as_ref().map_or(0, Vec::len),
+        query.node_ids.as_ref().map_or(0, Vec::len),
+    ] {
+        if count > 20 {
+            return Err(ApiError::BadRequest(
+                "too many operation log filters".to_string(),
+            ));
+        }
+    }
+    if query
+        .keyword
+        .as_ref()
+        .is_some_and(|v| v.chars().count() > 100)
+    {
+        return Err(ApiError::BadRequest(
+            "operation log keyword is too long".to_string(),
+        ));
+    }
+    let from = query
+        .occurred_from
+        .as_deref()
+        .map(DateTime::parse_from_rfc3339)
+        .transpose()
+        .map_err(|_| ApiError::BadRequest("invalid occurredFrom".to_string()))?;
+    let to = query
+        .occurred_to
+        .as_deref()
+        .map(DateTime::parse_from_rfc3339)
+        .transpose()
+        .map_err(|_| ApiError::BadRequest("invalid occurredTo".to_string()))?;
+    if from.zip(to).is_some_and(|(from, to)| from > to) {
+        return Err(ApiError::BadRequest(
+            "occurredFrom must not exceed occurredTo".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn push_filters(builder: &mut QueryBuilder<'_, Sqlite>, query: &OperationLogQuery) {
+    builder.push(" WHERE 1 = 1");
+    macro_rules! list_filter {
+        ($field:literal, $values:expr, $map:expr) => {
+            if let Some(values) = $values {
+                if !values.is_empty() {
+                    builder.push(concat!(" AND ", $field, " IN ("));
+                    let mut first = true;
+                    for value in values {
+                        if !first {
+                            builder.push(",");
+                        }
+                        first = false;
+                        builder.push_bind(($map)(value));
+                    }
+                    builder.push(")");
+                }
+            }
+        };
+    }
+    list_filter!("module", &query.modules, |v: &OperationModule| v
+        .as_str()
+        .to_string());
+    list_filter!("event_code", &query.event_codes, |v: &String| v.clone());
+    list_filter!("outcome", &query.outcomes, |v: &OperationOutcome| v
+        .as_str()
+        .to_string());
+    list_filter!("impact", &query.impacts, |v: &OperationImpact| v
+        .as_str()
+        .to_string());
+    list_filter!("actor_user_id", &query.user_ids, |v: &i64| *v);
+    list_filter!("origin_node_id", &query.node_ids, |v: &String| v.clone());
+    if let Some(value) = &query.occurred_from {
+        builder
+            .push(" AND occurred_at >= ")
+            .push_bind(value.clone());
+    }
+    if let Some(value) = &query.occurred_to {
+        builder
+            .push(" AND occurred_at <= ")
+            .push_bind(value.clone());
+    }
+    if let Some(value) = query
+        .keyword
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        let pattern = format!("%{value}%");
+        builder
+            .push(" AND (actor_display_name LIKE ")
+            .push_bind(pattern.clone())
+            .push(" OR event_code LIKE ")
+            .push_bind(pattern.clone())
+            .push(" OR target_id LIKE ")
+            .push_bind(pattern.clone())
+            .push(" OR trace_id LIKE ")
+            .push_bind(pattern)
+            .push(")");
+    }
+}
+
+fn module_for_event(event: &str) -> OperationModule {
+    if event.starts_with("user_") || event.starts_with("auth_") {
+        OperationModule::Auth
+    } else if event.starts_with("node_") || event.starts_with("runtime_") {
+        OperationModule::Nodes
+    } else if event.starts_with("suite_") || event.starts_with("image_") {
+        OperationModule::Suites
+    } else if event.starts_with("docker_") {
+        OperationModule::Docker
+    } else if event.starts_with("file_") {
+        OperationModule::Files
+    } else if event.starts_with("process_") {
+        OperationModule::Processes
+    } else if event.starts_with("disk_") {
+        OperationModule::Disks
+    } else if event.starts_with("monitoring_") {
+        OperationModule::Monitoring
+    } else if event.starts_with("script_") {
+        OperationModule::Scripts
+    } else if event.starts_with("scheduled_task_") {
+        OperationModule::ScheduledTasks
+    } else if event.starts_with("upgrade_") {
+        OperationModule::Upgrades
+    } else if event.starts_with("terminal_") {
+        OperationModule::Terminal
+    } else {
+        OperationModule::Settings
+    }
+}
+
+fn normalize_event_code(value: &str) -> String {
+    truncate(&value.trim().to_ascii_lowercase().replace('-', "_"), 128)
+}
+fn is_high_impact(event: &str) -> bool {
+    [
+        "delete",
+        "remove",
+        "uninstall",
+        "erase",
+        "reset",
+        "terminate",
+        "retire",
+        "force",
+    ]
+    .iter()
+    .any(|v| event.contains(v))
+}
+fn impact_for_outcome(outcome: OperationOutcome, requested: OperationImpact) -> OperationImpact {
+    if outcome == OperationOutcome::Failure || outcome == OperationOutcome::TimedOut {
+        OperationImpact::Error
+    } else {
+        requested
+    }
+}
+fn safe_method(value: &str) -> Option<String> {
+    let value = value.trim().to_ascii_uppercase();
+    matches!(value.as_str(), "POST" | "PUT" | "PATCH" | "DELETE").then_some(value)
+}
+fn safe_route_template(value: &str) -> Option<String> {
+    let path = value.split('?').next().unwrap_or("").trim();
+    path.starts_with("/api/").then(|| truncate(path, 256))
+}
+fn non_empty(value: &str, max: usize) -> Option<String> {
+    (!value.trim().is_empty()).then(|| truncate(value.trim(), max))
+}
+fn truncate(value: &str, max: usize) -> String {
+    value.chars().take(max).collect()
+}
+
+fn sanitize_reported_client_ip(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() || value.len() > 64 || value.parse::<IpAddr>().is_err() {
+        return None;
+    }
+    Some(value.to_string())
+}
+fn redact_error(value: &str) -> String {
+    let lowered = value.to_ascii_lowercase();
+    if ["token", "password", "authorization", "secret", "cookie"]
+        .iter()
+        .any(|v| lowered.contains(v))
+    {
+        "Sensitive error details were redacted".to_string()
+    } else {
+        truncate(value, MAX_ERROR_SUMMARY_BYTES)
+    }
+}
+fn sanitize_parameters(
+    raw: Option<Value>,
+) -> (
+    BTreeMap<String, OperationParameterValue>,
+    Option<String>,
+    Option<String>,
+) {
+    let mut safe = BTreeMap::new();
+    let mut error_code = None;
+    let mut error_summary = None;
+    if let Some(Value::Object(values)) = raw {
+        for (key, value) in values {
+            let normalized = key.to_ascii_lowercase();
+            if [
+                "password",
+                "token",
+                "authorization",
+                "secret",
+                "cookie",
+                "command",
+                "environment",
+                "requestbody",
+            ]
+            .iter()
+            .any(|v| normalized.contains(v))
+            {
+                continue;
+            }
+            if normalized == "errorcode" {
+                error_code = value.as_str().map(|v| truncate(v, 128));
+                continue;
+            }
+            if normalized == "error" || normalized == "errorsummary" {
+                error_summary = Some(redact_error(value.as_str().unwrap_or("Operation failed")));
+                continue;
+            }
+            if let Some(value) = parameter_from_json(value) {
+                safe.insert(truncate(&key, 64), value);
+            }
+        }
+    }
+    (safe, error_code, error_summary)
+}
+fn sanitize_parameter_map(
+    values: BTreeMap<String, OperationParameterValue>,
+) -> BTreeMap<String, OperationParameterValue> {
+    values
+        .into_iter()
+        .filter(|(key, _)| {
+            ![
+                "password",
+                "token",
+                "authorization",
+                "secret",
+                "cookie",
+                "command",
+                "environment",
+            ]
+            .iter()
+            .any(|v| key.to_ascii_lowercase().contains(v))
+        })
+        .take(32)
+        .map(|(key, value)| (truncate(&key, 64), value))
+        .collect()
+}
+fn parameter_from_json(value: Value) -> Option<OperationParameterValue> {
+    match value {
+        Value::String(v) => Some(OperationParameterValue::String(truncate(&v, 256))),
+        Value::Number(v) => v.as_f64().map(OperationParameterValue::Number),
+        Value::Bool(v) => Some(OperationParameterValue::Boolean(v)),
+        _ => None,
+    }
+}
+
+fn normalize_operation_target(
+    event: &mut StoredOperationEvent,
+    parameters: &BTreeMap<String, OperationParameterValue>,
+) {
+    if matches!(
+        event.target_kind.as_deref(),
+        Some("fileTask" | "fileTransfer" | "disk_operation" | "imagePullTask")
+    ) {
+        let resource_kind = match event.target_kind.as_deref() {
+            Some("fileTask" | "fileTransfer") => Some("file"),
+            Some("disk_operation") => Some("disk"),
+            _ => None,
+        };
+        if event.task_id.is_none() {
+            event.task_id = event.target_id.take();
+        }
+        event.target_kind = None;
+        event.target_id = None;
+        event.target_display_name = None;
+        event.target_ownership = None;
+        if let (Some(kind), Some(display_name)) =
+            (resource_kind, parameter_display_name(parameters))
+        {
+            event.target_kind = Some(kind.to_string());
+            event.target_id = Some(display_name.clone());
+            event.target_display_name = Some(display_name);
+        }
+        return;
+    }
+    if event.target_display_name.is_none() {
+        event.target_display_name = parameter_display_name(parameters);
+    }
+}
+
+fn parameter_display_name(
+    parameters: &BTreeMap<String, OperationParameterValue>,
+) -> Option<String> {
+    [
+        "targetName",
+        "nodeName",
+        "scriptName",
+        "taskName",
+        "processName",
+        "suiteName",
+        "projectName",
+        "containerName",
+        "volumeName",
+        "networkName",
+        "targetPath",
+        "mountPath",
+        "deviceName",
+        "imageRef",
+        "image",
+        "name",
+        "version",
+    ]
+    .into_iter()
+    .find_map(|key| match parameters.get(key) {
+        Some(OperationParameterValue::String(value)) if !is_opaque_identifier(value) => {
+            non_empty(value, 256)
+        }
+        _ => None,
+    })
+}
+
+async fn enrich_target_display_name(pool: &DbPool, event: &mut StoredOperationEvent) {
+    if event.target_display_name.is_some() {
+        return;
+    }
+    let (Some(kind), Some(id)) = (event.target_kind.as_deref(), event.target_id.as_deref()) else {
+        return;
+    };
+    let resolved = match kind {
+        "node" if id == "local" => Some("Local Node".to_string()),
+        "node" => {
+            query_display_name(pool, "SELECT name FROM nodes WHERE node_id = ?", id).await
+        }
+        "agent" => {
+            query_display_name(
+                pool,
+                "SELECT n.name FROM node_identities i JOIN nodes n ON n.node_id = i.node_id WHERE i.agent_id = ?",
+                id,
+            )
+            .await
+        }
+        "script" => {
+            query_display_name(pool, "SELECT name FROM scripts WHERE script_id = ?", id).await
+        }
+        "scheduled_task" => {
+            query_display_name(
+                pool,
+                "SELECT name FROM scheduled_tasks WHERE task_id = ?",
+                id,
+            )
+            .await
+        }
+        "upgrade_plan" => {
+            query_display_name(
+                pool,
+                "SELECT target_version FROM upgrade_plans WHERE plan_id = ?",
+                id,
+            )
+            .await
+        }
+        "file" | "docker_image" | "image" | "container" | "network" | "volume"
+        | "upgrade_release" | "seclab"
+            if !is_opaque_identifier(id) =>
+        {
+            Some(id.to_string())
+        }
+        _ => None,
+    };
+    event.target_display_name = resolved.map(|value| truncate(&value, 256));
+}
+
+async fn query_display_name(pool: &DbPool, sql: &str, id: &str) -> Option<String> {
+    match sqlx::query_scalar::<_, String>(sql)
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+    {
+        Ok(value) => value.and_then(|value| non_empty(&value, 256)),
+        Err(error) => {
+            warn!(%error, "Operation audit target name resolution failed");
+            None
+        }
+    }
+}
+
+fn is_opaque_identifier(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).is_ok()
+        || (value.len() >= 24 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn actor_kind_value(value: OperationActorKind) -> &'static str {
+    match value {
+        OperationActorKind::User => "user",
+        OperationActorKind::Anonymous => "anonymous",
+        OperationActorKind::System => "system",
+        OperationActorKind::Agent => "agent",
+    }
+}
+fn parse_module(value: &str) -> Result<OperationModule, ApiError> {
+    match value {
+        "auth" => Ok(OperationModule::Auth),
+        "nodes" => Ok(OperationModule::Nodes),
+        "suites" => Ok(OperationModule::Suites),
+        "docker" => Ok(OperationModule::Docker),
+        "files" => Ok(OperationModule::Files),
+        "processes" => Ok(OperationModule::Processes),
+        "disks" => Ok(OperationModule::Disks),
+        "monitoring" => Ok(OperationModule::Monitoring),
+        "scripts" => Ok(OperationModule::Scripts),
+        "scheduledTasks" => Ok(OperationModule::ScheduledTasks),
+        "upgrades" => Ok(OperationModule::Upgrades),
+        "terminal" => Ok(OperationModule::Terminal),
+        "settings" => Ok(OperationModule::Settings),
+        _ => Err(ApiError::Internal("invalid operation module".to_string())),
+    }
+}
+fn parse_outcome(value: &str) -> Result<OperationOutcome, ApiError> {
+    match value {
+        "success" => Ok(OperationOutcome::Success),
+        "failure" => Ok(OperationOutcome::Failure),
+        "partial" => Ok(OperationOutcome::Partial),
+        "canceled" => Ok(OperationOutcome::Canceled),
+        "timedOut" => Ok(OperationOutcome::TimedOut),
+        _ => Err(ApiError::Internal("invalid operation outcome".to_string())),
+    }
+}
+fn parse_impact(value: &str) -> Result<OperationImpact, ApiError> {
+    match value {
+        "info" => Ok(OperationImpact::Info),
+        "warning" => Ok(OperationImpact::Warning),
+        "error" => Ok(OperationImpact::Error),
+        _ => Err(ApiError::Internal("invalid operation impact".to_string())),
+    }
+}
+fn parse_actor_kind(value: &str) -> Result<OperationActorKind, ApiError> {
+    match value {
+        "user" => Ok(OperationActorKind::User),
+        "anonymous" => Ok(OperationActorKind::Anonymous),
+        "system" => Ok(OperationActorKind::System),
+        "agent" => Ok(OperationActorKind::Agent),
+        _ => Err(ApiError::Internal("invalid operation actor".to_string())),
+    }
+}
+fn parse_origin_kind(value: &str) -> Result<OperationOriginKind, ApiError> {
+    match value {
+        "master" => Ok(OperationOriginKind::Master),
+        "agent" => Ok(OperationOriginKind::Agent),
+        _ => Err(ApiError::Internal("invalid operation origin".to_string())),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{LogPayload, fetch_platform_logs};
+    use super::*;
     use crate::test_support::setup_test_db;
+    #[test]
+    fn sanitizer_drops_sensitive_and_complex_values() {
+        let (parameters, code, summary) = sanitize_parameters(Some(
+            serde_json::json!({"nodeId":"n1","password":"bad","items":[1],"errorCode":"FAILED","error":"safe summary"}),
+        ));
+        assert_eq!(parameters.len(), 1);
+        assert_eq!(code.as_deref(), Some("FAILED"));
+        assert_eq!(summary.as_deref(), Some("safe summary"));
+    }
+    #[test]
+    fn registry_computes_module_and_high_impact() {
+        assert_eq!(
+            module_for_event("script_run_completed"),
+            OperationModule::Scripts
+        );
+        assert!(is_high_impact("node_remove"));
+    }
 
-    async fn insert_platform_log(
-        pool: &crate::state::DbPool,
-        module: &str,
-        event: &str,
-        username: &str,
-        target_id: &str,
-        timestamp: &str,
-    ) {
-        sqlx::query(
-            r#"
-            INSERT INTO platform_logs (
-                user_id, username, module, event, target_type, target_id, timestamp,
-                status, client_ip, trace_id, source, request_path, method, metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(Option::<i64>::None)
-        .bind(username)
-        .bind(module)
-        .bind(event)
-        .bind("Target")
-        .bind(target_id)
-        .bind(timestamp)
-        .bind("SUCCESS")
-        .bind("127.0.0.1")
-        .bind(format!("trace-{target_id}"))
-        .bind("seclab_api")
-        .bind("/api/v1/test")
-        .bind("POST")
-        .bind("{}")
-        .execute(pool)
-        .await
-        .unwrap();
+    #[test]
+    fn anonymous_actor_is_not_classified_as_user() {
+        let event =
+            OperationEventBuilder::new("anonymous", "user_login", "127.0.0.1".parse().unwrap());
+        assert_eq!(event.event.actor_kind, "anonymous");
+        assert!(event.event.actor_user_id.is_none());
+        assert!(event.event.target_kind.is_none());
+        assert!(event.event.target_id.is_none());
+    }
+
+    #[test]
+    fn reported_client_ip_accepts_only_ip_addresses() {
+        assert_eq!(
+            sanitize_reported_client_ip(Some(" ::ffff:10.121.7.7 ")).as_deref(),
+            Some("::ffff:10.121.7.7")
+        );
+        assert_eq!(sanitize_reported_client_ip(Some("forwarded-client")), None);
+        assert_eq!(sanitize_reported_client_ip(None), None);
     }
 
     #[tokio::test]
-    async fn fetch_platform_logs_filters_keyword_and_time_range() {
+    async fn target_resolution_uses_domain_name_and_moves_operation_id() {
         let pool = setup_test_db().await;
-        insert_platform_log(
-            &pool,
-            "System",
-            "agent_deploy",
-            "alice",
-            "agent-01",
-            "2024-01-02T10:00:00Z",
+        sqlx::query(
+            "INSERT INTO nodes (node_id, name, normalized_name) VALUES ('node-id', 'Edge Node', 'edge node')",
         )
-        .await;
-        insert_platform_log(
-            &pool,
-            "System",
-            "agent_check",
-            "bob",
-            "agent-02",
-            "2024-01-03T10:00:00Z",
-        )
-        .await;
-        insert_platform_log(
-            &pool,
-            "Auth",
-            "user_login",
-            "alice",
-            "1",
-            "2024-01-04T10:00:00Z",
-        )
-        .await;
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut node_event =
+            OperationEventBuilder::new("admin", "node_update", "127.0.0.1".parse().unwrap())
+                .target_type("node")
+                .target_id("node-id")
+                .event;
+        enrich_target_display_name(&pool, &mut node_event).await;
+        assert_eq!(node_event.target_display_name.as_deref(), Some("Edge Node"));
 
-        let result = fetch_platform_logs(
+        let mut operation_event = OperationEventBuilder::new(
+            "admin",
+            "disk_operation_finished",
+            "127.0.0.1".parse().unwrap(),
+        )
+        .target_type("disk_operation")
+        .target_id("019f6f64-cc8d-7a30-9812-845e0f56f185")
+        .event;
+        let parameters = BTreeMap::from([(
+            "targetName".to_string(),
+            OperationParameterValue::String("/dev/sdb".to_string()),
+        )]);
+        normalize_operation_target(&mut operation_event, &parameters);
+        assert_eq!(
+            operation_event.task_id.as_deref(),
+            Some("019f6f64-cc8d-7a30-9812-845e0f56f185")
+        );
+        assert_eq!(operation_event.target_kind.as_deref(), Some("disk"));
+        assert_eq!(
+            operation_event.target_display_name.as_deref(),
+            Some("/dev/sdb")
+        );
+    }
+
+    #[tokio::test]
+    async fn query_validates_pagination_and_uses_stable_order() {
+        let pool = setup_test_db().await;
+        for event_id in [
+            "018f0000-0000-7000-8000-000000000001",
+            "018f0000-0000-7000-8000-000000000002",
+        ] {
+            insert_event(
+                &pool,
+                &StoredOperationEvent {
+                    event_id: event_id.to_string(),
+                    occurred_at: "2025-01-01T00:00:00Z".to_string(),
+                    module: OperationModule::Nodes,
+                    event_code: "node_update".to_string(),
+                    actor_kind: "user".to_string(),
+                    actor_user_id: None,
+                    actor_display_name: "admin".to_string(),
+                    origin_kind: "master".to_string(),
+                    origin_node_id: None,
+                    origin_node_name: None,
+                    target_kind: Some("node".to_string()),
+                    target_id: Some("node-1".to_string()),
+                    target_display_name: None,
+                    target_ownership: None,
+                    outcome: OperationOutcome::Success,
+                    impact: OperationImpact::Info,
+                    trace_id: "trace".to_string(),
+                    task_id: None,
+                    client_ip: "127.0.0.1".to_string(),
+                    request_method: Some("PATCH".to_string()),
+                    route_template: Some("/api/v1/node/{node_id}".to_string()),
+                    parameters_json: "{}".to_string(),
+                    error_code: None,
+                    error_summary: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let page = query_operation_logs(
             &pool,
-            LogPayload {
+            OperationLogQuery {
                 page: 1,
-                page_size: 10,
-                modules: None,
-                events: None,
-                event_prefixes: None,
-                statuses: None,
-                start_at: Some(1_704_153_600_000),
-                end_at: Some(1_704_326_399_000),
-                keyword: Some("deploy".to_string()),
+                page_size: 20,
+                modules: Some(vec![OperationModule::Nodes]),
+                event_codes: None,
+                outcomes: None,
+                impacts: None,
+                user_ids: None,
+                node_ids: None,
+                occurred_from: None,
+                occurred_to: None,
+                keyword: None,
             },
         )
         .await
         .unwrap();
-
-        assert_eq!(result.total, 1);
-        assert_eq!(result.logs.len(), 1);
-        assert_eq!(result.logs[0].event, "agent_deploy");
-        assert_eq!(result.logs[0].target_id, "agent-01");
+        assert_eq!(page.total, 2);
+        assert!(page.items[0].event_id > page.items[1].event_id);
+        assert_eq!(page.items[0].client_ip.as_deref(), Some("127.0.0.1"));
+        let invalid = query_operation_logs(
+            &pool,
+            OperationLogQuery {
+                page: 0,
+                page_size: 10,
+                modules: None,
+                event_codes: None,
+                outcomes: None,
+                impacts: None,
+                user_ids: None,
+                node_ids: None,
+                occurred_from: None,
+                occurred_to: None,
+                keyword: None,
+            },
+        )
+        .await;
+        assert!(invalid.is_err());
     }
 }

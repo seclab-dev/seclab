@@ -7,7 +7,7 @@ use crate::{
         node_runtime_client::{AgentOperationContext, NodeRuntimeClient},
     },
     services::{
-        logging::{self, PlatformLogEntry},
+        logging::{self, OperationEventBuilder},
         node_read_model,
     },
     state::AppState,
@@ -198,11 +198,19 @@ async fn create_operation(
         }
         Err(error) => {
             mark_submission_failed(&state, &operation_id, &error).await?;
-            record_submit(&state, &admin, &actor, &node_id, &operation_id, true);
+            record_submit(&state, &admin, &actor, &node_id, &operation_id, None, true);
             return Err(error);
         }
     };
-    record_submit(&state, &admin, &actor, &node_id, &operation_id, false);
+    record_submit(
+        &state,
+        &admin,
+        &actor,
+        &node_id,
+        &operation_id,
+        Some(&operation.target),
+        false,
+    );
     tokio::spawn(track_operation(Arc::clone(&state), node_id, operation_id));
     Ok((
         StatusCode::ACCEPTED,
@@ -639,12 +647,13 @@ fn record_submit(
     actor: &DiskActor,
     node_id: &str,
     operation_id: &str,
+    target: Option<&seclab_contracts::disks::DiskOperationTarget>,
     failed: bool,
 ) {
     let Ok(ip) = actor.client_ip.parse::<IpAddr>() else {
         return;
     };
-    PlatformLogEntry::new(&admin.username, "disk_operation_submitted", ip)
+    OperationEventBuilder::new(&admin.username, "disk_operation_submitted", ip)
         .user_id(admin.id)
         .module(LogModule::System)
         .target_type("disk_operation")
@@ -661,7 +670,11 @@ fn record_submit(
         } else {
             PlatformLogLevel::Warning
         })
-        .metadata(json!({"nodeId": node_id, "result": if failed {"failed"} else {"submitted"}}))
+        .metadata(json!({
+            "nodeId": node_id,
+            "targetName": target.and_then(disk_target_display_name),
+            "result": if failed {"failed"} else {"submitted"}
+        }))
         .finish(&state.metadata_db);
 }
 
@@ -682,25 +695,45 @@ async fn record_terminal(state: &AppState, operation: &DiskOperation) {
     };
     let actor_name: String = row.get("actor_name");
     let trace_id: String = row.get("trace_id");
-    let failed = matches!(
-        operation.status,
-        DiskOperationStatus::Failed | DiskOperationStatus::Partial
-    );
-    PlatformLogEntry::new(&actor_name, "disk_operation_finished", ip)
+    OperationEventBuilder::new(&actor_name, "disk_operation_finished", ip)
         .user_id(row.get("actor_user_id"))
         .module(LogModule::System)
         .target_type("disk_operation")
         .target_id(&operation.operation_id)
         .trace_id(&trace_id)
         .request("BACKGROUND", "/api/v1/node/{nodeId}/disk-operations")
-        .status(if failed { LogStatus::Failed } else { LogStatus::Success })
-        .level(if failed { PlatformLogLevel::Error } else { PlatformLogLevel::Warning })
-        .metadata(json!({"nodeId": operation.node_id, "result": status_name(operation.status), "errorCode": operation.error_code}))
+        .outcome(match operation.status {
+            DiskOperationStatus::Partial => seclab_contracts::logging::OperationOutcome::Partial,
+            DiskOperationStatus::Canceled => seclab_contracts::logging::OperationOutcome::Canceled,
+            DiskOperationStatus::Failed => seclab_contracts::logging::OperationOutcome::Failure,
+            _ => seclab_contracts::logging::OperationOutcome::Success,
+        })
+        .level(match operation.status {
+            DiskOperationStatus::Failed => PlatformLogLevel::Error,
+            DiskOperationStatus::Partial => PlatformLogLevel::Warning,
+            DiskOperationStatus::Canceled => PlatformLogLevel::Info,
+            _ => PlatformLogLevel::Warning,
+        })
+        .metadata(json!({
+            "nodeId": operation.node_id,
+            "targetName": disk_target_display_name(&operation.target),
+            "result": status_name(operation.status),
+            "errorCode": operation.error_code
+        }))
         .finish(&state.metadata_db);
     let _ = sqlx::query("UPDATE disk_operations SET terminal_logged = 1 WHERE operation_id = ?")
         .bind(&operation.operation_id)
         .execute(&state.metadata_db)
         .await;
+}
+
+fn disk_target_display_name(target: &seclab_contracts::disks::DiskOperationTarget) -> Option<&str> {
+    target
+        .mount_path
+        .as_deref()
+        .or(target.device_name.as_deref())
+        .or(target.volume_id.as_deref())
+        .or(target.disk_id.as_deref())
 }
 
 fn erase_confirmation(node_name: &str, device_name: &str, fingerprint: &str) -> String {

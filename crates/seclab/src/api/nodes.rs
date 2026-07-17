@@ -5,7 +5,7 @@ use crate::api::node_proxy::{proxy_handler_for_node, websocket_proxy_handler_for
 use crate::models::logging::LogModule;
 use crate::models::node_api_types::{NodeCreatePayload, NodeUpdatePayload};
 use crate::models::nodes::NodeStatus;
-use crate::services::logging::{self, PlatformLogEntry};
+use crate::services::logging::{self, OperationEventBuilder};
 use crate::services::node_check::{NodeCheckResponse, check_node_health};
 use crate::services::node_deploy::{
     NodeDeployError, NodeDeployInput, NodeDeployPayload, deploy_node, deploy_node_with,
@@ -238,18 +238,16 @@ fn should_guard_create_payload(payload: &NodeCreatePayload) -> bool {
 
 pub async fn precheck(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(conn): ConnectInfo<SocketAddr>,
-    admin: AuthenticatedAdmin,
-    headers: HeaderMap,
+    ConnectInfo(_conn): ConnectInfo<SocketAddr>,
+    _admin: AuthenticatedAdmin,
+    _headers: HeaderMap,
     Json(payload): Json<NodePrecheckPayload>,
 ) -> ApiResult<Response> {
-    let trace_id = logging::resolve_trace_id(&headers);
     let addr = payload
         .addr
         .clone()
         .ok_or_else(|| ApiError::BadRequest("node address must not be empty".to_string()))?;
     assert_target_not_current_host(&addr).await?;
-    let precheck_target = addr.clone();
     let user = payload
         .user
         .clone()
@@ -284,19 +282,6 @@ pub async fn precheck(
         precheck_node(&state.metadata_db, input).await
     }
     .await;
-    let mut platform_log = PlatformLogEntry::new(&admin.username, "node_precheck", conn.ip())
-        .module(LogModule::System)
-        .target_type("node")
-        .target_id(&precheck_target)
-        .trace_id(&trace_id)
-        .source("seclab_api")
-        .request("POST", "/api/v1/nodes/precheck");
-    match &result {
-        Ok(_) => platform_log = platform_log.set_success(),
-        Err(err) => platform_log = platform_log.metadata(json!({ "error": err })),
-    }
-    platform_log.finish(&state.metadata_db);
-
     Ok(ApiResponse::success_with_raw("Node precheck completed", Some(result?)).into_response())
 }
 
@@ -478,7 +463,7 @@ pub async fn deploy_create(
             deploy_node_with(deploy_input, Some(Arc::clone(&state_clone.deploy_sessions))).await;
 
         let mut platform_log =
-            PlatformLogEntry::new(&claims_username, "node_deploy_create", client_ip)
+            OperationEventBuilder::new(&claims_username, "node_deploy_create", client_ip)
                 .module(LogModule::System)
                 .target_type("node")
                 .target_id(&node_id_clone)
@@ -637,7 +622,7 @@ pub async fn update(
             .ok_or(ApiError::NotFound)
     }
     .await;
-    let mut platform_log = PlatformLogEntry::new(&admin.username, "node_update", conn.ip())
+    let mut platform_log = OperationEventBuilder::new(&admin.username, "node_update", conn.ip())
         .module(LogModule::System)
         .target_type("node")
         .target_id(&node_id)
@@ -662,14 +647,20 @@ pub async fn remove(
     Path(node_id): Path<String>,
 ) -> ApiResult<Response> {
     let trace_id = logging::resolve_trace_id(&headers);
+    let target_name = node_read_model::get_node_summary(&state.metadata_db, &node_id)
+        .await?
+        .map(|node| node.name);
     let result = node_inventory::delete_node(&state.metadata_db, &node_id).await;
-    let mut platform_log = PlatformLogEntry::new(&admin.username, "node_remove", conn.ip())
+    let mut platform_log = OperationEventBuilder::new(&admin.username, "node_remove", conn.ip())
         .module(LogModule::System)
         .target_type("node")
         .target_id(&node_id)
         .trace_id(&trace_id)
         .source("seclab_api")
         .request("DELETE", "/api/v1/node/{node_id}/remove");
+    if let Some(target_name) = target_name.as_deref() {
+        platform_log = platform_log.target_display_name(target_name);
+    }
 
     match &result {
         Ok(_) => platform_log = platform_log.set_success(),
@@ -722,13 +713,14 @@ pub async fn deploy(
         )
         .await;
 
-        let mut platform_log = PlatformLogEntry::new(&claims_username, "node_deploy", client_ip)
-            .module(LogModule::System)
-            .target_type("node")
-            .target_id(&node_id_clone)
-            .trace_id(&trace_id)
-            .source("seclab_api")
-            .request("POST", "/api/v1/node/{node_id}/deploy");
+        let mut platform_log =
+            OperationEventBuilder::new(&claims_username, "node_deploy", client_ip)
+                .module(LogModule::System)
+                .target_type("node")
+                .target_id(&node_id_clone)
+                .trace_id(&trace_id)
+                .source("seclab_api")
+                .request("POST", "/api/v1/node/{node_id}/deploy");
 
         if let Err(err) = &result {
             platform_log = platform_log.metadata(json!({ "error": err }));
@@ -758,33 +750,13 @@ pub async fn deploy_progress(
 
 pub async fn check(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(conn): ConnectInfo<SocketAddr>,
-    admin: AuthenticatedAdmin,
-    headers: HeaderMap,
+    ConnectInfo(_conn): ConnectInfo<SocketAddr>,
+    _admin: AuthenticatedAdmin,
+    _headers: HeaderMap,
     Path(node_id): Path<String>,
 ) -> ApiResult<Response> {
-    let trace_id = logging::resolve_trace_id(&headers);
     let result: Result<NodeCheckResponse, ApiError> =
         check_node_health(&state.metadata_db, &node_id).await;
-
-    let mut platform_log = PlatformLogEntry::new(&admin.username, "node_check", conn.ip())
-        .module(LogModule::System)
-        .target_type("node")
-        .target_id(&node_id)
-        .trace_id(&trace_id)
-        .source("seclab_api")
-        .request("POST", "/api/v1/node/{node_id}/check");
-    match &result {
-        Ok(summary) => {
-            platform_log = platform_log
-                .set_success()
-                .metadata(json!({ "status": summary.status }));
-        }
-        Err(err) => {
-            platform_log = platform_log.metadata(json!({ "error": err }));
-        }
-    }
-    platform_log.finish(&state.metadata_db);
 
     Ok(ApiResponse::success_with_raw("Node check completed", Some(result?)).into_response())
 }
@@ -799,7 +771,7 @@ pub async fn repair(
 ) -> ApiResult<Response> {
     let trace_id = logging::resolve_trace_id(&headers);
     let result = repair_node(&state.metadata_db, &node_id, payload).await;
-    let mut platform_log = PlatformLogEntry::new(&admin.username, "node_repair", conn.ip())
+    let mut platform_log = OperationEventBuilder::new(&admin.username, "node_repair", conn.ip())
         .module(LogModule::System)
         .target_type("node")
         .target_id(&node_id)
@@ -824,7 +796,7 @@ pub async fn retire(
 ) -> ApiResult<Response> {
     let trace_id = logging::resolve_trace_id(&headers);
     let result = retire_node(&state.metadata_db, &node_id).await;
-    let mut platform_log = PlatformLogEntry::new(&admin.username, "node_retire", conn.ip())
+    let mut platform_log = OperationEventBuilder::new(&admin.username, "node_retire", conn.ip())
         .module(LogModule::System)
         .target_type("node")
         .target_id(&node_id)
@@ -849,7 +821,7 @@ pub async fn uninstall(
 ) -> ApiResult<Response> {
     let trace_id = logging::resolve_trace_id(&headers);
     let result = uninstall_node(&state.metadata_db, &node_id).await;
-    let mut platform_log = PlatformLogEntry::new(&admin.username, "node_uninstall", conn.ip())
+    let mut platform_log = OperationEventBuilder::new(&admin.username, "node_uninstall", conn.ip())
         .module(LogModule::System)
         .target_type("node")
         .target_id(&node_id)
