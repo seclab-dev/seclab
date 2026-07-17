@@ -1,24 +1,28 @@
 <script setup lang="ts">
 /**
  * @file FirewallManagerView.vue
- * @description SecLab 平台远程主机防火墙状态检测视窗。
+ * @description 当前 Node 实际生效防火墙规则的只读观察视图。
  */
 
-import { ref, onMounted, watch, computed } from 'vue'
-import { useNodeStore } from '@/stores/node'
-import { useWindowManagerStore } from '@/stores/window-manager'
-import { systemApi } from '@/api/modules/system'
-import type { FirewallStatusInfo } from '@/api/interface/system'
-import {
-  SecLabCard,
-  SecLabTag,
-  SecLabAlert,
-  SecLabDescriptions,
-  SecLabLoading,
-  SecLabEmpty,
-  SecLabTable,
-} from '@/components/ui'
+import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import type { FirewallRuleSummary } from '@/api/modules/firewall'
+import { useFirewallRules } from '@/composables/useFirewallRules'
+import { useWindowManagerStore } from '@/stores/window-manager'
+import {
+  SecLabAlert,
+  SecLabButton,
+  SecLabDescriptions,
+  SecLabDrawer,
+  SecLabEmpty,
+  SecLabInput,
+  SecLabLoading,
+  SecLabPagination,
+  SecLabSelect,
+  SecLabTable,
+  SecLabTag,
+} from '@/components/ui'
+import type { SecLabTableColumn } from '@/components/ui/SecLabTable.vue'
 
 const props = defineProps<{
   isMaximized?: boolean
@@ -27,445 +31,699 @@ const props = defineProps<{
 }>()
 
 const { t } = useI18n()
-const nodeStore = useNodeStore()
 const windowStore = useWindowManagerStore()
-
-const loading = ref(false)
-const firewallInfo = ref<FirewallStatusInfo | null>(null)
+const manager = useFirewallRules()
+const drawerVisible = ref(false)
 
 watch(
-  loading,
-  (busy) => {
-    if (!props.windowId) return
-    windowStore.updateWindowRuntimeState(props.windowId, {
-      busy,
-      allowsNodeSwitch: false,
-      blockLevel: busy ? 'busy' : 'open',
-      blockReason: busy ? t('app.firewallManager.guardBusy') : t('app.firewallManager.guardOpen'),
+  () => props.windowId,
+  (windowId) => {
+    if (!windowId) return
+    windowStore.updateWindowRuntimeState(windowId, {
+      busy: false,
+      activeSession: false,
+      allowsNodeSwitch: true,
+      blockLevel: 'open',
+      blockReason: t('app.firewallManager.guardOpen'),
     })
   },
   { immediate: true },
 )
 
-const systemClient = computed(() => systemApi.forNode(nodeStore.currentNodeId))
-const currentNodeName = computed(() => {
-  const activeNode = nodeStore.nodes.find((node) => node.id === nodeStore.currentNodeId)
-  return activeNode?.name || nodeStore.currentNodeId || '--'
-})
-const backendColumns = computed(() => [
-  { prop: 'backend', label: t('app.firewallManager.backend'), minWidth: 120, slot: 'backend' },
-  { prop: 'active', label: t('app.firewallManager.active'), minWidth: 120, slot: 'active' },
-  { prop: 'serviceStatus', label: t('app.firewallManager.serviceStatus'), minWidth: 150 },
-  { prop: 'version', label: t('app.firewallManager.version'), minWidth: 180, slot: 'version' },
-  { prop: 'commandPath', label: t('app.firewallManager.commandPath'), minWidth: 180, slot: 'path' },
+const engineOptions = computed(() => [
+  { value: 'all', label: t('app.firewallManager.filters.allEngines') },
+  { value: 'nftables', label: 'nftables' },
+  { value: 'iptables', label: 'iptables' },
 ])
-const ruleColumns = computed(() => [
-  { prop: 'backend', label: t('app.firewallManager.backend'), minWidth: 110, slot: 'backend' },
-  { prop: 'scope', label: t('app.firewallManager.scope'), minWidth: 130 },
-  { prop: 'action', label: t('app.firewallManager.action'), minWidth: 110, slot: 'action' },
-  { prop: 'protocol', label: t('app.firewallManager.protocol'), minWidth: 100, slot: 'protocol' },
-  { prop: 'port', label: t('app.firewallManager.port'), minWidth: 110, slot: 'port' },
-  { prop: 'source', label: t('app.firewallManager.source'), minWidth: 150, slot: 'source' },
-  { prop: 'raw', label: t('app.firewallManager.rawRule'), minWidth: 280, slot: 'raw' },
+const familyOptions = computed(() => [
+  { value: 'all', label: t('app.firewallManager.filters.allFamilies') },
+  ...['inet', 'ipv4', 'ipv6', 'bridge', 'arp', 'netdev', 'unknown'].map((value) => ({
+    value,
+    label: t(`app.firewallManager.families.${value}`),
+  })),
+])
+const actionOptions = computed(() => [
+  { value: 'all', label: t('app.firewallManager.filters.allActions') },
+  ...[
+    'accept',
+    'drop',
+    'reject',
+    'return',
+    'jump',
+    'goto',
+    'log',
+    'masquerade',
+    'dnat',
+    'snat',
+    'redirect',
+    'queue',
+    'continue',
+    'other',
+  ].map((value) => ({ value, label: t(`app.firewallManager.actions.${value}`) })),
 ])
 
-/**
- * 触发主机防火墙状态检测
- */
-const triggerDetection = async () => {
-  loading.value = true
-  try {
-    const res = await systemClient.value.detectFirewall()
-    if (res.data) {
-      firewallInfo.value = res.data
-    }
-  } catch (err) {
-    console.error('Failed to detect firewall status:', err)
-  } finally {
-    loading.value = false
-  }
-}
-
-// 监听目标计算节点改变，动态自动重测
-watch(
-  () => nodeStore.currentNodeId,
-  () => {
-    triggerDetection()
+const columns = computed<SecLabTableColumn[]>(() => [
+  {
+    prop: 'engine',
+    label: t('app.firewallManager.columns.engine'),
+    width: 108,
+    slot: 'engine',
   },
+  {
+    prop: 'family',
+    label: t('app.firewallManager.columns.family'),
+    width: 92,
+    slot: 'family',
+  },
+  {
+    prop: 'table',
+    label: t('app.firewallManager.columns.scope'),
+    minWidth: 160,
+    slot: 'scope',
+  },
+  {
+    prop: 'action',
+    label: t('app.firewallManager.columns.action'),
+    width: 112,
+    slot: 'action',
+  },
+  {
+    prop: 'protocol',
+    label: t('app.firewallManager.columns.protocol'),
+    width: 90,
+    slot: 'protocol',
+  },
+  {
+    prop: 'sourceAddress',
+    label: t('app.firewallManager.columns.source'),
+    minWidth: 150,
+    slot: 'source',
+  },
+  {
+    prop: 'destinationAddress',
+    label: t('app.firewallManager.columns.destination'),
+    minWidth: 180,
+    slot: 'destination',
+  },
+  {
+    prop: 'ruleId',
+    label: t('app.firewallManager.columns.detail'),
+    width: 88,
+    align: 'center',
+    slot: 'detail',
+    fixed: 'right',
+  },
+])
+
+const totalPages = computed(() =>
+  Math.max(1, Math.ceil((manager.page.value?.total ?? 0) / manager.pageSize.value)),
 )
-
-onMounted(() => {
-  triggerDetection()
-})
-
-const firewallInfoItems = computed(() => {
-  if (!firewallInfo.value) return []
+const hasFilters = computed(
+  () =>
+    Boolean(manager.keyword.value.trim()) ||
+    manager.engine.value !== 'all' ||
+    manager.family.value !== 'all' ||
+    manager.action.value !== 'all',
+)
+const collectionTag = computed(() =>
+  manager.page.value?.collection.status === 'partial'
+    ? { type: 'warning' as const, label: t('app.firewallManager.collection.partial') }
+    : { type: 'success' as const, label: t('app.firewallManager.collection.complete') },
+)
+const detailItems = computed(() => {
+  const summary = manager.detail.value?.summary
+  if (!summary) return []
   return [
-    { label: t('app.firewallManager.targetNode'), slot: 'targetNode' },
-    { label: t('app.firewallManager.installStatus'), slot: 'installedStatus' },
-    { label: t('app.firewallManager.primaryBackend'), slot: 'firewallType' },
-    { label: t('app.firewallManager.version'), slot: 'version' },
-    { label: t('app.firewallManager.active'), slot: 'activity' },
-    { label: t('app.firewallManager.serviceStatus'), slot: 'serviceStatus' },
-  ]
+    {
+      label: t('app.firewallManager.detail.kind'),
+      value: t(`app.firewallManager.kinds.${summary.kind}`),
+    },
+    { label: t('app.firewallManager.columns.engine'), value: summary.engine },
+    {
+      label: t('app.firewallManager.columns.family'),
+      value: t(`app.firewallManager.families.${summary.family}`),
+    },
+    { label: t('app.firewallManager.detail.table'), value: summary.table },
+    { label: t('app.firewallManager.detail.chain'), value: summary.chain },
+    { label: t('app.firewallManager.detail.position'), value: summary.position },
+    { label: t('app.firewallManager.columns.action'), value: formatAction(summary) },
+    summary.protocol
+      ? { label: t('app.firewallManager.columns.protocol'), value: summary.protocol }
+      : null,
+    summary.sourceAddress
+      ? { label: t('app.firewallManager.detail.sourceAddress'), value: summary.sourceAddress }
+      : null,
+    summary.destinationAddress
+      ? {
+          label: t('app.firewallManager.detail.destinationAddress'),
+          value: summary.destinationAddress,
+        }
+      : null,
+    summary.sourcePorts.length
+      ? {
+          label: t('app.firewallManager.detail.sourcePorts'),
+          value: summary.sourcePorts.join(', '),
+        }
+      : null,
+    summary.destinationPorts.length
+      ? {
+          label: t('app.firewallManager.detail.destinationPorts'),
+          value: summary.destinationPorts.join(', '),
+        }
+      : null,
+    summary.inputInterface
+      ? { label: t('app.firewallManager.detail.inputInterface'), value: summary.inputInterface }
+      : null,
+    summary.outputInterface
+      ? { label: t('app.firewallManager.detail.outputInterface'), value: summary.outputInterface }
+      : null,
+    summary.comment
+      ? { label: t('app.firewallManager.detail.comment'), value: summary.comment }
+      : null,
+  ].filter((item): item is NonNullable<typeof item> => item !== null)
 })
 
-const backendCount = computed(() => firewallInfo.value?.detectedBackends?.length ?? 0)
-const ruleCount = computed(() => firewallInfo.value?.rules?.length ?? 0)
-
-const getBackendTagType = (backend: string) => {
-  if (backend === 'ufw') return 'primary'
-  if (backend === 'firewalld') return 'warning'
-  if (backend === 'nftables') return 'info'
-  if (backend === 'iptables') return 'default'
+function actionTagType(action: FirewallRuleSummary['action']) {
+  if (action === 'accept') return 'success'
+  if (action === 'drop' || action === 'reject') return 'danger'
+  if (action === 'jump' || action === 'goto' || action === 'continue') return 'info'
   return 'default'
 }
 
-const getActionTagType = (action: string) => {
-  const normalized = action.toLowerCase()
-  if (normalized.includes('accept') || normalized.includes('allow') || normalized === 'service') {
-    return 'success'
-  }
-  if (normalized.includes('drop') || normalized.includes('deny') || normalized.includes('reject')) {
-    return 'danger'
-  }
-  return 'default'
+function formatAction(rule: FirewallRuleSummary) {
+  const label = t(`app.firewallManager.actions.${rule.action}`)
+  return rule.actionTarget ? `${label} → ${rule.actionTarget}` : label
+}
+
+function formatEndpoint(address: string | undefined, ports: string[]) {
+  if (!address && ports.length === 0) return t('app.firewallManager.any')
+  if (!address) return ports.join(', ')
+  if (ports.length === 0) return address
+  return `${address}:${ports.join(', ')}`
+}
+
+function openDetail(rule: FirewallRuleSummary) {
+  if (!rule.capabilities.canViewDetail) return
+  drawerVisible.value = true
+  void manager.loadDetail(rule)
+}
+
+function closeDetail() {
+  drawerVisible.value = false
+  manager.clearDetail()
 }
 </script>
 
 <template>
-  <div class="firewall-app flex-column" data-page="firewall-manager">
-    <!-- 主体内容呈现区 -->
-    <div class="content flex-1 overflow-auto">
-      <div class="content-container">
-        <SecLabLoading :loading="loading" :text="t('app.firewallManager.loading')">
-          <div v-if="firewallInfo" class="firewall-dashboard">
-            <div class="summary-grid mb-4" data-ui="firewall-summary-grid">
-              <div class="summary-tile">
-                <span class="summary-label">{{ t('app.firewallManager.detectedBackends') }}</span>
-                <strong>{{ backendCount }}</strong>
-              </div>
-              <div class="summary-tile">
-                <span class="summary-label">{{ t('app.firewallManager.ruleCount') }}</span>
-                <strong>{{ ruleCount }}</strong>
-              </div>
-              <div class="summary-tile">
-                <span class="summary-label">{{ t('app.firewallManager.platform') }}</span>
-                <strong>{{ firewallInfo.platform?.toUpperCase() || '--' }}</strong>
-              </div>
+  <div class="firewall-view" data-page="firewall-manager" data-ui="firewall-rules">
+    <div class="toolbar" data-ui="toolbar" data-slot="toolbar">
+      <div class="filters" data-slot="filters">
+        <label class="visually-hidden" for="firewall-rule-search">
+          {{ t('app.firewallManager.filters.searchLabel') }}
+        </label>
+        <SecLabInput
+          id="firewall-rule-search"
+          v-model="manager.keyword.value"
+          class="search-input"
+          name="firewallRuleSearch"
+          :aria-label="t('app.firewallManager.filters.searchLabel')"
+          :placeholder="t('app.firewallManager.filters.searchPlaceholder')"
+        />
+
+        <label class="visually-hidden" for="firewall-engine-filter">
+          {{ t('app.firewallManager.filters.engineLabel') }}
+        </label>
+        <SecLabSelect
+          id="firewall-engine-filter"
+          v-model="manager.engine.value"
+          class="filter-select"
+          name="firewallEngineFilter"
+          :aria-label="t('app.firewallManager.filters.engineLabel')"
+          :options="engineOptions"
+        />
+
+        <label class="visually-hidden" for="firewall-family-filter">
+          {{ t('app.firewallManager.filters.familyLabel') }}
+        </label>
+        <SecLabSelect
+          id="firewall-family-filter"
+          v-model="manager.family.value"
+          class="filter-select"
+          name="firewallFamilyFilter"
+          :aria-label="t('app.firewallManager.filters.familyLabel')"
+          :options="familyOptions"
+        />
+
+        <label class="visually-hidden" for="firewall-action-filter">
+          {{ t('app.firewallManager.filters.actionLabel') }}
+        </label>
+        <SecLabSelect
+          id="firewall-action-filter"
+          v-model="manager.action.value"
+          class="filter-select"
+          name="firewallActionFilter"
+          :aria-label="t('app.firewallManager.filters.actionLabel')"
+          :options="actionOptions"
+        />
+      </div>
+
+      <SecLabButton
+        type="secondary"
+        class="refresh-button"
+        :loading="manager.manualRefreshing.value"
+        data-slot="refresh"
+        @click="manager.refresh"
+      >
+        <span class="refresh-label">
+          {{
+            manager.manualRefreshing.value
+              ? t('app.firewallManager.refreshing')
+              : t('app.firewallManager.refresh')
+          }}
+        </span>
+      </SecLabButton>
+    </div>
+
+    <SecLabAlert
+      v-if="manager.warning.value"
+      type="warning"
+      :title="t('app.firewallManager.messages.stale')"
+      :description="manager.warning.value"
+      show-icon
+      data-ui="refresh-warning"
+    />
+    <SecLabAlert
+      v-if="manager.page.value?.collection.status === 'partial'"
+      type="warning"
+      :title="
+        t('app.firewallManager.collection.partialCoverage', {
+          coverage: manager.page.value.collection.coveragePercent.toFixed(0),
+        })
+      "
+      show-icon
+      data-ui="partial-collection"
+    />
+
+    <div class="content" data-slot="content">
+      <div
+        v-if="manager.phase.value === 'initialLoading'"
+        class="center-state initial-loading-state"
+        aria-busy="true"
+        data-ui="initial-loading"
+      >
+        <SecLabLoading
+          class="initial-loading"
+          :loading="true"
+          :text="t('app.firewallManager.loading')"
+        />
+      </div>
+
+      <div
+        v-else-if="manager.phase.value === 'initialError'"
+        class="center-state error-state"
+        data-ui="initial-error"
+      >
+        <SecLabEmpty icon="error" data-slot="error-empty">
+          <span class="error-title">{{ t('app.firewallManager.messages.initialError') }}</span>
+          <template #extra>
+            <div class="error-actions">
+              <SecLabButton type="secondary" @click="manager.retry">
+                {{ t('app.firewallManager.retry') }}
+              </SecLabButton>
             </div>
+          </template>
+        </SecLabEmpty>
+      </div>
 
-            <!-- 安全体检摘要 -->
-            <SecLabCard class="mb-4">
-              <template #title>
-                <div class="card-title flex-layout gap-2">
-                  <span>{{ t('app.firewallManager.hostSummary') }}</span>
-                </div>
-              </template>
+      <SecLabEmpty
+        v-else-if="manager.page.value?.availableTotal === 0"
+        :description="t('app.firewallManager.empty')"
+        data-ui="rules-empty"
+      />
 
-              <SecLabDescriptions
-                :items="firewallInfoItems"
-                :data="firewallInfo"
-                :column="2"
-                border
-              >
-                <template #targetNode>
-                  <span class="code-text">{{ currentNodeName }}</span>
-                </template>
-                <template #installedStatus>
-                  <span v-if="firewallInfo.installed" class="font-bold text-success">
-                    {{ t('app.firewallManager.detected') }}
-                  </span>
-                  <span v-else class="font-bold text-muted">
-                    {{ t('app.firewallManager.unknownProtection') }}
-                  </span>
-                </template>
-                <template #firewallType>
-                  <SecLabTag
-                    v-if="firewallInfo.primaryBackend"
-                    :type="getBackendTagType(firewallInfo.primaryBackend)"
-                    >{{ firewallInfo.primaryBackend.toUpperCase() }}</SecLabTag
-                  >
-                  <span v-else class="text-muted">--</span>
-                </template>
-                <template #version>
-                  <span v-if="firewallInfo.version" class="code-text">{{
-                    firewallInfo.version
-                  }}</span>
-                  <span v-else class="text-muted">--</span>
-                </template>
-                <template #activity>
-                  <SecLabTag v-if="firewallInfo.active" type="success">{{
-                    t('app.firewallManager.activeStatus')
-                  }}</SecLabTag>
-                  <SecLabTag v-else-if="firewallInfo.installed" type="danger" size="small">{{
-                    t('app.firewallManager.inactiveStatus')
-                  }}</SecLabTag>
-                  <span v-else class="text-muted">--</span>
-                </template>
-                <template #serviceStatus>
-                  <span class="code-text">{{ firewallInfo.serviceStatus }}</span>
-                </template>
-              </SecLabDescriptions>
-            </SecLabCard>
-
-            <SecLabCard class="mb-4">
-              <template #title>
-                <span>{{ t('app.firewallManager.backendInventory') }}</span>
-              </template>
-              <SecLabTable
-                :data="firewallInfo.detectedBackends || []"
-                :columns="backendColumns"
-                border
-              >
-                <template #backend="{ row }">
-                  <SecLabTag :type="getBackendTagType(row.backend)">{{
-                    row.backend.toUpperCase()
-                  }}</SecLabTag>
-                </template>
-                <template #active="{ row }">
-                  <SecLabTag :type="row.active ? 'success' : 'warning'">
-                    {{
-                      row.active
-                        ? t('app.firewallManager.activeStatus')
-                        : t('app.firewallManager.inactiveStatus')
-                    }}
-                  </SecLabTag>
-                </template>
-                <template #version="{ row }">
-                  <span class="code-text">{{ row.version || '--' }}</span>
-                </template>
-                <template #path="{ row }">
-                  <span class="code-text">{{ row.commandPath || '--' }}</span>
-                </template>
-                <template #empty>
-                  <SecLabEmpty :description="t('app.firewallManager.noBackend')" />
-                </template>
-              </SecLabTable>
-            </SecLabCard>
-
-            <SecLabCard class="mb-4">
-              <template #title>
-                <span>{{ t('app.firewallManager.ruleSummary') }}</span>
-              </template>
-              <SecLabTable :data="firewallInfo.rules || []" :columns="ruleColumns" border>
-                <template #backend="{ row }">
-                  <SecLabTag :type="getBackendTagType(row.backend)">{{
-                    row.backend.toUpperCase()
-                  }}</SecLabTag>
-                </template>
-                <template #action="{ row }">
-                  <SecLabTag :type="getActionTagType(row.action)">{{ row.action }}</SecLabTag>
-                </template>
-                <template #protocol="{ row }">
-                  <span class="code-text">{{ row.protocol || '--' }}</span>
-                </template>
-                <template #port="{ row }">
-                  <span class="code-text">{{ row.port || '--' }}</span>
-                </template>
-                <template #source="{ row }">
-                  <span class="code-text">{{ row.source || '--' }}</span>
-                </template>
-                <template #raw="{ row }">
-                  <span class="raw-rule">{{ row.raw }}</span>
-                </template>
-                <template #empty>
-                  <SecLabEmpty :description="t('app.firewallManager.noRules')" />
-                </template>
-              </SecLabTable>
-            </SecLabCard>
-
-            <SecLabAlert
-              v-if="firewallInfo.warnings?.length"
-              type="warning"
-              :title="t('app.firewallManager.warningTitle')"
-              class="mb-4"
-            >
-              <ul class="warning-list">
-                <li v-for="warning in firewallInfo.warnings" :key="warning">
-                  {{ warning }}
-                </li>
-              </ul>
-            </SecLabAlert>
-
-            <!-- 边界防御诊断报告 -->
-            <SecLabCard v-if="firewallInfo.installed">
-              <template #title>
-                <span>{{ t('app.firewallManager.diagnosisTitle') }}</span>
-              </template>
-              <div class="diagnosis-content">
-                <div v-if="firewallInfo.active" class="diagnosis-status healthy">
-                  <div class="status-indicator healthy"></div>
-                  <div class="status-details">
-                    <h4>{{ t('app.firewallManager.healthyTitle') }}</h4>
-                    <p>
-                      {{ t('app.firewallManager.healthyDesc') }}
-                    </p>
-                  </div>
-                </div>
-                <div v-else class="diagnosis-status warned">
-                  <div class="status-indicator warned"></div>
-                  <div class="status-details">
-                    <h4>{{ t('app.firewallManager.inactiveTitle') }}</h4>
-                    <p>
-                      {{ t('app.firewallManager.inactiveDesc') }}
-                    </p>
-                  </div>
-                </div>
-              </div>
-            </SecLabCard>
+      <div v-else class="table-workspace" data-ui="table-workspace">
+        <div class="table-meta" data-slot="status">
+          <div class="status-cluster">
+            <SecLabTag :type="collectionTag.type" effect="light">
+              {{ collectionTag.label }}
+            </SecLabTag>
+            <span>
+              {{
+                t('app.firewallManager.ruleCount', {
+                  filtered: manager.page.value?.total ?? 0,
+                  total: manager.page.value?.availableTotal ?? 0,
+                })
+              }}
+            </span>
           </div>
+          <span v-if="manager.loadedAt.value" class="collected-at">
+            {{
+              t('app.firewallManager.collectedAt', {
+                time: manager.loadedAt.value.toLocaleString(),
+              })
+            }}
+          </span>
+        </div>
 
-          <div v-else class="empty-status">
-            <SecLabEmpty :description="t('app.firewallManager.empty')" />
-          </div>
-        </SecLabLoading>
+        <div class="table-region" data-slot="table">
+          <SecLabTable
+            :data="manager.rules.value"
+            :columns="columns"
+            row-key="ruleId"
+            border
+            data-ui="table"
+          >
+            <template #engine="{ row }">
+              <SecLabTag type="info" effect="light">{{ row.engine }}</SecLabTag>
+            </template>
+            <template #family="{ row }">
+              {{ t(`app.firewallManager.families.${row.family}`) }}
+            </template>
+            <template #scope="{ row }">
+              <span class="code-text">{{ row.table }}/{{ row.chain }}</span>
+            </template>
+            <template #action="{ row }">
+              <SecLabTag :type="actionTagType(row.action)" effect="light">
+                {{ formatAction(row) }}
+              </SecLabTag>
+            </template>
+            <template #protocol="{ row }">
+              <span v-if="row.protocol" class="code-text">{{ row.protocol }}</span>
+            </template>
+            <template #source="{ row }">
+              <span class="code-text">{{
+                formatEndpoint(row.sourceAddress, row.sourcePorts)
+              }}</span>
+            </template>
+            <template #destination="{ row }">
+              <span class="code-text">
+                {{ formatEndpoint(row.destinationAddress, row.destinationPorts) }}
+              </span>
+            </template>
+            <template #detail="{ row }">
+              <SecLabButton
+                type="secondary"
+                size="small"
+                :disabled="!row.capabilities.canViewDetail"
+                :aria-label="t('app.firewallManager.detail.openAria')"
+                @click="openDetail(row)"
+              >
+                {{ t('app.firewallManager.detail.open') }}
+              </SecLabButton>
+            </template>
+            <template #empty>
+              <SecLabEmpty
+                :description="
+                  hasFilters
+                    ? t('app.firewallManager.filteredEmpty')
+                    : t('app.firewallManager.empty')
+                "
+                data-ui="filtered-empty"
+              />
+            </template>
+          </SecLabTable>
+        </div>
+
+        <div class="pagination-bar" data-slot="pagination">
+          <SecLabPagination
+            :current-page="manager.currentPage.value"
+            :total-pages="totalPages"
+            :aria-label="t('app.firewallManager.pagination.label')"
+            :previous-label="t('app.firewallManager.pagination.previous')"
+            :next-label="t('app.firewallManager.pagination.next')"
+            data-ui="pagination"
+            @page-change="manager.goToPage"
+          />
+        </div>
       </div>
     </div>
+
+    <SecLabDrawer
+      v-model="drawerVisible"
+      :title="t('app.firewallManager.detail.title')"
+      width="520px"
+      data-ui="rule-detail-drawer"
+      @close="closeDetail"
+    >
+      <div data-slot="detail">
+        <SecLabLoading
+          v-if="manager.detailLoading.value"
+          :loading="true"
+          :text="t('app.firewallManager.detail.loading')"
+        />
+        <SecLabAlert
+          v-else-if="manager.detailError.value"
+          type="error"
+          :title="manager.detailError.value"
+          show-icon
+          data-ui="detail-error"
+        />
+        <template v-else-if="manager.detail.value">
+          <SecLabAlert
+            v-if="manager.detail.value.parseStatus === 'partial'"
+            type="warning"
+            :title="t('app.firewallManager.detail.partial')"
+            show-icon
+            data-ui="detail-partial"
+          />
+          <SecLabDescriptions :items="detailItems" :column="1" border />
+
+          <div v-if="manager.detail.value.matches.length" class="detail-group" data-slot="matches">
+            <div class="detail-heading">{{ t('app.firewallManager.detail.matches') }}</div>
+            <div
+              v-for="(match, index) in manager.detail.value.matches"
+              :key="`${match.field}-${index}`"
+              class="expression-row"
+            >
+              <span class="code-text">{{ match.field }}</span>
+              <span>{{ match.operator }}</span>
+              <span class="code-text">{{ match.value }}</span>
+            </div>
+          </div>
+
+          <div v-if="manager.detail.value.effects.length" class="detail-group" data-slot="effects">
+            <div class="detail-heading">{{ t('app.firewallManager.detail.effects') }}</div>
+            <div
+              v-for="(effect, index) in manager.detail.value.effects"
+              :key="`${effect.action}-${index}`"
+              class="expression-row"
+            >
+              <SecLabTag :type="actionTagType(effect.action)" effect="light">
+                {{ t(`app.firewallManager.actions.${effect.action}`) }}
+              </SecLabTag>
+              <span v-if="effect.target" class="code-text">{{ effect.target }}</span>
+            </div>
+          </div>
+        </template>
+      </div>
+    </SecLabDrawer>
   </div>
 </template>
 
 <style scoped>
-.firewall-app {
+.firewall-view {
   height: 100%;
-  background-color: var(--sdl-bg-canvas);
-  overflow: hidden;
+  min-height: 0;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
+  background: var(--sdl-bg-panel);
+}
+
+.toolbar {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sdl-space-3);
+  padding: var(--sdl-space-3) var(--sdl-space-4);
+  border-bottom: 1px solid var(--sdl-border-subtle);
+}
+
+.filters {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--sdl-space-2);
+  flex-wrap: wrap;
+}
+
+.search-input {
+  width: min(280px, 34vw);
+}
+
+.filter-select {
+  width: 150px;
+}
+
+.refresh-button {
+  flex: 0 0 auto;
+}
+
+.refresh-label {
+  display: inline-block;
+  white-space: nowrap;
 }
 
 .content {
-  padding: var(--sdl-space-4);
-  box-sizing: border-box;
+  flex: 1;
   min-height: 0;
-  overflow-y: auto;
-  overflow-x: hidden;
-  scrollbar-gutter: stable;
-}
-
-.content-container {
-  max-width: 1180px;
-  margin: 0 auto;
-}
-
-.alert-desc {
-  margin: 0;
-  line-height: 1.6;
-}
-
-.code-text {
-  font-family: monospace;
-  background-color: var(--sdl-bg-muted);
-  padding: 2px 6px;
-  border-radius: var(--sdl-radius-sm);
-  color: var(--sdl-text-primary);
-  font-size: 12px;
-}
-
-.badge-text {
-  font-family: monospace;
-  font-weight: bold;
-  color: var(--sdl-primary);
-}
-
-.summary-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: var(--sdl-space-4);
-}
-
-.summary-tile {
-  background-color: var(--sdl-bg-card);
-  border: 1px solid var(--sdl-border-default);
-  border-radius: var(--sdl-radius-md);
-  padding: var(--sdl-space-4);
   display: flex;
   flex-direction: column;
-  gap: var(--sdl-space-2);
-  min-width: 0;
+  padding: var(--sdl-space-4);
+  overflow: hidden;
 }
 
-.summary-tile strong {
-  font-size: 24px;
-  line-height: 1.1;
-  color: var(--sdl-text-primary);
-}
-
-.summary-label {
-  color: var(--sdl-text-muted);
-  font-size: 12px;
-}
-
-.raw-rule {
-  font-family: monospace;
-  color: var(--sdl-text-secondary);
-  white-space: normal;
-  word-break: break-all;
-}
-
-.warning-list {
-  margin: 0;
-  padding-left: var(--sdl-space-4);
-  color: var(--sdl-text-secondary);
-  line-height: 1.6;
-}
-
-.diagnosis-content {
-  padding: var(--sdl-space-2);
-}
-
-.diagnosis-status {
+.center-state {
+  flex: 1;
+  min-height: 0;
   display: flex;
-  gap: var(--sdl-space-4);
-  align-items: flex-start;
+  align-items: center;
+  justify-content: center;
 }
 
-.status-indicator {
-  width: 12px;
-  height: 12px;
-  border-radius: var(--sdl-radius-pill);
-  margin-top: 6px;
-  flex-shrink: 0;
+.error-state {
+  flex-direction: column;
 }
 
-.status-indicator.healthy {
-  background-color: var(--sdl-success);
-  box-shadow: 0 0 0 6px var(--sdl-success-soft);
+.initial-loading-state,
+.initial-loading {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
 }
 
-.status-indicator.warned {
-  background-color: var(--sdl-warning);
-  box-shadow: 0 0 0 6px var(--sdl-warning-soft);
+.initial-loading :deep(.sl-loading-spinner),
+.initial-loading :deep(.sl-loading-text) {
+  min-width: 0;
+  max-width: 100%;
 }
 
-.status-details h4 {
-  margin: 0 0 var(--sdl-space-2);
-  font-size: 16px;
+.initial-loading :deep(.sl-loading-text) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.error-title {
+  display: block;
+}
+
+.error-title {
+  margin-bottom: var(--sdl-space-2);
+  color: var(--sdl-text-primary);
+  font-size: var(--sdl-font-subtitle);
   font-weight: 600;
 }
 
-.status-details p {
-  margin: 0;
+.error-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.table-workspace {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.table-meta {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sdl-space-3);
+  padding-bottom: var(--sdl-space-3);
   color: var(--sdl-text-secondary);
-  line-height: 1.6;
-  font-size: 13px;
+  font-size: var(--sdl-font-body-sm);
 }
 
-.diagnosis-status.healthy .status-details h4 {
-  color: var(--sdl-success);
+.status-cluster {
+  display: flex;
+  align-items: center;
+  gap: var(--sdl-space-2);
 }
 
-.diagnosis-status.warned .status-details h4 {
-  color: var(--sdl-warning);
+.collected-at {
+  color: var(--sdl-text-muted);
 }
 
-.mb-4 {
-  margin-bottom: var(--sdl-space-4);
+.table-region {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.pagination-bar {
+  flex-shrink: 0;
+  padding-top: var(--sdl-space-3);
+}
+
+.code-text {
+  font-family: var(--sdl-font-mono);
+  color: var(--sdl-text-primary);
+  font-size: var(--sdl-font-body-sm);
+  overflow-wrap: anywhere;
+}
+
+.detail-group {
+  margin-top: var(--sdl-space-5);
+}
+
+.detail-heading {
+  margin-bottom: var(--sdl-space-2);
+  color: var(--sdl-text-primary);
+  font-size: var(--sdl-font-subtitle);
+  font-weight: 600;
+}
+
+.expression-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sdl-space-2);
+  padding: var(--sdl-space-2) 0;
+  border-bottom: 1px solid var(--sdl-border-subtle);
+  color: var(--sdl-text-secondary);
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+:deep(.sl-table-container) {
+  min-width: 980px;
 }
 
 @media (max-width: 760px) {
-  .summary-grid {
-    grid-template-columns: 1fr;
+  .toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .filters,
+  .search-input,
+  .filter-select {
+    width: 100%;
+  }
+
+  .table-meta {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .content {
+    padding: var(--sdl-space-3);
   }
 }
 </style>

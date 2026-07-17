@@ -7,6 +7,7 @@ use seclab_contracts::{
         CreateDiskOperationRequest, DiskDetail, DiskInventory, DiskOperation, ManagedDiskVolume,
     },
     files::{FileDocument, FileSaveResult, UpdateFileContentRequest},
+    firewall::{FirewallRuleDetail, FirewallRuleListPage},
     logging::{PlatformLog, PlatformLogList, PlatformLogQuery},
     monitoring::{SystemMonitoringOverview, SystemMonitoringSeriesPage, SystemMonitoringSettings},
     notification::{
@@ -72,6 +73,8 @@ fn export_contract_bindings() {
     export_type::<FileDocument>(&cfg);
     export_type::<FileSaveResult>(&cfg);
     export_type::<UpdateFileContentRequest>(&cfg);
+    export_type::<FirewallRuleListPage>(&cfg);
+    export_type::<FirewallRuleDetail>(&cfg);
     export_type::<SeclabNetworkConfig>(&cfg);
     export_type::<SeclabNetworkUpdateResult>(&cfg);
     export_type::<LogStatus>(&cfg);

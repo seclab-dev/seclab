@@ -133,6 +133,12 @@ fn ensure_proxy_path_allowed(path_with_query: &str) -> ApiResult<()> {
             "system monitoring must use the node semantic gateway",
         ));
     }
+    if path == "/api/v1/agent/firewall" || path.starts_with("/api/v1/agent/firewall/") {
+        return Err(ApiError::forbidden(
+            ErrorCode::AuthForbidden,
+            "firewall observation must use the node semantic gateway",
+        ));
+    }
     if path == "/api/v1/agent/websocket/process-manager/ws"
         || path == "/api/v1/agent/processes"
         || path.starts_with("/api/v1/agent/processes/")
@@ -594,6 +600,7 @@ mod tests {
     fn semantic_system_monitoring_cannot_bypass_master_gateway() {
         assert!(ensure_proxy_path_allowed("/api/v1/agent/system-monitoring/settings").is_err());
         assert!(ensure_proxy_path_allowed("/api/v1/agent/system/about").is_ok());
+        assert!(ensure_proxy_path_allowed("/api/v1/agent/firewall/rules/list").is_err());
     }
 
     #[test]

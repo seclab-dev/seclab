@@ -406,11 +406,15 @@ fn decode_domain_body<T: DeserializeOwned>(
     if !status.is_success() || !payload.success {
         let status = axum::http::StatusCode::from_u16(status.as_u16())
             .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
-        return Err(ApiError::new(
+        let mut error = ApiError::new(
             status,
             payload.error_code.unwrap_or(ErrorCode::AgentRequestFailed),
             payload.message,
-        ));
+        );
+        if let Some(message_key) = payload.message_key {
+            error = error.with_message_key(message_key);
+        }
+        return Err(error);
     }
 
     let data = payload
@@ -687,7 +691,7 @@ mod tests {
             "POST",
             "/api/v1/agent/docker/image-pull-tasks",
             StatusCode::FORBIDDEN,
-            r#"{"success":false,"code":403,"message":"access forbidden","errorCode":"AUTH_FORBIDDEN","data":"AUTH_FORBIDDEN"}"#,
+            r#"{"success":false,"code":403,"message":"access forbidden","errorCode":"AUTH_FORBIDDEN"}"#,
         );
         let error = result.unwrap_err().to_string();
         assert!(error.contains("status=403"));
@@ -699,13 +703,17 @@ mod tests {
         let error = decode_domain_body::<Vec<String>>(
             "/api/v1/agent/disks",
             StatusCode::SERVICE_UNAVAILABLE,
-            r#"{"success":false,"code":503,"message":"disk inventory unavailable","errorCode":"DISK_INVENTORY_PARTIAL","data":"DISK_INVENTORY_PARTIAL"}"#,
+            r#"{"success":false,"code":503,"message":"disk inventory unavailable","messageKey":"api.errors.DISK_INVENTORY_PARTIAL","errorCode":"DISK_INVENTORY_PARTIAL"}"#,
         )
         .unwrap_err();
 
         assert_eq!(error.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(error.code, ErrorCode::DiskInventoryPartial);
         assert_eq!(error.message, "disk inventory unavailable");
+        assert_eq!(
+            error.message_key.as_deref(),
+            Some("api.errors.DISK_INVENTORY_PARTIAL")
+        );
     }
 
     #[test]

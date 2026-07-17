@@ -7,6 +7,7 @@ pub mod desktop_apps;
 pub mod disks;
 pub mod docker;
 pub mod files;
+pub mod firewall;
 pub mod node_proxy;
 pub mod nodes;
 pub mod notifications;

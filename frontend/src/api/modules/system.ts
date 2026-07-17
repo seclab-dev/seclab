@@ -1,5 +1,5 @@
 import http from '@/api'
-import type { SystemAboutInfo, FirewallStatusInfo } from '../interface/system'
+import type { SystemAboutInfo } from '../interface/system'
 
 const buildSystemPath = (path: string, nodeId?: string) => {
   if (!nodeId || nodeId === 'local') {
@@ -11,9 +11,6 @@ const buildSystemPath = (path: string, nodeId?: string) => {
 const createScopedSystemApi = (nodeId?: string) => ({
   fetchAbout: () => {
     return http.get<SystemAboutInfo>(buildSystemPath('/agent/system/about', nodeId))
-  },
-  detectFirewall: () => {
-    return http.get<FirewallStatusInfo>(buildSystemPath('/agent/system/firewall/detect', nodeId))
   },
 })
 

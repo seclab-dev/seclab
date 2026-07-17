@@ -2,6 +2,7 @@
 
 pub mod disks;
 pub mod docker;
+pub mod firewall;
 pub mod fs;
 pub mod host_terminal;
 pub mod process;

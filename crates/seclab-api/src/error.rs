@@ -50,7 +50,7 @@ impl ApiError {
         self
     }
 
-    /// 附加内部细节；细节会放入响应 `data` 并记录 5xx 日志。
+    /// 附加内部诊断细节；仅记录 5xx 日志，不进入公共响应。
     pub fn with_detail(mut self, detail: impl Into<Cow<'static, str>>) -> Self {
         self.detail = Some(detail.into());
         self
@@ -352,16 +352,8 @@ impl IntoResponse for ApiError {
             );
         }
 
-        let detail = if self.status.is_server_error() {
-            self.code.as_str().to_string()
-        } else {
-            self.detail
-                .map(Cow::into_owned)
-                .unwrap_or_else(|| self.code.as_str().to_string())
-        };
-
         let mut resp =
-            ApiResponse::error_with_code(&self.message, self.code, detail, self.status.as_u16());
+            ApiResponse::<()>::error_with_code(&self.message, self.code, self.status.as_u16());
         if let Some(mk) = self.message_key {
             resp.message_key = Some(mk.into_owned());
         }

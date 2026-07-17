@@ -99,6 +99,12 @@ pub enum ErrorCode {
     FileTransferExpired,
     FileChecksumMismatch,
     FileStorageExhausted,
+    FirewallInvalidQuery,
+    FirewallRuleNotFound,
+    FirewallSnapshotExpired,
+    FirewallRulesetTooLarge,
+    FirewallUnsupportedPlatform,
+    FirewallUnavailable,
     ProcessInvalidId,
     ProcessNotFound,
     ProcessChanged,
@@ -238,6 +244,12 @@ impl ErrorCode {
             ErrorCode::FileTransferExpired => "FILE_TRANSFER_EXPIRED",
             ErrorCode::FileChecksumMismatch => "FILE_CHECKSUM_MISMATCH",
             ErrorCode::FileStorageExhausted => "FILE_STORAGE_EXHAUSTED",
+            ErrorCode::FirewallInvalidQuery => "FIREWALL_INVALID_QUERY",
+            ErrorCode::FirewallRuleNotFound => "FIREWALL_RULE_NOT_FOUND",
+            ErrorCode::FirewallSnapshotExpired => "FIREWALL_SNAPSHOT_EXPIRED",
+            ErrorCode::FirewallRulesetTooLarge => "FIREWALL_RULESET_TOO_LARGE",
+            ErrorCode::FirewallUnsupportedPlatform => "FIREWALL_UNSUPPORTED_PLATFORM",
+            ErrorCode::FirewallUnavailable => "FIREWALL_UNAVAILABLE",
             ErrorCode::ProcessInvalidId => "PROCESS_INVALID_ID",
             ErrorCode::ProcessNotFound => "PROCESS_NOT_FOUND",
             ErrorCode::ProcessChanged => "PROCESS_CHANGED",
@@ -402,14 +414,14 @@ impl<T> ApiResponse<T> {
         }
     }
 
-    /// 快速构建一个带业务错误码的失败响应。
-    pub fn error_with_code(message: &str, error_code: ErrorCode, raw_data: T, code: u16) -> Self {
+    /// 快速构建一个带业务错误码且不携带 `data` 的失败响应。
+    pub fn error_with_code(message: &str, error_code: ErrorCode, code: u16) -> Self {
         ApiResponse {
             success: false,
             message: message.to_string(),
             message_key: None,
             error_code: Some(error_code),
-            data: Some(raw_data),
+            data: None,
             code,
         }
     }
@@ -523,5 +535,25 @@ impl<T: Serialize> IntoResponse for ApiResponse<T> {
             }
         };
         (status_code, Json(self)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coded_error_does_not_duplicate_error_code_in_data() {
+        let response = ApiResponse::<serde_json::Value>::error_with_code(
+            "unavailable",
+            ErrorCode::FirewallUnavailable,
+            503,
+        );
+
+        assert!(!response.success);
+        assert_eq!(response.error_code, Some(ErrorCode::FirewallUnavailable));
+        assert!(response.data.is_none());
+        let serialized = serde_json::to_value(&response).unwrap();
+        assert!(serialized.get("data").is_none());
     }
 }

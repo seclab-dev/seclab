@@ -4,6 +4,7 @@ pub mod api;
 pub mod auth;
 pub mod disks;
 pub mod files;
+pub mod firewall;
 pub mod logging;
 pub mod monitoring;
 pub mod notification;
