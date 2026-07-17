@@ -3,6 +3,7 @@
 
 export * from './api'
 export * from './auth'
+export * from './disks'
 export * from './files'
 export * from './logging'
 export * from './monitoring'

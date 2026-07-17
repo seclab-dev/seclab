@@ -1,5 +1,6 @@
 //! API 入口：各业务路由模块的统一聚合。
 
+pub mod disks;
 pub mod docker;
 pub mod fs;
 pub mod host_terminal;

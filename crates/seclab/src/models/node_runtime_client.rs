@@ -390,23 +390,36 @@ async fn decode_domain_response<T: DeserializeOwned>(
 ) -> ApiResult<T> {
     let status = response.status();
     let body = response.text().await.map_err(AgentClientError::from)?;
-    let payload = serde_json::from_str::<ContractApiResponse<T>>(&body).map_err(|error| {
+    decode_domain_body(path, status, &body)
+}
+
+/// 解析 Agent 领域响应；失败 envelope 不按成功领域 DTO 反序列化。
+fn decode_domain_body<T: DeserializeOwned>(
+    path: &str,
+    status: StatusCode,
+    body: &str,
+) -> ApiResult<T> {
+    let payload = serde_json::from_str::<ContractApiResponse<Value>>(body).map_err(|error| {
         ApiError::bad_gateway(ErrorCode::AgentRequestFailed, "invalid Agent response")
             .with_detail(format!("{path}: {error}"))
     })?;
-    if status.is_success() && payload.success {
-        return payload
-            .data
-            .ok_or_else(|| ApiError::internal("Agent domain response is missing data"));
+    if !status.is_success() || !payload.success {
+        let status = axum::http::StatusCode::from_u16(status.as_u16())
+            .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+        return Err(ApiError::new(
+            status,
+            payload.error_code.unwrap_or(ErrorCode::AgentRequestFailed),
+            payload.message,
+        ));
     }
 
-    let status = axum::http::StatusCode::from_u16(status.as_u16())
-        .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
-    Err(ApiError::new(
-        status,
-        payload.error_code.unwrap_or(ErrorCode::AgentRequestFailed),
-        payload.message,
-    ))
+    let data = payload
+        .data
+        .ok_or_else(|| ApiError::internal("Agent domain response is missing data"))?;
+    serde_json::from_value(data).map_err(|error| {
+        ApiError::bad_gateway(ErrorCode::AgentRequestFailed, "invalid Agent response")
+            .with_detail(format!("{path}: {error}"))
+    })
 }
 
 fn apply_operation_context(
@@ -636,8 +649,8 @@ fn dedupe_vary(headers: &mut HeaderMap) {
 #[cfg(test)]
 mod tests {
     use super::{
-        NodeRuntimeClient, StatusCode, apply_operation_context, decode_json_body,
-        is_file_content_stream, is_long_running_request,
+        NodeRuntimeClient, StatusCode, apply_operation_context, decode_domain_body,
+        decode_json_body, is_file_content_stream, is_long_running_request,
     };
     use crate::models::node_identities::{NodeIdentityRecord, insert_node_identity};
     use crate::models::node_sessions::{NodeSessionRecord, insert_node_session};
@@ -679,6 +692,32 @@ mod tests {
         let error = result.unwrap_err().to_string();
         assert!(error.contains("status=403"));
         assert!(error.contains("AUTH_FORBIDDEN"));
+    }
+
+    #[test]
+    fn domain_error_does_not_deserialize_data_as_success_type() {
+        let error = decode_domain_body::<Vec<String>>(
+            "/api/v1/agent/disks",
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"success":false,"code":503,"message":"disk inventory unavailable","errorCode":"DISK_INVENTORY_PARTIAL","data":"DISK_INVENTORY_PARTIAL"}"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.code, ErrorCode::DiskInventoryPartial);
+        assert_eq!(error.message, "disk inventory unavailable");
+    }
+
+    #[test]
+    fn domain_success_deserializes_typed_data() {
+        let data = decode_domain_body::<Vec<String>>(
+            "/api/v1/agent/example",
+            StatusCode::OK,
+            r#"{"success":true,"code":200,"message":"ok","data":["value"]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(data, vec!["value"]);
     }
 
     #[test]

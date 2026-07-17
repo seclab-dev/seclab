@@ -28,29 +28,6 @@ export interface SystemAboutInfo {
   diskTotalBytes: number
 }
 
-export interface DiskInfo {
-  name: string
-  sizeBytes: number
-  partitionCount: number
-  diskType: string
-  model: string
-  serial: string
-  partitionTable: string
-  isSystemDisk: boolean
-  readOnly: boolean
-  partitions: DiskPartitionInfo[]
-}
-
-export interface DiskPartitionInfo {
-  name: string
-  sizeBytes: number
-  usedBytes: number | null
-  availableBytes: number | null
-  usagePercent: number | null
-  mountpoint: string
-  filesystem: string
-}
-
 export interface FirewallStatusInfo {
   installed: boolean
   firewallType: string | null

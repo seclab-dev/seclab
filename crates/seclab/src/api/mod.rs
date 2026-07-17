@@ -4,6 +4,7 @@ mod agent;
 pub mod apps;
 pub mod auth;
 pub mod desktop_apps;
+pub mod disks;
 pub mod docker;
 pub mod files;
 pub mod node_proxy;

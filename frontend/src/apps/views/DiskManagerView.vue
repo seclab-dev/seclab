@@ -1,25 +1,32 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+/**
+ * @file DiskManagerView.vue
+ * @description 节点级可信 Linux 数据卷管理界面。
+ */
+
+import { computed, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { systemApi } from '@/api/modules/system'
-import type { DiskInfo, DiskPartitionInfo } from '@/api/interface/system'
-import { useNotificationStore } from '@/stores/notification'
-import { useConfirmationModalStore } from '@/stores/confirmation-modal'
+import type { CreateDiskOperationRequest, DiskPartition, DiskSummary } from '@/api/modules/disks'
+import { useDiskManager } from '@/composables/useDiskManager'
 import { useNodeStore } from '@/stores/node'
+import { useNotificationStore } from '@/stores/notification'
 import { useWindowManagerStore } from '@/stores/window-manager'
 import { formatBytes } from '@/utils/units'
 import {
-  SecLabButton,
-  SecLabCard,
-  SecLabTag,
-  SecLabTable,
-  SecLabLoading,
-  SecLabInput,
-  SecLabDialog,
   SecLabActionMenu,
+  SecLabAlert,
+  SecLabButton,
+  SecLabDescriptions,
+  SecLabDialog,
+  SecLabDrawer,
+  SecLabEmpty,
+  SecLabFormItem,
+  SecLabInput,
+  SecLabLoading,
+  SecLabTable,
+  SecLabTag,
 } from '@/components/ui'
 import type { SecLabTableColumn } from '@/components/ui/SecLabTable.vue'
-import SecLabIcon from '@/components/icons/SecLabIcon.vue'
 
 const props = defineProps<{
   isMaximized?: boolean
@@ -28,794 +35,842 @@ const props = defineProps<{
 }>()
 
 const { t } = useI18n()
-const notificationStore = useNotificationStore()
-const confirmationModal = useConfirmationModalStore()
 const nodeStore = useNodeStore()
+const notifications = useNotificationStore()
 const windowStore = useWindowManagerStore()
-const systemClient = computed(() => systemApi.forNode(nodeStore.currentNodeId))
+const targetNodeId =
+  typeof props.payload?.nodeId === 'string' && props.payload.nodeId
+    ? props.payload.nodeId
+    : nodeStore.currentNodeId
+const manager = useDiskManager(targetNodeId)
 
-const loading = ref(false)
-const actionLoading = ref(false)
-const diskRows = ref<DiskInfo[]>([])
-const diskMountRoot = '/mnt'
-const mountDialogVisible = ref(false)
-const mountpointInput = ref('')
-const pendingMountTarget = ref<
-  | { action: 'initialize'; disk: DiskInfo; partition?: undefined }
-  | { action: 'mount'; disk: DiskInfo; partition: DiskPartitionInfo }
-  | null
->(null)
-const diskBusy = computed(() => loading.value || actionLoading.value)
-const diskManagementReadOnly = computed(() => diskRows.value.some((disk) => disk.readOnly))
+const detailOpen = ref(false)
+const operationOpen = ref(false)
+const formOpen = ref(false)
+const eraseOpen = ref(false)
+const formatOpen = ref(false)
+const targetDisk = ref<DiskSummary | null>(null)
+const targetPartition = ref<DiskPartition | null>(null)
+type DiskFormKind =
+  | 'createPartition'
+  | 'adoptFilesystem'
+  | 'adoptMounted'
+  | 'mountVolume'
+  | 'unmountVolume'
+  | 'changeMountLocation'
+  | 'removeManagedVolume'
+const formKind = ref<DiskFormKind>('createPartition')
+const form = reactive({ mountName: '', confirmationText: '' })
+
+const inventory = computed(() => manager.inventory.value)
+const disks = computed(() => inventory.value?.disks ?? [])
+const busy = computed(() => manager.submitting.value || manager.activeOperation.value)
+const nodeName = computed(() => inventory.value?.node.nodeName || targetNodeId)
 
 watch(
-  diskBusy,
-  (busy) => {
+  busy,
+  (value) => {
     if (!props.windowId) return
     windowStore.updateWindowRuntimeState(props.windowId, {
-      busy,
+      busy: value,
       allowsNodeSwitch: false,
-      blockLevel: busy ? 'busy' : 'open',
-      blockReason: busy ? t('app.diskManager.guardBusy') : t('app.diskManager.guardOpen'),
+      blockLevel: value ? 'busy' : 'open',
+      blockReason: value ? t('app.diskManager.guardBusy') : t('app.diskManager.guardOpen'),
     })
   },
   { immediate: true },
 )
+watch(
+  () => manager.operation.value,
+  (value) => {
+    if (value) operationOpen.value = true
+  },
+)
 
-/** 分区表格列配置 */
-const partitionColumns = computed<SecLabTableColumn[]>(() => [
-  { prop: 'name', label: t('app.diskManager.partition.columns.name'), minWidth: 120 },
+const columns = computed<SecLabTableColumn[]>(() => [
+  {
+    prop: 'deviceName',
+    label: t('app.diskManager.columns.device'),
+    minWidth: 130,
+    slot: 'device',
+    align: 'center',
+  },
   {
     prop: 'sizeBytes',
-    label: t('app.diskManager.partition.columns.size'),
-    minWidth: 110,
+    label: t('app.diskManager.columns.capacity'),
+    width: 120,
     slot: 'size',
-  },
-  {
-    prop: 'usedBytes',
-    label: t('app.diskManager.partition.columns.used'),
-    minWidth: 110,
-    slot: 'used',
-  },
-  {
-    prop: 'availableBytes',
-    label: t('app.diskManager.partition.columns.available'),
-    minWidth: 110,
-    slot: 'available',
-  },
-  {
-    prop: 'usagePercent',
-    label: t('app.diskManager.partition.columns.usage'),
-    minWidth: 100,
-    slot: 'usage',
-  },
-  { prop: 'mountpoint', label: t('app.diskManager.partition.columns.mountpoint'), minWidth: 140 },
-  { prop: 'filesystem', label: t('app.diskManager.partition.columns.filesystem'), minWidth: 120 },
-  {
-    label: t('app.diskManager.partition.columns.action'),
-    minWidth: 150,
     align: 'center',
-    headerAlign: 'center',
+  },
+  {
+    prop: 'mediaType',
+    label: t('app.diskManager.columns.media'),
+    width: 100,
+    slot: 'media',
+    align: 'center',
+  },
+  {
+    prop: 'topologyStatus',
+    label: t('app.diskManager.columns.topology'),
+    width: 120,
+    slot: 'topology',
+    align: 'center',
+  },
+  {
+    prop: 'ownership',
+    label: t('app.diskManager.columns.ownership'),
+    width: 115,
+    slot: 'ownership',
+    align: 'center',
+  },
+  {
+    prop: 'protectionReasons',
+    label: t('app.diskManager.columns.protection'),
+    minWidth: 180,
+    slot: 'protection',
+  },
+  {
+    label: t('app.diskManager.columns.actions'),
+    width: 150,
+    align: 'center',
     fixed: 'right',
-    slot: 'action',
+    slot: 'actions',
   },
 ])
+const partitionColumns = computed<SecLabTableColumn[]>(() => [
+  {
+    prop: 'deviceName',
+    label: t('app.diskManager.detail.partition'),
+    minWidth: 120,
+    slot: 'device',
+    align: 'center',
+  },
+  {
+    prop: 'filesystem',
+    label: t('app.diskManager.detail.filesystem'),
+    width: 130,
+    slot: 'filesystem',
+    align: 'center',
+  },
+  {
+    prop: 'sizeBytes',
+    label: t('app.diskManager.columns.capacity'),
+    width: 110,
+    slot: 'size',
+    align: 'center',
+  },
+  {
+    prop: 'mounts',
+    label: t('app.diskManager.detail.mount'),
+    minWidth: 160,
+    slot: 'mounts',
+    align: 'center',
+  },
+  {
+    prop: 'ownership',
+    label: t('app.diskManager.columns.ownership'),
+    width: 110,
+    slot: 'ownership',
+    align: 'center',
+  },
+  { label: t('app.diskManager.columns.actions'), width: 120, align: 'center', slot: 'actions' },
+])
 
-const sortedDiskRows = computed(() => {
-  return [...diskRows.value].sort((a, b) => Number(b.sizeBytes) - Number(a.sizeBytes))
-})
-
-const reloadDisks = async () => {
-  loading.value = true
-  try {
-    const response = await systemClient.value.fetchDisks()
-    if (!response.success) {
-      throw new Error(response.message || t('app.diskManager.messages.loadFailed'))
-    }
-    diskRows.value = response.data ?? []
-  } catch (error) {
-    const message =
-      error instanceof Error ? error.message : t('app.diskManager.messages.loadFailed')
-    notificationStore.error(message)
-  } finally {
-    loading.value = false
-  }
+const tagType = (value: string): 'success' | 'warning' | 'danger' | 'info' | 'default' => {
+  if (['ready', 'managed', 'succeeded', 'mounted'].includes(value)) return 'success'
+  if (['partial', 'external', 'canceled', 'unmounted'].includes(value)) return 'warning'
+  if (['unavailable', 'failed', 'system'].includes(value)) return 'danger'
+  if (['queued', 'validating', 'preparing', 'applying', 'verifying', 'canceling'].includes(value))
+    return 'info'
+  return 'default'
 }
+const label = (scope: string, value: string) => t(`app.diskManager.${scope}.${value}`)
+const protectionText = (reasons: string[]) =>
+  reasons.length
+    ? reasons.map((reason) => label('protection', reason)).join('、')
+    : t('app.diskManager.protection.none')
 
-const handleInitPartition = async (disk: DiskInfo) => {
-  if (diskManagementReadOnly.value || !canInitializeDisk(disk) || actionLoading.value) return
-  openMountDialog('initialize', disk)
-}
-
-const confirmInitPartition = async (disk: DiskInfo, mountpoint: string) => {
-  if (diskManagementReadOnly.value) return
-  const confirmed = await confirmationModal.showConfirmation(
-    t('app.diskManager.confirm.initMessage', { disk: disk.name, mountpoint }),
-    t('app.diskManager.confirm.title'),
-    t('app.diskManager.actions.initPartition'),
-    t('confirmation.cancel'),
-  )
-  if (!confirmed) return
-
-  const dangerConfirmed = await confirmationModal.showConfirmation(
-    t('app.diskManager.confirm.initDangerMessage', { disk: disk.name }),
-    t('app.diskManager.confirm.dangerTitle'),
-    t('app.diskManager.confirm.initDangerConfirm'),
-    t('confirmation.cancel'),
-  )
-  if (!dangerConfirmed) return
-
-  actionLoading.value = true
-  try {
-    const response = await systemClient.value.initializeDisk(disk.name, 'ext4', mountpoint)
-    if (!response.success) {
-      throw new Error(response.message || t('app.diskManager.messages.partitionFailed'))
-    }
-    notificationStore.success(t('app.diskManager.messages.partitionSuccess', { disk: disk.name }))
-    await reloadDisks()
-  } catch (error) {
-    const message =
-      error instanceof Error ? error.message : t('app.diskManager.messages.partitionFailed')
-    notificationStore.error(message)
-  } finally {
-    actionLoading.value = false
-  }
-}
-
-const textOrPlaceholder = (value?: string) => {
-  if (!value) return '--'
-  const text = value.trim()
-  return text.length > 0 ? text : '--'
-}
-
-const formatUsagePercent = (value: number | null) => {
-  if (value == null || Number.isNaN(value)) return '--'
-  return `${value.toFixed(2)}%`
-}
-
-const isUnformattedDisk = (disk: DiskInfo) => {
-  if (!disk.partitions.length) return true
-  return disk.partitions.every((partition) => {
-    const fs = (partition.filesystem || '').trim()
-    return !fs || fs === '--'
-  })
-}
-
-const isMountedPartition = (partition: DiskPartitionInfo) => {
-  return getMountpoints(partition).length > 0
-}
-
-const getMountpoints = (partition: DiskPartitionInfo) => {
-  return (partition.mountpoint || '')
-    .split(',')
-    .map((value) => value.trim())
-    .filter((value) => value.length > 0 && value !== '--')
-}
-
-const hasFilesystem = (partition: DiskPartitionInfo) => {
-  const fs = (partition.filesystem || '').trim()
-  return fs.length > 0 && fs !== '--'
-}
-
-const isManagedMountpoint = (mountpoint: string) => {
-  const normalized = mountpoint.length > 1 ? mountpoint.replace(/\/+$/, '') : mountpoint
-  return normalized.startsWith(`${diskMountRoot}/`)
-}
-
-const isManagedMountedPartition = (partition: DiskPartitionInfo) => {
-  const mountpoints = getMountpoints(partition)
-  return mountpoints.length === 1 && isManagedMountpoint(mountpoints[0])
-}
-
-const hasExternalMountpoint = (partition: DiskPartitionInfo) => {
-  const mountpoints = getMountpoints(partition)
-  return mountpoints.some((mountpoint) => !isManagedMountpoint(mountpoint))
-}
-
-const canInitializeDisk = (disk: DiskInfo) => {
-  if (diskManagementReadOnly.value || disk.isSystemDisk) return false
-  return !disk.partitions.some(isMountedPartition)
-}
-
-const canRepartitionDisk = (disk: DiskInfo) => {
-  return (
-    !diskManagementReadOnly.value &&
-    !disk.isSystemDisk &&
-    disk.partitions.length > 0 &&
-    !disk.partitions.some(isMountedPartition)
-  )
-}
-
-const canMountPartition = (disk: DiskInfo, partition: DiskPartitionInfo) => {
-  return (
-    !diskManagementReadOnly.value &&
-    !disk.isSystemDisk &&
-    !isMountedPartition(partition) &&
-    hasFilesystem(partition)
-  )
-}
-
-const canUnmountPartition = (disk: DiskInfo, partition: DiskPartitionInfo) => {
-  return !diskManagementReadOnly.value && !disk.isSystemDisk && isManagedMountedPartition(partition)
-}
-
-const canFormatPartition = (disk: DiskInfo, partition: DiskPartitionInfo) => {
-  return !diskManagementReadOnly.value && !disk.isSystemDisk && !isMountedPartition(partition)
-}
-
-const partitionActions = (disk: DiskInfo, partition: DiskPartitionInfo) => {
-  const actions: Array<{
-    label: string
-    class?: string
-    disabled?: boolean
-    handler: () => void
-  }> = []
-
-  if (canMountPartition(disk, partition)) {
+const diskActions = (disk: DiskSummary) => {
+  const actions: Array<{ label: string; className?: string; handler: () => void }> = [
+    { label: t('app.diskManager.actions.detail'), handler: () => void openDetail(disk) },
+  ]
+  if (disk.capabilities.canCreatePartition) {
     actions.push({
-      label: t('app.diskManager.actions.mount'),
-      class: 'app-btn-start',
-      handler: () => {
-        void runPartitionAction('mount', disk, partition)
-      },
+      label: t('app.diskManager.actions.createPartition'),
+      handler: () => openForm('createPartition', disk),
     })
   }
-  if (canUnmountPartition(disk, partition)) {
+  if (disk.capabilities.canEraseAndCreatePartition) {
     actions.push({
-      label: t('app.diskManager.actions.unmount'),
-      class: 'app-btn-stop',
-      handler: () => {
-        void runPartitionAction('unmount', disk, partition)
-      },
+      label: t('app.diskManager.actions.erase'),
+      className: 'is-danger',
+      handler: () => openErase(disk),
     })
   }
-  if (canFormatPartition(disk, partition)) {
-    actions.push({
-      label: t('app.diskManager.actions.format'),
-      class: 'app-btn-delete',
-      handler: () => {
-        void runPartitionAction('format', disk, partition)
-      },
-    })
-  }
-  if (canRepartitionDisk(disk) && partition.name === disk.partitions[0]?.name) {
-    actions.push({
-      label: t('app.diskManager.actions.repartition'),
-      class: 'app-btn-delete',
-      handler: () => {
-        void handleInitPartition(disk)
-      },
-    })
-  }
-
-  if (actions.length === 0 || disk.isSystemDisk || hasExternalMountpoint(partition)) {
-    return [
-      {
-        label: t('app.diskManager.actions.unavailable'),
-        disabled: true,
-        handler: () => {},
-      },
-    ]
-  }
-
   return actions
 }
 
-const normalizeMountpointInput = (value: string) => {
-  const trimmed = value.trim().replace(/\/+$/, '')
-  if (!trimmed) return ''
-  const relative = trimmed.startsWith('/mnt/')
-    ? trimmed.slice('/mnt/'.length)
-    : trimmed.replace(/^\/+/, '')
-  if (!relative || relative.split('/').some((part) => !part || part === '.' || part === '..')) {
-    return ''
+/** 根据服务端能力生成分区操作，避免前端自行推断可执行动作。 */
+const partitionActions = (partition: DiskPartition) => {
+  const actions: Array<{ label: string; className?: string; handler: () => void }> = []
+  if (partition.capabilities.canFormat) {
+    actions.push({
+      label: t('app.diskManager.actions.formatPartition'),
+      className: 'app-btn-delete',
+      handler: () => openFormat(partition),
+    })
   }
-  return `${diskMountRoot}/${relative}`
-}
-
-const openMountDialog = (
-  action: 'initialize' | 'mount',
-  disk: DiskInfo,
-  partition?: DiskPartitionInfo,
-) => {
-  const name = partition?.name || disk.partitions[0]?.name || disk.name
-  mountpointInput.value = name
-  pendingMountTarget.value =
-    action === 'mount' && partition ? { action, disk, partition } : { action: 'initialize', disk }
-  mountDialogVisible.value = true
-}
-
-const closeMountDialog = () => {
-  mountDialogVisible.value = false
-  pendingMountTarget.value = null
-  mountpointInput.value = ''
-}
-
-const confirmMountDialog = async () => {
-  if (diskManagementReadOnly.value) return
-  const target = pendingMountTarget.value
-  if (!target) return
-  const mountpoint = normalizeMountpointInput(mountpointInput.value)
-  if (!mountpoint) {
-    notificationStore.error(t('app.diskManager.messages.invalidMountpoint'))
-    return
+  if (partition.capabilities.canAdoptFilesystem) {
+    actions.push({
+      label: t('app.diskManager.actions.adoptFilesystem'),
+      handler: () => openPartitionForm('adoptFilesystem', partition),
+    })
   }
-  closeMountDialog()
-  if (target.action === 'initialize') {
-    await confirmInitPartition(target.disk, mountpoint)
-    return
+  if (partition.capabilities.canAdoptMounted) {
+    actions.push({
+      label: t('app.diskManager.actions.adoptMounted'),
+      handler: () => openPartitionForm('adoptMounted', partition),
+    })
   }
-  await runPartitionAction('mount', target.disk, target.partition, mountpoint)
+  if (partition.capabilities.canMount) {
+    actions.push({
+      label: t('app.diskManager.actions.mountVolume'),
+      handler: () => openPartitionForm('mountVolume', partition),
+    })
+  }
+  if (partition.capabilities.canUnmount) {
+    actions.push({
+      label: t('app.diskManager.actions.unmountVolume'),
+      className: 'app-btn-delete',
+      handler: () => openPartitionForm('unmountVolume', partition),
+    })
+  }
+  if (partition.capabilities.canChangeMountLocation) {
+    actions.push({
+      label: t('app.diskManager.actions.changeMountLocation'),
+      handler: () => openPartitionForm('changeMountLocation', partition),
+    })
+  }
+  if (partition.capabilities.canRemoveManagedVolume) {
+    actions.push({
+      label: t('app.diskManager.actions.removeManagedVolume'),
+      className: 'app-btn-delete',
+      handler: () => openPartitionForm('removeManagedVolume', partition),
+    })
+  }
+  return actions
 }
 
-const runPartitionAction = async (
-  action: 'mount' | 'unmount' | 'format',
-  disk: DiskInfo,
-  partition: DiskPartitionInfo,
-  mountpoint?: string,
-) => {
-  if (diskManagementReadOnly.value || disk.isSystemDisk || actionLoading.value) return
+function openPartitionForm(
+  kind:
+    | 'adoptFilesystem'
+    | 'adoptMounted'
+    | 'mountVolume'
+    | 'unmountVolume'
+    | 'changeMountLocation'
+    | 'removeManagedVolume',
+  partition: DiskPartition,
+) {
+  const disk = manager.detail.value
+  if (disk) openForm(kind, disk, partition)
+}
 
-  const isMounted = isMountedPartition(partition)
-  if (action === 'mount' && !canMountPartition(disk, partition)) return
-  if (action === 'unmount' && !canUnmountPartition(disk, partition)) return
-  if (action === 'format' && !canFormatPartition(disk, partition)) return
-  let confirmed = false
-  if (action === 'mount') {
-    if (!mountpoint) {
-      openMountDialog('mount', disk, partition)
-      return
+async function openDetail(disk: DiskSummary) {
+  detailOpen.value = true
+  await manager.loadDetail(disk.diskId)
+}
+function openForm(kind: DiskFormKind, disk: DiskSummary, partition: DiskPartition | null = null) {
+  formKind.value = kind
+  targetDisk.value = disk
+  targetPartition.value = partition
+  form.mountName = partition?.managedVolume?.mountName ?? ''
+  formOpen.value = true
+}
+function openErase(disk: DiskSummary) {
+  targetDisk.value = disk
+  form.mountName = ''
+  form.confirmationText = ''
+  eraseOpen.value = true
+}
+function openFormat(partition: DiskPartition) {
+  const disk = manager.detail.value
+  if (!disk) return
+  targetDisk.value = disk
+  targetPartition.value = partition
+  form.confirmationText = ''
+  formatOpen.value = true
+}
+
+async function submitForm() {
+  const disk = targetDisk.value
+  if (!disk) return
+  let request: CreateDiskOperationRequest
+  if (formKind.value === 'createPartition') {
+    request = {
+      kind: 'createPartition',
+      diskId: disk.diskId,
+      expectedFingerprint: disk.fingerprint,
     }
-    confirmed = await confirmationModal.showConfirmation(
-      t('app.diskManager.confirm.mountMessage', {
-        disk: disk.name,
-        partition: partition.name,
-        mountpoint,
-      }),
-      t('app.diskManager.confirm.title'),
-      t('app.diskManager.actions.mount'),
-      t('confirmation.cancel'),
-    )
-  } else if (action === 'unmount') {
-    confirmed = await confirmationModal.showConfirmation(
-      t('app.diskManager.confirm.unmountMessage', { disk: disk.name, partition: partition.name }),
-      t('app.diskManager.confirm.title'),
-      t('app.diskManager.actions.unmount'),
-      t('confirmation.cancel'),
-    )
-  } else {
-    confirmed = await confirmationModal.showConfirmation(
-      t('app.diskManager.confirm.formatMessage', {
-        disk: disk.name,
-        partition: partition.name,
-      }),
-      t('app.diskManager.confirm.title'),
-      t('app.diskManager.actions.format'),
-      t('confirmation.cancel'),
-    )
-    if (confirmed) {
-      confirmed = await confirmationModal.showConfirmation(
-        t('app.diskManager.confirm.formatDangerMessage', { partition: partition.name }),
-        t('app.diskManager.confirm.dangerTitle'),
-        t('app.diskManager.confirm.formatDangerConfirm'),
-        t('confirmation.cancel'),
-      )
+  } else if (formKind.value === 'adoptFilesystem' && targetPartition.value) {
+    request = {
+      kind: 'adoptFilesystem',
+      diskId: disk.diskId,
+      partitionId: targetPartition.value.partitionId,
+      expectedFingerprint: disk.fingerprint,
     }
-  }
-  if (!confirmed) return
-
-  actionLoading.value = true
+  } else if (formKind.value === 'adoptMounted' && targetPartition.value) {
+    request = {
+      kind: 'adoptMounted',
+      diskId: disk.diskId,
+      partitionId: targetPartition.value.partitionId,
+      expectedFingerprint: disk.fingerprint,
+    }
+  } else if (formKind.value === 'mountVolume' && targetPartition.value?.managedVolume) {
+    request = {
+      kind: 'mountVolume',
+      volumeId: targetPartition.value.managedVolume.volumeId,
+      mountName: form.mountName,
+    }
+  } else if (formKind.value === 'unmountVolume' && targetPartition.value?.managedVolume) {
+    request = { kind: 'unmountVolume', volumeId: targetPartition.value.managedVolume.volumeId }
+  } else if (formKind.value === 'changeMountLocation' && targetPartition.value?.managedVolume) {
+    request = {
+      kind: 'changeMountLocation',
+      volumeId: targetPartition.value.managedVolume.volumeId,
+      mountName: form.mountName,
+    }
+  } else if (formKind.value === 'removeManagedVolume' && targetPartition.value?.managedVolume) {
+    request = {
+      kind: 'removeManagedVolume',
+      volumeId: targetPartition.value.managedVolume.volumeId,
+    }
+  } else return
   try {
-    let response
-    if (action === 'mount') {
-      response = await systemClient.value.mountPartition(disk.name, partition.name, mountpoint)
-    } else if (action === 'unmount') {
-      response = await systemClient.value.unmountPartition(disk.name, partition.name)
-    } else {
-      if (isMounted) {
-        throw new Error(t('app.diskManager.messages.formatNeedUnmount'))
-      }
-      response = await systemClient.value.formatPartition(disk.name, partition.name, 'ext4')
+    const value = await manager.submit(request)
+    if (value) {
+      formOpen.value = false
+      notifications.success(t('app.diskManager.messages.operationSubmitted'))
     }
-    if (!response.success) {
-      throw new Error(response.message || t('app.diskManager.messages.operationFailed'))
-    }
-    const successKey =
-      action === 'mount'
-        ? 'app.diskManager.messages.mountSuccess'
-        : action === 'unmount'
-          ? 'app.diskManager.messages.unmountSuccess'
-          : 'app.diskManager.messages.formatSuccess'
-    notificationStore.success(t(successKey, { partition: partition.name }))
-    await reloadDisks()
   } catch (error) {
-    const message =
-      error instanceof Error ? error.message : t('app.diskManager.messages.operationFailed')
-    notificationStore.error(message)
-  } finally {
-    actionLoading.value = false
+    notifications.error(
+      error instanceof Error ? error.message : t('app.diskManager.messages.operationFailed'),
+    )
   }
 }
 
-onMounted(async () => {
-  await reloadDisks()
+async function submitErase() {
+  const disk = targetDisk.value
+  if (!disk) return
+  try {
+    const value = await manager.submit({
+      kind: 'eraseAndCreatePartition',
+      diskId: disk.diskId,
+      expectedFingerprint: disk.fingerprint,
+      confirmationText: form.confirmationText,
+    })
+    if (value) {
+      eraseOpen.value = false
+      notifications.success(t('app.diskManager.messages.operationSubmitted'))
+    }
+  } catch (error) {
+    notifications.error(
+      error instanceof Error ? error.message : t('app.diskManager.messages.operationFailed'),
+    )
+  }
+}
+
+async function submitFormat() {
+  const disk = targetDisk.value
+  const partition = targetPartition.value
+  if (!disk || !partition) return
+  try {
+    const value = await manager.submit({
+      kind: 'formatPartition',
+      diskId: disk.diskId,
+      partitionId: partition.partitionId,
+      expectedFingerprint: disk.fingerprint,
+      confirmationText: form.confirmationText,
+    })
+    if (value) {
+      formatOpen.value = false
+      notifications.success(t('app.diskManager.messages.operationSubmitted'))
+    }
+  } catch (error) {
+    notifications.error(
+      error instanceof Error ? error.message : t('app.diskManager.messages.operationFailed'),
+    )
+  }
+}
+
+const detailItems = computed(() => {
+  const disk = manager.detail.value
+  if (!disk) return []
+  return [
+    { label: t('app.diskManager.detail.device'), value: `/dev/${disk.deviceName}` },
+    { label: t('app.diskManager.detail.capacity'), value: formatBytes(disk.sizeBytes) },
+    ...(disk.model ? [{ label: t('app.diskManager.detail.model'), value: disk.model }] : []),
+    ...(disk.serial ? [{ label: t('app.diskManager.detail.serial'), value: disk.serial }] : []),
+    ...(disk.transport
+      ? [{ label: t('app.diskManager.detail.transport'), value: disk.transport }]
+      : []),
+    {
+      label: t('app.diskManager.detail.identity'),
+      value: label('identity', disk.identityConfidence),
+    },
+    { label: t('app.diskManager.detail.fingerprint'), value: disk.fingerprint },
+  ]
+})
+const operationProgress = computed(() => {
+  const value = manager.operation.value
+  if (!value?.totalSteps) return 0
+  return Math.round((value.completedSteps / value.totalSteps) * 100)
+})
+const formNeedsMountName = computed(() =>
+  ['mountVolume', 'changeMountLocation'].includes(formKind.value),
+)
+const formIsDangerous = computed(() =>
+  ['unmountVolume', 'removeManagedVolume'].includes(formKind.value),
+)
+const formSubmitDisabled = computed(() => {
+  if (!formNeedsMountName.value) return false
+  if (!form.mountName) return true
+  return (
+    formKind.value === 'changeMountLocation' &&
+    form.mountName.toLowerCase() === targetPartition.value?.managedVolume?.mountName?.toLowerCase()
+  )
 })
 </script>
 
 <template>
-  <div class="disk-manager" data-page="disk-manager" data-seclab-app="disk-manager">
-    <div v-if="diskManagementReadOnly" class="read-only-notice" data-ui="disk-read-only-notice">
-      <SecLabIcon class="hint-icon" name="lock" :size="16" />
-      <div class="read-only-content">
-        <SecLabTag type="warning">{{ t('app.diskManager.labels.readOnly') }}</SecLabTag>
-        <span>{{ t('app.diskManager.messages.wslReadOnly') }}</span>
-      </div>
-    </div>
-    <div v-if="sortedDiskRows.length === 0 && !loading" class="empty-state">
-      <div class="empty-content">
-        <SecLabIcon class="empty-icon" name="disk" :size="48" />
-        <p>{{ t('app.diskManager.messages.empty') }}</p>
+  <div class="disk-manager" data-page="disk-manager">
+    <div class="toolbar" data-ui="toolbar">
+      <div class="toolbar-actions">
+        <SecLabButton v-if="manager.operation.value" @click="operationOpen = true">
+          {{ t('app.diskManager.actions.operation') }}
+        </SecLabButton>
+        <SecLabButton :loading="manager.inventoryState.value.refreshing" @click="manager.refresh">
+          {{ t('common.refresh') }}
+        </SecLabButton>
       </div>
     </div>
 
-    <template v-else>
-      <div class="grid">
-        <SecLabCard
-          v-for="disk in sortedDiskRows"
-          :key="disk.name"
-          class="card"
-          shadow="hover"
-          :class="{ 'is-system-disk': disk.isSystemDisk }"
-        >
-          <template #header>
-            <div class="card-header">
-              <span class="disk-name">{{ disk.name }}</span>
-              <SecLabTag v-if="disk.isSystemDisk" type="danger">
-                {{ t('app.diskManager.labels.systemDisk') }}
-              </SecLabTag>
-            </div>
-          </template>
+    <SecLabAlert
+      v-if="manager.inventoryState.value.warning"
+      data-ui="alert"
+      type="warning"
+      :title="t('app.diskManager.messages.refreshFailed')"
+      :description="manager.inventoryState.value.warning"
+      show-icon
+    />
+    <SecLabAlert
+      v-if="inventory && inventory.status !== 'ready'"
+      data-ui="alert"
+      :type="inventory.status === 'partial' ? 'warning' : 'error'"
+      :title="label('inventoryStatus', inventory.status)"
+      :description="t('app.diskManager.messages.failClosed')"
+      show-icon
+    />
+    <SecLabAlert
+      v-for="warning in inventory?.warnings ?? []"
+      :key="warning"
+      data-ui="alert"
+      type="warning"
+      :title="label('warnings', warning)"
+      show-icon
+    />
 
-          <div class="info-row">
-            <div class="item">
-              <span class="label">{{ t('app.diskManager.fields.size') }}</span>
-              <span class="value">{{ formatBytes(disk.sizeBytes) }}</span>
-            </div>
-            <div class="divider"></div>
-            <div class="item">
-              <span class="label">{{ t('app.diskManager.fields.partitionCount') }}</span>
-              <span class="value">{{ disk.partitionCount }}</span>
-            </div>
-            <div class="divider"></div>
-            <div class="item">
-              <span class="label">{{ t('app.diskManager.fields.diskType') }}</span>
-              <span class="value">{{ textOrPlaceholder(disk.diskType) }}</span>
-            </div>
-            <div class="divider"></div>
-            <div class="item">
-              <span class="label">{{ t('app.diskManager.fields.model') }}</span>
-              <span class="value">{{ textOrPlaceholder(disk.model) }}</span>
-            </div>
-            <div class="divider"></div>
-            <div class="item">
-              <span class="label">{{ t('app.diskManager.fields.serial') }}</span>
-              <span class="value">{{ textOrPlaceholder(disk.serial) }}</span>
-            </div>
-            <div class="divider"></div>
-            <div class="item">
-              <span class="label">{{ t('app.diskManager.fields.partitionTable') }}</span>
-              <span class="value">{{ textOrPlaceholder(disk.partitionTable) }}</span>
-            </div>
-          </div>
+    <div class="table-shell" data-ui="table" data-slot="content">
+      <SecLabTable v-if="disks.length" :data="disks" :columns="columns" row-key="diskId" border>
+        <template #device="{ row }: { row: DiskSummary }">
+          <strong>/dev/{{ row.deviceName }}</strong>
+        </template>
+        <template #size="{ row }: { row: DiskSummary }">{{ formatBytes(row.sizeBytes) }}</template>
+        <template #media="{ row }: { row: DiskSummary }">{{
+          row.mediaType ? label('media', row.mediaType) : ''
+        }}</template>
+        <template #topology="{ row }: { row: DiskSummary }">
+          <SecLabTag :type="tagType(row.topologyStatus)">{{
+            label('topology', row.topologyStatus)
+          }}</SecLabTag>
+        </template>
+        <template #ownership="{ row }: { row: DiskSummary }">
+          <SecLabTag :type="tagType(row.ownership)">{{
+            label('ownership', row.ownership)
+          }}</SecLabTag>
+        </template>
+        <template #protection="{ row }: { row: DiskSummary }">
+          <span :class="{ muted: row.protectionReasons.length === 0 }">{{
+            protectionText(row.protectionReasons)
+          }}</span>
+        </template>
+        <template #actions="{ row }: { row: DiskSummary }">
+          <SecLabActionMenu
+            :actions="diskActions(row)"
+            :label="t('app.diskManager.columns.actions')"
+          />
+        </template>
+      </SecLabTable>
+      <SecLabEmpty
+        v-else-if="!manager.inventoryState.value.initialLoading"
+        :description="manager.inventoryState.value.error || t('app.diskManager.messages.empty')"
+      />
+      <SecLabLoading :loading="manager.inventoryState.value.initialLoading" cover />
+    </div>
 
-          <div v-if="isUnformattedDisk(disk)" class="unformatted-section">
-            <div class="unformatted-hint">
-              <SecLabIcon class="hint-icon" name="info" :size="14" />
-              <p>
-                {{
-                  diskManagementReadOnly
-                    ? t('app.diskManager.messages.unformattedDiskReadOnly')
-                    : t('app.diskManager.messages.unformattedDisk')
-                }}
-              </p>
-            </div>
-            <div class="unformatted-actions">
-              <SecLabButton
-                v-if="canInitializeDisk(disk)"
-                type="primary"
-                :loading="actionLoading"
-                @click="handleInitPartition(disk)"
-              >
-                {{ t('app.diskManager.actions.initPartition') }}
-              </SecLabButton>
-              <SecLabButton v-if="!canInitializeDisk(disk)" type="secondary" disabled>
-                {{ t('app.diskManager.actions.unavailable') }}
-              </SecLabButton>
-            </div>
-          </div>
-
-          <div v-else class="partition-section">
-            <div class="section-header">
-              <h4 class="section-title">{{ t('app.diskManager.partition.title') }}</h4>
-            </div>
-            <SecLabTable :data="disk.partitions" :columns="partitionColumns" border>
-              <template #size="{ row }: { row: any }">
-                {{ formatBytes(row.sizeBytes) }}
+    <SecLabDrawer
+      v-model="detailOpen"
+      data-ui="detail"
+      :title="t('app.diskManager.detail.title')"
+      width="900px"
+    >
+      <div class="detail-content" data-slot="detail">
+        <SecLabAlert
+          v-if="manager.detailState.value.error"
+          type="error"
+          :title="manager.detailState.value.error"
+          show-icon
+        />
+        <template v-if="manager.detail.value">
+          <SecLabDescriptions :items="detailItems" :column="2" border />
+          <SecLabAlert
+            v-if="manager.detail.value.references.length"
+            type="warning"
+            :title="t('app.diskManager.detail.references')"
+            :description="manager.detail.value.references.map((item) => item.summary).join('、')"
+            show-icon
+          />
+          <div class="partition-table-shell" data-ui="table" data-slot="content">
+            <SecLabTable
+              :data="manager.detail.value.partitions"
+              :columns="partitionColumns"
+              row-key="partitionId"
+              border
+            >
+              <template #device="{ row }: { row: DiskPartition }">
+                /dev/{{ row.deviceName }}
               </template>
-              <template #used="{ row }: { row: any }">
-                {{ row.usedBytes == null ? '--' : formatBytes(row.usedBytes) }}
+              <template #filesystem="{ row }: { row: DiskPartition }">{{
+                row.filesystem.filesystemType || ''
+              }}</template>
+              <template #size="{ row }: { row: DiskPartition }">{{
+                formatBytes(row.sizeBytes)
+              }}</template>
+              <template #mounts="{ row }: { row: DiskPartition }">{{
+                row.mounts.join('、')
+              }}</template>
+              <template #ownership="{ row }: { row: DiskPartition }">
+                <SecLabTag :type="tagType(row.ownership)">{{
+                  label('ownership', row.ownership)
+                }}</SecLabTag>
               </template>
-              <template #available="{ row }: { row: any }">
-                {{ row.availableBytes == null ? '--' : formatBytes(row.availableBytes) }}
-              </template>
-              <template #usage="{ row }: { row: any }">
-                {{ formatUsagePercent(row.usagePercent) }}
-              </template>
-              <template #action="{ row }: { row: any }">
-                <div class="action-cell">
+              <template #actions="{ row }: { row: DiskPartition }">
+                <div class="partition-actions" data-ui="volume-actions">
                   <SecLabActionMenu
-                    :actions="partitionActions(disk, row)"
-                    :disabled="disk.isSystemDisk || actionLoading"
-                    :label="t('app.diskManager.partition.columns.action')"
+                    v-if="partitionActions(row).length"
+                    :actions="partitionActions(row)"
+                    :label="t('app.diskManager.columns.actions')"
                   />
+                  <span v-else class="muted">{{ t('app.diskManager.actions.unavailable') }}</span>
                 </div>
               </template>
+              <template #empty
+                ><SecLabEmpty :description="t('app.diskManager.detail.noPartitions')"
+              /></template>
             </SecLabTable>
           </div>
-
-          <div v-if="disk.isSystemDisk" class="system-disk-hint">
-            <SecLabIcon class="hint-icon" name="lock" :size="14" />
-            <span>{{ t('app.diskManager.messages.systemDiskBlocked') }}</span>
-          </div>
-        </SecLabCard>
+        </template>
+        <SecLabLoading :loading="manager.detailState.value.initialLoading" cover />
       </div>
-    </template>
-
-    <SecLabLoading :loading="loading" cover />
+    </SecLabDrawer>
 
     <SecLabDialog
-      :visible="mountDialogVisible"
-      :title="t('app.diskManager.mountDialog.title')"
-      width="420px"
-      @close="closeMountDialog"
+      :visible="formOpen"
+      data-ui="form"
+      :title="t(`app.diskManager.form.${formKind}Title`)"
+      width="520px"
+      @close="formOpen = false"
     >
-      <div class="mount-dialog-content">
-        <label class="mount-label">{{ t('app.diskManager.mountDialog.label') }}</label>
-        <SecLabInput
-          v-model="mountpointInput"
-          :placeholder="t('app.diskManager.mountDialog.placeholder')"
+      <div class="dialog-content" data-slot="content">
+        <SecLabAlert
+          :type="formIsDangerous ? 'warning' : 'info'"
+          :title="t(`app.diskManager.form.${formKind}Notice`)"
+          show-icon
         />
-        <p class="mount-hint">
-          {{
-            t('app.diskManager.mountDialog.hint', {
-              mountpoint: normalizeMountpointInput(mountpointInput) || '--',
-            })
-          }}
-        </p>
+        <SecLabFormItem
+          v-if="formNeedsMountName"
+          :label="t('app.diskManager.form.mountName')"
+          for="disk-mount-name"
+          required
+        >
+          <SecLabInput
+            id="disk-mount-name"
+            v-model="form.mountName"
+            name="diskMountName"
+            :maxlength="48"
+            placeholder="data"
+          />
+          <span class="field-hint">/mnt/{{ form.mountName || 'data' }}</span>
+        </SecLabFormItem>
       </div>
       <template #footer>
-        <SecLabButton type="secondary" @click="closeMountDialog">
-          {{ t('confirmation.cancel') }}
-        </SecLabButton>
-        <SecLabButton type="primary" @click="confirmMountDialog">
-          {{
-            pendingMountTarget?.action === 'initialize'
-              ? t('app.diskManager.actions.startPartition')
-              : t('app.diskManager.actions.mount')
-          }}
+        <SecLabButton @click="formOpen = false">{{ t('common.cancel') }}</SecLabButton>
+        <SecLabButton
+          :type="formIsDangerous ? 'danger' : 'primary'"
+          :disabled="formSubmitDisabled"
+          :loading="manager.submitting.value"
+          @click="submitForm"
+        >
+          {{ t('common.confirm') }}
         </SecLabButton>
       </template>
     </SecLabDialog>
+
+    <SecLabDialog
+      :visible="eraseOpen"
+      data-ui="form"
+      :title="t('app.diskManager.form.eraseTitle')"
+      width="560px"
+      @close="eraseOpen = false"
+    >
+      <div class="dialog-content" data-slot="content">
+        <SecLabAlert type="error" :title="t('app.diskManager.form.eraseNotice')" show-icon />
+        <SecLabDescriptions
+          v-if="targetDisk"
+          :items="[
+            { label: t('app.diskManager.targetNode'), value: nodeName },
+            { label: t('app.diskManager.detail.device'), value: `/dev/${targetDisk.deviceName}` },
+            {
+              label: t('app.diskManager.detail.capacity'),
+              value: formatBytes(targetDisk.sizeBytes),
+            },
+          ]"
+          :column="1"
+          border
+        />
+        <SecLabFormItem
+          :label="t('app.diskManager.form.confirmation')"
+          for="disk-erase-confirmation"
+          required
+        >
+          <SecLabInput
+            id="disk-erase-confirmation"
+            v-model="form.confirmationText"
+            name="diskEraseConfirmation"
+            :placeholder="targetDisk?.eraseConfirmationText || ''"
+            autocomplete="off"
+          />
+          <span class="confirmation-text">{{ targetDisk?.eraseConfirmationText }}</span>
+        </SecLabFormItem>
+      </div>
+      <template #footer>
+        <SecLabButton @click="eraseOpen = false">{{ t('common.cancel') }}</SecLabButton>
+        <SecLabButton
+          type="danger"
+          :disabled="form.confirmationText !== targetDisk?.eraseConfirmationText"
+          :loading="manager.submitting.value"
+          @click="submitErase"
+        >
+          {{ t('app.diskManager.actions.erase') }}
+        </SecLabButton>
+      </template>
+    </SecLabDialog>
+
+    <SecLabDialog
+      :visible="formatOpen"
+      data-ui="format-form"
+      :title="t('app.diskManager.form.formatPartitionTitle')"
+      width="560px"
+      @close="formatOpen = false"
+    >
+      <div class="dialog-content" data-slot="content">
+        <SecLabAlert
+          type="error"
+          :title="t('app.diskManager.form.formatPartitionNotice')"
+          show-icon
+        />
+        <SecLabDescriptions
+          v-if="targetDisk && targetPartition"
+          :items="[
+            { label: t('app.diskManager.targetNode'), value: nodeName },
+            {
+              label: t('app.diskManager.detail.partition'),
+              value: `/dev/${targetPartition.deviceName}`,
+            },
+            {
+              label: t('app.diskManager.detail.capacity'),
+              value: formatBytes(targetPartition.sizeBytes),
+            },
+          ]"
+          :column="1"
+          border
+        />
+        <SecLabFormItem
+          :label="t('app.diskManager.form.confirmation')"
+          for="disk-format-confirmation"
+          required
+        >
+          <SecLabInput
+            id="disk-format-confirmation"
+            v-model="form.confirmationText"
+            name="diskFormatConfirmation"
+            :placeholder="targetPartition?.formatConfirmationText || ''"
+            autocomplete="off"
+          />
+          <span class="confirmation-text">{{ targetPartition?.formatConfirmationText }}</span>
+        </SecLabFormItem>
+      </div>
+      <template #footer>
+        <SecLabButton @click="formatOpen = false">{{ t('common.cancel') }}</SecLabButton>
+        <SecLabButton
+          type="danger"
+          :disabled="form.confirmationText !== targetPartition?.formatConfirmationText"
+          :loading="manager.submitting.value"
+          @click="submitFormat"
+        >
+          {{ t('app.diskManager.actions.formatPartition') }}
+        </SecLabButton>
+      </template>
+    </SecLabDialog>
+
+    <SecLabDrawer
+      v-model="operationOpen"
+      data-ui="operation"
+      :title="t('app.diskManager.operation.title')"
+      width="600px"
+    >
+      <div v-if="manager.operation.value" class="operation-content" data-slot="content">
+        <SecLabTag :type="tagType(manager.operation.value.status)">
+          {{ label('operationStatus', manager.operation.value.status) }}
+        </SecLabTag>
+        <SecLabDescriptions
+          :items="[
+            {
+              label: t('app.diskManager.operation.kind'),
+              value: label('operationKind', manager.operation.value.kind),
+            },
+            { label: t('app.diskManager.operation.progress'), value: `${operationProgress}%` },
+            ...(manager.operation.value.target.deviceName
+              ? [
+                  {
+                    label: t('app.diskManager.detail.device'),
+                    value: `/dev/${manager.operation.value.target.deviceName}`,
+                  },
+                ]
+              : []),
+            ...(manager.operation.value.target.mountPath
+              ? [
+                  {
+                    label: t('app.diskManager.detail.mount'),
+                    value: manager.operation.value.target.mountPath,
+                  },
+                ]
+              : []),
+          ]"
+          :column="1"
+          border
+        />
+        <SecLabAlert
+          v-if="manager.operation.value.errorSummary"
+          type="error"
+          :title="
+            manager.operation.value.errorCode || t('app.diskManager.messages.operationFailed')
+          "
+          :description="manager.operation.value.errorSummary"
+          show-icon
+        />
+        <SecLabAlert
+          v-if="manager.operation.value.warningSummary || manager.operationState.value.warning"
+          type="warning"
+          :title="manager.operation.value.warningSummary || manager.operationState.value.warning"
+          show-icon
+        />
+        <SecLabButton
+          v-if="manager.operation.value.capabilities.canCancel"
+          type="danger"
+          :loading="manager.cancelling.value"
+          @click="manager.cancel"
+        >
+          {{ t('app.diskManager.actions.cancel') }}
+        </SecLabButton>
+      </div>
+      <SecLabEmpty v-else :description="t('app.diskManager.operation.empty')" />
+    </SecLabDrawer>
   </div>
 </template>
 
 <style scoped>
 .disk-manager {
   height: 100%;
-  padding: var(--sdl-space-3);
-  background: var(--sdl-bg-canvas);
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: var(--sdl-space-3);
+  min-height: 0;
   box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sdl-space-3);
+  padding: var(--sdl-space-3);
+  overflow: hidden;
+  background: var(--sdl-bg-canvas);
 }
-
-.empty-state {
+.toolbar,
+.toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sdl-space-2);
+}
+.toolbar {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+.field-hint,
+.muted {
+  color: var(--sdl-text-secondary);
+}
+.table-shell,
+.detail-content,
+.operation-content {
+  position: relative;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sdl-space-3);
+}
+.table-shell {
   flex: 1;
+  overflow: auto;
+}
+.detail-content {
+  height: 100%;
+  min-height: 0;
+}
+.partition-table-shell {
+  flex: 1 1 0;
+  width: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+.partition-actions {
   display: flex;
-  align-items: center;
   justify-content: center;
-  background: var(--sdl-bg-panel);
-  border: 1px solid var(--sdl-border-default);
-  border-radius: var(--sdl-radius-lg);
+  align-items: center;
 }
-
-.empty-content {
-  text-align: center;
+.dialog-content {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sdl-space-3);
 }
-
-.empty-icon {
+.confirmation-text {
   display: block;
-  margin-bottom: var(--sdl-space-3);
-  opacity: 0.5;
-}
-
-.empty-content p {
-  color: var(--sdl-text-secondary);
-  font-size: var(--sdl-font-body);
-}
-
-.grid {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sdl-space-3);
-}
-
-.read-only-notice {
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
-  gap: var(--sdl-space-3);
-  padding: var(--sdl-space-3) var(--sdl-space-4);
-  color: var(--sdl-text-secondary);
-  background: var(--sdl-warning-soft);
-  border: 1px solid var(--sdl-warning);
-  border-radius: var(--sdl-radius-md);
-  font-size: var(--sdl-font-body-sm);
-}
-
-.read-only-content {
-  display: flex;
-  align-items: center;
-  gap: var(--sdl-space-2);
-  min-width: 0;
-}
-
-.card.is-system-disk {
-  border-color: var(--sdl-danger-soft);
-}
-
-.card-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-
-.disk-name {
-  font-size: var(--sdl-font-subtitle);
-  font-weight: 700;
+  margin-top: var(--sdl-space-2);
+  padding: var(--sdl-space-2);
+  overflow-wrap: anywhere;
+  font-family: var(--sdl-font-mono);
   color: var(--sdl-text-primary);
-}
-
-.info-row {
-  display: flex;
-  align-items: center;
-  gap: var(--sdl-space-4);
-  background: var(--sdl-bg-panel);
-  padding: var(--sdl-space-2) var(--sdl-space-4);
-  border-radius: var(--sdl-radius-md);
-  overflow-x: auto;
-  scrollbar-width: none;
-}
-
-.info-row .item {
-  display: flex;
-  flex-direction: column;
-  flex-shrink: 0;
-}
-
-.info-row .label {
-  font-size: 10px;
-  color: var(--sdl-text-muted);
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-}
-
-.info-row .value {
-  font-size: var(--sdl-font-body-sm);
-  color: var(--sdl-text-primary);
-  font-weight: 600;
-}
-
-.info-row .divider {
-  width: 1px;
-  height: 20px;
-  background: var(--sdl-border-subtle);
-}
-
-.unformatted-section {
-  margin-top: var(--sdl-space-4);
-  background: var(--sdl-bg-panel);
+  background: var(--sdl-bg-sunken);
   border: 1px solid var(--sdl-border-default);
-  border-radius: var(--sdl-radius-md);
-  padding: var(--sdl-space-3) var(--sdl-space-4);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-
-.unformatted-hint {
-  display: flex;
-  align-items: center;
-  gap: var(--sdl-space-2);
-}
-
-.unformatted-hint p {
-  margin: 0;
-  color: var(--sdl-text-secondary);
-  font-weight: 500;
-}
-
-.unformatted-actions {
-  display: flex;
-  align-items: center;
-  gap: var(--sdl-space-2);
-  flex-shrink: 0;
-}
-
-.partition-section {
-  margin-top: var(--sdl-space-4);
-}
-
-.section-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--sdl-space-3);
-  margin-bottom: var(--sdl-space-2);
-}
-
-.section-title {
-  margin: 0;
-  font-size: var(--sdl-font-body-sm);
-  color: var(--sdl-text-secondary);
-  font-weight: 600;
-}
-
-.action-cell {
-  display: flex;
-  justify-content: center;
-}
-
-.system-disk-hint {
-  margin-top: var(--sdl-space-3);
-  padding: var(--sdl-space-2) var(--sdl-space-3);
-  background: var(--sdl-danger-soft);
   border-radius: var(--sdl-radius-sm);
-  color: var(--sdl-danger);
-  font-size: var(--sdl-font-caption);
-  display: flex;
-  align-items: center;
-  gap: var(--sdl-space-2);
 }
-
-.hint-icon {
-  flex-shrink: 0;
-}
-
-.mount-dialog-content {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sdl-space-2);
-}
-
-.mount-label {
-  color: var(--sdl-text-secondary);
-  font-size: var(--sdl-font-body-sm);
-  font-weight: 600;
-}
-
-.mount-hint {
-  margin: 0;
-  color: var(--sdl-text-muted);
-  font-size: var(--sdl-font-caption);
-  line-height: 1.5;
-}
-
-@media (max-width: 1024px) {
-  .info-row {
-    gap: var(--sdl-space-3);
+@media (max-width: 720px) {
+  .disk-manager {
+    padding: var(--sdl-space-2);
   }
 }
 </style>

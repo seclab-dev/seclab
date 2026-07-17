@@ -3,6 +3,9 @@
 use seclab_contracts::{
     api::{ApiResponse, ErrorCode},
     auth::{AuthBody, AuthSession, AuthUser},
+    disks::{
+        CreateDiskOperationRequest, DiskDetail, DiskInventory, DiskOperation, ManagedDiskVolume,
+    },
     files::{FileDocument, FileSaveResult, UpdateFileContentRequest},
     logging::{PlatformLog, PlatformLogList, PlatformLogQuery},
     monitoring::{SystemMonitoringOverview, SystemMonitoringSeriesPage, SystemMonitoringSettings},
@@ -61,6 +64,11 @@ fn export_contract_bindings() {
     export_type::<AuthUser>(&cfg);
     export_type::<AuthSession>(&cfg);
     export_type::<AuthBody>(&cfg);
+    export_type::<DiskInventory>(&cfg);
+    export_type::<DiskDetail>(&cfg);
+    export_type::<ManagedDiskVolume>(&cfg);
+    export_type::<CreateDiskOperationRequest>(&cfg);
+    export_type::<DiskOperation>(&cfg);
     export_type::<FileDocument>(&cfg);
     export_type::<FileSaveResult>(&cfg);
     export_type::<UpdateFileContentRequest>(&cfg);

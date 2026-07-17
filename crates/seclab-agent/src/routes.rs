@@ -1,7 +1,7 @@
 //! 路由注册：挂载所有 API 子路由并拼装主路由器。
 
 use super::api::{
-    docker, fs, host_terminal, process, runtime_logs, scheduled_tasks, script_runs,
+    disks, docker, fs, host_terminal, process, runtime_logs, scheduled_tasks, script_runs,
     suite_workloads, system, system_monitoring, upgrade, websocket,
 };
 use crate::db;
@@ -30,6 +30,7 @@ use tracing::info_span;
 pub fn state_api_router() -> Router<Arc<AppState>> {
     Router::new()
         .nest("/docker", docker::docker_router())
+        .nest("/disks", disks::disk_router())
         .nest("/files", fs::fs_router())
         .nest("/terminal", host_terminal::host_terminal_router())
         .nest("/runtime-logs", runtime_logs::runtime_log_router())
@@ -97,6 +98,9 @@ pub async fn create_router() -> Result<(Router, DbPool)> {
     crate::services::script_runs::recover(&app_state)
         .await
         .map_err(|error| anyhow::anyhow!("failed to recover script runs: {error:?}"))?;
+    crate::services::disk_operations::recover(&app_state)
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to recover disk operations: {error:?}"))?;
 
     // 配置 CORS：允许所有来源、常用方法
     let cors = CorsLayer::new()

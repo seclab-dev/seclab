@@ -101,6 +101,16 @@ fn rebuild_scoped_proxy_path(path_with_query: &str, node_id: &str) -> String {
 
 fn ensure_proxy_path_allowed(path_with_query: &str) -> ApiResult<()> {
     let path = path_with_query.split('?').next().unwrap_or(path_with_query);
+    if path == "/api/v1/agent/disks"
+        || path.starts_with("/api/v1/agent/disks/")
+        || path == "/api/v1/agent/disk-operations"
+        || path.starts_with("/api/v1/agent/disk-operations/")
+    {
+        return Err(ApiError::forbidden(
+            ErrorCode::AuthForbidden,
+            "disk management must use the node semantic API",
+        ));
+    }
     if path == "/api/v1/agent/script-runs" || path.starts_with("/api/v1/agent/script-runs/") {
         return Err(ApiError::forbidden(
             ErrorCode::AuthForbidden,

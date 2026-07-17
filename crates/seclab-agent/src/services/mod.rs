@@ -1,5 +1,7 @@
 //! 服务层入口：聚合业务服务模块。
 
+pub mod disk_inventory;
+pub mod disk_operations;
 pub mod docker_activity;
 pub mod docker_project_tasks;
 pub mod docker_projects;
