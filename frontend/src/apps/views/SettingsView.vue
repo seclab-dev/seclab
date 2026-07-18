@@ -1,30 +1,22 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { formatDateTime } from '@/utils/time'
-import { seclabApi } from '@/api/modules/seclab'
 import { securityApi } from '@/api/modules/security'
-import { systemApi } from '@/api/modules/system'
 import {
   upgradesApi,
   type UpgradePlanDetail,
   type UpgradeReleaseRecord,
 } from '@/api/modules/upgrades'
-import type { SystemAboutInfo } from '@/api/interface/system'
-import { useNodeStore } from '@/stores/node'
 import { useToastStore } from '@/stores/toast'
-import { useThemeStore } from '@/stores/theme'
 import { useWindowManagerStore } from '@/stores/window-manager'
 import { useConfirmationModalStore } from '@/stores/confirmation-modal'
 import { forgetLoginEntry, rememberLoginEntry } from '@/utils/login-entry'
 import {
   SecLabButton,
   SecLabCard,
-  SecLabSelect,
-  SecLabAlert,
   SecLabFormItem,
-  SecLabDescriptions,
   SecLabMenu,
   SecLabInput,
   SecLabEmpty,
@@ -33,6 +25,9 @@ import {
   SecLabTag,
 } from '@/components/ui'
 import type { SecLabTableColumn } from '@/components/ui/SecLabTable.vue'
+import AboutSettings from './settings/AboutSettings.vue'
+import NetworkSettings from './settings/NetworkSettings.vue'
+import PersonalizationSettings from './settings/PersonalizationSettings.vue'
 import SystemMonitoringSettings from './settings/SystemMonitoringSettings.vue'
 
 const props = defineProps<{
@@ -42,25 +37,15 @@ const props = defineProps<{
 }>()
 
 const router = useRouter()
-const { t, te, locale } = useI18n()
-const nodeStore = useNodeStore()
+const { t, te } = useI18n()
 const toastStore = useToastStore()
-const themeStore = useThemeStore()
 const windowStore = useWindowManagerStore()
 const confirmationStore = useConfirmationModalStore()
-const systemClient = computed(() => systemApi.forNode(nodeStore.currentNodeId))
-
 const appVersion = import.meta.env.VITE_APP_VERSION ?? 'unknown'
-const gitHash = import.meta.env.VITE_GIT_HASH ?? 'unknown'
 
-const networkLoading = ref(false)
+const networkBusy = ref(false)
+const networkDirty = ref(false)
 const monitoringBusy = ref(false)
-const networkSaving = ref(false)
-const networkForm = ref({
-  host: '',
-  port: 0,
-  publicHost: '',
-})
 const securityLoading = ref(false)
 const securitySaving = ref(false)
 const credentialSaving = ref(false)
@@ -74,51 +59,7 @@ const passwordForm = ref({
   confirmPassword: '',
 })
 
-interface InterfaceOption {
-  value: string
-  label: string
-}
-
-const fetchedInterfaces = ref<InterfaceOption[]>([])
-const hasLoadedInterfaces = ref(false)
-
-const interfaceOptions = computed<InterfaceOption[]>(() => {
-  const items = hasLoadedInterfaces.value
-    ? fetchedInterfaces.value
-    : [
-        { value: '::', label: '' },
-        { value: '0.0.0.0', label: '' },
-      ]
-
-  return items.map((item) => {
-    if (item.value === '::') {
-      return { value: '::', label: t('app.settings.network.interfaceOptions.dualStack') }
-    }
-    if (item.value === '0.0.0.0') {
-      return { value: '0.0.0.0', label: t('app.settings.network.interfaceOptions.ipv4Only') }
-    }
-    return item
-  })
-})
-
-const loadInterfaces = async () => {
-  try {
-    const response = await seclabApi.fetchInterfaces()
-    if (response.success && response.data) {
-      fetchedInterfaces.value = response.data.map((item) => ({
-        value: item.ip,
-        label: item.label,
-      }))
-      hasLoadedInterfaces.value = true
-    }
-  } catch (error) {
-    console.error('Failed to load system network interfaces', error)
-  }
-}
-
-const aboutLoading = ref(false)
-const aboutCopying = ref(false)
-const aboutInfo = ref<SystemAboutInfo | null>(null)
+const aboutBusy = ref(false)
 const upgradeLoading = ref(false)
 const upgradeSyncing = ref(false)
 const upgradeStarting = ref(false)
@@ -157,29 +98,29 @@ const upgradeProgressPercent = computed(() => {
 
 const settingsBusy = computed(
   () =>
-    networkLoading.value ||
+    networkBusy.value ||
     monitoringBusy.value ||
-    networkSaving.value ||
     securityLoading.value ||
     securitySaving.value ||
     credentialSaving.value ||
-    aboutLoading.value ||
-    aboutCopying.value ||
+    aboutBusy.value ||
     upgradeLoading.value ||
     upgradeSyncing.value ||
     upgradeUploading.value ||
     isValidating.value ||
     upgradeStarting.value,
 )
+const settingsDirty = computed(() => networkDirty.value)
 
 watch(
-  settingsBusy,
-  (busy) => {
+  [settingsBusy, settingsDirty],
+  ([busy, dirty]) => {
     if (!props.windowId) return
     windowStore.updateWindowRuntimeState(props.windowId, {
       busy,
+      dirty,
       allowsNodeSwitch: false,
-      blockLevel: busy ? 'busy' : 'open',
+      blockLevel: busy ? 'busy' : dirty ? 'dirty' : 'open',
       blockReason: busy ? t('app.settings.guardBusy') : t('app.settings.guardOpen'),
     })
   },
@@ -257,163 +198,6 @@ const targetColumns = computed<SecLabTableColumn[]>(() => [
   { prop: 'status', label: t('app.settings.upgrade.status'), width: 120, slot: 'status' },
   { prop: 'errorDetail', label: t('app.settings.upgrade.error'), minWidth: 180, slot: 'error' },
 ])
-
-// --- 信息项定义 ---
-const softwareInfoItems = computed(() => [
-  { label: t('app.settings.about.version'), value: appVersion },
-  { label: t('app.settings.about.hash'), value: gitHash },
-])
-
-const hardwareInfoItems = computed(() => [
-  { label: t('app.settings.about.hostname'), value: textOrPlaceholder(aboutInfo.value?.hostname) },
-  { label: t('app.settings.about.osName'), value: textOrPlaceholder(aboutInfo.value?.osName) },
-  {
-    label: t('app.settings.about.osVersion'),
-    value: textOrPlaceholder(aboutInfo.value?.osVersion),
-  },
-  {
-    label: t('app.settings.about.kernelVersion'),
-    value: textOrPlaceholder(aboutInfo.value?.kernelVersion),
-  },
-  {
-    label: t('app.settings.about.architecture'),
-    value: textOrPlaceholder(aboutInfo.value?.architecture),
-  },
-  { label: t('app.settings.about.cpu'), value: cpuText() },
-  {
-    label: t('app.settings.about.cpuVendor'),
-    value: textOrPlaceholder(aboutInfo.value?.cpuVendor),
-  },
-  {
-    label: t('app.settings.about.cpuPhysicalCores'),
-    value: aboutInfo.value?.cpuPhysicalCores || '--',
-  },
-  {
-    label: t('app.settings.about.cpuLogicalCores'),
-    value: aboutInfo.value?.cpuLogicalCores || '--',
-  },
-  {
-    label: t('app.settings.about.cpuFrequency'),
-    value: formatCpuFreq(aboutInfo.value?.cpuFrequencyMhz),
-  },
-  {
-    label: t('app.settings.about.cpuCacheL3'),
-    value: textOrPlaceholder(aboutInfo.value?.cpuCacheL3),
-  },
-  { label: t('app.settings.about.memory'), value: formatBytes(aboutInfo.value?.memoryTotalBytes) },
-  {
-    label: t('app.settings.about.memoryAvailable'),
-    value: formatBytes(aboutInfo.value?.memoryAvailableBytes),
-  },
-  { label: t('app.settings.about.swapTotal'), value: formatBytes(aboutInfo.value?.swapTotalBytes) },
-  { label: t('app.settings.about.swapUsed'), value: formatBytes(aboutInfo.value?.swapUsedBytes) },
-  { label: t('app.settings.about.uptime'), value: formatUptime(aboutInfo.value?.uptimeSeconds) },
-  {
-    label: t('app.settings.about.bootTime'),
-    value: formatDateTime(aboutInfo.value?.bootTimeEpoch),
-  },
-  { label: t('app.settings.about.timezone'), value: textOrPlaceholder(aboutInfo.value?.timezone) },
-  { label: t('app.settings.about.locale'), value: textOrPlaceholder(aboutInfo.value?.locale) },
-  {
-    label: t('app.settings.about.virtualization'),
-    value: textOrPlaceholder(aboutInfo.value?.virtualization),
-  },
-  {
-    label: t('app.settings.about.primaryInterface'),
-    value: textOrPlaceholder(aboutInfo.value?.primaryInterface),
-  },
-  {
-    label: t('app.settings.about.macAddress'),
-    value: textOrPlaceholder(aboutInfo.value?.macAddress),
-  },
-  {
-    label: t('app.settings.about.ipv4Addresses'),
-    value: formatIpList(aboutInfo.value?.ipv4Addresses),
-  },
-  {
-    label: t('app.settings.about.ipv6Addresses'),
-    value: formatIpList(aboutInfo.value?.ipv6Addresses),
-  },
-  {
-    label: t('app.settings.about.defaultGateway'),
-    value: textOrPlaceholder(aboutInfo.value?.defaultGateway),
-  },
-  { label: t('app.settings.about.dnsServers'), value: formatDnsList(aboutInfo.value?.dnsServers) },
-  { label: t('app.settings.about.disk'), value: formatBytes(aboutInfo.value?.diskTotalBytes) },
-])
-
-const handleLocaleChange = (value: string | number | boolean | null) => {
-  if (value === 'en' || value === 'zh') {
-    locale.value = value
-    localStorage.setItem('seclab_locale', value)
-  }
-}
-
-const handleThemeChange = (value: string | number | boolean | null) => {
-  if (value === 'light' || value === 'dark') {
-    themeStore.setTheme(value)
-  }
-}
-
-const loadNetworkConfig = async () => {
-  networkLoading.value = true
-  try {
-    await loadInterfaces()
-    const response = await seclabApi.fetchNetwork()
-    if (!response.success) {
-      toastStore.error(response.message || t('app.settings.network.loadFailed'))
-      return
-    }
-    if (response.data) {
-      networkForm.value.host = response.data.host
-      networkForm.value.port = response.data.port
-      networkForm.value.publicHost = response.data.publicHost || ''
-    }
-  } catch (error) {
-    console.error('Failed to load SecLab network config', error)
-    toastStore.error(t('app.settings.network.loadFailed'))
-  } finally {
-    networkLoading.value = false
-  }
-}
-
-const saveNetworkConfig = async () => {
-  if (!networkForm.value.host.trim()) {
-    toastStore.error(t('app.settings.network.validationHost'))
-    return
-  }
-  if (
-    !Number.isInteger(networkForm.value.port) ||
-    networkForm.value.port < 1 ||
-    networkForm.value.port > 65535
-  ) {
-    toastStore.error(t('app.settings.network.validationPort'))
-    return
-  }
-
-  networkSaving.value = true
-  try {
-    const response = await seclabApi.updateNetwork({
-      host: networkForm.value.host.trim(),
-      port: networkForm.value.port,
-      publicHost: networkForm.value.publicHost.trim() || null,
-    })
-    if (!response.success || !response.data) {
-      toastStore.error(response.message || t('app.settings.network.saveFailed'))
-      return
-    }
-    toastStore.success(t('app.settings.network.saveSuccess'))
-    const target = response.data.nextUrl
-    setTimeout(() => {
-      window.location.replace(target)
-    }, 400)
-  } catch (error) {
-    console.error('Failed to save SecLab network config', error)
-    toastStore.error(t('app.settings.network.saveFailed'))
-  } finally {
-    networkSaving.value = false
-  }
-}
 
 const generateSafeEntryValue = () => {
   const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
@@ -552,112 +336,6 @@ const savePassword = async () => {
     toastStore.error(t('app.settings.security.passwordFailed'))
   } finally {
     credentialSaving.value = false
-  }
-}
-
-function formatBytes(bytes?: number) {
-  if (!bytes || bytes <= 0) return '--'
-  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
-  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
-  const value = bytes / Math.pow(1024, index)
-  return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[index]}`
-}
-
-function textOrPlaceholder(value?: string) {
-  if (!value) return '--'
-  const normalized = value.trim()
-  return normalized ? normalized : '--'
-}
-
-function cpuText() {
-  if (!aboutInfo.value) return '--'
-  const model = textOrPlaceholder(aboutInfo.value.cpuModel)
-  const cores =
-    aboutInfo.value.cpuLogicalCores > 0
-      ? ` (${t('app.settings.about.logicalCores', { count: aboutInfo.value.cpuLogicalCores })})`
-      : ''
-  return `${model}${cores}`
-}
-
-function formatUptime(seconds?: number) {
-  if (!seconds || seconds <= 0) return '--'
-  const days = Math.floor(seconds / 86400)
-  const hours = Math.floor((seconds % 86400) / 3600)
-  const minutes = Math.floor((seconds % 3600) / 60)
-  if (days > 0) return `${days}d ${hours}h ${minutes}m`
-  if (hours > 0) return `${hours}h ${minutes}m`
-  return `${minutes}m`
-}
-
-function formatCpuFreq(freqMhz?: number) {
-  if (!freqMhz || freqMhz <= 0) return '--'
-  if (freqMhz >= 1000) return `${(freqMhz / 1000).toFixed(2)} GHz`
-  return `${freqMhz} MHz`
-}
-
-function formatIpList(values?: string[]) {
-  if (!values || values.length === 0) return '--'
-  return values.join(', ')
-}
-
-function formatDnsList(values?: string[]) {
-  if (!values || values.length === 0) return '--'
-  return values.join(', ')
-}
-
-function buildAboutExport() {
-  return {
-    exportedAt: new Date().toISOString(),
-    app: {
-      version: appVersion,
-      gitHash,
-    },
-    system: aboutInfo.value,
-  }
-}
-
-const copyAboutInfo = async () => {
-  const payload = buildAboutExport()
-  const text = JSON.stringify(payload, null, 2)
-  aboutCopying.value = true
-  try {
-    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
-      await navigator.clipboard.writeText(text)
-    } else {
-      const textarea = document.createElement('textarea')
-      textarea.value = text
-      textarea.style.position = 'fixed'
-      textarea.style.opacity = '0'
-      document.body.appendChild(textarea)
-      textarea.focus()
-      textarea.select()
-      const copied = document.execCommand('copy')
-      document.body.removeChild(textarea)
-      if (!copied) throw new Error('copy failed')
-    }
-    toastStore.success(t('app.settings.about.copySuccess'))
-  } catch (error) {
-    console.error('Failed to copy system about info', error)
-    toastStore.error(t('app.settings.about.copyFailed'))
-  } finally {
-    aboutCopying.value = false
-  }
-}
-
-const loadAboutInfo = async () => {
-  aboutLoading.value = true
-  try {
-    const response = await systemClient.value.fetchAbout()
-    if (!response.success) {
-      toastStore.error(response.message || t('app.settings.about.loadFailed'))
-      return
-    }
-    aboutInfo.value = response.data ?? null
-  } catch (error) {
-    console.error('Failed to load system about info', error)
-    toastStore.error(t('app.settings.about.loadFailed'))
-  } finally {
-    aboutLoading.value = false
   }
 }
 
@@ -866,77 +544,69 @@ const deleteReleaseForVersion = async (version: string) => {
   }
 }
 
-onMounted(() => {
-  void loadNetworkConfig()
-  void loadSecuritySettings()
-  void loadAboutInfo()
-  void loadUpgradeReleases()
-  window.setInterval(() => {
-    void refreshUpgradePlan()
-  }, 10000)
-})
+const loadedSections = new Set<string>()
+
+/** 按需加载当前设置分区，避免打开应用时请求全部配置。 */
+const loadActiveSection = async (section: string) => {
+  if (loadedSections.has(section)) return
+  loadedSections.add(section)
+
+  if (section === 'security') {
+    await loadSecuritySettings()
+  } else if (section === 'upgrade') {
+    await loadUpgradeReleases()
+  }
+}
+
+watch(activeMenu, (section) => void loadActiveSection(section), { immediate: true })
+
+let upgradeRefreshTimer: number | undefined
+
+/** 停止升级计划轮询。 */
+const stopUpgradeRefreshTimer = () => {
+  if (upgradeRefreshTimer !== undefined) {
+    window.clearInterval(upgradeRefreshTimer)
+    upgradeRefreshTimer = undefined
+  }
+}
+
+/** 根据升级计划状态启停轮询，离开分区后不保留后台任务。 */
+const syncUpgradeRefreshTimer = () => {
+  stopUpgradeRefreshTimer()
+
+  if (
+    activeMenu.value !== 'upgrade' ||
+    !upgradePlan.value ||
+    isUpgradeFinished(upgradePlan.value.plan.status)
+  ) {
+    return
+  }
+
+  upgradeRefreshTimer = window.setInterval(() => void refreshUpgradePlan(), 10000)
+}
+
+watch([activeMenu, () => upgradePlan.value?.plan.status], syncUpgradeRefreshTimer)
+onBeforeUnmount(stopUpgradeRefreshTimer)
 </script>
 
 <template>
-  <div class="settings" data-seclab-app="settings">
-    <div class="sidebar">
+  <div class="settings" data-page="settings" data-seclab-app="settings">
+    <div class="sidebar" data-slot="navigation">
       <SecLabCard class="nav-card" shadow="never" full-height>
         <SecLabMenu v-model="activeMenu" :items="menuItems" />
       </SecLabCard>
     </div>
 
-    <div class="content">
+    <div class="content" data-slot="content">
       <div v-if="activeMenu === 'monitoring'" class="section">
         <SystemMonitoringSettings @busy-change="monitoringBusy = $event" />
       </div>
 
       <div v-else-if="activeMenu === 'network'" class="section">
-        <SecLabCard class="card" shadow="never">
-          <template #header>
-            <h2 class="section-title">{{ t('app.settings.network.label') }}</h2>
-          </template>
-
-          <div class="form-wrapper">
-            <p class="description">{{ t('app.settings.network.description') }}</p>
-
-            <div v-if="!networkLoading" class="sl-form network-form">
-              <SecLabFormItem :label="t('app.settings.network.host')">
-                <SecLabSelect
-                  v-model="networkForm.host"
-                  :options="interfaceOptions"
-                  class="select-control"
-                />
-              </SecLabFormItem>
-              <SecLabFormItem :label="t('app.settings.network.port')">
-                <SecLabInput
-                  v-model.number="networkForm.port"
-                  type="number"
-                  :min="1"
-                  :max="65535"
-                />
-              </SecLabFormItem>
-              <SecLabFormItem :label="t('app.settings.network.publicHost')">
-                <SecLabInput
-                  v-model="networkForm.publicHost"
-                  :placeholder="t('app.settings.network.publicHostPlaceholder')"
-                />
-              </SecLabFormItem>
-
-              <SecLabAlert type="warning" :title="t('app.settings.network.warning')" show-icon />
-
-              <div class="form-actions">
-                <SecLabButton type="primary" :loading="networkSaving" @click="saveNetworkConfig">
-                  {{ t('app.settings.network.save') }}
-                </SecLabButton>
-              </div>
-            </div>
-            <SecLabLoading
-              :loading="networkLoading"
-              :text="t('app.settings.network.loading')"
-              cover
-            />
-          </div>
-        </SecLabCard>
+        <NetworkSettings
+          @busy-change="networkBusy = $event"
+          @dirty-change="networkDirty = $event"
+        />
       </div>
 
       <div v-else-if="activeMenu === 'security'" class="section">
@@ -1041,39 +711,11 @@ onMounted(() => {
       </div>
 
       <div v-else-if="activeMenu === 'language'" class="section">
-        <SecLabCard class="card" shadow="never">
-          <template #header>
-            <h2 class="section-title">{{ t('app.settings.language.label') }}</h2>
-          </template>
-          <p class="description">{{ t('app.settings.language.description') }}</p>
-          <SecLabSelect
-            class="select-control"
-            :model-value="locale"
-            :options="[
-              { value: 'zh', label: t('app.settings.language.zh') },
-              { value: 'en', label: t('app.settings.language.en') },
-            ]"
-            @update:model-value="handleLocaleChange"
-          />
-        </SecLabCard>
+        <PersonalizationSettings kind="language" />
       </div>
 
       <div v-else-if="activeMenu === 'theme'" class="section">
-        <SecLabCard class="card" shadow="never">
-          <template #header>
-            <h2 class="section-title">{{ t('app.settings.theme.label') }}</h2>
-          </template>
-          <p class="description">{{ t('app.settings.theme.description') }}</p>
-          <SecLabSelect
-            class="select-control"
-            :model-value="themeStore.currentTheme"
-            :options="[
-              { value: 'light', label: t('app.settings.theme.light') },
-              { value: 'dark', label: t('app.settings.theme.dark') },
-            ]"
-            @update:model-value="handleThemeChange"
-          />
-        </SecLabCard>
+        <PersonalizationSettings kind="theme" />
       </div>
 
       <div v-else-if="activeMenu === 'upgrade'" class="section">
@@ -1087,28 +729,13 @@ onMounted(() => {
             <div v-if="!upgradePlan" class="upgrade-main-flow">
               <p class="description">{{ t('app.settings.upgrade.description') }}</p>
 
-              <div class="fine-grained-upgrade-link" style="margin-bottom: 16px">
-                <a
-                  href="javascript:void(0)"
-                  style="
-                    color: var(--sdl-primary);
-                    font-size: 13px;
-                    text-decoration: none;
-                    display: inline-flex;
-                    align-items: center;
-                    gap: 4px;
-                  "
-                  @click="goToNodeUpgradeGuide"
-                >
+              <div class="fine-grained-upgrade-link" data-ui="node-upgrade-guide">
+                <SecLabButton type="secondary" size="small" @click="goToNodeUpgradeGuide">
                   {{ t('app.settings.upgrade.fineGrainedLink') }}
-                </a>
+                </SecLabButton>
               </div>
 
-              <div
-                class="upgrade-upload-area"
-                style="position: relative"
-                data-ui="upgrade-upload-panel"
-              >
+              <div class="upgrade-upload-area" data-ui="upgrade-upload-panel">
                 <input
                   ref="fileInputRef"
                   type="file"
@@ -1152,10 +779,7 @@ onMounted(() => {
                     {{ uploadStatusText }}
                   </div>
                   <div class="progress-bar-bg">
-                    <div
-                      class="progress-bar-fill animated-glow"
-                      :style="{ width: uploadProgress + '%' }"
-                    ></div>
+                    <div class="progress-bar-fill" :style="{ width: uploadProgress + '%' }"></div>
                   </div>
                 </div>
 
@@ -1265,7 +889,7 @@ onMounted(() => {
                   </div>
                   <div class="progress-bar-bg">
                     <div
-                      class="progress-bar-fill animated-glow"
+                      class="progress-bar-fill"
                       :style="{ width: upgradeProgressPercent + '%' }"
                     ></div>
                   </div>
@@ -1301,29 +925,7 @@ onMounted(() => {
       </div>
 
       <div v-else-if="activeMenu === 'about'" class="section">
-        <SecLabCard class="card" shadow="never">
-          <template #header>
-            <h2 class="section-title">{{ t('app.settings.about.label') }}</h2>
-          </template>
-
-          <div class="about-wrapper">
-            <div class="about-toolbar">
-              <p class="description">{{ t('app.settings.about.description') }}</p>
-              <SecLabButton size="small" :loading="aboutCopying" @click="copyAboutInfo">
-                {{ t('app.settings.about.copyButton') }}
-              </SecLabButton>
-            </div>
-
-            <div class="about-body">
-              <h3 class="sub-title">{{ t('app.settings.about.software') }}</h3>
-              <SecLabDescriptions :items="softwareInfoItems" border class="desc-block" />
-
-              <h3 class="sub-title">{{ t('app.settings.about.hardware') }}</h3>
-              <SecLabDescriptions :items="hardwareInfoItems" border class="desc-block" />
-            </div>
-            <SecLabLoading :loading="aboutLoading" :text="t('app.settings.about.loading')" cover />
-          </div>
-        </SecLabCard>
+        <AboutSettings @busy-change="aboutBusy = $event" />
       </div>
 
       <div v-else class="section">
@@ -1502,7 +1104,8 @@ onMounted(() => {
   padding: var(--sdl-space-4);
   border: 1px dashed var(--sdl-border-subtle);
   border-radius: var(--sdl-radius-md);
-  background: var(--sdl-bg-sunken);
+  background: var(--sdl-bg-muted);
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: var(--sdl-space-3);
@@ -1565,36 +1168,21 @@ onMounted(() => {
 .progress-bar-bg {
   width: 100%;
   height: 8px;
-  background: var(--sdl-bg-sunken);
-  border-radius: var(--sdl-radius-full);
+  background: var(--sdl-bg-muted);
+  border-radius: var(--sdl-radius-pill);
   overflow: hidden;
   border: 1px solid var(--sdl-border-subtle);
 }
 
 .progress-bar-fill {
   height: 100%;
-  border-radius: var(--sdl-radius-full);
-  background: linear-gradient(90deg, var(--sdl-primary) 0%, #a855f7 100%);
+  border-radius: var(--sdl-radius-pill);
+  background: var(--sdl-primary);
   transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-  box-shadow: 0 0 8px rgba(var(--sdl-primary-rgb), 0.5);
 }
 
-/* 进度流动炫光动画 */
-.animated-glow {
-  background-size: 200% 200%;
-  animation: progressGlow 2s linear infinite;
-}
-
-@keyframes progressGlow {
-  0% {
-    background-position: 0% 50%;
-  }
-  50% {
-    background-position: 100% 50%;
-  }
-  100% {
-    background-position: 0% 50%;
-  }
+.fine-grained-upgrade-link {
+  margin-bottom: var(--sdl-space-4);
 }
 
 /* 状态 B 的 execution 头部面板 */
@@ -1616,7 +1204,7 @@ onMounted(() => {
 
 .execution-title {
   margin: 0;
-  font-size: var(--sdl-font-body-md);
+  font-size: var(--sdl-font-body);
   font-weight: 700;
   color: var(--sdl-text-primary);
   display: flex;
