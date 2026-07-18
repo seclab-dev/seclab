@@ -21,8 +21,8 @@ vi.mock('@/stores/window-manager', () => ({
     openWindowWithPayload: vi.fn(),
   }),
 }))
-vi.mock('@/stores/notification', () => ({
-  useNotificationStore: () => ({ error: vi.fn(), success: vi.fn() }),
+vi.mock('@/stores/toast', () => ({
+  useToastStore: () => ({ error: vi.fn(), success: vi.fn() }),
 }))
 vi.mock('@/composables/useFileOperations', () => ({
   useFileOperations: () => ({

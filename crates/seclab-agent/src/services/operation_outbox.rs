@@ -78,7 +78,7 @@ mod tests {
             event_code: "docker_started".into(),
             actor: OperationActor {
                 kind: OperationActorKind::User,
-                user_id: None,
+                user_id: Some(7),
                 display_name: "admin".into(),
             },
             client_ip: Some("127.0.0.1".into()),
@@ -92,7 +92,9 @@ mod tests {
             error_summary: None,
         };
         enqueue(&pool, &event).await.unwrap();
-        assert_eq!(pending(&pool, 20).await.unwrap().len(), 1);
+        let pending_events = pending(&pool, 20).await.unwrap();
+        assert_eq!(pending_events.len(), 1);
+        assert_eq!(pending_events[0].actor.user_id, Some(7));
         acknowledge(&pool, &["evt".into()]).await.unwrap();
         assert!(pending(&pool, 20).await.unwrap().is_empty());
     }

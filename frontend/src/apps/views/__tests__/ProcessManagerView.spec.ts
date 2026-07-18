@@ -25,7 +25,7 @@ vi.mock('@/stores/window-manager', () => ({
 vi.mock('@/stores/confirmation-modal', () => ({
   useConfirmationModalStore: () => confirmation,
 }))
-vi.mock('@/stores/notification', () => ({ useNotificationStore: () => notifications }))
+vi.mock('@/stores/toast', () => ({ useToastStore: () => notifications }))
 
 const response = <T>(data: T) => ({ success: true, code: 200, message: '', data })
 const processId = 'a'.repeat(64)

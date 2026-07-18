@@ -249,6 +249,7 @@ fn operation_context(
         )
     })?;
     Ok(AgentOperationContext {
+        actor_user_id: admin.id,
         actor_name: admin.username.clone(),
         client_ip,
         trace_id: trace_id.to_string(),

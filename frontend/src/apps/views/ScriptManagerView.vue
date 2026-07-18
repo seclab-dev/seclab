@@ -9,7 +9,7 @@ import { useI18n } from 'vue-i18n'
 import type { ScriptDetail, ScriptRun, ScriptSummary } from '@/api/modules/scripts'
 import { useScriptLibrary } from '@/composables/useScriptLibrary'
 import { useConfirmationModalStore } from '@/stores/confirmation-modal'
-import { useNotificationStore } from '@/stores/notification'
+import { useToastStore } from '@/stores/toast'
 import { useWindowManagerStore } from '@/stores/window-manager'
 import MonacoEditor from '@/components/editor/MonacoEditor.vue'
 import SecLabIcon from '@/components/icons/SecLabIcon.vue'
@@ -34,7 +34,7 @@ const props = defineProps<{ windowId?: string }>()
 const { t } = useI18n()
 const library = useScriptLibrary()
 const confirmation = useConfirmationModalStore()
-const notifications = useNotificationStore()
+const notifications = useToastStore()
 const windowStore = useWindowManagerStore()
 
 type EditorMode = 'view' | 'create' | 'edit' | 'clone'

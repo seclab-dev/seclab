@@ -1,22 +1,47 @@
 import http from '@/api'
 import type {
-  NotificationCreatePayload,
-  NotificationList,
+  NotificationArchiveStateRequest,
+  NotificationBatchArchiveStateRequest,
+  NotificationDetail,
+  NotificationPage,
   NotificationQuery,
-  NotificationBatchDeletePayload,
+  NotificationReadStateRequest,
+  NotificationUnreadSummary,
 } from '@/api/generated'
 
+/** 个人通知中心只读内容与个人状态接口。 */
 export const notificationsApi = {
-  create: (payload: NotificationCreatePayload) => {
-    return http.post<null>('/notifications', payload)
+  query(payload: NotificationQuery, signal?: AbortSignal) {
+    return http.post<NotificationPage>('/notifications/query', payload, { signal })
   },
-  list: (params?: NotificationQuery) => {
-    return http.get<NotificationList>('/notifications', params)
+  unreadSummary(signal?: AbortSignal) {
+    return http.get<NotificationUnreadSummary>('/notifications/unread-summary', undefined, {
+      signal,
+    })
   },
-  clear: () => {
-    return http.delete<null>('/notifications')
+  detail(notificationId: string, signal?: AbortSignal) {
+    return http.get<NotificationDetail>(
+      `/notifications/${encodeURIComponent(notificationId)}`,
+      undefined,
+      { signal },
+    )
   },
-  batchRemove: (payload: NotificationBatchDeletePayload) => {
-    return http.delete<null>('/notifications/batch', payload)
+  updateReadState(notificationId: string, payload: NotificationReadStateRequest) {
+    return http.patch<null>(
+      `/notifications/${encodeURIComponent(notificationId)}/read-state`,
+      payload,
+    )
+  },
+  readAll() {
+    return http.post<null>('/notifications/read-all')
+  },
+  updateArchiveState(notificationId: string, payload: NotificationArchiveStateRequest) {
+    return http.patch<null>(
+      `/notifications/${encodeURIComponent(notificationId)}/archive-state`,
+      payload,
+    )
+  },
+  updateBatchArchiveState(payload: NotificationBatchArchiveStateRequest) {
+    return http.post<null>('/notifications/archive-state', payload)
   },
 }

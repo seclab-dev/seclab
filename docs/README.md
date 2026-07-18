@@ -22,5 +22,7 @@ linked-docs -> ../seclab-docs
 
 ## 本仓库私有文档
 
+- [architecture/notification-center.md](architecture/notification-center.md)：个人通知中心的领域边界、可信投影、接口隔离与前端生命周期。
+- [architecture/operation-runtime-logs.md](architecture/operation-runtime-logs.md)：操作日志与运行日志的领域边界和查询模型。
 - [architecture/SecLabDocker管理控制台设计文档.md](architecture/SecLabDocker管理控制台设计文档.md)：Docker 管理控制台具体组件设计。
 - [todo/SecLab 架构安全改进规划.md](todo/SecLab 架构安全改进规划.md)：当前仓库安全改造 TODO。

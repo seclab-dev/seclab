@@ -172,6 +172,7 @@ pub struct SuiteCatalogAssetPath {
 
 #[derive(Clone, Debug)]
 struct SuiteAuditContext {
+    user_id: i64,
     username: String,
     client_ip: IpAddr,
     trace_id: String,
@@ -181,6 +182,7 @@ impl SuiteAuditContext {
     /// 从请求提取套件审计日志需要的用户、IP 与 trace 上下文。
     fn from_request(admin: &AuthenticatedAdmin, headers: &HeaderMap, conn: SocketAddr) -> Self {
         Self {
+            user_id: admin.id,
             username: admin.username.clone(),
             client_ip: extract_client_ip(headers, conn),
             trace_id: logging::resolve_trace_id(headers),
@@ -189,6 +191,7 @@ impl SuiteAuditContext {
 
     fn agent_operation_context(&self) -> AgentOperationContext {
         AgentOperationContext {
+            actor_user_id: self.user_id,
             actor_name: self.username.clone(),
             client_ip: self.client_ip.to_string(),
             trace_id: self.trace_id.clone(),
@@ -222,6 +225,7 @@ fn extract_client_ip(headers: &HeaderMap, conn: SocketAddr) -> IpAddr {
 /// 创建套件平台日志的基础记录。
 fn suite_platform_log(ctx: &SuiteAuditContext, event: &str) -> OperationEventBuilder {
     OperationEventBuilder::new(&ctx.username, event, ctx.client_ip)
+        .user_id(ctx.user_id)
         .module(LogModule::Docker)
         .source("seclab_api")
         .trace_id(&ctx.trace_id)
@@ -949,6 +953,7 @@ async fn prewarm_suite_images(
             Arc::clone(&state),
             node_id.to_string(),
             image_ref.clone(),
+            None,
         );
         loop {
             if is_install_cancel_requested(suite_task_id) {

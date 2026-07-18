@@ -5,7 +5,7 @@
 import { computed, type Ref } from 'vue'
 import { fsApi } from '@/api/modules/fs'
 import type { FileOperation, FileOperationItemRequest, FileOperationTask } from '@/api/interface/fs'
-import { useNotificationStore } from '@/stores/notification'
+import { useToastStore } from '@/stores/toast'
 import { useI18n } from 'vue-i18n'
 
 const UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024
@@ -19,19 +19,19 @@ const newIdempotencyKey = () =>
 const wait = (delayMs: number) => new Promise((resolve) => window.setTimeout(resolve, delayMs))
 
 export function useFileOperations(nodeId: Readonly<Ref<string>>) {
-  const notificationStore = useNotificationStore()
+  const toastStore = useToastStore()
   const { t } = useI18n()
   const fsClient = computed(() => fsApi.forNode(nodeId.value))
 
   const createFile = async (path: string, content = '') => {
     const res = await fsClient.value.createFile({ path, content })
-    if (!res.success) notificationStore.error(res.message || t('app.fileManager.writeFailed'))
+    if (!res.success) toastStore.error(res.message || t('app.fileManager.writeFailed'))
     return res.success
   }
 
   const mkdir = async (path: string, recursive = false) => {
     const res = await fsClient.value.mkdir({ path, recursive })
-    if (!res.success) notificationStore.error(res.message || t('app.fileManager.mkdirFailed'))
+    if (!res.success) toastStore.error(res.message || t('app.fileManager.mkdirFailed'))
     return res.success
   }
 
@@ -42,13 +42,13 @@ export function useFileOperations(nodeId: Readonly<Ref<string>>) {
       await wait(TASK_POLL_INTERVAL_MS)
       const res = await fsClient.value.taskDetail(current.taskId)
       if (!res.success || !res.data) {
-        notificationStore.error(res.message || t('app.fileManager.fetchError'))
+        toastStore.error(res.message || t('app.fileManager.fetchError'))
         return false
       }
       current = res.data
     }
     if (current.status !== 'succeeded') {
-      notificationStore.error(current.errorSummary || t('app.fileManager.fetchError'))
+      toastStore.error(current.errorSummary || t('app.fileManager.fetchError'))
       return false
     }
     return true
@@ -69,7 +69,7 @@ export function useFileOperations(nodeId: Readonly<Ref<string>>) {
       idempotencyKey: newIdempotencyKey(),
     })
     if (!res.success || !res.data) {
-      notificationStore.error(res.message || t('app.fileManager.fetchError'))
+      toastStore.error(res.message || t('app.fileManager.fetchError'))
       return false
     }
     return pollTask(res.data)
@@ -90,12 +90,12 @@ export function useFileOperations(nodeId: Readonly<Ref<string>>) {
       await wait(TASK_POLL_INTERVAL_MS)
       const res = await fsClient.value.transferDetail(transferId)
       if (!res.success || !res.data) {
-        notificationStore.error(res.message || t('app.fileManager.fetchError'))
+        toastStore.error(res.message || t('app.fileManager.fetchError'))
         return false
       }
       if (!TERMINAL_TRANSFER_STATUSES.has(res.data.status)) continue
       if (res.data.status !== 'completed') {
-        notificationStore.error(res.data.errorSummary || t('app.fileManager.downloadFailed'))
+        toastStore.error(res.data.errorSummary || t('app.fileManager.downloadFailed'))
         return false
       }
       return true
@@ -111,7 +111,7 @@ export function useFileOperations(nodeId: Readonly<Ref<string>>) {
       overwrite: false,
     })
     if (!res.success || !res.data) {
-      notificationStore.error(res.message || t('app.fileManager.downloadFailed'))
+      toastStore.error(res.message || t('app.fileManager.downloadFailed'))
       return false
     }
     const link = document.createElement('a')
@@ -127,7 +127,7 @@ export function useFileOperations(nodeId: Readonly<Ref<string>>) {
     const client = fsClient.value
     const active = await client.activeTransfers()
     if (!active.success) {
-      notificationStore.error(active.message || t('app.fileManager.uploadFailed'))
+      toastStore.error(active.message || t('app.fileManager.uploadFailed'))
       return false
     }
     const resumable = active.data?.find(
@@ -146,7 +146,7 @@ export function useFileOperations(nodeId: Readonly<Ref<string>>) {
           overwrite: false,
         })
     if (!created.success || !created.data) {
-      notificationStore.error(created.message || t('app.fileManager.uploadFailed'))
+      toastStore.error(created.message || t('app.fileManager.uploadFailed'))
       return false
     }
 
@@ -175,9 +175,7 @@ export function useFileOperations(nodeId: Readonly<Ref<string>>) {
       return true
     } catch (error) {
       await client.cancelTransfer(transferId)
-      notificationStore.error(
-        error instanceof Error ? error.message : t('app.fileManager.uploadFailed'),
-      )
+      toastStore.error(error instanceof Error ? error.message : t('app.fileManager.uploadFailed'))
       return false
     }
   }

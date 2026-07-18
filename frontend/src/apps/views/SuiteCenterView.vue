@@ -22,7 +22,7 @@ import {
 import AppIcon from '@/components/icons/AppIcon.vue'
 import SecLabIcon from '@/components/icons/SecLabIcon.vue'
 import { useNodeStore } from '@/stores/node'
-import { useNotificationStore } from '@/stores/notification'
+import { useToastStore } from '@/stores/toast'
 import { useWindowManagerStore } from '@/stores/window-manager'
 
 type SuiteCategory = 'all' | 'tools' | 'other'
@@ -37,7 +37,7 @@ interface SuiteCard {
 }
 
 const { t, locale } = useI18n()
-const notificationStore = useNotificationStore()
+const toastStore = useToastStore()
 const windowStore = useWindowManagerStore()
 const nodeStore = useNodeStore()
 
@@ -159,7 +159,7 @@ async function refreshSuites() {
   try {
     const response = await suitesApi.fetchSuites(currentNodeId.value)
     if (!response.success || !response.data) {
-      notificationStore.error(response.message || t('app.suiteCenter.messages.loadFailed'))
+      toastStore.error(response.message || t('app.suiteCenter.messages.loadFailed'))
       return
     }
     catalog.value = response.data.catalog
@@ -172,7 +172,7 @@ async function refreshSuites() {
     }
   } catch (error) {
     console.error('Failed to load suites', error)
-    notificationStore.error(t('app.suiteCenter.messages.loadFailed'))
+    toastStore.error(t('app.suiteCenter.messages.loadFailed'))
   } finally {
     loading.value = false
   }
@@ -209,23 +209,23 @@ function handleFileSelected(event: Event) {
 async function confirmImportSuite() {
   const file = selectedImportFile.value
   if (!file) {
-    notificationStore.error(t('app.suiteCenter.messages.selectPackageFirst'))
+    toastStore.error(t('app.suiteCenter.messages.selectPackageFirst'))
     return
   }
   operatingId.value = 'import'
   try {
     const response = await suitesApi.importSuite(file)
     if (!response.success) {
-      notificationStore.error(response.message || t('app.suiteCenter.messages.importFailed'))
+      toastStore.error(response.message || t('app.suiteCenter.messages.importFailed'))
       return
     }
-    notificationStore.success(t('app.suiteCenter.messages.importSuccess'))
+    toastStore.success(t('app.suiteCenter.messages.importSuccess'))
     await refreshSuites()
     importDialogVisible.value = false
     resetImportSelection()
   } catch (error) {
     console.error('Failed to import suite', error)
-    notificationStore.error(t('app.suiteCenter.messages.importFailed'))
+    toastStore.error(t('app.suiteCenter.messages.importFailed'))
   } finally {
     operatingId.value = ''
   }
@@ -233,7 +233,7 @@ async function confirmImportSuite() {
 
 async function installSuite(card: SuiteCard) {
   if (currentNodeUnavailable.value) {
-    notificationStore.error(t('app.suiteCenter.messages.loadFailed'))
+    toastStore.error(t('app.suiteCenter.messages.loadFailed'))
     return
   }
   operatingId.value = `install:${card.suite.suiteId}`
@@ -252,7 +252,7 @@ async function installSuite(card: SuiteCard) {
   try {
     const response = await suitesApi.installSuite(card.suite.suiteId, targetNodeId)
     if (!response.success || !response.data) {
-      notificationStore.error(response.message || t('app.suiteCenter.messages.installFailed'))
+      toastStore.error(response.message || t('app.suiteCenter.messages.installFailed'))
       operatingId.value = ''
       installProgress.value = null
       return
@@ -270,7 +270,7 @@ async function installSuite(card: SuiteCard) {
     startInstallProgressPolling(response.data.taskId)
   } catch (error) {
     console.error('Failed to install suite', error)
-    notificationStore.error(t('app.suiteCenter.messages.installFailed'))
+    toastStore.error(t('app.suiteCenter.messages.installFailed'))
     operatingId.value = ''
     installProgress.value = null
     cancelingInstall.value = false
@@ -286,11 +286,11 @@ async function cancelInstallSuite() {
     if (response.success && response.data) {
       installProgress.value = response.data
     } else {
-      notificationStore.error(response.message || t('app.suiteCenter.messages.cancelInstallFailed'))
+      toastStore.error(response.message || t('app.suiteCenter.messages.cancelInstallFailed'))
     }
   } catch (error) {
     console.error('Failed to cancel suite install', error)
-    notificationStore.error(t('app.suiteCenter.messages.cancelInstallFailed'))
+    toastStore.error(t('app.suiteCenter.messages.cancelInstallFailed'))
   } finally {
     cancelingInstall.value = false
   }
@@ -315,13 +315,13 @@ async function pollInstallProgress(taskId: string) {
 
     clearInstallProgressTimer()
     if (response.data.status === 'success') {
-      notificationStore.success(t('app.suiteCenter.messages.installSuccess'))
+      toastStore.success(t('app.suiteCenter.messages.installSuccess'))
       await refreshSuites()
     } else if (response.data.status === 'canceled') {
-      notificationStore.success(t('app.suiteCenter.messages.cancelInstallSuccess'))
+      toastStore.success(t('app.suiteCenter.messages.cancelInstallSuccess'))
       await refreshSuites()
     } else {
-      notificationStore.error(response.data.error || t('app.suiteCenter.messages.installFailed'))
+      toastStore.error(response.data.error || t('app.suiteCenter.messages.installFailed'))
       await refreshSuites()
     }
     operatingId.value = ''
@@ -349,17 +349,17 @@ async function confirmDeleteSuite() {
   try {
     const response = await suitesApi.deleteSuite(suite.suiteId)
     if (!response.success) {
-      notificationStore.error(response.message || t('app.suiteCenter.messages.deleteFailed'))
+      toastStore.error(response.message || t('app.suiteCenter.messages.deleteFailed'))
       return
     }
-    notificationStore.success(t('app.suiteCenter.messages.deleteSuccess'))
+    toastStore.success(t('app.suiteCenter.messages.deleteSuccess'))
     deleteDialogVisible.value = false
     selectedDeleteSuite.value = null
     closeDetail()
     await refreshSuites()
   } catch (error) {
     console.error('Failed to delete suite package', error)
-    notificationStore.error(t('app.suiteCenter.messages.deleteFailed'))
+    toastStore.error(t('app.suiteCenter.messages.deleteFailed'))
   } finally {
     operatingId.value = ''
   }
@@ -370,15 +370,15 @@ async function enableInstance(instance: SuiteInstanceSummary) {
   try {
     const response = await suitesApi.enableInstance(instance.instanceId)
     if (!response.success) {
-      notificationStore.error(response.message || t('app.suiteCenter.messages.enableFailed'))
+      toastStore.error(response.message || t('app.suiteCenter.messages.enableFailed'))
       return
     }
-    notificationStore.success(t('app.suiteCenter.messages.enableSuccess'))
+    toastStore.success(t('app.suiteCenter.messages.enableSuccess'))
     await refreshSuites()
     await windowStore.refreshDesktopState()
   } catch (error) {
     console.error('Failed to enable suite', error)
-    notificationStore.error(t('app.suiteCenter.messages.enableFailed'))
+    toastStore.error(t('app.suiteCenter.messages.enableFailed'))
   } finally {
     operatingId.value = ''
   }
@@ -389,16 +389,16 @@ async function disableInstance(instance: SuiteInstanceSummary) {
   try {
     const response = await suitesApi.disableInstance(instance.instanceId)
     if (!response.success) {
-      notificationStore.error(response.message || t('app.suiteCenter.messages.disableFailed'))
+      toastStore.error(response.message || t('app.suiteCenter.messages.disableFailed'))
       return
     }
-    notificationStore.success(t('app.suiteCenter.messages.disableSuccess'))
+    toastStore.success(t('app.suiteCenter.messages.disableSuccess'))
     windowStore.closeWindowsBySuiteInstanceId(instance.instanceId)
     await refreshSuites()
     await windowStore.refreshDesktopState()
   } catch (error) {
     console.error('Failed to disable suite', error)
-    notificationStore.error(t('app.suiteCenter.messages.disableFailed'))
+    toastStore.error(t('app.suiteCenter.messages.disableFailed'))
   } finally {
     operatingId.value = ''
   }
@@ -429,10 +429,10 @@ async function confirmUninstallInstance() {
       removeData: removeSuiteData.value,
     })
     if (!response.success) {
-      notificationStore.error(response.message || t('app.suiteCenter.messages.uninstallFailed'))
+      toastStore.error(response.message || t('app.suiteCenter.messages.uninstallFailed'))
       return
     }
-    notificationStore.success(t('app.suiteCenter.messages.uninstallSuccess'))
+    toastStore.success(t('app.suiteCenter.messages.uninstallSuccess'))
     uninstallDialogVisible.value = false
     selectedUninstallSuite.value = null
     removeSuiteData.value = false
@@ -442,7 +442,7 @@ async function confirmUninstallInstance() {
     await windowStore.refreshDesktopState()
   } catch (error) {
     console.error('Failed to uninstall suite', error)
-    notificationStore.error(t('app.suiteCenter.messages.uninstallFailed'))
+    toastStore.error(t('app.suiteCenter.messages.uninstallFailed'))
   } finally {
     operatingId.value = ''
   }

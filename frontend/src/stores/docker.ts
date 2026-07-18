@@ -10,7 +10,7 @@ import { defineStore } from 'pinia'
 import { useI18n } from 'vue-i18n'
 import { dockerApi } from '@/api/modules/docker'
 import type * as dockerType from '@/api/interface/docker'
-import { useNotificationStore } from '@/stores/notification'
+import { useToastStore } from '@/stores/toast'
 import { useConfirmationModalStore } from '@/stores/confirmation-modal'
 import { useNodeStore } from '@/stores/node'
 
@@ -51,7 +51,7 @@ const emptyProjectStates = (): dockerType.ProjectStateCounts => ({
 
 export const useDockerStore = defineStore('docker', () => {
   const { t } = useI18n()
-  const notificationStore = useNotificationStore()
+  const toastStore = useToastStore()
   const modalStore = useConfirmationModalStore()
   const nodeStore = useNodeStore()
 
@@ -457,7 +457,7 @@ export const useDockerStore = defineStore('docker', () => {
     const unique = Array.from(new Set(ids))
     let nextIds = unique
     if (unique.length > MAX_OVERVIEW_CONTAINERS) {
-      notificationStore.error(
+      toastStore.error(
         t('app.docker.messages.maxOverviewContainers', { count: MAX_OVERVIEW_CONTAINERS }),
       )
       nextIds = unique.slice(0, MAX_OVERVIEW_CONTAINERS)
@@ -1135,7 +1135,7 @@ export const useDockerStore = defineStore('docker', () => {
       .map((id, index) => ({ id: id || '', name: names[index] || id || '' }))
       .filter((item) => item.id)
     if (validTargets.length === 0) {
-      notificationStore.error(t('app.docker.messages.invalidContainerNameOrId'))
+      toastStore.error(t('app.docker.messages.invalidContainerNameOrId'))
       return false
     }
     if (validTargets.some(({ id }) => containerActionLoadingIds.value.includes(id))) {
@@ -1164,7 +1164,7 @@ export const useDockerStore = defineStore('docker', () => {
       if (validTargets.length > 1) {
         const res = await dockerClient.value.batchContainerAction({ ids: targetIds, action })
         if (!res.success || !res.data) {
-          notificationStore.error(
+          toastStore.error(
             t('app.docker.messages.containerActionFailed', {
               name: t('app.docker.messages.containerCount', { count: validTargets.length }),
               action,
@@ -1175,7 +1175,7 @@ export const useDockerStore = defineStore('docker', () => {
         }
         const failures = res.data.items.filter((item) => !item.success)
         failures.forEach((item) => {
-          notificationStore.error(
+          toastStore.error(
             t('app.docker.messages.containerActionFailed', {
               name: item.name,
               action,
@@ -1202,7 +1202,7 @@ export const useDockerStore = defineStore('docker', () => {
                       ? await client.killContainer(id)
                       : await client.removeContainer(id)
         if (!res.success) {
-          notificationStore.error(
+          toastStore.error(
             t('app.docker.messages.containerActionFailed', {
               name,
               action,
@@ -1214,7 +1214,7 @@ export const useDockerStore = defineStore('docker', () => {
         succeeded = true
       }
       if (succeeded) {
-        notificationStore.success(
+        toastStore.success(
           t('app.docker.messages.containerActionSuccess', {
             count: validTargets.length,
             action,
@@ -1258,7 +1258,7 @@ export const useDockerStore = defineStore('docker', () => {
     try {
       const res = await dockerClient.value.createComposeProject(payload)
       if (!res.success || !res.data) {
-        notificationStore.error(res.message || t('common.unknownError'))
+        toastStore.error(res.message || t('common.unknownError'))
         return false
       }
       acceptProjectOperation(res.data)
@@ -1282,7 +1282,7 @@ export const useDockerStore = defineStore('docker', () => {
           ? dockerClient.value.stopComposeProject(name)
           : dockerClient.value.restartComposeProject(name))
       if (!res.success || !res.data) {
-        notificationStore.error(res.message || t('common.unknownError'))
+        toastStore.error(res.message || t('common.unknownError'))
         return false
       }
       acceptProjectOperation(res.data)
@@ -1299,7 +1299,7 @@ export const useDockerStore = defineStore('docker', () => {
     try {
       const res = await dockerClient.value.redeployComposeProject(name, { pullImages })
       if (!res.success || !res.data) {
-        notificationStore.error(res.message || t('common.unknownError'))
+        toastStore.error(res.message || t('common.unknownError'))
         return false
       }
       acceptProjectOperation(res.data)
@@ -1320,7 +1320,7 @@ export const useDockerStore = defineStore('docker', () => {
     try {
       const res = await dockerClient.value.scaleComposeProject(name, service, { replicas })
       if (!res.success || !res.data) {
-        notificationStore.error(res.message || t('common.unknownError'))
+        toastStore.error(res.message || t('common.unknownError'))
         return false
       }
       acceptProjectOperation(res.data)
@@ -1337,7 +1337,7 @@ export const useDockerStore = defineStore('docker', () => {
     try {
       const res = await dockerClient.value.deleteComposeProject(name)
       if (!res.success || !res.data) {
-        notificationStore.error(res.message || t('common.unknownError'))
+        toastStore.error(res.message || t('common.unknownError'))
         return false
       }
       acceptProjectOperation(res.data)
@@ -1416,11 +1416,11 @@ export const useDockerStore = defineStore('docker', () => {
       operation: t(`app.docker.projects.deploymentProgress.operations.${operation.operation}`),
     }
     if (operation.status === 'succeeded') {
-      notificationStore.success(t('app.docker.projects.operationResult.succeeded', params))
+      toastStore.success(t('app.docker.projects.operationResult.succeeded', params))
     } else if (operation.status === 'cancelled') {
-      notificationStore.warning(t('app.docker.projects.operationResult.cancelled', params))
+      toastStore.warning(t('app.docker.projects.operationResult.cancelled', params))
     } else {
-      notificationStore.error(
+      toastStore.error(
         operation.errorSummary || t('app.docker.projects.operationResult.failed', params),
       )
     }
@@ -1505,7 +1505,7 @@ export const useDockerStore = defineStore('docker', () => {
   /** 删除镜像 */
   const handleDeleteImage = async (id: string): Promise<boolean> => {
     if (!id) {
-      notificationStore.error(t('app.docker.messages.invalidImageId'))
+      toastStore.error(t('app.docker.messages.invalidImageId'))
       return false
     }
     if (imageDeleteLoadingId.value) return false
@@ -1525,7 +1525,7 @@ export const useDockerStore = defineStore('docker', () => {
     try {
       const res = await dockerClient.value.removeImage(id)
       if (!res.success) {
-        notificationStore.error(
+        toastStore.error(
           t('app.docker.messages.deleteImageFailed', {
             name: displayName,
             message: res.message || t('common.unknownError'),
@@ -1533,7 +1533,7 @@ export const useDockerStore = defineStore('docker', () => {
         )
         return false
       }
-      notificationStore.success(t('app.docker.messages.deleteImageSuccess', { name: displayName }))
+      toastStore.success(t('app.docker.messages.deleteImageSuccess', { name: displayName }))
       await Promise.all([fetchImagesList(), fetchOverviewData()])
       return true
     } finally {
@@ -1584,17 +1584,15 @@ export const useDockerStore = defineStore('docker', () => {
     try {
       const res = await dockerClient.value.createNetwork(payload)
       if (!res.success) {
-        notificationStore.error(
+        toastStore.error(
           t('app.docker.messages.createNetworkFailed', {
             message: res.message || t('common.unknownError'),
           }),
         )
         return false
       }
-      notificationStore.success(
-        t('app.docker.messages.createNetworkSuccess', { name: payload.name }),
-      )
-      if (res.data?.warning) notificationStore.info(res.data.warning)
+      toastStore.success(t('app.docker.messages.createNetworkSuccess', { name: payload.name }))
+      if (res.data?.warning) toastStore.info(res.data.warning)
       await fetchNetworks()
       return true
     } finally {
@@ -1609,14 +1607,14 @@ export const useDockerStore = defineStore('docker', () => {
     try {
       const res = await dockerClient.value.removeNetwork(network.id)
       if (!res.success) {
-        notificationStore.error(
+        toastStore.error(
           t('app.docker.messages.deleteNetworkFailed', {
             message: res.message || t('common.unknownError'),
           }),
         )
         return false
       }
-      notificationStore.success(t('app.docker.messages.deleteNetworkSuccess'))
+      toastStore.success(t('app.docker.messages.deleteNetworkSuccess'))
       if (networkDetail.value?.summary.id === network.id) clearNetworkDetail()
       await fetchNetworks()
       return true
@@ -1632,14 +1630,14 @@ export const useDockerStore = defineStore('docker', () => {
     try {
       const res = await dockerClient.value.connectNetwork(networkId, { container: containerId })
       if (!res.success) {
-        notificationStore.error(
+        toastStore.error(
           t('app.docker.messages.connectNetworkFailed', {
             message: res.message || t('common.unknownError'),
           }),
         )
         return false
       }
-      notificationStore.success(t('app.docker.messages.connectNetworkSuccess'))
+      toastStore.success(t('app.docker.messages.connectNetworkSuccess'))
       await fetchNetworkDetail(networkId)
       return true
     } finally {
@@ -1661,14 +1659,14 @@ export const useDockerStore = defineStore('docker', () => {
         force,
       })
       if (!res.success) {
-        notificationStore.error(
+        toastStore.error(
           t('app.docker.messages.disconnectNetworkFailed', {
             message: res.message || t('common.unknownError'),
           }),
         )
         return false
       }
-      notificationStore.success(t('app.docker.messages.disconnectNetworkSuccess'))
+      toastStore.success(t('app.docker.messages.disconnectNetworkSuccess'))
       await fetchNetworkDetail(networkId)
       return true
     } finally {
@@ -1716,11 +1714,11 @@ export const useDockerStore = defineStore('docker', () => {
   const submitContainerConfig = async () => {
     if (containerCreateLoading.value) return
     if (!selectedImageId.value) {
-      notificationStore.error(t('app.docker.messages.imageRequired'))
+      toastStore.error(t('app.docker.messages.imageRequired'))
       return
     }
     if (!containerForm.value.name.trim()) {
-      notificationStore.error(t('app.docker.messages.containerNameRequired'))
+      toastStore.error(t('app.docker.messages.containerNameRequired'))
       return
     }
     containerCreateLoading.value = true
@@ -1740,7 +1738,7 @@ export const useDockerStore = defineStore('docker', () => {
         autoStart: true,
       })
       if (res.success) {
-        notificationStore.success(
+        toastStore.success(
           t('app.docker.messages.createContainerSuccess', { name: containerForm.value.name }),
         )
         isContainerCreateActive.value = false
@@ -1770,9 +1768,7 @@ export const useDockerStore = defineStore('docker', () => {
         })
         return false
       }
-      notificationStore.success(
-        t('app.docker.messages.createVolumeSuccess', { name: payload.name }),
-      )
+      toastStore.success(t('app.docker.messages.createVolumeSuccess', { name: payload.name }))
       await fetchVolumes()
       return true
     } finally {
@@ -1794,14 +1790,14 @@ export const useDockerStore = defineStore('docker', () => {
     try {
       const res = await dockerClient.value.removeVolume(volume.name)
       if (!res.success) {
-        notificationStore.error(
+        toastStore.error(
           t('app.docker.messages.deleteVolumeFailed', {
             message: res.message || t('common.unknownError'),
           }),
         )
         return false
       }
-      notificationStore.success(t('app.docker.messages.deleteVolumeSuccess'))
+      toastStore.success(t('app.docker.messages.deleteVolumeSuccess'))
       await fetchVolumes()
       return true
     } finally {
@@ -1820,11 +1816,11 @@ export const useDockerStore = defineStore('docker', () => {
     )
     if (!confirmed) return
     pruneLoading.value = true
-    notificationStore.info(t('app.docker.messages.pruneStarted'))
+    toastStore.info(t('app.docker.messages.pruneStarted'))
     try {
       const res = await dockerClient.value.pruneSystem()
       if (res.success) {
-        notificationStore.success(t('app.docker.messages.pruneSuccess'))
+        toastStore.success(t('app.docker.messages.pruneSuccess'))
         await Promise.all([
           fetchContainers(),
           fetchImagesList(),
@@ -1834,14 +1830,14 @@ export const useDockerStore = defineStore('docker', () => {
           fetchDockerDiskUsage(),
         ])
       } else {
-        notificationStore.error(
+        toastStore.error(
           t('app.docker.messages.pruneFailed', {
             message: res.message || t('common.unknownError'),
           }),
         )
       }
     } catch (error) {
-      notificationStore.error(
+      toastStore.error(
         t('app.docker.messages.pruneFailed', {
           message: error instanceof Error ? error.message : t('common.unknownError'),
         }),

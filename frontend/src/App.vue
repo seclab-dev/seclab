@@ -3,11 +3,11 @@ import { RouterView } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import SecLabToast from './components/ui/SecLabToast.vue'
 import SecLabModal from './components/ui/SecLabModal.vue'
-import { useNotificationStore } from './stores/notification'
+import { useToastStore } from './stores/toast'
 import { useConfirmationModalStore } from './stores/confirmation-modal'
 
 const { t } = useI18n()
-const notificationStore = useNotificationStore()
+const toastStore = useToastStore()
 const modalStore = useConfirmationModalStore()
 </script>
 
@@ -24,14 +24,14 @@ const modalStore = useConfirmationModalStore()
   <!-- 全局 UI 组件 -->
   <SecLabToast
     :toasts="
-      notificationStore.activeNotifications.map((n) => ({
+      toastStore.activeNotifications.map((n) => ({
         id: String(n.id),
         type: n.type,
         title: n.title || t(`notification.title.${n.type}`),
         message: n.message,
       }))
     "
-    @close="(id) => notificationStore.removeNotification(Number(id))"
+    @close="(id) => toastStore.removeNotification(Number(id))"
   />
   <SecLabModal
     :visible="modalStore.modalData.isVisible"

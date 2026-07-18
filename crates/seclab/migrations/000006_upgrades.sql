@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS upgrade_plans (
     status TEXT NOT NULL CHECK (
         status IN ('draft', 'running', 'paused', 'succeeded', 'failed', 'canceled')
     ) DEFAULT 'draft',
+    requested_by_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
     requested_by TEXT NOT NULL,
     started_at TEXT,
     finished_at TEXT,

@@ -3,7 +3,7 @@ import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type { ProcessSignalResult } from '@/api/generated'
 import type { NetworkConnectionSummary, ProcessSummary } from '@/api/modules/process'
-import { useNotificationStore } from '@/stores/notification'
+import { useToastStore } from '@/stores/toast'
 import { useConfirmationModalStore } from '@/stores/confirmation-modal'
 import { useWindowManagerStore } from '@/stores/window-manager'
 import { useNodeStore } from '@/stores/node'
@@ -50,7 +50,7 @@ const PROCESS_STATUS_OPTIONS: ProcessState[] = [
 ]
 
 const { t } = useI18n()
-const notificationStore = useNotificationStore()
+const toastStore = useToastStore()
 const confirmationModal = useConfirmationModalStore()
 const windowStore = useWindowManagerStore()
 const nodeStore = useNodeStore()
@@ -220,12 +220,10 @@ const statusTagType = (status: ProcessState) => {
 
 const notifySignalResult = (result: ProcessSignalResult) => {
   if (result.status === 'outcomeUnknown') {
-    notificationStore.warning(
-      t('app.processManager.messages.outcomeUnknown', { pid: result.pid ?? '--' }),
-    )
+    toastStore.warning(t('app.processManager.messages.outcomeUnknown', { pid: result.pid ?? '--' }))
     return
   }
-  notificationStore.success(
+  toastStore.success(
     t('app.processManager.messages.signalDelivered', {
       pid: result.pid ?? '--',
       signal: formatSignalAction(result.signal),
@@ -260,7 +258,7 @@ const terminateProcess = async (process: ProcessSummary, signal: 'TERM' | 'KILL'
     const result = await processManager.forceKill(process.processId, confirmation.confirmationToken)
     if (result) notifySignalResult(result)
   } catch (error) {
-    notificationStore.error(
+    toastStore.error(
       error instanceof Error ? error.message : t('app.processManager.messages.killFailed'),
     )
   }

@@ -2,7 +2,7 @@
 import { computed, ref, watch, onMounted, onUnmounted } from 'vue'
 import { fsApi } from '@/api/modules/fs'
 import type { FsEntry } from '@/api/interface/fs'
-import { useNotificationStore } from '@/stores/notification'
+import { useToastStore } from '@/stores/toast'
 import { useNodeStore } from '@/stores/node'
 import { useWindowManagerStore } from '@/stores/window-manager'
 import { useI18n } from 'vue-i18n'
@@ -34,7 +34,7 @@ const props = defineProps<{
 }>()
 
 const { t } = useI18n()
-const notificationStore = useNotificationStore()
+const toastStore = useToastStore()
 const nodeStore = useNodeStore()
 const windowStore = useWindowManagerStore()
 const targetNodeId = ref(
@@ -200,7 +200,7 @@ const loadEntries = async (path: string) => {
       return undefined
     if (!res.success) {
       listError.value = res.message || t('app.fileManager.fetchError')
-      notificationStore.error(`${t('app.fileManager.loadError')}: ${listError.value}`)
+      toastStore.error(`${t('app.fileManager.loadError')}: ${listError.value}`)
       return false
     }
     if (!res.data) return false
@@ -215,7 +215,7 @@ const loadEntries = async (path: string) => {
     if (requestSequence !== listRequestSequence.value || requestNodeId !== targetNodeId.value)
       return undefined
     listError.value = error instanceof Error ? error.message : t('app.fileManager.fetchError')
-    notificationStore.error(`${t('app.fileManager.loadError')}: ${listError.value}`)
+    toastStore.error(`${t('app.fileManager.loadError')}: ${listError.value}`)
     return false
   } finally {
     if (requestSequence === listRequestSequence.value && requestNodeId === targetNodeId.value) {
@@ -262,14 +262,14 @@ const goParent = async () => {
 const copyCurrentPath = async () => {
   const path = selectedEntry.value?.path || currentDisplayPath.value
   if (!navigator.clipboard) {
-    notificationStore.error(t('app.fileManager.copyPathUnsupported'))
+    toastStore.error(t('app.fileManager.copyPathUnsupported'))
     return
   }
   try {
     await navigator.clipboard.writeText(path)
-    notificationStore.success(t('app.fileManager.copyPathSuccess'))
+    toastStore.success(t('app.fileManager.copyPathSuccess'))
   } catch (error) {
-    notificationStore.error(
+    toastStore.error(
       `${t('app.fileManager.copyPathFailed')}: ${error instanceof Error ? error.message : String(error)}`,
     )
   }
@@ -438,9 +438,9 @@ const handleDelete = async (entry: FsEntry) => {
 }
 
 const copyEntryPath = async (entry: FsEntry) => {
-  if (!navigator.clipboard) return notificationStore.error(t('app.fileManager.copyPathUnsupported'))
+  if (!navigator.clipboard) return toastStore.error(t('app.fileManager.copyPathUnsupported'))
   await navigator.clipboard.writeText(entry.path)
-  notificationStore.success(t('app.fileManager.copyPathSuccess'))
+  toastStore.success(t('app.fileManager.copyPathSuccess'))
 }
 
 // Context menu

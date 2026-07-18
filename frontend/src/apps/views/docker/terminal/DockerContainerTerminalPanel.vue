@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { SecLabButton, SecLabSelect } from '@/components/ui'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { useNotificationStore } from '@/stores/notification'
+import { useToastStore } from '@/stores/toast'
 import { buildTerminalTheme, useThemeStore } from '@/stores/theme'
 import { useDockerTerminalWs } from './useDockerTerminalWs'
 import { Terminal } from '@xterm/xterm'
@@ -21,7 +21,7 @@ const emit = defineEmits<{
   (e: 'activeChange', value: boolean): void
 }>()
 
-const notificationStore = useNotificationStore()
+const toastStore = useToastStore()
 const themeStore = useThemeStore()
 const { t } = useI18n()
 const {
@@ -105,7 +105,7 @@ const resetTerminalView = () => {
 
 const connectTerminal = () => {
   if (!props.containerId) {
-    notificationStore.error(t('app.docker.containers.terminalPanel.missingContainerId'))
+    toastStore.error(t('app.docker.containers.terminalPanel.missingContainerId'))
     return
   }
   if (!xterm || !fitAddon) return
@@ -184,7 +184,7 @@ watch(
     if (message.kind === 'terminalStarted') {
       actualShell.value = message.payload.shell
       if (message.payload.shell !== selectedShell.value) {
-        notificationStore.info(
+        toastStore.info(
           t('app.docker.containers.terminalPanel.shellFallback', {
             shell: message.payload.shell,
           }),
@@ -209,7 +209,7 @@ watch(
       return
     }
     if (message.kind === 'terminalError') {
-      notificationStore.error(
+      toastStore.error(
         message.payload.message || t('app.docker.containers.terminalPanel.terminalError'),
       )
       xterm.writeln(

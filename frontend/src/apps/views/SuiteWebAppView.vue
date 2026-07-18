@@ -14,7 +14,7 @@ import {
 } from '@seclab-dev/suite-sdk'
 import { SecLabButton } from '@/components/ui'
 import SecLabIcon from '@/components/icons/SecLabIcon.vue'
-import { useNotificationStore, type NotificationType } from '@/stores/notification'
+import { useToastStore, type ToastType } from '@/stores/toast'
 import { useThemeStore } from '@/stores/theme'
 import { useWindowManagerStore } from '@/stores/window-manager'
 
@@ -27,7 +27,7 @@ const props = defineProps<{
 const { t, locale } = useI18n()
 const themeStore = useThemeStore()
 const windowManagerStore = useWindowManagerStore()
-const notificationStore = useNotificationStore()
+const toastStore = useToastStore()
 
 const iframeKey = ref(0)
 const iframeRef = ref<HTMLIFrameElement | null>(null)
@@ -90,7 +90,7 @@ function resolveSuiteLocale() {
   return locale.value === 'en' ? 'en-US' : 'zh-CN'
 }
 
-function normalizeNotificationType(type: unknown): NotificationType {
+function normalizeToastType(type: unknown): ToastType {
   return type === 'success' || type === 'error' || type === 'warning' || type === 'info'
     ? type
     : 'info'
@@ -111,8 +111,8 @@ function handleSuiteNotification(payload: unknown) {
       ? notification.duration
       : undefined
 
-  notificationStore.showToast(
-    normalizeNotificationType(notification.type),
+  toastStore.showToast(
+    normalizeToastType(notification.type),
     message || title,
     duration,
     title || undefined,

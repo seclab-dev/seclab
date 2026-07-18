@@ -114,12 +114,19 @@ pub async fn create_router() -> Result<(Router, crate::state::DbPool)> {
     crate::services::file_task_audit::spawn_reconciler(Arc::clone(&app_state));
     crate::services::logging::init_operation_log_writer(app_state.metadata_db.clone());
     crate::services::logging::spawn_retention_worker(app_state.metadata_db.clone());
+    notifications::spawn_retention_worker(app_state.metadata_db.clone());
     disks::recover_operations(Arc::clone(&app_state)).await?;
 
     // 配置 CORS：允许所有来源、常用方法
     let cors = CorsLayer::new()
         .allow_origin(Any) // 你也可以用 .allow_origin("https://example.com".parse().unwrap())
-        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ])
         .allow_headers(Any);
 
     // 创建一个需要状态的路由实例，并立即为其提供状态

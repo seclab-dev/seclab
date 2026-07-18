@@ -43,10 +43,10 @@ impl LoginTracker {
     }
 
     /// 记录一次登录失败。
-    pub async fn record_failure(&self, ip: &IpAddr) {
+    pub async fn record_failure(&self, ip: &IpAddr) -> bool {
         let now = Instant::now();
         let mut failures = self.failures.write().await;
-        failures
+        let record = failures
             .entry(*ip)
             .and_modify(|record| {
                 record.count += 1;
@@ -56,6 +56,7 @@ impl LoginTracker {
                 count: 1,
                 last_failure: now,
             });
+        record.count == self.lockout_threshold
     }
 
     /// 清除当前 IP 的失败记录。

@@ -1,0 +1,930 @@
+<script setup lang="ts">
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
+import type {
+  NotificationArchiveScope,
+  NotificationCategory,
+  NotificationCode,
+  NotificationDetail,
+  NotificationReadFilter,
+  NotificationSeverity,
+  NotificationSummary,
+  OperationModule,
+} from '@/api/generated'
+import { notificationsApi } from '@/api/modules/notifications'
+import { useNotificationCenterStore } from '@/stores/notification-center'
+import { useToastStore } from '@/stores/toast'
+import { useWindowManagerStore } from '@/stores/window-manager'
+import type { AppId } from '@/apps/registry'
+import { formatDateTime } from '@/utils/time'
+import {
+  SecLabActionMenu,
+  SecLabAlert,
+  SecLabButton,
+  SecLabCheckbox,
+  SecLabDescriptions,
+  SecLabDrawer,
+  SecLabEmpty,
+  SecLabFormItem,
+  SecLabInput,
+  SecLabLoading,
+  SecLabPagination,
+  SecLabSelect,
+  SecLabTable,
+  SecLabTag,
+} from '@/components/ui'
+import type { SecLabTableColumn } from '@/components/ui/SecLabTable.vue'
+
+defineProps<{
+  isMaximized?: boolean
+  payload?: Record<string, unknown>
+}>()
+
+const { t } = useI18n()
+const toastStore = useToastStore()
+const centerStore = useNotificationCenterStore()
+const windowStore = useWindowManagerStore()
+
+const page = ref(1)
+const pageSize = ref(20)
+const total = ref(0)
+const items = ref<NotificationSummary[]>([])
+const archiveScope = ref<NotificationArchiveScope>('active')
+const readFilter = ref<NotificationReadFilter>('all')
+const category = ref<'all' | NotificationCategory>('all')
+const severity = ref<'all' | NotificationSeverity>('all')
+const module = ref<'all' | OperationModule>('all')
+const keyword = ref('')
+const createdFrom = ref('')
+const createdTo = ref('')
+const filtersExpanded = ref(false)
+const selectedIds = ref<string[]>([])
+
+const initialLoading = ref(false)
+const refreshing = ref(false)
+const loadError = ref<string>()
+const refreshError = ref<string>()
+const loadedOnce = ref(false)
+
+const drawerOpen = ref(false)
+const detail = ref<NotificationDetail>()
+const detailLoading = ref(false)
+const detailError = ref<string>()
+const pendingIds = ref(new Set<string>())
+const readAllPending = ref(false)
+const batchPending = ref(false)
+
+let listSequence = 0
+let listController: AbortController | undefined
+let detailSequence = 0
+let detailController: AbortController | undefined
+
+const pageSizeOptions = [20, 50, 100].map((value) => ({ label: String(value), value }))
+const readOptions = computed(() => [
+  { label: t('app.notificationCenter.filters.all'), value: 'all' },
+  { label: t('app.notificationCenter.filters.unread'), value: 'unread' },
+  { label: t('app.notificationCenter.filters.read'), value: 'read' },
+])
+const archiveOptions = computed(() => [
+  { label: t('app.notificationCenter.filters.active'), value: 'active' },
+  { label: t('app.notificationCenter.filters.archived'), value: 'archived' },
+])
+const categoryOptions = computed(() => [
+  { label: t('app.notificationCenter.filters.all'), value: 'all' },
+  ...(['task', 'security', 'system'] as NotificationCategory[]).map((value) => ({
+    label: t(`app.notificationCenter.category.${value}`),
+    value,
+  })),
+])
+const severityOptions = computed(() => [
+  { label: t('app.notificationCenter.filters.all'), value: 'all' },
+  ...(['success', 'info', 'warning', 'error'] as NotificationSeverity[]).map((value) => ({
+    label: t(`app.notificationCenter.severity.${value}`),
+    value,
+  })),
+])
+const moduleOptions = computed(() => [
+  { label: t('app.notificationCenter.filters.all'), value: 'all' },
+  ...(
+    [
+      'auth',
+      'nodes',
+      'suites',
+      'docker',
+      'files',
+      'processes',
+      'disks',
+      'monitoring',
+      'scripts',
+      'scheduledTasks',
+      'upgrades',
+      'terminal',
+      'settings',
+    ] as OperationModule[]
+  ).map((value) => ({ label: t(`app.operationLog.modules.${value}`), value })),
+])
+
+const tableColumns = computed<SecLabTableColumn[]>(() => [
+  { label: t('app.notificationCenter.columns.state'), width: 84, align: 'center', slot: 'state' },
+  { label: t('app.notificationCenter.columns.time'), width: 176, slot: 'time' },
+  { label: t('app.notificationCenter.columns.severity'), width: 92, slot: 'severity' },
+  {
+    label: t('app.notificationCenter.columns.content'),
+    minWidth: 260,
+    slot: 'content',
+  },
+  { label: t('app.notificationCenter.columns.source'), minWidth: 190, slot: 'source' },
+  {
+    label: t('app.notificationCenter.columns.actions'),
+    width: 104,
+    align: 'center',
+    slot: 'actions',
+  },
+])
+
+const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)))
+const hasQueryFilters = computed(
+  () =>
+    readFilter.value !== 'all' ||
+    category.value !== 'all' ||
+    severity.value !== 'all' ||
+    module.value !== 'all' ||
+    keyword.value.trim() !== '' ||
+    createdFrom.value !== '' ||
+    createdTo.value !== '',
+)
+const emptyDescription = computed(() => {
+  if (hasQueryFilters.value) return t('app.notificationCenter.emptyFiltered')
+  return archiveScope.value === 'archived'
+    ? t('app.notificationCenter.emptyArchived')
+    : t('app.notificationCenter.emptyActive')
+})
+
+const detailItems = computed(() => {
+  if (!detail.value) return []
+  const current = detail.value
+  const values = [
+    {
+      label: t('app.notificationCenter.detail.createdAt'),
+      value: formatDateTime(current.createdAt),
+    },
+    {
+      label: t('app.notificationCenter.detail.category'),
+      value: t(`app.notificationCenter.category.${current.category}`),
+    },
+    {
+      label: t('app.notificationCenter.detail.severity'),
+      value: t(`app.notificationCenter.severity.${current.severity}`),
+    },
+    current.outcome
+      ? {
+          label: t('app.notificationCenter.detail.outcome'),
+          value: t(`app.notificationCenter.outcome.${current.outcome}`),
+        }
+      : null,
+    {
+      label: t('app.notificationCenter.detail.module'),
+      value: t(`app.operationLog.modules.${current.source.module}`),
+    },
+    current.source.nodeName || current.source.nodeId
+      ? {
+          label: t('app.notificationCenter.detail.node'),
+          value: current.source.nodeName ?? current.source.nodeId,
+        }
+      : null,
+    current.subject
+      ? {
+          label: t('app.notificationCenter.detail.subject'),
+          value: current.subject.displayName ?? current.subject.id,
+        }
+      : null,
+    current.taskId
+      ? { label: t('app.notificationCenter.detail.taskId'), value: current.taskId }
+      : null,
+    {
+      label: t('app.notificationCenter.detail.operationEventId'),
+      value: current.operationEventId,
+    },
+    { label: t('app.notificationCenter.detail.traceId'), value: current.traceId },
+    current.errorCode
+      ? { label: t('app.notificationCenter.detail.errorCode'), value: current.errorCode }
+      : null,
+    current.errorSummary
+      ? { label: t('app.notificationCenter.detail.errorSummary'), value: current.errorSummary }
+      : null,
+    Object.keys(current.parameters).length > 0
+      ? {
+          label: t('app.notificationCenter.detail.parameters'),
+          value: JSON.stringify(current.parameters),
+          span: 2,
+        }
+      : null,
+  ]
+  return values.filter((value): value is NonNullable<typeof value> => value !== null)
+})
+
+function buildQuery() {
+  return {
+    page: page.value,
+    pageSize: pageSize.value,
+    archiveScope: archiveScope.value,
+    readFilter: readFilter.value,
+    categories: category.value === 'all' ? undefined : [category.value],
+    severities: severity.value === 'all' ? undefined : [severity.value],
+    modules: module.value === 'all' ? undefined : [module.value],
+    createdFrom: createdFrom.value ? new Date(createdFrom.value).toISOString() : undefined,
+    createdTo: createdTo.value ? new Date(createdTo.value).toISOString() : undefined,
+    keyword: keyword.value.trim() || undefined,
+  }
+}
+
+/** 执行 latest-request-wins 列表查询；静默刷新失败时保留现有结果。 */
+async function loadNotifications(silent = false) {
+  const sequence = ++listSequence
+  listController?.abort()
+  const controller = new AbortController()
+  listController = controller
+  if (loadedOnce.value || silent) refreshing.value = true
+  else initialLoading.value = true
+  if (!silent) loadError.value = undefined
+  refreshError.value = undefined
+  try {
+    const response = await notificationsApi.query(buildQuery(), controller.signal)
+    if (sequence !== listSequence || controller.signal.aborted) return
+    if (!response.success || !response.data) throw new Error(response.message)
+    items.value = response.data.items
+    total.value = response.data.total
+    selectedIds.value = selectedIds.value.filter((id) =>
+      response.data?.items.some((item) => item.notificationId === id),
+    )
+    loadedOnce.value = true
+  } catch (cause) {
+    if (sequence !== listSequence || controller.signal.aborted) return
+    const message = cause instanceof Error ? cause.message : t('app.notificationCenter.fetchFailed')
+    if (loadedOnce.value) refreshError.value = message
+    else loadError.value = message
+  } finally {
+    if (sequence === listSequence) {
+      initialLoading.value = false
+      refreshing.value = false
+      listController = undefined
+    }
+  }
+}
+
+function applyFilters() {
+  page.value = 1
+  void loadNotifications()
+}
+
+function toggleSelection(notificationId: string) {
+  selectedIds.value = selectedIds.value.includes(notificationId)
+    ? selectedIds.value.filter((id) => id !== notificationId)
+    : [...selectedIds.value, notificationId]
+}
+
+function setPending(notificationId: string, pending: boolean) {
+  const next = new Set(pendingIds.value)
+  if (pending) next.add(notificationId)
+  else next.delete(notificationId)
+  pendingIds.value = next
+}
+
+async function updateReadState(item: NotificationSummary, read: boolean) {
+  if (pendingIds.value.has(item.notificationId)) return
+  setPending(item.notificationId, true)
+  try {
+    const response = await notificationsApi.updateReadState(item.notificationId, { read })
+    if (!response.success) throw new Error(response.message)
+    const readAt = read ? new Date().toISOString() : undefined
+    item.readAt = readAt
+    if (detail.value?.notificationId === item.notificationId) detail.value.readAt = readAt
+    await centerStore.refreshUnreadSummary()
+  } catch {
+    toastStore.error(t('app.notificationCenter.updateFailed'))
+  } finally {
+    setPending(item.notificationId, false)
+  }
+}
+
+async function updateArchiveState(item: NotificationSummary, archived: boolean) {
+  if (pendingIds.value.has(item.notificationId)) return
+  setPending(item.notificationId, true)
+  try {
+    const response = await notificationsApi.updateArchiveState(item.notificationId, { archived })
+    if (!response.success) throw new Error(response.message)
+    items.value = items.value.filter((row) => row.notificationId !== item.notificationId)
+    total.value = Math.max(0, total.value - 1)
+    selectedIds.value = selectedIds.value.filter((id) => id !== item.notificationId)
+    if (detail.value?.notificationId === item.notificationId) drawerOpen.value = false
+    await centerStore.refreshUnreadSummary()
+  } catch {
+    toastStore.error(t('app.notificationCenter.updateFailed'))
+  } finally {
+    setPending(item.notificationId, false)
+  }
+}
+
+async function markAllRead() {
+  if (readAllPending.value) return
+  readAllPending.value = true
+  try {
+    const response = await notificationsApi.readAll()
+    if (!response.success) throw new Error(response.message)
+    const now = new Date().toISOString()
+    items.value.forEach((item) => {
+      item.readAt ??= now
+    })
+    await centerStore.refreshUnreadSummary()
+  } catch {
+    toastStore.error(t('app.notificationCenter.updateFailed'))
+  } finally {
+    readAllPending.value = false
+  }
+}
+
+async function updateSelectedArchiveState() {
+  if (batchPending.value || selectedIds.value.length === 0) return
+  batchPending.value = true
+  try {
+    const response = await notificationsApi.updateBatchArchiveState({
+      notificationIds: selectedIds.value,
+      archived: archiveScope.value === 'active',
+    })
+    if (!response.success) throw new Error(response.message)
+    const selected = new Set(selectedIds.value)
+    items.value = items.value.filter((item) => !selected.has(item.notificationId))
+    total.value = Math.max(0, total.value - selected.size)
+    selectedIds.value = []
+    await centerStore.refreshUnreadSummary()
+  } catch {
+    toastStore.error(t('app.notificationCenter.updateFailed'))
+  } finally {
+    batchPending.value = false
+  }
+}
+
+async function openDetail(item: NotificationSummary) {
+  drawerOpen.value = true
+  detail.value = undefined
+  detailError.value = undefined
+  detailLoading.value = true
+  const sequence = ++detailSequence
+  detailController?.abort()
+  const controller = new AbortController()
+  detailController = controller
+  try {
+    const response = await notificationsApi.detail(item.notificationId, controller.signal)
+    if (sequence !== detailSequence || controller.signal.aborted) return
+    if (!response.success || !response.data) throw new Error(response.message)
+    detail.value = response.data
+    if (!item.readAt) await updateReadState(item, true)
+  } catch (cause) {
+    if (sequence !== detailSequence || controller.signal.aborted) return
+    detailError.value =
+      cause instanceof Error ? cause.message : t('app.notificationCenter.detailFailed')
+  } finally {
+    if (sequence === detailSequence) {
+      detailLoading.value = false
+      detailController = undefined
+    }
+  }
+}
+
+function openTarget(item: NotificationSummary) {
+  if (!item.action) return
+  windowStore.openWindowWithPayload(item.action.appId as AppId, item.action.payload)
+}
+
+function rowActions(item: NotificationSummary) {
+  return [
+    {
+      label: t('app.notificationCenter.actions.details'),
+      handler: () => void openDetail(item),
+    },
+    item.readAt
+      ? {
+          label: t('app.notificationCenter.actions.markUnread'),
+          disabled: pendingIds.value.has(item.notificationId),
+          handler: () => void updateReadState(item, false),
+        }
+      : {
+          label: t('app.notificationCenter.actions.markRead'),
+          disabled: pendingIds.value.has(item.notificationId),
+          handler: () => void updateReadState(item, true),
+        },
+    item.archivedAt
+      ? {
+          label: t('app.notificationCenter.actions.restore'),
+          disabled: pendingIds.value.has(item.notificationId),
+          handler: () => void updateArchiveState(item, false),
+        }
+      : {
+          label: t('app.notificationCenter.actions.archive'),
+          disabled: pendingIds.value.has(item.notificationId),
+          handler: () => void updateArchiveState(item, true),
+        },
+  ]
+}
+
+function notificationTitle(code: NotificationCode) {
+  return t(`app.notificationCenter.events.${code}`)
+}
+
+function sourceText(item: NotificationSummary) {
+  const source =
+    item.source.nodeName ??
+    item.source.nodeId ??
+    t(`app.operationLog.modules.${item.source.module}`)
+  const subject = item.subject?.displayName ?? item.subject?.id
+  return subject ? `${source} · ${subject}` : source
+}
+
+function severityTagType(value: NotificationSeverity): 'success' | 'info' | 'warning' | 'danger' {
+  if (value === 'error') return 'danger'
+  return value
+}
+
+watch([page, pageSize], () => void loadNotifications())
+watch(archiveScope, () => {
+  selectedIds.value = []
+  applyFilters()
+})
+watch(
+  () => centerStore.version,
+  (next, previous) => {
+    if (previous && next !== previous && loadedOnce.value) void loadNotifications(true)
+  },
+)
+watch(drawerOpen, (open) => {
+  if (!open) {
+    detailSequence += 1
+    detailController?.abort()
+    detailController = undefined
+  }
+})
+
+onMounted(() => void loadNotifications())
+onBeforeUnmount(() => {
+  listSequence += 1
+  detailSequence += 1
+  listController?.abort()
+  detailController?.abort()
+})
+</script>
+
+<template>
+  <div
+    class="notification-center"
+    data-page="notification-center"
+    data-ui="notification-center-app"
+  >
+    <div class="toolbar" data-slot="toolbar">
+      <div class="toolbar-filters">
+        <SecLabFormItem
+          :label="t('app.notificationCenter.filters.readState')"
+          for="notification-read-filter"
+        >
+          <SecLabSelect
+            id="notification-read-filter"
+            v-model="readFilter"
+            name="notificationReadFilter"
+            :aria-label="t('app.notificationCenter.filters.readState')"
+            :options="readOptions"
+          />
+        </SecLabFormItem>
+        <SecLabFormItem :label="t('common.search')" for="notification-keyword">
+          <SecLabInput
+            id="notification-keyword"
+            v-model="keyword"
+            name="notificationKeyword"
+            :aria-label="t('common.search')"
+            :maxlength="100"
+            :placeholder="t('app.notificationCenter.searchPlaceholder')"
+            @keyup.enter="applyFilters"
+          />
+        </SecLabFormItem>
+      </div>
+      <div class="toolbar-actions" data-slot="primary-actions">
+        <SecLabButton @click="filtersExpanded = !filtersExpanded">
+          {{
+            filtersExpanded
+              ? t('app.notificationCenter.hideFilters')
+              : t('app.notificationCenter.moreFilters')
+          }}
+        </SecLabButton>
+        <SecLabButton :loading="refreshing" @click="loadNotifications(true)">
+          {{ t('app.notificationCenter.refresh') }}
+        </SecLabButton>
+        <SecLabButton
+          :disabled="centerStore.unreadCount === 0"
+          :loading="readAllPending"
+          @click="markAllRead"
+        >
+          {{ t('app.notificationCenter.markAllRead') }}
+        </SecLabButton>
+      </div>
+    </div>
+
+    <div v-if="filtersExpanded" class="advanced-filters" data-slot="advanced-filters">
+      <SecLabFormItem
+        :label="t('app.notificationCenter.filters.archiveScope')"
+        for="notification-archive-filter"
+      >
+        <SecLabSelect
+          id="notification-archive-filter"
+          v-model="archiveScope"
+          name="notificationArchiveScope"
+          :aria-label="t('app.notificationCenter.filters.archiveScope')"
+          :options="archiveOptions"
+        />
+      </SecLabFormItem>
+      <SecLabFormItem
+        :label="t('app.notificationCenter.filters.category')"
+        for="notification-category-filter"
+      >
+        <SecLabSelect
+          id="notification-category-filter"
+          v-model="category"
+          name="notificationCategory"
+          :aria-label="t('app.notificationCenter.filters.category')"
+          :options="categoryOptions"
+        />
+      </SecLabFormItem>
+      <SecLabFormItem
+        :label="t('app.notificationCenter.filters.severity')"
+        for="notification-severity-filter"
+      >
+        <SecLabSelect
+          id="notification-severity-filter"
+          v-model="severity"
+          name="notificationSeverity"
+          :aria-label="t('app.notificationCenter.filters.severity')"
+          :options="severityOptions"
+        />
+      </SecLabFormItem>
+      <SecLabFormItem
+        :label="t('app.notificationCenter.filters.module')"
+        for="notification-module-filter"
+      >
+        <SecLabSelect
+          id="notification-module-filter"
+          v-model="module"
+          name="notificationModule"
+          :aria-label="t('app.notificationCenter.filters.module')"
+          :options="moduleOptions"
+        />
+      </SecLabFormItem>
+      <SecLabFormItem
+        :label="t('app.notificationCenter.filters.from')"
+        for="notification-created-from"
+      >
+        <SecLabInput
+          id="notification-created-from"
+          v-model="createdFrom"
+          name="notificationCreatedFrom"
+          type="datetime-local"
+          :aria-label="t('app.notificationCenter.filters.from')"
+        />
+      </SecLabFormItem>
+      <SecLabFormItem :label="t('app.notificationCenter.filters.to')" for="notification-created-to">
+        <SecLabInput
+          id="notification-created-to"
+          v-model="createdTo"
+          name="notificationCreatedTo"
+          type="datetime-local"
+          :aria-label="t('app.notificationCenter.filters.to')"
+        />
+      </SecLabFormItem>
+      <SecLabButton class="apply-filter-button" type="primary" @click="applyFilters">
+        {{ t('common.search') }}
+      </SecLabButton>
+    </div>
+
+    <SecLabAlert
+      v-if="refreshError"
+      type="warning"
+      show-icon
+      closable
+      :title="t('app.notificationCenter.refreshFailed')"
+      :description="refreshError"
+      :close-label="t('common.close')"
+      data-slot="refresh-warning"
+      @close="refreshError = undefined"
+    />
+    <SecLabAlert
+      v-if="loadError"
+      type="error"
+      show-icon
+      :title="t('app.notificationCenter.fetchFailed')"
+      :description="loadError"
+      data-slot="load-error"
+    />
+
+    <div class="table-shell" data-slot="notification-list">
+      <div v-if="selectedIds.length" class="selection-bar" data-slot="batch-actions">
+        <span>{{ selectedIds.length }}</span>
+        <SecLabButton :loading="batchPending" @click="updateSelectedArchiveState">
+          {{
+            archiveScope === 'active'
+              ? t('app.notificationCenter.archiveSelected')
+              : t('app.notificationCenter.restoreSelected')
+          }}
+        </SecLabButton>
+      </div>
+      <SecLabTable
+        :data="items"
+        :columns="tableColumns"
+        row-key="notificationId"
+        border
+        data-ui="notification-table"
+      >
+        <template #state="{ row }: { row: NotificationSummary }">
+          <div class="state-cell">
+            <SecLabCheckbox
+              :id="`notification-select-${row.notificationId}`"
+              :model-value="selectedIds.includes(row.notificationId)"
+              :name="`notificationSelect-${row.notificationId}`"
+              :aria-label="notificationTitle(row.code)"
+              @change="toggleSelection(row.notificationId)"
+            />
+            <span
+              class="read-indicator"
+              :class="{ unread: !row.readAt }"
+              :title="
+                row.readAt
+                  ? t('app.notificationCenter.readLabel')
+                  : t('app.notificationCenter.unreadLabel')
+              "
+            />
+          </div>
+        </template>
+        <template #time="{ row }: { row: NotificationSummary }">
+          <span class="time-cell">{{ formatDateTime(row.createdAt) }}</span>
+        </template>
+        <template #severity="{ row }: { row: NotificationSummary }">
+          <SecLabTag :type="severityTagType(row.severity)" size="small">
+            {{ t(`app.notificationCenter.severity.${row.severity}`) }}
+          </SecLabTag>
+        </template>
+        <template #content="{ row }: { row: NotificationSummary }">
+          <button class="content-button" type="button" @click="openDetail(row)">
+            <strong>{{ notificationTitle(row.code) }}</strong>
+            <span v-if="row.outcome">{{ t(`app.notificationCenter.outcome.${row.outcome}`) }}</span>
+          </button>
+        </template>
+        <template #source="{ row }: { row: NotificationSummary }">
+          <span class="source-cell">{{ sourceText(row) }}</span>
+        </template>
+        <template #actions="{ row }: { row: NotificationSummary }">
+          <SecLabActionMenu
+            :actions="rowActions(row)"
+            :disabled="pendingIds.has(row.notificationId)"
+            :label="t('common.actions')"
+          />
+        </template>
+        <template #empty>
+          <SecLabEmpty :description="emptyDescription">
+            <template #extra>
+              <SecLabButton v-if="loadError" @click="loadNotifications()">
+                {{ t('app.notificationCenter.refresh') }}
+              </SecLabButton>
+            </template>
+          </SecLabEmpty>
+        </template>
+      </SecLabTable>
+      <SecLabLoading :loading="initialLoading" cover />
+    </div>
+
+    <div class="footer" data-slot="pagination">
+      <div class="pagination-controls" data-ui="pagination-controls">
+        <SecLabPagination
+          :current-page="page"
+          :total-pages="totalPages"
+          @page-change="(value) => (page = value)"
+        />
+        <SecLabSelect
+          id="notification-page-size"
+          v-model="pageSize"
+          name="notificationPageSize"
+          :aria-label="t('app.notificationCenter.pageSize')"
+          :options="pageSizeOptions"
+        />
+      </div>
+    </div>
+
+    <SecLabDrawer
+      v-model="drawerOpen"
+      :title="t('app.notificationCenter.details')"
+      width="min(560px, 92vw)"
+      data-ui="notification-detail-drawer"
+    >
+      <SecLabAlert
+        v-if="detailError"
+        type="error"
+        show-icon
+        :title="t('app.notificationCenter.detailFailed')"
+        :description="detailError"
+      />
+      <SecLabLoading :loading="detailLoading" />
+      <div v-if="detail" class="detail-content" data-slot="notification-detail">
+        <h3>{{ notificationTitle(detail.code) }}</h3>
+        <SecLabDescriptions :items="detailItems" :column="2" border />
+      </div>
+      <template #footer>
+        <SecLabButton v-if="detail?.action" type="primary" @click="openTarget(detail)">
+          {{ t('app.notificationCenter.openTarget') }}
+        </SecLabButton>
+      </template>
+    </SecLabDrawer>
+  </div>
+</template>
+
+<style scoped>
+.notification-center {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sdl-space-3);
+  padding: var(--sdl-space-3);
+  box-sizing: border-box;
+  background: var(--sdl-bg-canvas);
+  overflow: hidden;
+}
+
+.toolbar,
+.toolbar-filters,
+.toolbar-actions,
+.advanced-filters,
+.selection-bar,
+.footer,
+.state-cell {
+  display: flex;
+  align-items: end;
+  gap: var(--sdl-space-3);
+}
+
+.toolbar {
+  justify-content: space-between;
+  flex: 0 0 auto;
+}
+
+.toolbar-filters {
+  flex: 1 1 420px;
+  min-width: 0;
+}
+
+.toolbar-filters :deep(.sl-form-item:first-child) {
+  flex: 0 0 150px;
+}
+
+.toolbar-filters :deep(.sl-form-item:last-child) {
+  flex: 1 1 280px;
+  max-width: 460px;
+}
+
+.toolbar-actions {
+  justify-content: flex-end;
+  flex: 0 0 auto;
+}
+
+.advanced-filters {
+  align-items: end;
+  flex-wrap: wrap;
+  padding: var(--sdl-space-3);
+  border: 1px solid var(--sdl-border-subtle);
+  border-radius: var(--sdl-radius-md);
+  background: var(--sdl-bg-surface);
+}
+
+.advanced-filters :deep(.sl-form-item) {
+  flex: 1 1 150px;
+  min-width: 140px;
+  max-width: 220px;
+  margin-bottom: 0;
+}
+
+.apply-filter-button {
+  align-self: flex-end;
+}
+
+.table-shell {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  border-radius: var(--sdl-radius-md);
+}
+
+.selection-bar {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  justify-content: flex-end;
+  align-items: center;
+  padding: var(--sdl-space-2) var(--sdl-space-3);
+  background: var(--sdl-bg-surface);
+  border: 1px solid var(--sdl-border-subtle);
+}
+
+.state-cell {
+  align-items: center;
+  justify-content: center;
+  gap: var(--sdl-space-2);
+}
+
+.read-indicator {
+  width: 8px;
+  height: 8px;
+  border-radius: var(--sdl-radius-pill);
+  background: var(--sdl-text-muted);
+}
+
+.read-indicator.unread {
+  background: var(--sdl-primary);
+}
+
+.time-cell {
+  font-family: var(--sdl-font-mono);
+  font-size: var(--sdl-font-caption);
+  color: var(--sdl-text-secondary);
+  white-space: nowrap;
+}
+
+.content-button {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--sdl-space-1);
+  padding: 0;
+  color: var(--sdl-text-primary);
+  border: 0;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.content-button span,
+.source-cell {
+  color: var(--sdl-text-secondary);
+  font-size: var(--sdl-font-body-sm);
+}
+
+.source-cell {
+  word-break: break-word;
+}
+
+.footer {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  min-height: 32px;
+}
+
+.pagination-controls {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sdl-space-3);
+}
+
+.pagination-controls :deep(.sl-select) {
+  flex: 0 0 72px;
+  width: 72px;
+}
+
+.detail-content h3 {
+  margin: 0 0 var(--sdl-space-4);
+  color: var(--sdl-text-primary);
+  font-size: var(--sdl-font-title);
+}
+
+@media (max-width: 760px) {
+  .notification-center {
+    padding: var(--sdl-space-2);
+  }
+
+  .toolbar,
+  .toolbar-filters,
+  .toolbar-actions {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .toolbar-actions {
+    justify-content: flex-start;
+  }
+
+  .toolbar-filters :deep(.sl-form-item) {
+    flex: 1 1 100%;
+    max-width: none;
+  }
+
+  .advanced-filters :deep(.sl-form-item) {
+    max-width: none;
+  }
+}
+</style>

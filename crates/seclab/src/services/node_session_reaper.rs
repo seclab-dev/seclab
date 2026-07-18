@@ -1,6 +1,7 @@
 //! 节点会话回收服务：定期清理租约过期的活跃会话，并收敛节点离线状态。
 
 use crate::models::node_sessions::{close_session_by_id, list_expired_active_sessions};
+use crate::models::nodes::get_node_by_id;
 use crate::services::node_runtime::settle_node_after_session_loss;
 use crate::services::runtime_metrics;
 use crate::state::{AppState, DbPool};
@@ -39,7 +40,32 @@ pub async fn reap_expired_sessions(pool: &DbPool) -> sqlx::Result<usize> {
         }
 
         reaped += 1;
+        let previous = get_node_by_id(pool, &session.node_id).await?;
         settle_node_after_session_loss(pool, &session.node_id).await?;
+        if previous
+            .as_ref()
+            .is_some_and(|node| matches!(node.status.as_str(), "online" | "degraded"))
+        {
+            crate::services::logging::OperationEventBuilder::new(
+                "system",
+                "node_offline",
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            )
+            .target_type("node")
+            .target_id(&session.node_id)
+            .target_display_name(
+                previous
+                    .as_ref()
+                    .map_or(session.node_id.as_str(), |node| node.name.as_str()),
+            )
+            .set_success()
+            .metadata(serde_json::json!({
+                "nodeId": session.node_id,
+                "nodeName": previous.as_ref().map(|node| node.name.as_str()),
+                "reason": "leaseExpired",
+            }))
+            .finish(pool);
+        }
     }
 
     runtime_metrics::record_lease_expired(reaped);

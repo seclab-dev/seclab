@@ -2,7 +2,7 @@
 import { computed, ref, watchEffect, onUnmounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useWindowManagerStore, type WindowInstance } from '../../stores/window-manager'
-import { useNotificationStore } from '../../stores/notification'
+import { useToastStore } from '../../stores/toast'
 import AppIcon from '../icons/AppIcon.vue'
 
 const props = defineProps<{
@@ -10,7 +10,7 @@ const props = defineProps<{
 }>()
 
 const store = useWindowManagerStore()
-const notificationStore = useNotificationStore()
+const toastStore = useToastStore()
 const { t } = useI18n()
 const isDragging = ref(false)
 const isResizing = ref(false)
@@ -20,7 +20,7 @@ const handleClose = () => {
   const guard = store.checkBeforeCloseWindow(props.windowData.id)
   if (!guard.allowed) {
     const reason = guard.blockers.map((item) => item.reason).join('；')
-    notificationStore.error(reason || t('guard.closeWindowBlocked'))
+    toastStore.error(reason || t('guard.closeWindowBlocked'))
     return
   }
   store.closeWindow(props.windowData.id)

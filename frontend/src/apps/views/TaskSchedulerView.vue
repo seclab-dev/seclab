@@ -15,7 +15,7 @@ import type {
 } from '@/api/generated/scheduled-tasks'
 import { useTaskScheduler } from '@/composables/useTaskScheduler'
 import { useConfirmationModalStore } from '@/stores/confirmation-modal'
-import { useNotificationStore } from '@/stores/notification'
+import { useToastStore } from '@/stores/toast'
 import {
   SecLabActionMenu,
   SecLabAlert,
@@ -44,7 +44,7 @@ defineProps<{
 }>()
 
 const { t } = useI18n()
-const notifications = useNotificationStore()
+const notifications = useToastStore()
 const confirmation = useConfirmationModalStore()
 const scheduler = useTaskScheduler()
 const selectedTaskIds = ref<string[]>([])

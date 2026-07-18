@@ -10,8 +10,11 @@ use seclab_contracts::logging::{
     OperationLogSummary, OperationModule, OperationOrigin, OperationOriginKind, OperationOutcome,
     OperationParameterValue, OperationTarget,
 };
+use seclab_contracts::notification::{
+    NotificationCategory, NotificationCode, NotificationSeverity,
+};
 use serde_json::Value;
-use sqlx::{FromRow, QueryBuilder, Sqlite};
+use sqlx::{FromRow, QueryBuilder, Sqlite, Transaction};
 use tokio::sync::mpsc;
 use tracing::{error, warn};
 
@@ -464,14 +467,253 @@ impl OperationLogRow {
 }
 
 async fn insert_event(pool: &DbPool, event: &StoredOperationEvent) -> Result<(), ApiError> {
-    sqlx::query("INSERT OR IGNORE INTO operation_logs (event_id,occurred_at,module,event_code,actor_kind,actor_user_id,actor_display_name,origin_kind,origin_node_id,origin_node_name,target_kind,target_id,target_display_name,target_ownership,outcome,impact,trace_id,task_id,client_ip,request_method,route_template,parameters_json,error_code,error_summary) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    let mut transaction = pool.begin().await?;
+    let result = sqlx::query("INSERT OR IGNORE INTO operation_logs (event_id,occurred_at,module,event_code,actor_kind,actor_user_id,actor_display_name,origin_kind,origin_node_id,origin_node_name,target_kind,target_id,target_display_name,target_ownership,outcome,impact,trace_id,task_id,client_ip,request_method,route_template,parameters_json,error_code,error_summary) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
         .bind(&event.event_id).bind(&event.occurred_at).bind(event.module.as_str()).bind(&event.event_code)
         .bind(&event.actor_kind).bind(event.actor_user_id).bind(&event.actor_display_name).bind(&event.origin_kind)
         .bind(&event.origin_node_id).bind(&event.origin_node_name).bind(&event.target_kind).bind(&event.target_id)
         .bind(&event.target_display_name).bind(&event.target_ownership).bind(event.outcome.as_str()).bind(event.impact.as_str())
         .bind(&event.trace_id).bind(&event.task_id).bind(&event.client_ip).bind(&event.request_method).bind(&event.route_template)
-        .bind(&event.parameters_json).bind(&event.error_code).bind(&event.error_summary).execute(pool).await?;
+        .bind(&event.parameters_json).bind(&event.error_code).bind(&event.error_summary).execute(&mut *transaction).await?;
+    if result.rows_affected() > 0 {
+        project_notification(&mut transaction, event).await?;
+    }
+    transaction.commit().await?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NotificationRecipientPolicy {
+    Actor,
+    ScheduledTaskOwner,
+    AllActiveAdmins,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NotificationRegistration {
+    code: NotificationCode,
+    category: NotificationCategory,
+    recipients: NotificationRecipientPolicy,
+    allowed_parameters: &'static [&'static str],
+}
+
+/// 在操作事件事务内按严格注册表创建个人通知投影。
+async fn project_notification(
+    transaction: &mut Transaction<'_, Sqlite>,
+    event: &StoredOperationEvent,
+) -> Result<(), ApiError> {
+    let Some(registration) = notification_registration(event) else {
+        return Ok(());
+    };
+    let recipients = notification_recipients(transaction, event, registration.recipients).await?;
+    if recipients.is_empty() {
+        warn!(event_id = %event.event_id, event_code = %event.event_code, "Notification event has no trusted recipient");
+        return Ok(());
+    }
+    let parameters =
+        serde_json::from_str::<BTreeMap<String, OperationParameterValue>>(&event.parameters_json)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(key, _)| registration.allowed_parameters.contains(&key.as_str()))
+            .collect::<BTreeMap<_, _>>();
+    let parameters_json = serde_json::to_string(&parameters).unwrap_or_else(|_| "{}".to_string());
+    let severity = notification_severity(event.outcome);
+    for recipient_user_id in recipients {
+        let notification_id = new_uuid_v7();
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO user_notifications (
+                notification_id, recipient_user_id, operation_event_id, created_at,
+                code, category, severity, outcome, source_module, source_node_id,
+                source_node_name, subject_kind, subject_id, subject_display_name,
+                task_id, parameters_json, error_code, error_summary, trace_id,
+                read_at, archived_at, state_changed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+            "#,
+        )
+        .bind(notification_id)
+        .bind(recipient_user_id)
+        .bind(&event.event_id)
+        .bind(&event.occurred_at)
+        .bind(registration.code.as_str())
+        .bind(registration.category.as_str())
+        .bind(severity.as_str())
+        .bind(event.outcome.as_str())
+        .bind(event.module.as_str())
+        .bind(&event.origin_node_id)
+        .bind(&event.origin_node_name)
+        .bind(&event.target_kind)
+        .bind(&event.target_id)
+        .bind(&event.target_display_name)
+        .bind(&event.task_id)
+        .bind(&parameters_json)
+        .bind(&event.error_code)
+        .bind(&event.error_summary)
+        .bind(&event.trace_id)
+        .bind(&event.occurred_at)
+        .execute(&mut **transaction)
+        .await?;
+    }
+    Ok(())
+}
+
+fn notification_registration(event: &StoredOperationEvent) -> Option<NotificationRegistration> {
+    const TASK_PARAMETERS: &[&str] = &[
+        "nodeId",
+        "nodeName",
+        "suiteName",
+        "scriptName",
+        "taskName",
+        "projectName",
+        "name",
+        "operation",
+        "result",
+        "targetPath",
+        "mountPath",
+        "imageRef",
+        "image",
+        "version",
+        "completedItemCount",
+        "failedItemCount",
+        "sizeBytes",
+        "transferredBytes",
+    ];
+    const SYSTEM_PARAMETERS: &[&str] = &["nodeId", "nodeName", "reason"];
+    const SECURITY_PARAMETERS: &[&str] = &["username", "clientIp", "lockoutSeconds"];
+    let event_code = event.event_code.as_str();
+    let task = |code, recipients| NotificationRegistration {
+        code,
+        category: NotificationCategory::Task,
+        recipients,
+        allowed_parameters: TASK_PARAMETERS,
+    };
+    match event_code {
+        "node_deploy" => Some(task(
+            NotificationCode::NodeDeploymentFinished,
+            NotificationRecipientPolicy::Actor,
+        )),
+        "suite_install_completed" | "suite_install_failed" | "suite_install_canceled" => {
+            Some(task(
+                NotificationCode::SuiteInstallationFinished,
+                NotificationRecipientPolicy::Actor,
+            ))
+        }
+        "script_run_completed" => Some(task(
+            NotificationCode::ScriptRunFinished,
+            NotificationRecipientPolicy::Actor,
+        )),
+        "scheduled_task_run_completed" => Some(task(
+            NotificationCode::ScheduledTaskRunFinished,
+            NotificationRecipientPolicy::ScheduledTaskOwner,
+        )),
+        "disk_operation_finished" => Some(task(
+            NotificationCode::DiskOperationFinished,
+            NotificationRecipientPolicy::Actor,
+        )),
+        "node_offline" => Some(NotificationRegistration {
+            code: NotificationCode::NodeOffline,
+            category: NotificationCategory::System,
+            recipients: NotificationRecipientPolicy::AllActiveAdmins,
+            allowed_parameters: SYSTEM_PARAMETERS,
+        }),
+        "node_recovered" => Some(NotificationRegistration {
+            code: NotificationCode::NodeRecovered,
+            category: NotificationCategory::System,
+            recipients: NotificationRecipientPolicy::AllActiveAdmins,
+            allowed_parameters: SYSTEM_PARAMETERS,
+        }),
+        "login_lockout" => Some(NotificationRegistration {
+            code: NotificationCode::LoginLockout,
+            category: NotificationCategory::Security,
+            recipients: NotificationRecipientPolicy::AllActiveAdmins,
+            allowed_parameters: SECURITY_PARAMETERS,
+        }),
+        "upgrade_plan_succeeded" | "upgrade_plan_failed" | "upgrade_plan_canceled" => Some(task(
+            NotificationCode::UpgradePlanFinished,
+            NotificationRecipientPolicy::Actor,
+        )),
+        _ if event_code.starts_with("scheduled_task_") && event_code.ends_with("_completed") => {
+            Some(task(
+                NotificationCode::ScheduledTaskOperationFinished,
+                NotificationRecipientPolicy::Actor,
+            ))
+        }
+        _ if event_code.starts_with("file_task_") && !event_code.ends_with("_submitted") => {
+            Some(task(
+                NotificationCode::FileTaskFinished,
+                NotificationRecipientPolicy::Actor,
+            ))
+        }
+        _ if event_code.starts_with("file_transfer_") && !event_code.ends_with("_submitted") => {
+            Some(task(
+                NotificationCode::FileTransferFinished,
+                NotificationRecipientPolicy::Actor,
+            ))
+        }
+        _ if event_code.starts_with("docker_image_")
+            || (event.module == OperationModule::Docker
+                && event.task_id.is_some()
+                && matches!(event_code, "image_pull" | "image_pull_cancelled")) =>
+        {
+            Some(task(
+                NotificationCode::DockerImageTaskFinished,
+                NotificationRecipientPolicy::Actor,
+            ))
+        }
+        _ if event.module == OperationModule::Docker
+            && event_code.starts_with("compose_")
+            && ["_succeeded", "_failed", "_cancelled"]
+                .iter()
+                .any(|suffix| event_code.ends_with(suffix)) =>
+        {
+            Some(task(
+                NotificationCode::DockerProjectTaskFinished,
+                NotificationRecipientPolicy::Actor,
+            ))
+        }
+        _ => None,
+    }
+}
+
+async fn notification_recipients(
+    transaction: &mut Transaction<'_, Sqlite>,
+    event: &StoredOperationEvent,
+    policy: NotificationRecipientPolicy,
+) -> Result<Vec<i64>, ApiError> {
+    match policy {
+        NotificationRecipientPolicy::Actor => Ok(event.actor_user_id.into_iter().collect()),
+        NotificationRecipientPolicy::ScheduledTaskOwner => {
+            if let Some(user_id) = event.actor_user_id {
+                return Ok(vec![user_id]);
+            }
+            let owner = match event.target_id.as_deref() {
+                Some(task_id) => {
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT created_by_user_id FROM scheduled_tasks WHERE task_id = ?",
+                    )
+                    .bind(task_id)
+                    .fetch_optional(&mut **transaction)
+                    .await?
+                }
+                None => None,
+            };
+            Ok(owner.into_iter().collect())
+        }
+        NotificationRecipientPolicy::AllActiveAdmins => Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM users WHERE status = 'active' ORDER BY id",
+        )
+        .fetch_all(&mut **transaction)
+        .await?),
+    }
+}
+
+const fn notification_severity(outcome: OperationOutcome) -> NotificationSeverity {
+    match outcome {
+        OperationOutcome::Success => NotificationSeverity::Success,
+        OperationOutcome::Failure | OperationOutcome::TimedOut => NotificationSeverity::Error,
+        OperationOutcome::Partial => NotificationSeverity::Warning,
+        OperationOutcome::Canceled => NotificationSeverity::Info,
+    }
 }
 
 fn validate_query(query: &OperationLogQuery) -> Result<(), ApiError> {
@@ -750,6 +992,12 @@ fn normalize_operation_target(
     event: &mut StoredOperationEvent,
     parameters: &BTreeMap<String, OperationParameterValue>,
 ) {
+    if event.task_id.is_none()
+        && let Some(OperationParameterValue::String(task_id)) =
+            parameters.get("taskId").or_else(|| parameters.get("runId"))
+    {
+        event.task_id = non_empty(task_id, 128);
+    }
     if matches!(
         event.target_kind.as_deref(),
         Some("fileTask" | "fileTransfer" | "disk_operation" | "imagePullTask")
@@ -1102,5 +1350,100 @@ mod tests {
         )
         .await;
         assert!(invalid.is_err());
+    }
+
+    #[tokio::test]
+    async fn registered_terminal_event_projects_once_with_safe_parameters() {
+        let pool = setup_test_db().await;
+        sqlx::query("INSERT INTO users (id, username, password_hash) VALUES (1, 'admin', 'hash')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut event = OperationEventBuilder::new(
+            "admin",
+            "script_run_completed",
+            "127.0.0.1".parse().unwrap(),
+        )
+        .user_id(1)
+        .target_type("script")
+        .target_id("script-1")
+        .task_id("run-1")
+        .set_success()
+        .event;
+        event.parameters_json = serde_json::json!({
+            "scriptName": "Safe Script",
+            "token": "must-not-project",
+            "unregistered": "must-not-project",
+        })
+        .to_string();
+
+        insert_event(&pool, &event).await.unwrap();
+        insert_event(&pool, &event).await.unwrap();
+
+        let operation_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM operation_logs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let notification_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_notifications")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let (recipient, code, parameters): (i64, String, String) = sqlx::query_as(
+            "SELECT recipient_user_id, code, parameters_json FROM user_notifications",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(operation_count, 1);
+        assert_eq!(notification_count, 1);
+        assert_eq!(recipient, 1);
+        assert_eq!(code, "scriptRunFinished");
+        assert!(parameters.contains("Safe Script"));
+        assert!(!parameters.contains("token"));
+        assert!(!parameters.contains("unregistered"));
+    }
+
+    #[tokio::test]
+    async fn system_transition_notifies_only_active_admins() {
+        let pool = setup_test_db().await;
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, status) VALUES \
+             (1, 'active-1', 'hash', 'active'), \
+             (2, 'active-2', 'hash', 'active'), \
+             (3, 'disabled', 'hash', 'disabled')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let event =
+            OperationEventBuilder::new("system", "node_offline", "127.0.0.1".parse().unwrap())
+                .target_type("node")
+                .target_id("node-1")
+                .set_success()
+                .event;
+        insert_event(&pool, &event).await.unwrap();
+
+        let recipients = sqlx::query_scalar::<_, i64>(
+            "SELECT recipient_user_id FROM user_notifications ORDER BY recipient_user_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(recipients, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn unregistered_operation_event_does_not_create_notification() {
+        let pool = setup_test_db().await;
+        let event =
+            OperationEventBuilder::new("system", "runtime_heartbeat", "127.0.0.1".parse().unwrap())
+                .set_success()
+                .event;
+        insert_event(&pool, &event).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_notifications")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }

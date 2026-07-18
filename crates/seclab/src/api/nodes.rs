@@ -455,6 +455,7 @@ pub async fn deploy_create(
     let state_clone = Arc::clone(&state);
     let node_id_clone = node_id.clone();
     let claims_username = admin.username.clone();
+    let actor_user_id = admin.id;
     let client_ip = conn.ip();
     let trace_id = logging::resolve_trace_id(&headers);
 
@@ -464,6 +465,7 @@ pub async fn deploy_create(
 
         let mut platform_log =
             OperationEventBuilder::new(&claims_username, "node_deploy_create", client_ip)
+                .user_id(actor_user_id)
                 .module(LogModule::System)
                 .target_type("node")
                 .target_id(&node_id_clone)
@@ -703,6 +705,7 @@ pub async fn deploy(
     let state_clone = Arc::clone(&state);
     let node_id_clone = node_id.clone();
     let claims_username = admin.username.clone();
+    let actor_user_id = admin.id;
 
     tokio::spawn(async move {
         let result = deploy_node(
@@ -715,6 +718,7 @@ pub async fn deploy(
 
         let mut platform_log =
             OperationEventBuilder::new(&claims_username, "node_deploy", client_ip)
+                .user_id(actor_user_id)
                 .module(LogModule::System)
                 .target_type("node")
                 .target_id(&node_id_clone)

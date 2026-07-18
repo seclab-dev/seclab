@@ -48,6 +48,7 @@ pub struct UpgradePlanRecord {
     pub scope: String,
     pub strategy: String,
     pub status: String,
+    pub requested_by_user_id: i64,
     pub requested_by: String,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
@@ -227,10 +228,11 @@ pub async fn insert_plan(pool: &DbPool, record: &UpgradePlanRecord) -> sqlx::Res
             scope,
             strategy,
             status,
+            requested_by_user_id,
             requested_by,
             started_at,
             finished_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(&record.plan_id)
@@ -239,6 +241,7 @@ pub async fn insert_plan(pool: &DbPool, record: &UpgradePlanRecord) -> sqlx::Res
     .bind(&record.scope)
     .bind(&record.strategy)
     .bind(&record.status)
+    .bind(record.requested_by_user_id)
     .bind(&record.requested_by)
     .bind(&record.started_at)
     .bind(&record.finished_at)
@@ -259,6 +262,7 @@ pub async fn get_plan(pool: &DbPool, plan_id: &str) -> sqlx::Result<Option<Upgra
             scope,
             strategy,
             status,
+            requested_by_user_id,
             requested_by,
             started_at,
             finished_at,

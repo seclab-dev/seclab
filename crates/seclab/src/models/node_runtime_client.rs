@@ -42,6 +42,7 @@ pub struct NodeRuntimeClient {
 /// Master 向 Agent 发起变更请求时注入的可信操作者上下文。
 #[derive(Debug, Clone)]
 pub struct AgentOperationContext {
+    pub actor_user_id: i64,
     pub actor_name: String,
     pub client_ip: String,
     pub trace_id: String,
@@ -151,6 +152,7 @@ impl NodeRuntimeClient {
         let mut request = apply_operation_context(
             self.client.post(url),
             "user",
+            Some(context.actor_user_id),
             &context.actor_name,
             Some(&context.client_ip),
             &context.trace_id,
@@ -170,7 +172,7 @@ impl NodeRuntimeClient {
         source: &str,
         trace_id: &str,
     ) -> RequestBuilder {
-        apply_operation_context(request, "system", source, None, trace_id)
+        apply_operation_context(request, "system", None, source, None, trace_id)
     }
 
     /// 携带可信系统操作上下文发起 POST 请求。
@@ -246,6 +248,7 @@ impl NodeRuntimeClient {
         let response = apply_operation_context(
             self.client.put(self.build_uri(path)),
             "user",
+            Some(context.actor_user_id),
             &context.actor_name,
             Some(&context.client_ip),
             &context.trace_id,
@@ -267,6 +270,7 @@ impl NodeRuntimeClient {
         let response = apply_operation_context(
             self.client.post(self.build_uri(path)),
             "user",
+            Some(context.actor_user_id),
             &context.actor_name,
             Some(&context.client_ip),
             &context.trace_id,
@@ -289,6 +293,7 @@ impl NodeRuntimeClient {
     ) -> ApiResult<Response> {
         for name in [
             "x-seclab-actor-kind",
+            "x-seclab-actor-user-id",
             "x-seclab-actor-name",
             "x-seclab-client-ip",
             "x-seclab-trace-id",
@@ -299,6 +304,9 @@ impl NodeRuntimeClient {
             "x-seclab-actor-kind",
             header::HeaderValue::from_static("user"),
         );
+        if let Ok(value) = header::HeaderValue::from_str(&context.actor_user_id.to_string()) {
+            headers.insert("x-seclab-actor-user-id", value);
+        }
         for (name, value) in [
             ("x-seclab-actor-name", context.actor_name.as_str()),
             ("x-seclab-client-ip", context.client_ip.as_str()),
@@ -320,6 +328,7 @@ impl NodeRuntimeClient {
         let response = apply_operation_context(
             self.client.delete(self.build_uri(path)),
             "user",
+            Some(context.actor_user_id),
             &context.actor_name,
             Some(&context.client_ip),
             &context.trace_id,
@@ -429,14 +438,18 @@ fn decode_domain_body<T: DeserializeOwned>(
 fn apply_operation_context(
     request: RequestBuilder,
     actor_kind: &str,
+    actor_user_id: Option<i64>,
     actor_name: &str,
     client_ip: Option<&str>,
     trace_id: &str,
 ) -> RequestBuilder {
-    let request = request
+    let mut request = request
         .header("x-seclab-actor-kind", actor_kind)
         .header("x-seclab-actor-name", actor_name)
         .header("x-seclab-trace-id", trace_id);
+    if let Some(actor_user_id) = actor_user_id {
+        request = request.header("x-seclab-actor-user-id", actor_user_id);
+    }
     match client_ip {
         Some(client_ip) => request.header("x-seclab-client-ip", client_ip),
         None => request,
@@ -670,6 +683,7 @@ mod tests {
         let request = apply_operation_context(
             reqwest::Client::new().post("http://localhost/test"),
             "system",
+            None,
             "image-acquisition",
             None,
             "trace-1",

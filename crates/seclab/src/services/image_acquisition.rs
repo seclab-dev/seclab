@@ -72,9 +72,20 @@ pub struct ImageTask {
     pub controller_error: Option<String>,
     pub registry_error: Option<String>,
     #[serde(skip)]
+    actor: Option<ImageTaskActor>,
+    #[serde(skip)]
     cancel: Arc<AtomicBool>,
     #[serde(skip)]
     finished_at: Option<Instant>,
+}
+
+/// 镜像后台任务持久到终态日志的可信发起人。
+#[derive(Clone, Debug)]
+pub struct ImageTaskActor {
+    pub user_id: i64,
+    pub name: String,
+    pub client_ip: IpAddr,
+    pub trace_id: String,
 }
 
 /// 单个目标节点的镜像分发状态。
@@ -144,7 +155,13 @@ impl ImageAcquisitionService {
     }
 
     /// 创建后台镜像获取任务。
-    pub fn start(&self, state: Arc<AppState>, node_id: String, image_ref: String) -> ImageTask {
+    pub fn start(
+        &self,
+        state: Arc<AppState>,
+        node_id: String,
+        image_ref: String,
+        actor: Option<ImageTaskActor>,
+    ) -> ImageTask {
         self.cleanup();
         let task = ImageTask {
             task_id: Uuid::new_v4().to_string(),
@@ -157,6 +174,7 @@ impl ImageAcquisitionService {
             status_text: "Waiting to acquire image".to_string(),
             controller_error: None,
             registry_error: None,
+            actor,
             cancel: Arc::new(AtomicBool::new(false)),
             finished_at: None,
         };
@@ -199,6 +217,7 @@ impl ImageAcquisitionService {
         state: Arc<AppState>,
         image_ref: String,
         targets: Vec<(String, String)>,
+        actor: ImageTaskActor,
     ) -> ImageDistributionTask {
         self.cleanup();
         let task_id = Uuid::new_v4().to_string();
@@ -206,7 +225,12 @@ impl ImageAcquisitionService {
         let children = targets
             .into_iter()
             .map(|(node_id, node_name)| {
-                let child = self.start(Arc::clone(&state), node_id.clone(), image_ref.clone());
+                let child = self.start(
+                    Arc::clone(&state),
+                    node_id.clone(),
+                    image_ref.clone(),
+                    Some(actor.clone()),
+                );
                 ImageDistributionRecordTarget {
                     node_id,
                     node_name,
@@ -364,20 +388,31 @@ impl ImageAcquisitionService {
         });
         if let Some(task) = self.get(task_id) {
             let (event, message_key) = image_log_descriptor(&task.status, task.source.as_ref());
-            let mut log =
-                OperationEventBuilder::new("system", event, IpAddr::V4(Ipv4Addr::LOCALHOST))
-                    .module(LogModule::Docker)
-                    .target_type("docker_image")
-                    .target_id(&task.image_ref)
-                    .metadata(serde_json::json!({
-                        "message_key": message_key,
-                        "node_id": task.node_id,
-                        "image_ref": task.image_ref,
-                        "source": task.source,
-                        "stage": task.stage,
-                        "controller_error": task.controller_error,
-                        "registry_error": task.registry_error,
-                    }));
+            let actor_name = task
+                .actor
+                .as_ref()
+                .map_or("system", |actor| actor.name.as_str());
+            let client_ip = task
+                .actor
+                .as_ref()
+                .map_or(IpAddr::V4(Ipv4Addr::LOCALHOST), |actor| actor.client_ip);
+            let mut log = OperationEventBuilder::new(actor_name, event, client_ip)
+                .module(LogModule::Docker)
+                .target_type("docker_image")
+                .target_id(&task.image_ref)
+                .task_id(&task.task_id)
+                .metadata(serde_json::json!({
+                    "message_key": message_key,
+                    "node_id": task.node_id,
+                    "image_ref": task.image_ref,
+                    "source": task.source,
+                    "stage": task.stage,
+                    "controller_error": task.controller_error,
+                    "registry_error": task.registry_error,
+                }));
+            if let Some(actor) = task.actor.as_ref() {
+                log = log.user_id(actor.user_id).trace_id(&actor.trace_id);
+            }
             if task.status == ImageTaskStatus::Success {
                 log = log.set_success();
             }

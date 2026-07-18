@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone)]
 pub struct NewDockerActivity {
     pub actor_kind: DockerActivityActorKind,
+    pub actor_user_id: Option<i64>,
     pub actor_name: String,
     pub client_ip: Option<String>,
     pub level: DockerActivityLevel,
@@ -65,7 +66,7 @@ pub async fn record(pool: &DbPool, activity: NewDockerActivity) {
                 DockerActivityActorKind::System => OperationActorKind::System,
                 DockerActivityActorKind::User => OperationActorKind::User,
             },
-            user_id: None,
+            user_id: activity.actor_user_id,
             display_name: activity.actor_name.trim().chars().take(128).collect(),
         },
         client_ip,

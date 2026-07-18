@@ -14,7 +14,7 @@ import {
 } from '@/api/modules/docker'
 import { useDockerStore } from '@/stores/docker'
 import { useNodeStore } from '@/stores/node'
-import { useNotificationStore } from '@/stores/notification'
+import { useToastStore } from '@/stores/toast'
 import {
   SecLabAlert,
   SecLabButton,
@@ -32,7 +32,7 @@ const DEFAULT_TAG = 'latest'
 const { t } = useI18n()
 const dockerStore = useDockerStore()
 const nodeStore = useNodeStore()
-const notificationStore = useNotificationStore()
+const toastStore = useToastStore()
 const activeMode = ref<'search' | 'reference'>('search')
 const directReference = ref('')
 const directReferenceError = ref('')
@@ -227,10 +227,10 @@ const fetchPullProgress = async (taskId: string) => {
       stopPolling()
       isCanceling.value = false
       if (response.data.status === 'success') {
-        notificationStore.success(t('app.docker.images.registry.success'))
+        toastStore.success(t('app.docker.images.registry.success'))
         await dockerStore.fetchImagesList()
       } else if (response.data.status === 'failed') {
-        notificationStore.error(
+        toastStore.error(
           t('app.docker.images.registry.failed', {
             error:
               response.data.registryError ||
@@ -239,7 +239,7 @@ const fetchPullProgress = async (taskId: string) => {
           }),
         )
       } else if (response.data.status === 'cancelled') {
-        notificationStore.success(t('app.docker.images.registry.cancelled'))
+        toastStore.success(t('app.docker.images.registry.cancelled'))
       }
     }
   } catch (error) {
@@ -257,7 +257,7 @@ const fetchPullProgress = async (taskId: string) => {
       registryError: errMsg,
     }
     isCanceling.value = false
-    notificationStore.error(t('app.docker.images.registry.failed', { error: errMsg }))
+    toastStore.error(t('app.docker.images.registry.failed', { error: errMsg }))
   }
 }
 
@@ -285,7 +285,7 @@ const startImagePull = async (imageRef: string) => {
       startPolling(response.data.taskId)
       return
     }
-    notificationStore.error(
+    toastStore.error(
       t('app.docker.images.registry.failed', {
         error: response.message || t('common.unknownError'),
       }),
@@ -293,7 +293,7 @@ const startImagePull = async (imageRef: string) => {
   } catch (error) {
     console.error('Failed to start image pull:', error)
     const errMsg = error instanceof Error ? error.message : String(error)
-    notificationStore.error(t('app.docker.images.registry.failed', { error: errMsg }))
+    toastStore.error(t('app.docker.images.registry.failed', { error: errMsg }))
   } finally {
     isStartingPull.value = false
   }
@@ -333,7 +333,7 @@ const cancelPull = async () => {
     console.error('Failed to cancel image pull:', error)
     const errMsg = error instanceof Error ? error.message : String(error)
     isCanceling.value = false
-    notificationStore.error(t('app.docker.images.registry.cancelFailed', { error: errMsg }))
+    toastStore.error(t('app.docker.images.registry.cancelFailed', { error: errMsg }))
   }
 }
 

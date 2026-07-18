@@ -247,6 +247,7 @@ pub fn build_release_view(release: UpgradeReleaseRecord) -> UpgradeReleaseView {
 pub async fn create_plan(
     pool: &DbPool,
     payload: UpgradePlanCreatePayload,
+    requested_by_user_id: i64,
     requested_by: &str,
 ) -> ApiResult<UpgradePlanDetail> {
     let target_version = normalize_version(&payload.target_version)?;
@@ -333,6 +334,7 @@ pub async fn create_plan(
         scope: scope.to_string(),
         strategy: strategy.to_string(),
         status: "draft".to_string(),
+        requested_by_user_id,
         requested_by: requested_by.to_string(),
         started_at: None,
         finished_at: None,
@@ -1137,6 +1139,15 @@ async fn target_plan_overwrites_same_version(pool: &DbPool, plan_id: &str) -> Ap
 }
 
 async fn refresh_plan_terminal_status(pool: &DbPool, plan_id: &str) -> ApiResult<()> {
+    let Some(current_plan) = get_plan(pool, plan_id).await? else {
+        return Err(ApiError::NotFound);
+    };
+    if matches!(
+        current_plan.status.as_str(),
+        "succeeded" | "failed" | "canceled"
+    ) {
+        return Ok(());
+    }
     let total = count_targets_by_plan(pool, plan_id).await?;
     if total == 0 {
         return Ok(());
@@ -1159,6 +1170,21 @@ async fn refresh_plan_terminal_status(pool: &DbPool, plan_id: &str) -> ApiResult
     if terminal {
         let now = Utc::now().to_rfc3339();
         update_plan_status(pool, plan_id, terminal_status, None, Some(&now)).await?;
+        record_event(
+            pool,
+            plan_id,
+            None,
+            &format!("plan_{terminal_status}"),
+            &format!("Upgrade plan {terminal_status}"),
+            json!({
+                "result": terminal_status,
+                "targetCount": total,
+                "succeededCount": succeeded,
+                "failedCount": failed,
+                "canceledCount": canceled,
+            }),
+        )
+        .await?;
         // 不自动删除版本包，升级包物理文件由用户在升级页面手动按需管理和清理
     }
     Ok(())
@@ -1896,8 +1922,9 @@ async fn record_event(
     )
     .await?;
 
-    let username = if let Ok(Some(plan)) = get_plan(pool, plan_id).await {
-        plan.requested_by
+    let plan = get_plan(pool, plan_id).await.ok().flatten();
+    let username = if let Some(plan) = plan.as_ref() {
+        plan.requested_by.clone()
     } else {
         "system".to_string()
     };
@@ -1911,6 +1938,21 @@ async fn record_event(
         crate::models::logging::LogStatus::Failed
     } else {
         crate::models::logging::LogStatus::Success
+    };
+    let outcome = if event_type == "plan_canceled" {
+        seclab_contracts::logging::OperationOutcome::Canceled
+    } else if event_type == "plan_failed"
+        && metadata
+            .get("succeededCount")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or_default()
+            > 0
+    {
+        seclab_contracts::logging::OperationOutcome::Partial
+    } else if status == crate::models::logging::LogStatus::Failed {
+        seclab_contracts::logging::OperationOutcome::Failure
+    } else {
+        seclab_contracts::logging::OperationOutcome::Success
     };
 
     let mut log_meta = serde_json::Map::new();
@@ -1934,17 +1976,21 @@ async fn record_event(
         }
     }
 
-    crate::services::logging::OperationEventBuilder::new(
+    let mut operation = crate::services::logging::OperationEventBuilder::new(
         &username,
         &format!("upgrade_{}", event_type),
         client_ip,
-    )
-    .module(crate::models::logging::LogModule::System)
-    .target_type("upgrade_plan")
-    .target_id(plan_id)
-    .status(status)
-    .metadata(serde_json::Value::Object(log_meta))
-    .finish(pool);
+    );
+    if let Some(plan) = plan.as_ref() {
+        operation = operation.user_id(plan.requested_by_user_id);
+    }
+    operation
+        .module(crate::models::logging::LogModule::System)
+        .target_type("upgrade_plan")
+        .target_id(plan_id)
+        .outcome(outcome)
+        .metadata(serde_json::Value::Object(log_meta))
+        .finish(pool);
 
     Ok(())
 }
@@ -1994,6 +2040,7 @@ mod tests {
             scope: "{}".to_string(),
             strategy: json!({ "overwriteSameVersion": true }).to_string(),
             status: "running".to_string(),
+            requested_by_user_id: 1,
             requested_by: "tester".to_string(),
             started_at: Some(now.clone()),
             finished_at: None,
@@ -2031,6 +2078,10 @@ mod tests {
     #[tokio::test]
     async fn running_controller_target_recovers_after_restart() {
         let pool = crate::test_support::setup_test_db().await;
+        sqlx::query("INSERT INTO users (id, username, password_hash) VALUES (1, 'tester', 'hash')")
+            .execute(&pool)
+            .await
+            .unwrap();
         let plan_id = "plan-controller-restart";
         let target_id = "target-controller-restart";
         let target_version = env!("CARGO_PKG_VERSION");

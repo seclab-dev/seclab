@@ -8,7 +8,7 @@ import { ref, computed, defineAsyncComponent } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useDockerStore } from '@/stores/docker'
 import { useNodeStore } from '@/stores/node'
-import { useNotificationStore } from '@/stores/notification'
+import { useToastStore } from '@/stores/toast'
 import { dockerApi } from '@/api/modules/docker'
 import SecLabIcon from '@/components/icons/SecLabIcon.vue'
 import {
@@ -25,7 +25,7 @@ import {
 const { t } = useI18n()
 const store = useDockerStore()
 const nodeStore = useNodeStore()
-const notificationStore = useNotificationStore()
+const toastStore = useToastStore()
 const activeTab = ref<'local' | 'registry' | 'distribute'>('local')
 const settingsVisible = ref(false)
 const settingsLoading = ref(false)
@@ -107,7 +107,7 @@ async function saveSettings() {
     })
     if (response.success) {
       settingsVisible.value = false
-      notificationStore.success(t('app.docker.images.settings.saveSuccess'))
+      toastStore.success(t('app.docker.images.settings.saveSuccess'))
     } else {
       settingsError.value = response.message || t('app.docker.images.settings.saveFailed')
     }

@@ -28,7 +28,7 @@ import {
   SecLabDialog,
   SecLabCheckbox,
 } from '@/components/ui'
-import { useNotificationStore } from '@/stores/notification'
+import { useToastStore } from '@/stores/toast'
 import { useConfirmationModalStore } from '@/stores/confirmation-modal'
 import { formatDateTime } from '@/utils/time'
 
@@ -41,7 +41,7 @@ const router = useRouter()
 const { t } = useI18n()
 const nodeStore = useNodeStore()
 const windowStore = useWindowManagerStore()
-const notificationStore = useNotificationStore()
+const toastStore = useToastStore()
 const confirmationModal = useConfirmationModalStore()
 
 const nodes = computed(() => nodeStore.nodes)
@@ -94,16 +94,16 @@ const switchCurrentNode = async (nodeId: string) => {
   if (nodeId === nodeStore.currentNodeId) return
   const guardMessage = buildNodeSwitchBlockMessage()
   if (guardMessage) {
-    notificationStore.error(guardMessage)
+    toastStore.error(guardMessage)
     return
   }
   const result = nodeStore.requestSwitchCurrentNode(nodeId)
   if (!result.switched) {
-    notificationStore.error(result.reason || t('app.nodes.switchFailed'))
+    toastStore.error(result.reason || t('app.nodes.switchFailed'))
     return
   }
   const targetNode = nodeStore.nodes.find((node) => node.id === nodeId)
-  notificationStore.success(t('app.nodes.switchSuccess', { name: targetNode?.name || nodeId }))
+  toastStore.success(t('app.nodes.switchSuccess', { name: targetNode?.name || nodeId }))
 }
 const createForm = reactive({
   name: '',
@@ -450,12 +450,12 @@ const checkNode = async (node: NodeSummary) => {
   try {
     const res = await nodesApi.check(node.id)
     if (!res.success) {
-      notificationStore.error(res.message || t('app.nodes.check.failed'))
+      toastStore.error(res.message || t('app.nodes.check.failed'))
       return
     }
     const payload = res.data as NodeCheckResponse | undefined
     if (!payload) {
-      notificationStore.error(t('app.nodes.check.failed'))
+      toastStore.error(t('app.nodes.check.failed'))
       return
     }
     checkDetail.value = payload
@@ -463,7 +463,7 @@ const checkNode = async (node: NodeSummary) => {
     isCheckDrawerVisible.value = true
     await fetchNodes()
   } catch {
-    notificationStore.error(t('app.nodes.check.failed'))
+    toastStore.error(t('app.nodes.check.failed'))
   } finally {
     setChecking(node.id, false)
   }
@@ -486,34 +486,34 @@ const cancelCreate = () => {
 
 const validateCreateForm = () => {
   if (createForm.addr.trim() === '') {
-    notificationStore.error(t('app.nodes.create.addrRequired'))
+    toastStore.error(t('app.nodes.create.addrRequired'))
     return false
   }
   if (createForm.user.trim() === '') {
-    notificationStore.error(t('app.nodes.create.userRequired'))
+    toastStore.error(t('app.nodes.create.userRequired'))
     return false
   }
   if (createForm.authMode === 'password' && createForm.pwd.trim() === '') {
-    notificationStore.error(t('app.nodes.create.passwordRequired'))
+    toastStore.error(t('app.nodes.create.passwordRequired'))
     return false
   }
   if (createForm.authMode === 'key' && createForm.privateKey.trim() === '') {
-    notificationStore.error(t('app.nodes.create.privateKeyRequired'))
+    toastStore.error(t('app.nodes.create.privateKeyRequired'))
     return false
   }
   if (createForm.seclabUrl.trim() !== '') {
     try {
       const url = new URL(createForm.seclabUrl.trim())
       if (url.protocol !== 'https:') {
-        notificationStore.error(t('app.nodes.create.seclabUrlHttpsRequired'))
+        toastStore.error(t('app.nodes.create.seclabUrlHttpsRequired'))
         return false
       }
       if (url.pathname !== '/' || url.search !== '' || url.hash !== '') {
-        notificationStore.error(t('app.nodes.create.seclabUrlBaseRequired'))
+        toastStore.error(t('app.nodes.create.seclabUrlBaseRequired'))
         return false
       }
     } catch {
-      notificationStore.error(t('app.nodes.create.seclabUrlInvalid'))
+      toastStore.error(t('app.nodes.create.seclabUrlInvalid'))
       return false
     }
   }
@@ -568,7 +568,7 @@ const submitCreate = async () => {
     const res = await nodesApi.precheck(precheckPayload)
     if (!res.success || !res.data) {
       const message = res.message || t('app.nodes.precheck.failed')
-      notificationStore.error(message)
+      toastStore.error(message)
       precheckSubmitting.value = false
       return
     }
@@ -591,7 +591,7 @@ const submitCreate = async () => {
       return
     }
   } catch {
-    notificationStore.error(t('app.nodes.precheck.failed'))
+    toastStore.error(t('app.nodes.precheck.failed'))
     precheckSubmitting.value = false
     return
   }
@@ -726,14 +726,14 @@ const submitEdit = async () => {
     const res = await nodesApi.update(editTarget.value.id, payload)
     if (!res.success) {
       const msg = res.message || t('app.nodes.edit.failed')
-      notificationStore.error(msg)
+      toastStore.error(msg)
       editError.value = msg
       editSubmitting.value = false
       return
     }
   } catch {
     const msg = t('app.nodes.edit.failed')
-    notificationStore.error(msg)
+    toastStore.error(msg)
     editError.value = msg
     editSubmitting.value = false
     return
@@ -761,13 +761,13 @@ const handleDeleteAction = async (node: NodeSummary) => {
   try {
     const res = await nodesApi.remove(node.id)
     if (!res.success) {
-      notificationStore.error(res.message || t('app.nodes.delete.failed'))
+      toastStore.error(res.message || t('app.nodes.delete.failed'))
       return
     }
-    notificationStore.success(t('app.nodes.delete.success'))
+    toastStore.success(t('app.nodes.delete.success'))
     await fetchNodes()
   } catch {
-    notificationStore.error(t('app.nodes.delete.failed'))
+    toastStore.error(t('app.nodes.delete.failed'))
   } finally {
     setDeleting(node.id, false)
   }
@@ -888,7 +888,7 @@ const startPollingProgress = (nodeId: string) => {
           if (res.data.error) {
             deployError.value = res.data.error
           } else {
-            notificationStore.success(
+            toastStore.success(
               t('app.nodes.deploy.success', { name: deployTarget.value?.name || '' }),
             )
             startCountdown()
@@ -1104,7 +1104,7 @@ const executeNodeAction = async (node: NodeSummary, action: 'repair' | 'retire' 
   if (isUninstallingCurrentNode) {
     const guardMessage = buildNodeSwitchBlockMessage()
     if (guardMessage) {
-      notificationStore.error(guardMessage)
+      toastStore.error(guardMessage)
       return
     }
   }
@@ -1129,22 +1129,22 @@ const executeNodeAction = async (node: NodeSummary, action: 'repair' | 'retire' 
       res = await nodesApi.uninstall(node.id)
     }
     if (!res.success) {
-      notificationStore.error(res.message || t('app.nodes.actions.failed', { action: actionLabel }))
+      toastStore.error(res.message || t('app.nodes.actions.failed', { action: actionLabel }))
       return
     }
     if (isUninstallingCurrentNode) {
       const switchResult = nodeStore.requestSwitchCurrentNode('local')
       if (switchResult.switched) {
-        notificationStore.success(t('app.nodes.actions.currentUninstallSuccess'))
+        toastStore.success(t('app.nodes.actions.currentUninstallSuccess'))
       } else {
-        notificationStore.error(switchResult.reason || t('app.nodes.switchFailed'))
+        toastStore.error(switchResult.reason || t('app.nodes.switchFailed'))
       }
     } else {
-      notificationStore.success(t('app.nodes.actions.success', { action: actionLabel }))
+      toastStore.success(t('app.nodes.actions.success', { action: actionLabel }))
     }
     await fetchNodes()
   } catch {
-    notificationStore.error(t('app.nodes.actions.failed', { action: actionLabel }))
+    toastStore.error(t('app.nodes.actions.failed', { action: actionLabel }))
   }
 }
 
@@ -1206,7 +1206,7 @@ const openUpgradeDialog = async () => {
     }
   } catch (err) {
     console.error('Failed to load releases', err)
-    notificationStore.error(t('app.nodes.upgradeDialog.noReleases'))
+    toastStore.error(t('app.nodes.upgradeDialog.noReleases'))
   }
 }
 
@@ -1221,14 +1221,12 @@ const submitUpgradePlan = async () => {
     }
     const createResponse = await upgradesApi.createPlan(payload)
     if (!createResponse.success || !createResponse.data) {
-      notificationStore.error(
-        createResponse.message || t('app.nodes.upgradeDialog.createPlanFailed'),
-      )
+      toastStore.error(createResponse.message || t('app.nodes.upgradeDialog.createPlanFailed'))
       return
     }
     const startResponse = await upgradesApi.startPlan(createResponse.data.plan.planId)
     if (!startResponse.success || !startResponse.data) {
-      notificationStore.error(startResponse.message || t('app.nodes.upgradeDialog.startPlanFailed'))
+      toastStore.error(startResponse.message || t('app.nodes.upgradeDialog.startPlanFailed'))
       return
     }
 
@@ -1242,11 +1240,11 @@ const submitUpgradePlan = async () => {
       JSON.stringify(startResponse.data),
     )
 
-    notificationStore.success(t('app.nodes.upgradeDialog.startPlanSuccess') || '升级任务已成功启动')
+    toastStore.success(t('app.nodes.upgradeDialog.startPlanSuccess') || '升级任务已成功启动')
     router.push({ path: '/upgrade-progress', query: { planId: startResponse.data.plan.planId } })
   } catch (err) {
     console.error('Failed to submit upgrade plan', err)
-    notificationStore.error(t('app.nodes.upgradeDialog.startPlanFailed'))
+    toastStore.error(t('app.nodes.upgradeDialog.startPlanFailed'))
   } finally {
     upgradeSubmitting.value = false
   }

@@ -4,7 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { upgradesApi } from '@/api/modules/upgrades'
 import type { UpgradePlanDetail } from '@/api/modules/upgrades'
-import { useNotificationStore } from '@/stores/notification'
+import { useToastStore } from '@/stores/toast'
 import http from '@/api'
 import { resetAuthState } from '@/router'
 import { useWindowManagerStore } from '@/stores/window-manager'
@@ -14,7 +14,7 @@ import { getLoginEntryPath } from '@/utils/login-entry'
 const router = useRouter()
 const route = useRoute()
 const { t } = useI18n()
-const notificationStore = useNotificationStore()
+const toastStore = useToastStore()
 const windowStore = useWindowManagerStore()
 
 const upgradePlan = ref<UpgradePlanDetail | null>(null)
@@ -106,14 +106,14 @@ const cancelUpgrade = async () => {
   try {
     const response = await upgradesApi.cancelPlan(planId)
     if (response.success) {
-      notificationStore.success(t('upgradeProgress.notifications.cancelSuccess'))
+      toastStore.success(t('upgradeProgress.notifications.cancelSuccess'))
       upgradePlan.value = response.data ?? null
     } else {
-      notificationStore.error(response.message || t('upgradeProgress.notifications.cancelFailed'))
+      toastStore.error(response.message || t('upgradeProgress.notifications.cancelFailed'))
     }
   } catch (error) {
     console.error('Failed to cancel upgrade', error)
-    notificationStore.error(t('upgradeProgress.notifications.cancelFailed'))
+    toastStore.error(t('upgradeProgress.notifications.cancelFailed'))
   } finally {
     isCancelling.value = false
   }

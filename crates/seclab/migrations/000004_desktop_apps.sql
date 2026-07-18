@@ -74,5 +74,5 @@ VALUES
     ('script-manager', 'app.scriptManager.appName', '/images/apps/script-manager.png', 1024, 720, 860, 560, 0, 120),
     ('operation-log', 'app.operationLog.appName', '/images/apps/platform-log.png', 1024, 720, 860, 560, 0, 130),
     ('runtime-log', 'app.runtimeLog.appName', '/images/apps/runtime-log.png', 1024, 720, 860, 560, 0, 140),
-    ('notification-history', 'app.notificationHistory.appName', '/images/apps/notification-history.png', 1024, 720, 860, 560, 0, 150),
+    ('notification-center', 'app.notificationCenter.appName', '/images/apps/notification-center.png', 1024, 720, 860, 560, 0, 150),
     ('settings', 'app.settings.appName', '/images/apps/settings.png', 1024, 720, 860, 560, 0, 160);

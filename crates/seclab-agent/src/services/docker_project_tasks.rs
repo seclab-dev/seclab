@@ -94,8 +94,8 @@ pub async fn create(
     sqlx::query(
         "INSERT INTO docker_compose_project_tasks (\
             id, project_name, operation, status, stage, progress_percent, \
-            service_name, replicas, pull_images, actor_kind, actor_name, client_ip, trace_id\
-         ) VALUES (?1, ?2, ?3, 'queued', 'preparing', 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            service_name, replicas, pull_images, actor_kind, actor_user_id, actor_name, client_ip, trace_id\
+         ) VALUES (?1, ?2, ?3, 'queued', 'preparing', 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
     )
     .bind(&id)
     .bind(request.project_name)
@@ -104,6 +104,7 @@ pub async fn create(
     .bind(request.replicas.map(|value| value as i64))
     .bind(request.pull_images)
     .bind(context.actor_kind.as_str())
+    .bind(context.actor_user_id)
     .bind(&context.actor_name)
     .bind(&context.client_ip)
     .bind(&context.trace_id)
@@ -239,7 +240,7 @@ async fn finish(
 async fn record_terminal_activity(pool: &DbPool, task_id: &str) {
     let row = match sqlx::query(
         "SELECT project_name, operation, status, service_name, replicas, pull_images, \
-         actor_kind, actor_name, client_ip, trace_id, error_summary \
+         actor_kind, actor_user_id, actor_name, client_ip, trace_id, error_summary \
          FROM docker_compose_project_tasks WHERE id = ?1",
     )
     .bind(task_id)
@@ -260,6 +261,7 @@ async fn record_terminal_activity(pool: &DbPool, task_id: &str) {
     };
     let context = DockerOperationContext {
         actor_kind,
+        actor_user_id: row.try_get("actor_user_id").ok().flatten(),
         actor_name: row
             .try_get("actor_name")
             .unwrap_or_else(|_| "unknown".to_string()),

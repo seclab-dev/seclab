@@ -767,8 +767,8 @@ async fn run_image_pull_task(
                 .record_success(
                     &state.metadata_db,
                     "image.pull",
-                    Some(("image", &target)),
-                    json!({ "name": image_name, "tag": tag }),
+                    Some(("imagePullTask", &task_id)),
+                    json!({ "imageRef": target, "name": image_name, "tag": tag }),
                     false,
                 )
                 .await;
@@ -778,8 +778,8 @@ async fn run_image_pull_task(
                 .record_success(
                     &state.metadata_db,
                     "image.pull.cancelled",
-                    Some(("image", &target)),
-                    json!({ "name": image_name, "tag": tag }),
+                    Some(("imagePullTask", &task_id)),
+                    json!({ "imageRef": target, "name": image_name, "tag": tag }),
                     true,
                 )
                 .await;
@@ -789,8 +789,8 @@ async fn run_image_pull_task(
                 .record_failure(
                     &state.metadata_db,
                     "image.pull",
-                    Some(("image", &target)),
-                    json!({ "name": image_name, "tag": tag }),
+                    Some(("imagePullTask", &task_id)),
+                    json!({ "imageRef": target, "name": image_name, "tag": tag }),
                     error.to_string(),
                 )
                 .await;

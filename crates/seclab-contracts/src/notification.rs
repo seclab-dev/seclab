@@ -1,84 +1,263 @@
-//! 通知历史契约：统一通知写入与查询模型。
+//! 个人通知中心契约：定义可信事件投影、个人状态与查询边界。
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
 use ts_rs::TS;
 
-/// 通知类型。
+use crate::logging::{OperationModule, OperationOutcome, OperationParameterValue};
+
+/// 通知注册表中的稳定事件码。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "camelCase")]
 #[ts(export_to = "notification/")]
-pub enum NotificationLevel {
-    Success,
-    Error,
-    Warning,
-    Info,
+pub enum NotificationCode {
+    NodeDeploymentFinished,
+    SuiteInstallationFinished,
+    ScriptRunFinished,
+    ScheduledTaskOperationFinished,
+    ScheduledTaskRunFinished,
+    FileTaskFinished,
+    FileTransferFinished,
+    DiskOperationFinished,
+    DockerImageTaskFinished,
+    DockerProjectTaskFinished,
+    UpgradePlanFinished,
+    NodeOffline,
+    NodeRecovered,
+    LoginLockout,
 }
 
-impl NotificationLevel {
-    /// 返回稳定字符串表示，用于数据库与前端对齐。
+impl NotificationCode {
+    /// 返回数据库使用的稳定值。
     pub const fn as_str(self) -> &'static str {
         match self {
-            NotificationLevel::Success => "success",
-            NotificationLevel::Error => "error",
-            NotificationLevel::Warning => "warning",
-            NotificationLevel::Info => "info",
+            Self::NodeDeploymentFinished => "nodeDeploymentFinished",
+            Self::SuiteInstallationFinished => "suiteInstallationFinished",
+            Self::ScriptRunFinished => "scriptRunFinished",
+            Self::ScheduledTaskOperationFinished => "scheduledTaskOperationFinished",
+            Self::ScheduledTaskRunFinished => "scheduledTaskRunFinished",
+            Self::FileTaskFinished => "fileTaskFinished",
+            Self::FileTransferFinished => "fileTransferFinished",
+            Self::DiskOperationFinished => "diskOperationFinished",
+            Self::DockerImageTaskFinished => "dockerImageTaskFinished",
+            Self::DockerProjectTaskFinished => "dockerProjectTaskFinished",
+            Self::UpgradePlanFinished => "upgradePlanFinished",
+            Self::NodeOffline => "nodeOffline",
+            Self::NodeRecovered => "nodeRecovered",
+            Self::LoginLockout => "loginLockout",
         }
     }
 }
 
-/// 单条通知历史记录。
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize, TS)]
+/// 通知所属类别。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "notification/")]
-pub struct NotificationRecord {
-    pub id: i64,
-    pub level: String,
-    pub message: String,
-    pub created_at: i64,
+pub enum NotificationCategory {
+    Task,
+    Security,
+    System,
 }
 
-/// 创建通知时的请求体。
+impl NotificationCategory {
+    /// 返回数据库使用的稳定值。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Task => "task",
+            Self::Security => "security",
+            Self::System => "system",
+        }
+    }
+}
+
+/// 通知严重度。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "notification/")]
+pub enum NotificationSeverity {
+    Success,
+    Info,
+    Warning,
+    Error,
+}
+
+impl NotificationSeverity {
+    /// 返回数据库使用的稳定值。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// 通知查询范围。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "notification/")]
+pub enum NotificationArchiveScope {
+    Active,
+    Archived,
+}
+
+/// 通知读取状态筛选。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "notification/")]
+pub enum NotificationReadFilter {
+    All,
+    Read,
+    Unread,
+}
+
+/// 通知来源摘要。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "notification/", optional_fields)]
+pub struct NotificationSource {
+    pub module: OperationModule,
+    pub node_id: Option<String>,
+    pub node_name: Option<String>,
+}
+
+/// 通知关联的安全目标摘要。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "notification/", optional_fields)]
+pub struct NotificationSubject {
+    pub kind: String,
+    pub id: String,
+    pub display_name: Option<String>,
+}
+
+/// 后端注册表计算的安全应用动作。
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "notification/")]
-pub struct NotificationCreatePayload {
-    pub level: NotificationLevel,
-    pub message: String,
+pub struct NotificationAction {
+    pub app_id: String,
+    pub label_key: String,
+    #[ts(type = "Record<string, string | number | boolean>")]
+    pub payload: BTreeMap<String, OperationParameterValue>,
 }
 
-/// 通知历史查询参数。
+/// 当前用户对通知可执行的能力。
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "notification/")]
+pub struct NotificationCapabilities {
+    pub can_view_details: bool,
+    pub can_mark_read: bool,
+    pub can_mark_unread: bool,
+    pub can_archive: bool,
+    pub can_restore: bool,
+    pub can_open_target: bool,
+}
+
+/// 通知列表摘要。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "notification/", optional_fields)]
+pub struct NotificationSummary {
+    pub notification_id: String,
+    pub created_at: String,
+    pub code: NotificationCode,
+    pub category: NotificationCategory,
+    pub severity: NotificationSeverity,
+    pub outcome: Option<OperationOutcome>,
+    pub source: NotificationSource,
+    pub subject: Option<NotificationSubject>,
+    pub task_id: Option<String>,
+    pub operation_event_id: String,
+    #[ts(type = "Record<string, string | number | boolean>")]
+    pub parameters: BTreeMap<String, OperationParameterValue>,
+    pub read_at: Option<String>,
+    pub archived_at: Option<String>,
+    pub action: Option<NotificationAction>,
+    pub capabilities: NotificationCapabilities,
+}
+
+/// 通知详情。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "notification/", optional_fields)]
+pub struct NotificationDetail {
+    #[serde(flatten)]
+    pub summary: NotificationSummary,
+    pub error_code: Option<String>,
+    pub error_summary: Option<String>,
+    pub trace_id: String,
+}
+
+/// 通知分页查询。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "notification/", optional_fields)]
 pub struct NotificationQuery {
     #[serde(default = "default_page")]
     pub page: u32,
     #[serde(default = "default_page_size")]
     pub page_size: u32,
-    #[ts(optional)]
+    #[serde(default = "default_archive_scope")]
+    pub archive_scope: NotificationArchiveScope,
+    #[serde(default = "default_read_filter")]
+    pub read_filter: NotificationReadFilter,
+    pub categories: Option<Vec<NotificationCategory>>,
+    pub severities: Option<Vec<NotificationSeverity>>,
+    pub modules: Option<Vec<OperationModule>>,
+    pub codes: Option<Vec<NotificationCode>>,
+    pub created_from: Option<String>,
+    pub created_to: Option<String>,
     pub keyword: Option<String>,
-    #[ts(optional)]
-    pub level: Option<NotificationLevel>,
 }
 
-/// 批量删除通知的请求体。
+/// 通知分页结果。
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "notification/")]
-pub struct NotificationBatchDeletePayload {
-    pub ids: Vec<i64>,
-}
-
-/// 通知历史分页返回。
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "notification/")]
-pub struct NotificationList {
+pub struct NotificationPage {
     pub total: i64,
     pub page: u32,
     pub page_size: u32,
-    pub records: Vec<NotificationRecord>,
+    pub items: Vec<NotificationSummary>,
+}
+
+/// 未读角标摘要。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "notification/", optional_fields)]
+pub struct NotificationUnreadSummary {
+    pub unread_count: i64,
+    pub latest_created_at: Option<String>,
+    pub version: String,
+}
+
+/// 单条通知读取状态变更。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "notification/")]
+pub struct NotificationReadStateRequest {
+    pub read: bool,
+}
+
+/// 单条通知归档状态变更。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "notification/")]
+pub struct NotificationArchiveStateRequest {
+    pub archived: bool,
+}
+
+/// 批量通知归档状态变更。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "notification/")]
+pub struct NotificationBatchArchiveStateRequest {
+    pub notification_ids: Vec<String>,
+    pub archived: bool,
 }
 
 fn default_page() -> u32 {
@@ -87,4 +266,12 @@ fn default_page() -> u32 {
 
 fn default_page_size() -> u32 {
     20
+}
+
+fn default_archive_scope() -> NotificationArchiveScope {
+    NotificationArchiveScope::Active
+}
+
+fn default_read_filter() -> NotificationReadFilter {
+    NotificationReadFilter::All
 }

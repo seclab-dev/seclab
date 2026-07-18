@@ -14,6 +14,7 @@ use axum::{
 use serde_json::Value;
 
 const ACTOR_KIND_HEADER: HeaderName = HeaderName::from_static("x-seclab-actor-kind");
+const ACTOR_USER_ID_HEADER: HeaderName = HeaderName::from_static("x-seclab-actor-user-id");
 const ACTOR_NAME_HEADER: HeaderName = HeaderName::from_static("x-seclab-actor-name");
 const CLIENT_IP_HEADER: HeaderName = HeaderName::from_static("x-seclab-client-ip");
 const TRACE_ID_HEADER: HeaderName = HeaderName::from_static("x-seclab-trace-id");
@@ -22,6 +23,7 @@ const TRACE_ID_HEADER: HeaderName = HeaderName::from_static("x-seclab-trace-id")
 #[derive(Debug, Clone)]
 pub struct DockerOperationContext {
     pub actor_kind: DockerActivityActorKind,
+    pub actor_user_id: Option<i64>,
     pub actor_name: String,
     pub client_ip: Option<String>,
     pub trace_id: Option<String>,
@@ -55,6 +57,7 @@ impl DockerOperationContext {
     pub fn system(source: impl Into<String>) -> Self {
         Self {
             actor_kind: DockerActivityActorKind::System,
+            actor_user_id: None,
             actor_name: source.into(),
             client_ip: None,
             trace_id: None,
@@ -145,6 +148,7 @@ impl DockerOperationContext {
     ) -> NewDockerActivity {
         NewDockerActivity {
             actor_kind: self.actor_kind,
+            actor_user_id: self.actor_user_id,
             actor_name: self.actor_name.clone(),
             client_ip: self.client_ip.clone(),
             level,
@@ -174,8 +178,18 @@ fn parse_context(headers: &HeaderMap) -> Option<DockerOperationContext> {
         Some("user") => DockerActivityActorKind::User,
         _ => return None,
     };
+    let actor_user_id = match actor_kind {
+        DockerActivityActorKind::User => Some(
+            header_text(headers, &ACTOR_USER_ID_HEADER)?
+                .parse::<i64>()
+                .ok()
+                .filter(|value| *value > 0)?,
+        ),
+        DockerActivityActorKind::System => None,
+    };
     Some(DockerOperationContext {
         actor_kind,
+        actor_user_id,
         actor_name,
         client_ip: header_text(headers, &CLIENT_IP_HEADER),
         trace_id: header_text(headers, &TRACE_ID_HEADER),
@@ -203,8 +217,10 @@ mod tests {
         assert!(parse_context(&headers).is_none());
 
         headers.insert(&ACTOR_NAME_HEADER, HeaderValue::from_static("admin"));
+        headers.insert(&ACTOR_USER_ID_HEADER, HeaderValue::from_static("1"));
         let context = parse_context(&headers).unwrap();
         assert_eq!(context.actor_kind, DockerActivityActorKind::User);
+        assert_eq!(context.actor_user_id, Some(1));
         assert_eq!(context.actor_name, "admin");
     }
 }

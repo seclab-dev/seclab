@@ -176,6 +176,7 @@ async fn create_operation(
     .map_err(|error| ApiError::database(error.to_string()))?;
 
     let context = AgentOperationContext {
+        actor_user_id: actor.user_id,
         actor_name: actor.name.clone(),
         client_ip: actor.client_ip.clone(),
         trace_id: actor.trace_id.clone(),
@@ -272,6 +273,7 @@ async fn cancel_operation(
     }
     let client = runtime_client(&state, &node_id).await?;
     let context = AgentOperationContext {
+        actor_user_id: actor.user_id,
         actor_name: actor.name,
         client_ip: actor.client_ip,
         trace_id: actor.trace_id,

@@ -108,10 +108,12 @@ pub async fn login(
         match (&payload.captcha_id, &payload.captcha) {
             (Some(captcha_id), Some(captcha)) => {
                 if !state.captcha_service.verify(captcha_id, captcha).await {
-                    state.login_tracker.record_failure(&client_ip).await;
+                    let newly_locked = state.login_tracker.record_failure(&client_ip).await;
                     return Ok(login_failure_after_failure(
                         &state,
                         client_ip,
+                        &payload.username,
+                        newly_locked,
                         "The captcha is invalid. Please try again.",
                         "api.auth.captchaInvalid",
                     )
@@ -169,10 +171,12 @@ pub async fn login(
         Ok(user) => user,
         Err(err) => {
             if err.code == ErrorCode::AuthWrongCredentials {
-                state.login_tracker.record_failure(&client_ip).await;
+                let newly_locked = state.login_tracker.record_failure(&client_ip).await;
                 return Ok(login_failure_after_failure(
                     &state,
                     client_ip,
+                    &payload.username,
+                    newly_locked,
                     "The username or password is incorrect.",
                     "api.auth.wrongCredentials",
                 )
@@ -241,10 +245,12 @@ pub async fn login(
                 "message_key": "platformLog.auth.login.invalidPassword"
             }))
             .finish(pool);
-        state.login_tracker.record_failure(&client_ip).await;
+        let newly_locked = state.login_tracker.record_failure(&client_ip).await;
         return Ok(login_failure_after_failure(
             &state,
             client_ip,
+            &payload.username,
+            newly_locked,
             "The username or password is incorrect.",
             "api.auth.wrongCredentials",
         )
@@ -415,10 +421,27 @@ fn login_failure_response(
 async fn login_failure_after_failure(
     state: &AppState,
     client_ip: std::net::IpAddr,
+    attempted_username: &str,
+    newly_locked: bool,
     message: &str,
     message_key: &str,
 ) -> Response {
     if let Some(remaining) = state.login_tracker.lockout_remaining_secs(&client_ip).await {
+        if newly_locked {
+            crate::services::logging::OperationEventBuilder::new(
+                "anonymous",
+                "login_lockout",
+                client_ip,
+            )
+            .module(LogModule::Auth)
+            .outcome(seclab_contracts::logging::OperationOutcome::Failure)
+            .metadata(json!({
+                "username": attempted_username,
+                "clientIp": client_ip.to_string(),
+                "lockoutSeconds": remaining,
+            }))
+            .finish(&state.metadata_db);
+        }
         return login_failure_response(
             StatusCode::TOO_MANY_REQUESTS,
             "Too many login attempts. Please try again later.",

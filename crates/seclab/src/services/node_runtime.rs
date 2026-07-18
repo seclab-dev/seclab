@@ -102,6 +102,7 @@ async fn mark_node_online(
     node_id: &str,
     update_registered_at: bool,
 ) -> sqlx::Result<()> {
+    let previous = get_node_by_id(pool, node_id).await?;
     transition_to_online(pool, node_id).await?;
     let now = Utc::now().to_rfc3339();
     let registered_at = if update_registered_at {
@@ -123,6 +124,26 @@ async fn mark_node_online(
     .bind(node_id)
     .execute(pool)
     .await?;
+
+    if previous
+        .as_ref()
+        .is_some_and(|node| node.status == "offline")
+    {
+        crate::services::logging::OperationEventBuilder::new(
+            "system",
+            "node_recovered",
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        )
+        .target_type("node")
+        .target_id(node_id)
+        .target_display_name(previous.as_ref().map_or(node_id, |node| node.name.as_str()))
+        .set_success()
+        .metadata(serde_json::json!({
+            "nodeId": node_id,
+            "nodeName": previous.as_ref().map(|node| node.name.as_str()),
+        }))
+        .finish(pool);
+    }
 
     Ok(())
 }

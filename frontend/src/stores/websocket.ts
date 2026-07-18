@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { computed, ref, watch } from 'vue'
 import { useWebSocket } from '@/composables/useWebSocket'
-import { useNotificationStore } from './notification'
+import { useToastStore } from './toast'
 import { useNodeStore } from './node'
 import { useI18n } from 'vue-i18n'
 
@@ -55,7 +55,7 @@ type ServerWsMessage =
  */
 export const useWebSocketStore = defineStore('webSocket', () => {
   const { t } = useI18n()
-  const notificationStore = useNotificationStore()
+  const toastStore = useToastStore()
   /**
    * `ref<ServerWsMessage | null>`: 最近一次从服务器收到的、已解析的 WebSocket 消息。
    */
@@ -114,7 +114,7 @@ export const useWebSocketStore = defineStore('webSocket', () => {
     },
     onError: (event) => {
       console.error('WebSocket Error:', event)
-      notificationStore.error(t('websocket.connectionError'))
+      toastStore.error(t('websocket.connectionError'))
     },
     onOpen: () => {
       // 当连接（或重连）成功时，重新订阅所有当前活跃的日志流

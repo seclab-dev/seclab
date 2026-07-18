@@ -13,7 +13,7 @@ import {
 } from '@/api/modules/upgrades'
 import type { SystemAboutInfo } from '@/api/interface/system'
 import { useNodeStore } from '@/stores/node'
-import { useNotificationStore } from '@/stores/notification'
+import { useToastStore } from '@/stores/toast'
 import { useThemeStore } from '@/stores/theme'
 import { useWindowManagerStore } from '@/stores/window-manager'
 import { useConfirmationModalStore } from '@/stores/confirmation-modal'
@@ -44,7 +44,7 @@ const props = defineProps<{
 const router = useRouter()
 const { t, te, locale } = useI18n()
 const nodeStore = useNodeStore()
-const notificationStore = useNotificationStore()
+const toastStore = useToastStore()
 const themeStore = useThemeStore()
 const windowStore = useWindowManagerStore()
 const confirmationStore = useConfirmationModalStore()
@@ -361,7 +361,7 @@ const loadNetworkConfig = async () => {
     await loadInterfaces()
     const response = await seclabApi.fetchNetwork()
     if (!response.success) {
-      notificationStore.error(response.message || t('app.settings.network.loadFailed'))
+      toastStore.error(response.message || t('app.settings.network.loadFailed'))
       return
     }
     if (response.data) {
@@ -371,7 +371,7 @@ const loadNetworkConfig = async () => {
     }
   } catch (error) {
     console.error('Failed to load SecLab network config', error)
-    notificationStore.error(t('app.settings.network.loadFailed'))
+    toastStore.error(t('app.settings.network.loadFailed'))
   } finally {
     networkLoading.value = false
   }
@@ -379,7 +379,7 @@ const loadNetworkConfig = async () => {
 
 const saveNetworkConfig = async () => {
   if (!networkForm.value.host.trim()) {
-    notificationStore.error(t('app.settings.network.validationHost'))
+    toastStore.error(t('app.settings.network.validationHost'))
     return
   }
   if (
@@ -387,7 +387,7 @@ const saveNetworkConfig = async () => {
     networkForm.value.port < 1 ||
     networkForm.value.port > 65535
   ) {
-    notificationStore.error(t('app.settings.network.validationPort'))
+    toastStore.error(t('app.settings.network.validationPort'))
     return
   }
 
@@ -399,17 +399,17 @@ const saveNetworkConfig = async () => {
       publicHost: networkForm.value.publicHost.trim() || null,
     })
     if (!response.success || !response.data) {
-      notificationStore.error(response.message || t('app.settings.network.saveFailed'))
+      toastStore.error(response.message || t('app.settings.network.saveFailed'))
       return
     }
-    notificationStore.success(t('app.settings.network.saveSuccess'))
+    toastStore.success(t('app.settings.network.saveSuccess'))
     const target = response.data.nextUrl
     setTimeout(() => {
       window.location.replace(target)
     }, 400)
   } catch (error) {
     console.error('Failed to save SecLab network config', error)
-    notificationStore.error(t('app.settings.network.saveFailed'))
+    toastStore.error(t('app.settings.network.saveFailed'))
   } finally {
     networkSaving.value = false
   }
@@ -448,7 +448,7 @@ const loadSecuritySettings = async () => {
   try {
     const response = await securityApi.fetchSettings()
     if (!response.success || !response.data) {
-      notificationStore.error(response.message || t('app.settings.security.loadFailed'))
+      toastStore.error(response.message || t('app.settings.security.loadFailed'))
       return
     }
     securityForm.value.safeEntry = response.data.safeEntry
@@ -456,7 +456,7 @@ const loadSecuritySettings = async () => {
     usernameForm.value = ''
   } catch (error) {
     console.error('Failed to load security settings', error)
-    notificationStore.error(t('app.settings.security.loadFailed'))
+    toastStore.error(t('app.settings.security.loadFailed'))
   } finally {
     securityLoading.value = false
   }
@@ -465,7 +465,7 @@ const loadSecuritySettings = async () => {
 const saveSecuritySettings = async () => {
   const safeEntry = securityForm.value.safeEntry.trim()
   if (safeEntry && !isValidSafeEntry(safeEntry)) {
-    notificationStore.error(t('app.settings.security.safeEntryInvalid'))
+    toastStore.error(t('app.settings.security.safeEntryInvalid'))
     return
   }
   securitySaving.value = true
@@ -475,7 +475,7 @@ const saveSecuritySettings = async () => {
       passwordComplexity: securityForm.value.passwordComplexity,
     })
     if (!response.success) {
-      notificationStore.error(response.message || t('app.settings.security.saveFailed'))
+      toastStore.error(response.message || t('app.settings.security.saveFailed'))
       return
     }
     securityForm.value.safeEntry = safeEntry
@@ -484,10 +484,10 @@ const saveSecuritySettings = async () => {
     } else {
       forgetLoginEntry()
     }
-    notificationStore.success(t('app.settings.security.saveSuccess'))
+    toastStore.success(t('app.settings.security.saveSuccess'))
   } catch (error) {
     console.error('Failed to save security settings', error)
-    notificationStore.error(t('app.settings.security.saveFailed'))
+    toastStore.error(t('app.settings.security.saveFailed'))
   } finally {
     securitySaving.value = false
   }
@@ -504,21 +504,21 @@ const clearSafeEntry = () => {
 const saveUsername = async () => {
   const username = usernameForm.value.trim()
   if (!/^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$/.test(username)) {
-    notificationStore.error(t('app.settings.security.usernameInvalid'))
+    toastStore.error(t('app.settings.security.usernameInvalid'))
     return
   }
   credentialSaving.value = true
   try {
     const response = await securityApi.updateUsername(username)
     if (!response.success) {
-      notificationStore.error(response.message || t('app.settings.security.usernameFailed'))
+      toastStore.error(response.message || t('app.settings.security.usernameFailed'))
       return
     }
     usernameForm.value = ''
-    notificationStore.success(t('app.settings.security.usernameSuccess'))
+    toastStore.success(t('app.settings.security.usernameSuccess'))
   } catch (error) {
     console.error('Failed to update username', error)
-    notificationStore.error(t('app.settings.security.usernameFailed'))
+    toastStore.error(t('app.settings.security.usernameFailed'))
   } finally {
     credentialSaving.value = false
   }
@@ -526,30 +526,30 @@ const saveUsername = async () => {
 
 const savePassword = async () => {
   if (!passwordForm.value.newPassword) {
-    notificationStore.error(t('app.settings.security.passwordRequired'))
+    toastStore.error(t('app.settings.security.passwordRequired'))
     return
   }
   if (passwordForm.value.newPassword.length < 5) {
-    notificationStore.error(t('app.settings.security.passwordTooShort'))
+    toastStore.error(t('app.settings.security.passwordTooShort'))
     return
   }
   if (passwordForm.value.newPassword !== passwordForm.value.confirmPassword) {
-    notificationStore.error(t('app.settings.security.passwordMismatch'))
+    toastStore.error(t('app.settings.security.passwordMismatch'))
     return
   }
   credentialSaving.value = true
   try {
     const response = await securityApi.updatePassword(passwordForm.value.newPassword)
     if (!response.success) {
-      notificationStore.error(response.message || t('app.settings.security.passwordFailed'))
+      toastStore.error(response.message || t('app.settings.security.passwordFailed'))
       return
     }
     passwordForm.value.newPassword = ''
     passwordForm.value.confirmPassword = ''
-    notificationStore.success(t('app.settings.security.passwordSuccess'))
+    toastStore.success(t('app.settings.security.passwordSuccess'))
   } catch (error) {
     console.error('Failed to update password', error)
-    notificationStore.error(t('app.settings.security.passwordFailed'))
+    toastStore.error(t('app.settings.security.passwordFailed'))
   } finally {
     credentialSaving.value = false
   }
@@ -635,10 +635,10 @@ const copyAboutInfo = async () => {
       document.body.removeChild(textarea)
       if (!copied) throw new Error('copy failed')
     }
-    notificationStore.success(t('app.settings.about.copySuccess'))
+    toastStore.success(t('app.settings.about.copySuccess'))
   } catch (error) {
     console.error('Failed to copy system about info', error)
-    notificationStore.error(t('app.settings.about.copyFailed'))
+    toastStore.error(t('app.settings.about.copyFailed'))
   } finally {
     aboutCopying.value = false
   }
@@ -649,13 +649,13 @@ const loadAboutInfo = async () => {
   try {
     const response = await systemClient.value.fetchAbout()
     if (!response.success) {
-      notificationStore.error(response.message || t('app.settings.about.loadFailed'))
+      toastStore.error(response.message || t('app.settings.about.loadFailed'))
       return
     }
     aboutInfo.value = response.data ?? null
   } catch (error) {
     console.error('Failed to load system about info', error)
-    notificationStore.error(t('app.settings.about.loadFailed'))
+    toastStore.error(t('app.settings.about.loadFailed'))
   } finally {
     aboutLoading.value = false
   }
@@ -666,14 +666,14 @@ const loadUpgradeReleases = async () => {
   try {
     const response = await upgradesApi.listReleases()
     if (!response.success) {
-      notificationStore.error(response.message || t('app.settings.upgrade.loadFailed'))
+      toastStore.error(response.message || t('app.settings.upgrade.loadFailed'))
       return
     }
     upgradeReleases.value = response.data ?? []
     selectedUpgradeVersion.value ||= upgradeReleases.value[0]?.version || ''
   } catch (error) {
     console.error('Failed to load upgrade releases', error)
-    notificationStore.error(t('app.settings.upgrade.loadFailed'))
+    toastStore.error(t('app.settings.upgrade.loadFailed'))
   } finally {
     upgradeLoading.value = false
   }
@@ -689,7 +689,7 @@ const onUpgradeFileChange = (event: Event) => {
   if (file) {
     const fileName = file.name.toLowerCase()
     if (!fileName.endsWith('.tar.gz') && !fileName.endsWith('.tgz')) {
-      notificationStore.error(t('app.settings.upgrade.invalidFormat'))
+      toastStore.error(t('app.settings.upgrade.invalidFormat'))
       uploadFile.value = null
       input.value = ''
       return
@@ -702,7 +702,7 @@ const onUpgradeFileChange = (event: Event) => {
 
 const uploadUpgradeRelease = async () => {
   if (!uploadFile.value) {
-    notificationStore.error(t('app.settings.upgrade.selectFile'))
+    toastStore.error(t('app.settings.upgrade.selectFile'))
     return
   }
   upgradeUploading.value = true
@@ -723,11 +723,11 @@ const uploadUpgradeRelease = async () => {
 
     if (!response.success) {
       const msg = response.message || 'app.settings.upgrade.uploadFailed'
-      notificationStore.error(te(msg) ? t(msg) : msg)
+      toastStore.error(te(msg) ? t(msg) : msg)
       return
     }
 
-    notificationStore.success(t('app.settings.upgrade.uploadSuccess'))
+    toastStore.success(t('app.settings.upgrade.uploadSuccess'))
     uploadedRelease.value = response.data ?? null
 
     await loadUpgradeReleases()
@@ -741,7 +741,7 @@ const uploadUpgradeRelease = async () => {
     }
   } catch (error) {
     console.error('Failed to upload upgrade release', error)
-    notificationStore.error(t('app.settings.upgrade.uploadFailed'))
+    toastStore.error(t('app.settings.upgrade.uploadFailed'))
   } finally {
     upgradeUploading.value = false
     isValidating.value = false
@@ -751,7 +751,7 @@ const uploadUpgradeRelease = async () => {
 
 const startClusterUpgrade = async (overwriteSameVersion = false) => {
   if (!selectedUpgradeVersion.value) {
-    notificationStore.error(t('app.settings.upgrade.selectVersion'))
+    toastStore.error(t('app.settings.upgrade.selectVersion'))
     return
   }
   upgradeStarting.value = true
@@ -763,12 +763,12 @@ const startClusterUpgrade = async (overwriteSameVersion = false) => {
       overwriteSameVersion,
     })
     if (!createResponse.success || !createResponse.data) {
-      notificationStore.error(createResponse.message || t('app.settings.upgrade.startFailed'))
+      toastStore.error(createResponse.message || t('app.settings.upgrade.startFailed'))
       return
     }
     const startResponse = await upgradesApi.startPlan(createResponse.data.plan.planId)
     if (!startResponse.success || !startResponse.data) {
-      notificationStore.error(startResponse.message || t('app.settings.upgrade.startFailed'))
+      toastStore.error(startResponse.message || t('app.settings.upgrade.startFailed'))
       return
     }
     upgradePlan.value = startResponse.data
@@ -777,11 +777,11 @@ const startClusterUpgrade = async (overwriteSameVersion = false) => {
       'seclab.activeUpgradePlanDetail',
       JSON.stringify(startResponse.data),
     )
-    notificationStore.success(t('app.settings.upgrade.startSuccess'))
+    toastStore.success(t('app.settings.upgrade.startSuccess'))
     router.push({ path: '/upgrade-progress', query: { planId: startResponse.data.plan.planId } })
   } catch (error) {
     console.error('Failed to start upgrade plan', error)
-    notificationStore.error(t('app.settings.upgrade.startFailed'))
+    toastStore.error(t('app.settings.upgrade.startFailed'))
   } finally {
     upgradeStarting.value = false
   }
@@ -853,14 +853,14 @@ const deleteReleaseForVersion = async (version: string) => {
   try {
     const response = await upgradesApi.deleteRelease(version)
     if (response.success) {
-      notificationStore.success(t('app.settings.upgrade.deleteSuccess'))
+      toastStore.success(t('app.settings.upgrade.deleteSuccess'))
       await loadUpgradeReleases()
     } else {
-      notificationStore.error(response.message || t('app.settings.upgrade.deleteFailed'))
+      toastStore.error(response.message || t('app.settings.upgrade.deleteFailed'))
     }
   } catch (error) {
     console.error('Failed to delete release', error)
-    notificationStore.error(t('app.settings.upgrade.deleteFailed'))
+    toastStore.error(t('app.settings.upgrade.deleteFailed'))
   } finally {
     upgradeLoading.value = false
   }

@@ -26,18 +26,21 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 const ACTOR_KIND_HEADER: HeaderName = HeaderName::from_static("x-seclab-actor-kind");
+const ACTOR_USER_ID_HEADER: HeaderName = HeaderName::from_static("x-seclab-actor-user-id");
 const ACTOR_NAME_HEADER: HeaderName = HeaderName::from_static("x-seclab-actor-name");
 const CLIENT_IP_HEADER: HeaderName = HeaderName::from_static("x-seclab-client-ip");
 const TRACE_ID_HEADER: HeaderName = HeaderName::from_static("x-seclab-trace-id");
 
 fn inject_trusted_operation_context(
     headers: &mut HeaderMap,
+    actor_user_id: i64,
     actor_name: &str,
     client_ip: &str,
     trace_id: &str,
 ) {
     for name in [
         &ACTOR_KIND_HEADER,
+        &ACTOR_USER_ID_HEADER,
         &ACTOR_NAME_HEADER,
         &CLIENT_IP_HEADER,
         &TRACE_ID_HEADER,
@@ -45,6 +48,9 @@ fn inject_trusted_operation_context(
         headers.remove(name);
     }
     headers.insert(&ACTOR_KIND_HEADER, HeaderValue::from_static("user"));
+    if let Ok(value) = HeaderValue::from_str(&actor_user_id.to_string()) {
+        headers.insert(&ACTOR_USER_ID_HEADER, value);
+    }
     if let Ok(value) = HeaderValue::from_str(actor_name) {
         headers.insert(&ACTOR_NAME_HEADER, value);
     }
@@ -61,6 +67,7 @@ fn prepare_proxy_headers(parts: &axum::http::request::Parts) -> HeaderMap {
     let Some(admin) = parts.extensions.get::<AuthenticatedAdmin>() else {
         for name in [
             &ACTOR_KIND_HEADER,
+            &ACTOR_USER_ID_HEADER,
             &ACTOR_NAME_HEADER,
             &CLIENT_IP_HEADER,
             &TRACE_ID_HEADER,
@@ -75,7 +82,13 @@ fn prepare_proxy_headers(parts: &axum::http::request::Parts) -> HeaderMap {
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
     let trace_id = logging::resolve_trace_id(&headers);
-    inject_trusted_operation_context(&mut headers, &admin.username, &client_ip, &trace_id);
+    inject_trusted_operation_context(
+        &mut headers,
+        admin.id,
+        &admin.username,
+        &client_ip,
+        &trace_id,
+    );
     headers
 }
 
@@ -87,7 +100,13 @@ fn prepare_websocket_proxy_headers(
     let client_ip = admin.session.client_ip.as_deref().unwrap_or("unknown");
     let trace_id = logging::resolve_trace_id(incoming_headers);
     let mut headers = HeaderMap::new();
-    inject_trusted_operation_context(&mut headers, &admin.username, client_ip, &trace_id);
+    inject_trusted_operation_context(
+        &mut headers,
+        admin.id,
+        &admin.username,
+        client_ip,
+        &trace_id,
+    );
     headers
 }
 
@@ -549,8 +568,9 @@ pub fn agent_router() -> Router<Arc<AppState>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTOR_KIND_HEADER, ACTOR_NAME_HEADER, CLIENT_IP_HEADER, TRACE_ID_HEADER,
-        ensure_proxy_path_allowed, inject_trusted_operation_context, rebuild_scoped_proxy_path,
+        ACTOR_KIND_HEADER, ACTOR_NAME_HEADER, ACTOR_USER_ID_HEADER, CLIENT_IP_HEADER,
+        TRACE_ID_HEADER, ensure_proxy_path_allowed, inject_trusted_operation_context,
+        rebuild_scoped_proxy_path,
     };
     use axum::http::{HeaderMap, HeaderValue};
 
@@ -560,10 +580,11 @@ mod tests {
         headers.insert(&ACTOR_KIND_HEADER, HeaderValue::from_static("system"));
         headers.insert(&ACTOR_NAME_HEADER, HeaderValue::from_static("spoofed"));
 
-        inject_trusted_operation_context(&mut headers, "admin", "192.0.2.10", "trace-1");
+        inject_trusted_operation_context(&mut headers, 1, "admin", "192.0.2.10", "trace-1");
 
         assert_eq!(headers[&ACTOR_KIND_HEADER], "user");
         assert_eq!(headers[&ACTOR_NAME_HEADER], "admin");
+        assert_eq!(headers[&ACTOR_USER_ID_HEADER], "1");
         assert_eq!(headers[&CLIENT_IP_HEADER], "192.0.2.10");
         assert_eq!(headers[&TRACE_ID_HEADER], "trace-1");
     }

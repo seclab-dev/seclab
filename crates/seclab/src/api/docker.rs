@@ -1,11 +1,16 @@
 //! Docker 镜像获取任务 API。
 
-use crate::services::image_acquisition::{ImageDistributionTask, ImageTask};
+use crate::api::auth::AuthenticatedAdmin;
+use crate::services::{
+    image_acquisition::{ImageDistributionTask, ImageTask, ImageTaskActor},
+    logging,
+};
 use crate::state::AppState;
 use crate::types::{ApiResponse, ApiResult};
 use axum::{
     Json, Router,
     extract::{Path, State},
+    http::HeaderMap,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
@@ -119,7 +124,9 @@ fn controller_image_sort_key(image: &ControllerImageSummary) -> String {
 
 /// 校验全部输入后一次性创建镜像批量分发任务。
 pub async fn create_image_distribution_task(
+    admin: AuthenticatedAdmin,
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(payload): Json<CreateImageDistributionTaskRequest>,
 ) -> ApiResult<Response> {
     let image_ref = payload.image_ref.trim().to_string();
@@ -158,9 +165,12 @@ pub async fn create_image_distribution_task(
         }
         targets.push((node.node_id, node.name));
     }
-    let task = state
-        .image_acquisition
-        .start_distribution(Arc::clone(&state), image_ref, targets);
+    let task = state.image_acquisition.start_distribution(
+        Arc::clone(&state),
+        image_ref,
+        targets,
+        image_actor(&admin, &headers)?,
+    );
     Ok(
         ApiResponse::success_with_raw("Image distribution task started", Some(task))
             .into_response(),
@@ -243,7 +253,9 @@ fn find_distribution_task(state: &AppState, task_id: &str) -> ApiResult<ImageDis
 }
 
 pub async fn create_image_task(
+    admin: AuthenticatedAdmin,
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(payload): Json<CreateImageTaskRequest>,
 ) -> ApiResult<Response> {
     let node_id = payload.node_id.trim();
@@ -264,8 +276,30 @@ pub async fn create_image_task(
         Arc::clone(&state),
         node_id.to_string(),
         image_ref.to_string(),
+        Some(image_actor(&admin, &headers)?),
     );
     Ok(ApiResponse::success_with_raw("Image task started", Some(task)).into_response())
+}
+
+fn image_actor(admin: &AuthenticatedAdmin, headers: &HeaderMap) -> ApiResult<ImageTaskActor> {
+    let client_ip = admin
+        .session
+        .client_ip
+        .as_deref()
+        .ok_or_else(|| {
+            seclab_api::error::ApiError::forbidden(
+                ErrorCode::AuthForbidden,
+                "authenticated session is missing a trusted client IP",
+            )
+        })?
+        .parse()
+        .map_err(|_| seclab_api::error::ApiError::internal("trusted client IP is invalid"))?;
+    Ok(ImageTaskActor {
+        user_id: admin.id,
+        name: admin.username.clone(),
+        client_ip,
+        trace_id: logging::resolve_trace_id(headers),
+    })
 }
 
 pub async fn image_task_progress(

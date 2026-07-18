@@ -72,9 +72,9 @@ export const appRegistry = {
     nodeScope: 'explicit-node',
     nodeSwitchPolicy: 'allow',
   },
-  'notification-history': {
+  'notification-center': {
     component: markRaw(
-      defineAsyncComponent(() => import('@/apps/views/NotificationHistoryView.vue')),
+      defineAsyncComponent(() => import('@/apps/views/NotificationCenterView.vue')),
     ),
     title: '',
     i18nTitleKey: '',

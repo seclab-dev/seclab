@@ -5,7 +5,8 @@ import { resetAuthState } from '@/router'
 import { getLoginEntryPath } from '@/utils/login-entry'
 import { useWindowManagerStore, type WindowInstance } from '../../stores/window-manager'
 import type { AppId } from '@/apps/registry'
-import { useNotificationStore } from '../../stores/notification'
+import { useToastStore } from '../../stores/toast'
+import { useNotificationCenterStore } from '../../stores/notification-center'
 import { useConfirmationModalStore } from '../../stores/confirmation-modal'
 import SecLabTooltip from '../ui/SecLabTooltip.vue'
 import AppContextMenu from '../AppContextMenu.vue'
@@ -17,7 +18,8 @@ import { useNodeStore } from '../../stores/node'
 
 const { t } = useI18n()
 const store = useWindowManagerStore()
-const notificationStore = useNotificationStore()
+const toastStore = useToastStore()
+const notificationCenterStore = useNotificationCenterStore()
 const confirmationModal = useConfirmationModalStore()
 const router = useRouter()
 const appLibraryOpen = ref(false)
@@ -61,11 +63,13 @@ function handleBeforeUnload(event: BeforeUnloadEvent) {
 
 onMounted(() => {
   nodeStore.startAutoRefresh()
+  notificationCenterStore.startPolling()
   window.addEventListener('beforeunload', handleBeforeUnload)
 })
 
 onUnmounted(() => {
   nodeStore.stopAutoRefresh()
+  notificationCenterStore.stopPolling()
   window.removeEventListener('beforeunload', handleBeforeUnload)
 })
 
@@ -104,7 +108,7 @@ const suiteAppList = computed(() => appList.value.filter((app) => app.sourceType
 async function handleLogout() {
   const closeBlockMessage = buildCloseBlockMessage()
   if (closeBlockMessage) {
-    notificationStore.error(closeBlockMessage)
+    toastStore.error(closeBlockMessage)
     return
   }
 
@@ -117,12 +121,24 @@ async function handleLogout() {
   if (!confirmed) return
 
   await http.post('/auth/logout')
+  notificationCenterStore.stopPolling(true)
   resetAuthState()
 
   const windowsToClose = [...store.openWindows]
   windowsToClose.forEach((w) => store.closeWindow(w.id))
   window.location.replace(getLoginEntryPath())
 }
+
+/** 打开或聚焦个人通知中心。 */
+function openNotificationCenter() {
+  store.openWindow('notification-center')
+}
+
+const unreadBadge = computed(() => {
+  const count = notificationCenterStore.unreadCount
+  if (count <= 0) return ''
+  return count > 99 ? '99+' : String(count)
+})
 
 /**
  * @description 返回到桌面视图，并确保所有窗口被最小化。
@@ -203,7 +219,7 @@ function handleAddToDesktop() {
   const target = libraryContextMenu.value.target
   if (target) {
     store.addDesktopShortcut(target)
-    notificationStore.info(t('notification.addedToDesktop'))
+    toastStore.info(t('notification.addedToDesktop'))
   }
   closeLibraryContextMenu()
 }
@@ -286,6 +302,25 @@ function isAppOnDesktop(id: AppId | null): boolean {
     </div>
 
     <div class="header-operate">
+      <SecLabTooltip :text="$t('desktop.header.notifications')" position="bottom">
+        <button
+          type="button"
+          class="notification-center-btn"
+          data-ui="desktop-notification-button"
+          :aria-label="$t('desktop.header.notifications')"
+          @click="openNotificationCenter"
+        >
+          <AppIcon
+            :name="store.availableApps['notification-center']?.icon || 'notification-center'"
+            :size="18"
+            :label="$t('desktop.header.notifications')"
+            :decorative="false"
+          />
+          <span v-if="unreadBadge" class="notification-badge" data-slot="unread-badge">
+            {{ unreadBadge }}
+          </span>
+        </button>
+      </SecLabTooltip>
       <SecLabTooltip :text="$t('desktop.header.logout')" position="bottom">
         <button
           type="button"
@@ -700,7 +735,8 @@ function isAppOnDesktop(id: AppId | null): boolean {
   z-index: 1; /* 确保在绝对定位的标题上方 */
 }
 
-.logout-btn {
+.logout-btn,
+.notification-center-btn {
   background: none;
   border: none;
   color: inherit;
@@ -711,10 +747,34 @@ function isAppOnDesktop(id: AppId | null): boolean {
   border-radius: 4px;
   transition: background-color 0.2s;
   line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
 }
 
-.logout-btn:hover {
+.logout-btn:hover,
+.notification-center-btn:hover {
   background-color: var(--sdl-bg-hover);
+}
+
+.notification-badge {
+  position: absolute;
+  top: -5px;
+  right: -7px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--sdl-radius-pill);
+  background: var(--sdl-danger);
+  color: var(--sdl-text-on-danger);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
 }
 
 .library-panel-overlay {

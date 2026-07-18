@@ -11,8 +11,11 @@ use seclab_contracts::{
     logging::{OperationLogDetail, OperationLogPage, OperationLogQuery, OperationLogSummary},
     monitoring::{SystemMonitoringOverview, SystemMonitoringSeriesPage, SystemMonitoringSettings},
     notification::{
-        NotificationBatchDeletePayload, NotificationCreatePayload, NotificationLevel,
-        NotificationList, NotificationQuery, NotificationRecord,
+        NotificationAction, NotificationArchiveScope, NotificationArchiveStateRequest,
+        NotificationBatchArchiveStateRequest, NotificationCapabilities, NotificationCategory,
+        NotificationCode, NotificationDetail, NotificationPage, NotificationQuery,
+        NotificationReadFilter, NotificationReadStateRequest, NotificationSeverity,
+        NotificationSource, NotificationSubject, NotificationSummary, NotificationUnreadSummary,
     },
     process::{
         NetworkConnectionListPage, ProcessActionRequest, ProcessForceKillConfirmation,
@@ -85,12 +88,23 @@ fn export_contract_bindings() {
     export_type::<SystemMonitoringOverview>(&cfg);
     export_type::<SystemMonitoringSeriesPage>(&cfg);
     export_type::<SystemMonitoringSettings>(&cfg);
-    export_type::<NotificationLevel>(&cfg);
-    export_type::<NotificationRecord>(&cfg);
-    export_type::<NotificationCreatePayload>(&cfg);
+    export_type::<NotificationCode>(&cfg);
+    export_type::<NotificationCategory>(&cfg);
+    export_type::<NotificationSeverity>(&cfg);
+    export_type::<NotificationArchiveScope>(&cfg);
+    export_type::<NotificationReadFilter>(&cfg);
+    export_type::<NotificationSource>(&cfg);
+    export_type::<NotificationSubject>(&cfg);
+    export_type::<NotificationAction>(&cfg);
+    export_type::<NotificationCapabilities>(&cfg);
+    export_type::<NotificationSummary>(&cfg);
+    export_type::<NotificationDetail>(&cfg);
     export_type::<NotificationQuery>(&cfg);
-    export_type::<NotificationBatchDeletePayload>(&cfg);
-    export_type::<NotificationList>(&cfg);
+    export_type::<NotificationPage>(&cfg);
+    export_type::<NotificationUnreadSummary>(&cfg);
+    export_type::<NotificationReadStateRequest>(&cfg);
+    export_type::<NotificationArchiveStateRequest>(&cfg);
+    export_type::<NotificationBatchArchiveStateRequest>(&cfg);
     export_type::<ProcessListPage>(&cfg);
     export_type::<NetworkConnectionListPage>(&cfg);
     export_type::<ProcessActionRequest>(&cfg);

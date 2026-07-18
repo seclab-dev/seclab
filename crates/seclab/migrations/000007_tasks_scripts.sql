@@ -15,6 +15,8 @@ CREATE TABLE scheduled_tasks (
     owner_id TEXT,
     owner_name TEXT,
     manager_path TEXT,
+    created_by_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    created_by_name TEXT NOT NULL,
     revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0),
     deployment_status TEXT NOT NULL CHECK(deployment_status IN (
         'pending', 'applying', 'ready', 'waiting_for_node', 'failed', 'deleting', 'migrating'

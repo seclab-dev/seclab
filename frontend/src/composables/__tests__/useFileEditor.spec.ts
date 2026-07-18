@@ -18,7 +18,7 @@ const notifications = vi.hoisted(() => ({
 }))
 
 vi.mock('@/api/modules/fs', () => ({ fsApi: { forNode: api.forNode } }))
-vi.mock('@/stores/notification', () => ({ useNotificationStore: () => notifications }))
+vi.mock('@/stores/toast', () => ({ useToastStore: () => notifications }))
 
 const capabilities: FileDocument['capabilities'] = {
   canOpen: true,

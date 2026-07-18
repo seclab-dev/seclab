@@ -9,7 +9,7 @@ import { useI18n } from 'vue-i18n'
 import type { CreateDiskOperationRequest, DiskPartition, DiskSummary } from '@/api/modules/disks'
 import { useDiskManager } from '@/composables/useDiskManager'
 import { useNodeStore } from '@/stores/node'
-import { useNotificationStore } from '@/stores/notification'
+import { useToastStore } from '@/stores/toast'
 import { useWindowManagerStore } from '@/stores/window-manager'
 import { formatBytes } from '@/utils/units'
 import {
@@ -36,7 +36,7 @@ const props = defineProps<{
 
 const { t } = useI18n()
 const nodeStore = useNodeStore()
-const notifications = useNotificationStore()
+const notifications = useToastStore()
 const windowStore = useWindowManagerStore()
 const targetNodeId =
   typeof props.payload?.nodeId === 'string' && props.payload.nodeId

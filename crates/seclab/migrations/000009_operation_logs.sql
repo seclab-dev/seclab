@@ -1,4 +1,4 @@
--- 操作审计事件与通知历史。
+-- 操作审计事件与个人通知中心。
 CREATE TABLE operation_logs (
     event_id TEXT PRIMARY KEY,
     occurred_at TEXT NOT NULL,
@@ -36,17 +36,34 @@ CREATE INDEX idx_operation_logs_origin_occurred
     ON operation_logs (origin_node_id, occurred_at DESC, event_id DESC);
 CREATE INDEX idx_operation_logs_trace_id ON operation_logs (trace_id);
 
-CREATE TABLE IF NOT EXISTS notification_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    level TEXT NOT NULL,
-    title TEXT, -- 通知标题，用于未来区分标题与正文。
-    message TEXT NOT NULL,
-    message_key TEXT, -- 国际化消息键，套件或主控可用该字段延迟渲染文案。
-    payload_json TEXT NOT NULL DEFAULT '{}', -- 通知渲染与跳转所需的结构化参数。
-    source TEXT NOT NULL DEFAULT 'seclab', -- 通知来源，例如主控、Agent 或套件。
-    read_at INTEGER, -- 用户读取通知的时间戳，空值表示未读。
-    metadata TEXT NOT NULL DEFAULT '{}', -- 预留扩展字段，避免为展示上下文频繁新增列。
-    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+CREATE TABLE user_notifications (
+    notification_id TEXT PRIMARY KEY,
+    recipient_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    operation_event_id TEXT NOT NULL REFERENCES operation_logs(event_id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    code TEXT NOT NULL,
+    category TEXT NOT NULL CHECK (category IN ('task', 'security', 'system')),
+    severity TEXT NOT NULL CHECK (severity IN ('success', 'info', 'warning', 'error')),
+    outcome TEXT CHECK (outcome IS NULL OR outcome IN ('success', 'failure', 'partial', 'canceled', 'timedOut')),
+    source_module TEXT NOT NULL,
+    source_node_id TEXT,
+    source_node_name TEXT,
+    subject_kind TEXT,
+    subject_id TEXT,
+    subject_display_name TEXT,
+    task_id TEXT,
+    parameters_json TEXT NOT NULL DEFAULT '{}',
+    error_code TEXT,
+    error_summary TEXT,
+    trace_id TEXT NOT NULL,
+    read_at TEXT,
+    archived_at TEXT,
+    state_changed_at TEXT NOT NULL,
+    UNIQUE (recipient_user_id, operation_event_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_notification_history_created_at ON notification_history (created_at DESC);
+CREATE INDEX idx_user_notifications_recipient_archive_created
+    ON user_notifications (recipient_user_id, archived_at, created_at DESC, notification_id DESC);
+CREATE INDEX idx_user_notifications_recipient_unread
+    ON user_notifications (recipient_user_id, created_at DESC, notification_id DESC)
+    WHERE read_at IS NULL AND archived_at IS NULL;

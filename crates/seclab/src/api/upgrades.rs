@@ -69,7 +69,8 @@ pub async fn create_plan(
     admin: AuthenticatedAdmin,
     Json(payload): Json<UpgradePlanCreatePayload>,
 ) -> ApiResult<Response> {
-    let detail = upgrades::create_plan(&state.metadata_db, payload, &admin.username).await?;
+    let detail =
+        upgrades::create_plan(&state.metadata_db, payload, admin.id, &admin.username).await?;
     Ok(ApiResponse::success_with_raw("Upgrade plan created", Some(detail)).into_response())
 }
 

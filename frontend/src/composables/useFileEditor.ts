@@ -4,7 +4,7 @@
  */
 import type { Ref } from 'vue'
 import { fsApi } from '@/api/modules/fs'
-import { useNotificationStore } from '@/stores/notification'
+import { useToastStore } from '@/stores/toast'
 import { useI18n } from 'vue-i18n'
 import type { FileDocument } from '@/api/generated'
 
@@ -45,7 +45,7 @@ interface LoadOptions {
 
 /** 提供单个固定节点上的文件编辑状态操作。 */
 export function useFileEditor(nodeId: Readonly<Ref<string>>) {
-  const notificationStore = useNotificationStore()
+  const toastStore = useToastStore()
   const { t } = useI18n()
 
   /** 将服务端文档事实写入标签，同时保留保存期间产生的新输入。 */
@@ -92,7 +92,7 @@ export function useFileEditor(nodeId: Readonly<Ref<string>>) {
         if (wasLoaded) {
           tab.loadState = 'stale'
           tab.refreshWarning = message
-          notificationStore.warning(t('app.fileEditor.refreshFailed', { message }))
+          toastStore.warning(t('app.fileEditor.refreshFailed', { message }))
         } else {
           tab.loadState = 'initialError'
           tab.loadError = message
@@ -116,7 +116,7 @@ export function useFileEditor(nodeId: Readonly<Ref<string>>) {
       if (wasLoaded) {
         tab.loadState = 'stale'
         tab.refreshWarning = message
-        notificationStore.warning(t('app.fileEditor.refreshFailed', { message }))
+        toastStore.warning(t('app.fileEditor.refreshFailed', { message }))
       } else {
         tab.loadState = 'initialError'
         tab.loadError = message
@@ -147,7 +147,7 @@ export function useFileEditor(nodeId: Readonly<Ref<string>>) {
         applyDocument(tab, response.data, savedSnapshot)
         tab.saveState = 'idle'
         tab.saveError = undefined
-        notificationStore.success(t('app.fileEditor.saveReconciled'))
+        toastStore.success(t('app.fileEditor.saveReconciled'))
         return true
       }
     } catch {
@@ -156,7 +156,7 @@ export function useFileEditor(nodeId: Readonly<Ref<string>>) {
     if (requestSequence === tab.saveSequence) {
       tab.saveState = 'failed'
       tab.saveError = t('app.fileEditor.saveOutcomeUnknown')
-      notificationStore.warning(tab.saveError)
+      toastStore.warning(tab.saveError)
     }
     return false
   }
@@ -207,7 +207,7 @@ export function useFileEditor(nodeId: Readonly<Ref<string>>) {
         if (response.errorCode === 'FILE_CHANGED') {
           tab.saveState = 'conflict'
           tab.saveError = message
-          notificationStore.warning(t('app.fileEditor.conflictDetected'))
+          toastStore.warning(t('app.fileEditor.conflictDetected'))
           return false
         }
         if (isAmbiguousFailure(response.code, response.errorCode)) {
@@ -215,7 +215,7 @@ export function useFileEditor(nodeId: Readonly<Ref<string>>) {
         }
         tab.saveState = 'failed'
         tab.saveError = message
-        notificationStore.error(t('app.fileEditor.saveFailed', { message }))
+        toastStore.error(t('app.fileEditor.saveFailed', { message }))
         return false
       }
 
@@ -224,9 +224,9 @@ export function useFileEditor(nodeId: Readonly<Ref<string>>) {
       tab.saveError = undefined
       tab.durability = response.data.durability
       if (response.data.durability === 'uncertain') {
-        notificationStore.warning(t('app.fileEditor.durabilityUncertain'))
+        toastStore.warning(t('app.fileEditor.durabilityUncertain'))
       } else {
-        notificationStore.success(t('app.fileEditor.saveSuccess'))
+        toastStore.success(t('app.fileEditor.saveSuccess'))
       }
       return true
     } catch {

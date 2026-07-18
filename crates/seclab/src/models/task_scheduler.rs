@@ -59,6 +59,8 @@ pub struct ScheduledTaskRow {
     pub owner_id: Option<String>,
     pub owner_name: Option<String>,
     pub manager_path: Option<String>,
+    pub created_by_user_id: i64,
+    pub created_by_name: String,
     pub revision: i64,
     pub deployment_status: String,
     pub deployment_error_summary: Option<String>,
@@ -145,6 +147,7 @@ const TASK_SELECT: &str = r#"
            CASE WHEN t.node_id = 'local' THEN 'online' ELSE COALESCE(n.status, 'offline') END AS node_status,
            t.command, t.cron_expr, t.time_zone, t.desired_state, t.timeout_seconds,
            t.prevent_overlap, t.ownership_kind, t.owner_id, t.owner_name, t.manager_path,
+           t.created_by_user_id, t.created_by_name,
            t.revision, t.deployment_status, t.deployment_error_summary, t.last_synced_at,
            t.next_run_status, t.next_run_at, t.last_run_id,
            lr.status AS last_run_status, lr.finished_at AS last_run_finished_at,
@@ -238,8 +241,8 @@ pub async fn create_task(
         r#"INSERT INTO scheduled_tasks (
             task_id, name, name_key, description, node_id, command, cron_expr, time_zone,
             desired_state, timeout_seconds, prevent_overlap, ownership_kind, revision,
-            deployment_status, next_run_status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'custom', 1, 'pending', 'not_deployed', ?, ?)"#,
+            created_by_user_id, created_by_name, deployment_status, next_run_status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'custom', 1, ?, ?, 'pending', 'not_deployed', ?, ?)"#,
     )
     .bind(&task_id)
     .bind(request.name.trim())
@@ -256,6 +259,8 @@ pub async fn create_task(
     })
     .bind(i64::from(request.timeout_seconds))
     .bind(request.prevent_overlap)
+    .bind(actor.user_id)
+    .bind(&actor.name)
     .bind(&now)
     .bind(&now)
     .execute(&mut *tx)
@@ -475,11 +480,16 @@ pub async fn create_run(
     }
     let run_id = uuid::Uuid::now_v7().to_string();
     let now = now_string();
+    let actor_user_id = actor.map_or(task.created_by_user_id, |value| value.user_id);
+    let actor_name = actor.map_or(task.created_by_name.as_str(), |value| value.name.as_str());
+    let client_ip = actor.map_or("127.0.0.1", |value| value.client_ip.as_str());
+    let trace_id = actor
+        .map(|value| value.trace_id.clone())
+        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
     let result = sqlx::query("INSERT INTO scheduled_task_runs (run_id, task_id, node_id, trigger_source, status, phase, queued_at, overlap_guard, actor_user_id, actor_name, client_ip, trace_id, created_at, updated_at) VALUES (?, ?, ?, ?, 'queued', 'queued', ?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(&run_id).bind(task_id).bind(&task.node_id).bind(trigger_source_text(trigger))
         .bind(&now).bind(task.prevent_overlap.then_some(task_id))
-        .bind(actor.map(|value| value.user_id)).bind(actor.map(|value| value.name.as_str()))
-        .bind(actor.map(|value| value.client_ip.as_str())).bind(actor.map(|value| value.trace_id.as_str()))
+        .bind(actor_user_id).bind(actor_name).bind(client_ip).bind(trace_id)
         .bind(&now).bind(&now).execute(pool).await;
     if let Err(error) = result {
         if is_unique_violation(&error) {
@@ -1236,6 +1246,15 @@ mod tests {
         CreateScheduledTaskRequest, ScheduledTaskRunOutputSummary,
     };
 
+    async fn setup_pool() -> DbPool {
+        let pool = crate::test_support::setup_test_db().await;
+        sqlx::query("INSERT INTO users (id, username, password_hash) VALUES (1, 'tester', 'hash')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool
+    }
+
     fn actor() -> OperationActor {
         OperationActor {
             user_id: 1,
@@ -1285,7 +1304,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_is_custom_only_paginated_and_name_is_case_insensitive_unique() {
-        let pool = crate::test_support::setup_test_db().await;
+        let pool = setup_pool().await;
         let (first, _) = create_task(&pool, &request("Alpha"), &actor())
             .await
             .unwrap();
@@ -1320,7 +1339,7 @@ mod tests {
 
     #[tokio::test]
     async fn overlap_guard_and_remove_protection_cover_manual_runs() {
-        let pool = crate::test_support::setup_test_db().await;
+        let pool = setup_pool().await;
         let task = ready_task(&pool, "Overlap").await;
         create_run(
             &pool,
@@ -1347,7 +1366,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_report_enforces_node_and_monotonic_status() {
-        let pool = crate::test_support::setup_test_db().await;
+        let pool = setup_pool().await;
         let task = ready_task(&pool, "Report").await;
         let queued = create_run(
             &pool,
@@ -1422,7 +1441,7 @@ mod tests {
 
     #[tokio::test]
     async fn queued_remove_cancellation_restores_tombstone() {
-        let pool = crate::test_support::setup_test_db().await;
+        let pool = setup_pool().await;
         let task = ready_task(&pool, "Cancelable Remove").await;
         let remove = request_remove(&pool, &task.task_id, &actor())
             .await

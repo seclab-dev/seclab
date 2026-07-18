@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS docker_compose_project_tasks (
     replicas INTEGER CHECK (replicas IS NULL OR replicas >= 0),
     pull_images INTEGER NOT NULL DEFAULT 0 CHECK (pull_images IN (0, 1)),
     actor_kind TEXT NOT NULL CHECK (actor_kind IN ('user', 'system')),
+    actor_user_id INTEGER,
     actor_name TEXT NOT NULL,
     client_ip TEXT,
     trace_id TEXT,
