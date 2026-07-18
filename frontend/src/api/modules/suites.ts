@@ -20,12 +20,18 @@ export const suitesApi = {
     )
   },
   fetchInstallProgress: (taskId: string) => {
-    return http.get<suites.SuiteInstallProgress>(
+    return http.get<suites.SuiteInstallTaskResponse>(
       `/suite-install-tasks/${encodeURIComponent(taskId)}/progress`,
     )
   },
+  fetchInstallTasks: (nodeId: string, activeOnly = true) => {
+    return http.get<suites.SuiteInstallTaskResponse[]>('/suite-install-tasks/list', {
+      nodeId,
+      activeOnly,
+    })
+  },
   cancelInstall: (taskId: string) => {
-    return http.post<suites.SuiteInstallProgress>(
+    return http.post<suites.SuiteInstallTaskResponse>(
       `/suite-install-tasks/${encodeURIComponent(taskId)}/cancel`,
     )
   },

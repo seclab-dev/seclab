@@ -151,6 +151,15 @@ const menuItems = computed(() => [
 ])
 
 const activeMenu = ref('about')
+const implementedMenuKeys = new Set([
+  'about',
+  'monitoring',
+  'network',
+  'security',
+  'upgrade',
+  'language',
+  'theme',
+])
 
 const releaseColumns = computed<SecLabTableColumn[]>(() => [
   { prop: 'version', label: t('app.settings.upgrade.version'), minWidth: 120, align: 'center' },
@@ -598,18 +607,24 @@ onBeforeUnmount(stopUpgradeRefreshTimer)
     </div>
 
     <div class="content" data-slot="content">
-      <div v-if="activeMenu === 'monitoring'" class="section">
-        <SystemMonitoringSettings @busy-change="monitoringBusy = $event" />
-      </div>
+      <KeepAlive>
+        <SystemMonitoringSettings
+          v-if="activeMenu === 'monitoring'"
+          class="section"
+          @busy-change="monitoringBusy = $event"
+        />
+      </KeepAlive>
 
-      <div v-else-if="activeMenu === 'network'" class="section">
+      <KeepAlive>
         <NetworkSettings
+          v-if="activeMenu === 'network'"
+          class="section"
           @busy-change="networkBusy = $event"
           @dirty-change="networkDirty = $event"
         />
-      </div>
+      </KeepAlive>
 
-      <div v-else-if="activeMenu === 'security'" class="section">
+      <div v-if="activeMenu === 'security'" class="section">
         <SecLabCard class="card" shadow="never">
           <template #header>
             <h2 class="section-title">{{ t('app.settings.security.label') }}</h2>
@@ -710,15 +725,15 @@ onBeforeUnmount(stopUpgradeRefreshTimer)
         </SecLabCard>
       </div>
 
-      <div v-else-if="activeMenu === 'language'" class="section">
+      <div v-if="activeMenu === 'language'" class="section">
         <PersonalizationSettings kind="language" />
       </div>
 
-      <div v-else-if="activeMenu === 'theme'" class="section">
+      <div v-if="activeMenu === 'theme'" class="section">
         <PersonalizationSettings kind="theme" />
       </div>
 
-      <div v-else-if="activeMenu === 'upgrade'" class="section">
+      <div v-if="activeMenu === 'upgrade'" class="section">
         <SecLabCard class="card" shadow="never">
           <template #header>
             <h2 class="section-title">{{ t('app.settings.upgrade.label') }}</h2>
@@ -924,11 +939,15 @@ onBeforeUnmount(stopUpgradeRefreshTimer)
         </SecLabCard>
       </div>
 
-      <div v-else-if="activeMenu === 'about'" class="section">
-        <AboutSettings @busy-change="aboutBusy = $event" />
-      </div>
+      <KeepAlive>
+        <AboutSettings
+          v-if="activeMenu === 'about'"
+          class="section"
+          @busy-change="aboutBusy = $event"
+        />
+      </KeepAlive>
 
-      <div v-else class="section">
+      <div v-if="!implementedMenuKeys.has(activeMenu)" class="section">
         <SecLabCard class="card" shadow="never">
           <SecLabEmpty :description="t('app.settings.wip')" />
         </SecLabCard>

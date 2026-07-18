@@ -6,14 +6,16 @@ use crate::models::desktop_apps::{delete_desktop_apps, hide_suite_desktop_apps};
 use crate::models::logging::LogModule;
 use crate::models::node_runtime_client::AgentOperationContext;
 use crate::models::suites::{
-    SuiteAppEntryManifest, SuiteAppEntryRecord, SuiteInstanceSummary, SuiteManifest,
-    SuitePackageFile, SuitePackageSnapshot, delete_catalog_item, delete_instance,
-    delete_instance_app_entries, fetch_catalog_payload, fetch_instance,
-    fetch_instance_by_suite_and_node, insert_instance, list_suites, replace_instance_app_entries,
-    suite_has_instances, update_instance_status, upsert_catalog_item,
+    SuiteAppEntryManifest, SuiteAppEntryRecord, SuiteInstallTaskRecord, SuiteInstanceSummary,
+    SuiteManifest, SuitePackageFile, SuitePackageSnapshot, delete_catalog_item, delete_instance,
+    delete_instance_app_entries, fetch_catalog_payload, fetch_install_task, fetch_instance,
+    fetch_instance_by_suite_and_node, insert_install_task, insert_instance,
+    install_task_cancel_requested, list_install_tasks, list_suites, mark_install_task_canceling,
+    mark_install_task_recovery_pending, replace_instance_app_entries, suite_has_instances,
+    update_install_task, update_instance_status, upsert_catalog_item,
 };
 use crate::services::logging::{self, OperationEventBuilder};
-use crate::state::AppState;
+use crate::state::{AppState, DbPool};
 use crate::types::{ApiError, ApiResponse, ApiResult, new_uuid_v7};
 use axum::body::Body;
 use axum::extract::{Multipart, OriginalUri, Path, Query, State, connect_info::ConnectInfo};
@@ -27,10 +29,10 @@ use flate2::read::GzDecoder;
 use ring::digest;
 use seclab_contracts::types::DockerStatusSummary;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::io::{Cursor, Read};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::Arc;
 
 const MAX_SUITE_PACKAGE_BYTES: usize = 50 * 1024 * 1024;
 const MAX_SUITE_UNPACKED_BYTES: usize = 50 * 1024 * 1024;
@@ -38,8 +40,6 @@ const SUITE_PACKAGE_EXTENSION: &str = ".slsp";
 const MIN_SUITE_ICON_SIZE: u32 = 128;
 const SUITE_DELETE_BLOCKED_MESSAGE_KEY: &str =
     "app.suiteCenter.messages.deleteBlockedByInstalledInstances";
-static SUITE_INSTALL_SESSIONS: LazyLock<Mutex<HashMap<String, SuiteInstallProgress>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// 构建套件中心路由集合。
 pub fn suites_router() -> Router<Arc<AppState>> {
@@ -69,6 +69,7 @@ pub fn suite_instances_router() -> Router<Arc<AppState>> {
 /// 构建套件安装任务路由集合。
 pub fn suite_install_tasks_router() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/list", get(list_install_task_progress))
         .route("/{task_id}/progress", get(install_progress))
         .route("/{task_id}/cancel", post(cancel_install))
 }
@@ -87,28 +88,13 @@ pub struct SuiteListQuery {
     pub node_id: Option<String>,
 }
 
-/// 启动套件安装任务后的返回数据。
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// 安装任务列表查询参数。
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SuiteInstallTaskResponse {
-    pub task_id: String,
-    pub instance_id: String,
-}
-
-/// 套件安装任务的实时进度状态。
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SuiteInstallProgress {
-    pub task_id: String,
-    pub instance_id: String,
-    pub node_id: String,
-    pub progress_percent: u32,
-    pub status: String,
-    pub current_step: String,
-    pub current_image: Option<String>,
-    pub is_finished: bool,
-    pub error: Option<String>,
-    pub cancel_requested: bool,
+pub struct SuiteInstallTaskListQuery {
+    pub node_id: Option<String>,
+    #[serde(default)]
+    pub active_only: bool,
 }
 
 /// 套件安装任务路径参数。
@@ -505,18 +491,30 @@ pub async fn install_suite(
         app_entries: manifest.app_entries,
     };
 
-    upsert_install_progress(SuiteInstallProgress {
+    let install_task = SuiteInstallTaskRecord {
         task_id: task_id.clone(),
         instance_id: instance_id.clone(),
+        suite_id: manifest.metadata.suite_id.clone(),
         node_id: node_id.clone(),
-        progress_percent: 1,
+        progress_percent: 1_i64,
         status: "queued".to_string(),
         current_step: "queued".to_string(),
         current_image: None,
         is_finished: false,
         error: None,
         cancel_requested: false,
-    });
+        recovery_started_at: None,
+        created_at: String::new(),
+        updated_at: String::new(),
+        finished_at: None,
+    };
+    if let Err(err) = insert_install_task(&state.metadata_db, &install_task).await {
+        let _ = delete_instance(&state.metadata_db, &instance_id).await;
+        return Err(err.into());
+    }
+    let install_task = fetch_install_task(&state.metadata_db, &task_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
 
     let state_for_task = Arc::clone(&state);
     let task_id_for_task = task_id.clone();
@@ -535,10 +533,6 @@ pub async fn install_suite(
         .await;
     });
 
-    let data = SuiteInstallTaskResponse {
-        task_id: task_id.clone(),
-        instance_id: instance_id.clone(),
-    };
     finish_suite_platform_log(
         &state,
         &ctx,
@@ -560,7 +554,21 @@ pub async fn install_suite(
             error: None,
         },
     );
-    Ok(ApiResponse::success_with_raw("Suite install task started", data).into_response())
+    Ok(ApiResponse::success_with_raw("Suite install task started", install_task).into_response())
+}
+
+/// 查询节点上的套件安装任务，供应用恢复后台进度。
+pub async fn list_install_task_progress(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SuiteInstallTaskListQuery>,
+) -> ApiResult<Response> {
+    let tasks = list_install_tasks(
+        &state.metadata_db,
+        query.node_id.as_deref(),
+        query.active_only,
+    )
+    .await?;
+    Ok(ApiResponse::success_with_raw("Suite install tasks loaded", tasks).into_response())
 }
 
 /// 查询套件安装任务的实时进度。
@@ -568,25 +576,64 @@ pub async fn install_progress(
     State(state): State<Arc<AppState>>,
     Path(path): Path<SuiteInstallTaskPath>,
 ) -> ApiResult<Response> {
-    let mut progress = {
-        let sessions = SUITE_INSTALL_SESSIONS.lock().unwrap();
-        sessions.get(&path.task_id).cloned()
-    }
-    .ok_or(ApiError::NotFound)?;
+    let mut progress = fetch_install_task(&state.metadata_db, &path.task_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
 
-    if !progress.is_finished
-        && let Ok(client) =
+    if !progress.is_finished {
+        let mut recovered = false;
+        if let Ok(client) =
             NodeRuntimeClient::from_node_route(&state.metadata_db, Some(&progress.node_id)).await
-    {
-        let path = format!(
-            "/api/v1/agent/docker/suites/install-progress?instanceId={}",
-            progress.instance_id
-        );
-        if let Ok(agent_response) = client.get_json::<serde_json::Value>(&path).await
-            && let Some(agent_progress) = parse_agent_install_progress(&agent_response, &progress)
         {
-            progress = agent_progress;
-            upsert_install_progress(progress.clone());
+            let path = format!(
+                "/api/v1/agent/docker/suites/install-progress?instanceId={}",
+                progress.instance_id
+            );
+            if let Ok(agent_response) = client.get_json::<serde_json::Value>(&path).await
+                && let Some(agent_progress) =
+                    parse_agent_install_progress(&agent_response, &progress)
+            {
+                progress = agent_progress;
+                persist_install_progress(&state.metadata_db, &progress).await?;
+                reconcile_recovered_install(&state.metadata_db, &progress).await?;
+                recovered = true;
+            }
+        }
+
+        if !recovered {
+            progress = mark_install_task_recovery_pending(&state.metadata_db, &progress.task_id)
+                .await?
+                .ok_or(ApiError::NotFound)?;
+        }
+
+        if !recovered
+            && progress
+                .recovery_started_at
+                .as_deref()
+                .is_some_and(is_install_recovery_expired)
+        {
+            const RECOVERY_ERROR: &str = "Master 重启后两分钟内未能从 Agent 恢复安装任务";
+            update_instance_status(
+                &state.metadata_db,
+                &progress.instance_id,
+                "error",
+                Some(RECOVERY_ERROR),
+            )
+            .await?;
+            update_install_task(
+                &state.metadata_db,
+                &progress.task_id,
+                u32::try_from(progress.progress_percent).unwrap_or(0),
+                "failed",
+                "recovery_failed",
+                progress.current_image.clone(),
+                true,
+                Some(RECOVERY_ERROR.to_string()),
+            )
+            .await?;
+            progress = fetch_install_task(&state.metadata_db, &path.task_id)
+                .await?
+                .ok_or(ApiError::NotFound)?;
         }
     }
 
@@ -602,7 +649,9 @@ pub async fn cancel_install(
     Path(path): Path<SuiteInstallTaskPath>,
 ) -> ApiResult<Response> {
     let ctx = SuiteAuditContext::from_request(&admin, &headers, conn);
-    let progress = mark_install_canceling(&path.task_id).ok_or(ApiError::NotFound)?;
+    let progress = mark_install_task_canceling(&state.metadata_db, &path.task_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
     if progress.is_finished {
         finish_suite_platform_log(
             &state,
@@ -651,18 +700,18 @@ pub async fn cancel_install(
 
     let _ = delete_instance(&state.metadata_db, &progress.instance_id).await;
     update_install_progress(
+        &state.metadata_db,
         &path.task_id,
-        progress.progress_percent,
+        u32::try_from(progress.progress_percent).unwrap_or(100),
         "canceled",
         "canceled",
         progress.current_image,
         true,
         None,
-    );
-    let sessions = SUITE_INSTALL_SESSIONS.lock().unwrap();
-    let canceled = sessions
-        .get(&path.task_id)
-        .cloned()
+    )
+    .await;
+    let canceled = fetch_install_task(&state.metadata_db, &path.task_id)
+        .await?
         .ok_or(ApiError::NotFound)?;
     finish_suite_platform_log(
         &state,
@@ -694,9 +743,19 @@ async fn run_suite_install_task(
     request: AgentSuiteInstallRequest,
     audit_ctx: SuiteAuditContext,
 ) {
-    if is_install_cancel_requested(&task_id) {
+    if is_install_cancel_requested(&state.metadata_db, &task_id).await {
         let _ = delete_instance(&state.metadata_db, &instance_id).await;
-        update_install_progress(&task_id, 100, "canceled", "canceled", None, true, None);
+        update_install_progress(
+            &state.metadata_db,
+            &task_id,
+            100,
+            "canceled",
+            "canceled",
+            None,
+            true,
+            None,
+        )
+        .await;
         finish_suite_install_task_log(
             &state,
             &audit_ctx,
@@ -711,13 +770,24 @@ async fn run_suite_install_task(
         );
         return;
     }
-    update_install_progress(&task_id, 5, "running", "prepare", None, false, None);
+    update_install_progress(
+        &state.metadata_db,
+        &task_id,
+        5,
+        "running",
+        "prepare",
+        None,
+        false,
+        None,
+    )
+    .await;
 
     if let Err(err) = prewarm_suite_images(Arc::clone(&state), &task_id, &node_id, &request).await {
         let detail = err.to_string();
-        let canceled = is_install_cancel_requested(&task_id);
+        let canceled = is_install_cancel_requested(&state.metadata_db, &task_id).await;
         let _ = delete_instance(&state.metadata_db, &instance_id).await;
         update_install_progress(
+            &state.metadata_db,
             &task_id,
             if canceled { 100 } else { 40 },
             if canceled { "canceled" } else { "failed" },
@@ -725,7 +795,8 @@ async fn run_suite_install_task(
             None,
             true,
             (!canceled).then_some(detail.clone()),
-        );
+        )
+        .await;
         finish_suite_install_task_log(
             &state,
             &audit_ctx,
@@ -744,7 +815,17 @@ async fn run_suite_install_task(
         );
         return;
     }
-    update_install_progress(&task_id, 40, "running", "start_services", None, false, None);
+    update_install_progress(
+        &state.metadata_db,
+        &task_id,
+        40,
+        "running",
+        "start_services",
+        None,
+        false,
+        None,
+    )
+    .await;
 
     let client = match NodeRuntimeClient::from_node_route(&state.metadata_db, Some(&node_id)).await
     {
@@ -753,6 +834,7 @@ async fn run_suite_install_task(
             let detail = err.to_string();
             let _ = delete_instance(&state.metadata_db, &instance_id).await;
             update_install_progress(
+                &state.metadata_db,
                 &task_id,
                 100,
                 "failed",
@@ -760,7 +842,8 @@ async fn run_suite_install_task(
                 None,
                 true,
                 Some(detail.clone()),
-            );
+            )
+            .await;
             finish_suite_install_task_log(
                 &state,
                 &audit_ctx,
@@ -790,8 +873,20 @@ async fn run_suite_install_task(
             let detail = err.to_string();
             compensate_failed_install(&client, &request, &instance_id, &audit_ctx).await;
             let _ = delete_instance(&state.metadata_db, &instance_id).await;
-            if is_install_cancel_requested(&task_id) || is_install_canceled_error(&detail) {
-                update_install_progress(&task_id, 100, "canceled", "canceled", None, true, None);
+            if is_install_cancel_requested(&state.metadata_db, &task_id).await
+                || is_install_canceled_error(&detail)
+            {
+                update_install_progress(
+                    &state.metadata_db,
+                    &task_id,
+                    100,
+                    "canceled",
+                    "canceled",
+                    None,
+                    true,
+                    None,
+                )
+                .await;
                 finish_suite_install_task_log(
                     &state,
                     &audit_ctx,
@@ -806,6 +901,7 @@ async fn run_suite_install_task(
                 );
             } else {
                 update_install_progress(
+                    &state.metadata_db,
                     &task_id,
                     100,
                     "failed",
@@ -813,11 +909,12 @@ async fn run_suite_install_task(
                     None,
                     true,
                     Some(detail),
-                );
-                let progress = {
-                    let sessions = SUITE_INSTALL_SESSIONS.lock().unwrap();
-                    sessions.get(&task_id).cloned()
-                };
+                )
+                .await;
+                let progress = fetch_install_task(&state.metadata_db, &task_id)
+                    .await
+                    .ok()
+                    .flatten();
                 finish_suite_install_task_log(
                     &state,
                     &audit_ctx,
@@ -834,9 +931,19 @@ async fn run_suite_install_task(
             return;
         }
     };
-    if is_install_cancel_requested(&task_id) {
+    if is_install_cancel_requested(&state.metadata_db, &task_id).await {
         let _ = delete_instance(&state.metadata_db, &instance_id).await;
-        update_install_progress(&task_id, 100, "canceled", "canceled", None, true, None);
+        update_install_progress(
+            &state.metadata_db,
+            &task_id,
+            100,
+            "canceled",
+            "canceled",
+            None,
+            true,
+            None,
+        )
+        .await;
         finish_suite_install_task_log(
             &state,
             &audit_ctx,
@@ -854,7 +961,17 @@ async fn run_suite_install_task(
     if let Err(err) = ensure_agent_success(&agent_response) {
         let _ = delete_instance(&state.metadata_db, &instance_id).await;
         if is_install_canceled_error(&err) {
-            update_install_progress(&task_id, 100, "canceled", "canceled", None, true, None);
+            update_install_progress(
+                &state.metadata_db,
+                &task_id,
+                100,
+                "canceled",
+                "canceled",
+                None,
+                true,
+                None,
+            )
+            .await;
             finish_suite_install_task_log(
                 &state,
                 &audit_ctx,
@@ -869,6 +986,7 @@ async fn run_suite_install_task(
             );
         } else {
             update_install_progress(
+                &state.metadata_db,
                 &task_id,
                 100,
                 "failed",
@@ -876,7 +994,8 @@ async fn run_suite_install_task(
                 None,
                 true,
                 Some(err.clone()),
-            );
+            )
+            .await;
             finish_suite_install_task_log(
                 &state,
                 &audit_ctx,
@@ -898,6 +1017,7 @@ async fn run_suite_install_task(
     {
         let detail = err.to_string();
         update_install_progress(
+            &state.metadata_db,
             &task_id,
             100,
             "failed",
@@ -905,7 +1025,8 @@ async fn run_suite_install_task(
             None,
             true,
             Some(detail.clone()),
-        );
+        )
+        .await;
         finish_suite_install_task_log(
             &state,
             &audit_ctx,
@@ -921,7 +1042,17 @@ async fn run_suite_install_task(
         return;
     }
 
-    update_install_progress(&task_id, 100, "success", "completed", None, true, None);
+    update_install_progress(
+        &state.metadata_db,
+        &task_id,
+        100,
+        "success",
+        "completed",
+        None,
+        true,
+        None,
+    )
+    .await;
     finish_suite_install_task_log(
         &state,
         &audit_ctx,
@@ -946,7 +1077,7 @@ async fn prewarm_suite_images(
     let images = extract_suite_images(request)?;
     let count = images.len().max(1);
     for (index, image_ref) in images.iter().enumerate() {
-        if is_install_cancel_requested(suite_task_id) {
+        if is_install_cancel_requested(&state.metadata_db, suite_task_id).await {
             anyhow::bail!("suite install canceled");
         }
         let image_task = state.image_acquisition.start(
@@ -956,7 +1087,7 @@ async fn prewarm_suite_images(
             None,
         );
         loop {
-            if is_install_cancel_requested(suite_task_id) {
+            if is_install_cancel_requested(&state.metadata_db, suite_task_id).await {
                 state.image_acquisition.cancel(&image_task.task_id);
                 anyhow::bail!("suite install canceled");
             }
@@ -977,6 +1108,7 @@ async fn prewarm_suite_images(
                 crate::services::image_acquisition::ImageStage::Pulling => "pull_registry_image",
             };
             update_install_progress(
+                &state.metadata_db,
                 suite_task_id,
                 image_progress.min(40),
                 "running",
@@ -984,7 +1116,8 @@ async fn prewarm_suite_images(
                 Some(image_ref.clone()),
                 false,
                 None,
-            );
+            )
+            .await;
             match progress.status {
                 crate::services::image_acquisition::ImageTaskStatus::Success => break,
                 crate::services::image_acquisition::ImageTaskStatus::Failed => {
@@ -1100,30 +1233,11 @@ async fn compensate_failed_install(
     }
 }
 
-/// 新建或覆盖主控内存中的套件安装进度会话。
-fn upsert_install_progress(progress: SuiteInstallProgress) {
-    let mut sessions = SUITE_INSTALL_SESSIONS.lock().unwrap();
-    sessions.insert(progress.task_id.clone(), progress);
-}
-
-/// 将安装任务标记为正在取消，供后台任务和前端轮询读取。
-fn mark_install_canceling(task_id: &str) -> Option<SuiteInstallProgress> {
-    let mut sessions = SUITE_INSTALL_SESSIONS.lock().unwrap();
-    let progress = sessions.get_mut(task_id)?;
-    progress.cancel_requested = true;
-    if !progress.is_finished {
-        progress.status = "canceling".to_string();
-        progress.current_step = "canceling".to_string();
-    }
-    Some(progress.clone())
-}
-
 /// 判断安装任务是否已经收到取消请求。
-fn is_install_cancel_requested(task_id: &str) -> bool {
-    let sessions = SUITE_INSTALL_SESSIONS.lock().unwrap();
-    sessions
-        .get(task_id)
-        .is_some_and(|progress| progress.cancel_requested)
+async fn is_install_cancel_requested(pool: &DbPool, task_id: &str) -> bool {
+    install_task_cancel_requested(pool, task_id)
+        .await
+        .unwrap_or(false)
 }
 
 /// 判断 Agent 返回的安装错误是否由用户取消触发。
@@ -1131,8 +1245,10 @@ fn is_install_canceled_error(message: &str) -> bool {
     message.contains("suite install canceled")
 }
 
-/// 更新主控内存中的安装任务进度，并保持百分比单调递增。
-fn update_install_progress(
+/// 更新持久化安装任务进度，并保持百分比单调递增。
+#[allow(clippy::too_many_arguments)]
+async fn update_install_progress(
+    pool: &DbPool,
     task_id: &str,
     progress_percent: u32,
     status: &str,
@@ -1141,25 +1257,45 @@ fn update_install_progress(
     is_finished: bool,
     error: Option<String>,
 ) {
-    let mut sessions = SUITE_INSTALL_SESSIONS.lock().unwrap();
-    if let Some(progress) = sessions.get_mut(task_id) {
-        progress.progress_percent = progress.progress_percent.max(progress_percent.min(100));
-        progress.status = status.to_string();
-        progress.current_step = current_step.to_string();
-        progress.current_image = current_image;
-        progress.is_finished = is_finished;
-        progress.error = error;
-        if matches!(status, "canceled" | "failed" | "success") {
-            progress.cancel_requested = false;
-        }
+    if let Err(err) = update_install_task(
+        pool,
+        task_id,
+        progress_percent,
+        status,
+        current_step,
+        current_image,
+        is_finished,
+        error,
+    )
+    .await
+    {
+        tracing::error!(task_id, error = %err, "failed to persist suite install progress");
     }
+}
+
+/// 持久化从 Agent 合并得到的完整进度。
+async fn persist_install_progress(
+    pool: &DbPool,
+    progress: &SuiteInstallTaskRecord,
+) -> sqlx::Result<()> {
+    update_install_task(
+        pool,
+        &progress.task_id,
+        u32::try_from(progress.progress_percent).unwrap_or(100),
+        &progress.status,
+        &progress.current_step,
+        progress.current_image.clone(),
+        progress.is_finished,
+        progress.error.clone(),
+    )
+    .await
 }
 
 /// 将 Agent 返回的安装进度合并到主控任务进度中。
 fn parse_agent_install_progress(
     response: &serde_json::Value,
-    base: &SuiteInstallProgress,
-) -> Option<SuiteInstallProgress> {
+    base: &SuiteInstallTaskRecord,
+) -> Option<SuiteInstallTaskRecord> {
     let data = response.get("data")?;
     let mut progress = base.clone();
     let agent_percent = data
@@ -1168,7 +1304,9 @@ fn parse_agent_install_progress(
         .and_then(|value| u32::try_from(value).ok())
         .unwrap_or(0)
         .min(100);
-    progress.progress_percent = progress.progress_percent.max(40 + agent_percent * 60 / 100);
+    progress.progress_percent = progress
+        .progress_percent
+        .max(i64::from(40 + agent_percent * 60 / 100));
     progress.status = data
         .get("status")
         .and_then(serde_json::Value::as_str)
@@ -1196,6 +1334,41 @@ fn parse_agent_install_progress(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(progress.cancel_requested);
     Some(progress)
+}
+
+/// 判断持久化任务是否已经超过 Agent 恢复宽限期。
+fn is_install_recovery_expired(updated_at: &str) -> bool {
+    chrono::DateTime::parse_from_rfc3339(updated_at)
+        .map(|updated_at| {
+            chrono::Utc::now()
+                .signed_duration_since(updated_at)
+                .num_seconds()
+                >= 120
+        })
+        .unwrap_or(false)
+}
+
+/// 将 Agent 已结束的安装结果同步回实例状态。
+async fn reconcile_recovered_install(
+    pool: &DbPool,
+    progress: &SuiteInstallTaskRecord,
+) -> sqlx::Result<()> {
+    if !progress.is_finished {
+        return Ok(());
+    }
+    match progress.status.as_str() {
+        "success" => update_instance_status(pool, &progress.instance_id, "installed", None).await,
+        "canceled" => delete_instance(pool, &progress.instance_id).await,
+        _ => {
+            update_instance_status(
+                pool,
+                &progress.instance_id,
+                "error",
+                progress.error.as_deref(),
+            )
+            .await
+        }
+    }
 }
 
 /// 启用套件实例并注册应用入口。

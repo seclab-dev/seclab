@@ -1,7 +1,7 @@
 import { createPinia } from 'pinia'
 import { createI18n } from 'vue-i18n'
 import { createMemoryHistory, createRouter } from 'vue-router'
-import { defineComponent } from 'vue'
+import { defineComponent, onMounted } from 'vue'
 import { flushPromises, shallowMount } from '@vue/test-utils'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import SettingsView from '../SettingsView.vue'
@@ -91,7 +91,7 @@ const CardStub = defineComponent({
 
 const success = <T>(data: T) => ({ success: true, code: 200, message: '', data })
 
-const mountSettings = async () => {
+const mountSettings = async (sectionStubs: Record<string, unknown> = {}) => {
   const router = createRouter({
     history: createMemoryHistory(),
     routes: [{ path: '/', component: { template: '<div />' } }],
@@ -108,9 +108,11 @@ const mountSettings = async () => {
         createI18n({ legacy: false, locale: 'zh', messages: { zh } }),
       ],
       stubs: {
+        KeepAlive: false,
         SecLabCard: CardStub,
         SecLabMenu: MenuStub,
         SystemMonitoringSettings: true,
+        ...sectionStubs,
       },
     },
   })
@@ -159,6 +161,59 @@ describe('SettingsView', () => {
     await wrapper.get('[data-menu-key="network"]').trigger('click')
     await flushPromises()
     expect(wrapper.findComponent({ name: 'NetworkSettings' }).exists()).toBe(true)
+  })
+
+  it('快速切换模块后已停用分区的加载状态仍会正常收敛', async () => {
+    let resolveAbout!: () => void
+    const aboutFinished = new Promise<void>((resolve) => {
+      resolveAbout = resolve
+    })
+    const aboutMounted = vi.fn()
+    const AsyncAboutStub = defineComponent({
+      name: 'AboutSettings',
+      emits: ['busyChange'],
+      setup(_, { emit }) {
+        onMounted(async () => {
+          aboutMounted()
+          emit('busyChange', true)
+          await aboutFinished
+          emit('busyChange', false)
+        })
+      },
+      template: '<div data-page="settings-about-stub" />',
+    })
+    const NetworkStub = defineComponent({
+      name: 'NetworkSettings',
+      emits: ['busyChange', 'dirtyChange'],
+      setup(_, { emit }) {
+        onMounted(() => {
+          emit('busyChange', false)
+          emit('dirtyChange', false)
+        })
+      },
+      template: '<div data-page="settings-network-stub" />',
+    })
+    const wrapper = await mountSettings({
+      AboutSettings: AsyncAboutStub,
+      NetworkSettings: NetworkStub,
+    })
+    await flushPromises()
+    expect(windowManager.updateWindowRuntimeState).toHaveBeenLastCalledWith(
+      'settings-test',
+      expect.objectContaining({ busy: true }),
+    )
+
+    await wrapper.get('[data-menu-key="network"]').trigger('click')
+    resolveAbout()
+    await flushPromises()
+    expect(windowManager.updateWindowRuntimeState).toHaveBeenLastCalledWith(
+      'settings-test',
+      expect.objectContaining({ busy: false }),
+    )
+
+    await wrapper.get('[data-menu-key="about"]').trigger('click')
+    await flushPromises()
+    expect(aboutMounted).toHaveBeenCalledTimes(1)
   })
 
   it('没有运行中升级计划时不创建后台轮询', async () => {

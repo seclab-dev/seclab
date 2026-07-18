@@ -154,6 +154,7 @@ pub struct SuiteCatalogItem {
     pub created_at: String,
     pub updated_at: String,
     pub category: Option<String>,
+    pub instance_count: i64,
 }
 
 /// 套件实例摘要。
@@ -177,6 +178,27 @@ pub struct SuiteInstanceSummary {
 pub struct SuiteListResponse {
     pub catalog: Vec<SuiteCatalogItem>,
     pub instances: Vec<SuiteInstanceSummary>,
+}
+
+/// 可持久化并可恢复的套件安装任务。
+#[derive(Debug, Serialize, Deserialize, FromRow, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SuiteInstallTaskRecord {
+    pub task_id: String,
+    pub instance_id: String,
+    pub suite_id: String,
+    pub node_id: String,
+    pub progress_percent: i64,
+    pub status: String,
+    pub current_step: String,
+    pub current_image: Option<String>,
+    pub is_finished: bool,
+    pub error: Option<String>,
+    pub cancel_requested: bool,
+    pub recovery_started_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub finished_at: Option<String>,
 }
 
 /// 套件应用入口记录。
@@ -221,10 +243,20 @@ pub async fn list_suites(
     .fetch_all(pool)
     .await?;
     // name/summary 需要根据请求语言从 manifest_json 解析，不能直接使用表中的默认文案。
-    let catalog = catalog_rows
+    let mut catalog = catalog_rows
         .into_iter()
         .map(|row| row.into_catalog_item(locale))
         .collect::<sqlx::Result<Vec<_>>>()?;
+    let instance_counts = sqlx::query_as::<_, (String, i64)>(
+        "SELECT suite_id, COUNT(*) FROM suite_instances GROUP BY suite_id",
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .collect::<std::collections::HashMap<_, _>>();
+    for item in &mut catalog {
+        item.instance_count = instance_counts.get(&item.suite_id).copied().unwrap_or(0);
+    }
 
     let instances = if let Some(node_id) = node_id {
         sqlx::query_as::<_, SuiteInstanceSummary>(
@@ -300,6 +332,7 @@ impl SuiteCatalogRow {
             created_at: self.created_at,
             updated_at: self.updated_at,
             category: manifest.metadata.category.clone(),
+            instance_count: 0,
         })
     }
 }
@@ -614,6 +647,160 @@ pub async fn delete_instance(pool: &DbPool, instance_id: &str) -> sqlx::Result<(
     Ok(())
 }
 
+/// 创建可恢复的套件安装任务。
+pub async fn insert_install_task(pool: &DbPool, task: &SuiteInstallTaskRecord) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO suite_install_tasks (
+            task_id, instance_id, suite_id, node_id, progress_percent, status,
+            current_step, current_image, is_finished, error, cancel_requested
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        "#,
+    )
+    .bind(&task.task_id)
+    .bind(&task.instance_id)
+    .bind(&task.suite_id)
+    .bind(&task.node_id)
+    .bind(task.progress_percent)
+    .bind(&task.status)
+    .bind(&task.current_step)
+    .bind(&task.current_image)
+    .bind(task.is_finished)
+    .bind(&task.error)
+    .bind(task.cancel_requested)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// 读取单个套件安装任务。
+pub async fn fetch_install_task(
+    pool: &DbPool,
+    task_id: &str,
+) -> sqlx::Result<Option<SuiteInstallTaskRecord>> {
+    sqlx::query_as::<_, SuiteInstallTaskRecord>(
+        "SELECT * FROM suite_install_tasks WHERE task_id = ?1",
+    )
+    .bind(task_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// 查询节点上的套件安装任务。
+pub async fn list_install_tasks(
+    pool: &DbPool,
+    node_id: Option<&str>,
+    active_only: bool,
+) -> sqlx::Result<Vec<SuiteInstallTaskRecord>> {
+    sqlx::query_as::<_, SuiteInstallTaskRecord>(
+        r#"
+        SELECT * FROM suite_install_tasks
+        WHERE (?1 IS NULL OR node_id = ?1)
+          AND (?2 = 0 OR is_finished = 0)
+        ORDER BY updated_at DESC, task_id ASC
+        "#,
+    )
+    .bind(node_id)
+    .bind(active_only)
+    .fetch_all(pool)
+    .await
+}
+
+/// 标记安装任务正在取消并返回最新记录。
+pub async fn mark_install_task_canceling(
+    pool: &DbPool,
+    task_id: &str,
+) -> sqlx::Result<Option<SuiteInstallTaskRecord>> {
+    sqlx::query(
+        r#"
+        UPDATE suite_install_tasks
+        SET cancel_requested = 1,
+            status = CASE WHEN is_finished = 0 THEN 'canceling' ELSE status END,
+            current_step = CASE WHEN is_finished = 0 THEN 'canceling' ELSE current_step END,
+            updated_at = (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        WHERE task_id = ?1
+        "#,
+    )
+    .bind(task_id)
+    .execute(pool)
+    .await?;
+    fetch_install_task(pool, task_id).await
+}
+
+/// 判断安装任务是否收到取消请求。
+pub async fn install_task_cancel_requested(pool: &DbPool, task_id: &str) -> sqlx::Result<bool> {
+    Ok(sqlx::query_scalar::<_, bool>(
+        "SELECT cancel_requested FROM suite_install_tasks WHERE task_id = ?1",
+    )
+    .bind(task_id)
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or(false))
+}
+
+/// 记录安装任务首次无法从 Agent 恢复的时间。
+pub async fn mark_install_task_recovery_pending(
+    pool: &DbPool,
+    task_id: &str,
+) -> sqlx::Result<Option<SuiteInstallTaskRecord>> {
+    sqlx::query(
+        r#"
+        UPDATE suite_install_tasks
+        SET recovery_started_at = COALESCE(
+                recovery_started_at,
+                (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            )
+        WHERE task_id = ?1 AND is_finished = 0
+        "#,
+    )
+    .bind(task_id)
+    .execute(pool)
+    .await?;
+    fetch_install_task(pool, task_id).await
+}
+
+/// 更新安装任务进度并保持百分比单调递增。
+#[allow(clippy::too_many_arguments)]
+pub async fn update_install_task(
+    pool: &DbPool,
+    task_id: &str,
+    progress_percent: u32,
+    status: &str,
+    current_step: &str,
+    current_image: Option<String>,
+    is_finished: bool,
+    error: Option<String>,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE suite_install_tasks
+        SET progress_percent = MAX(progress_percent, ?2),
+            status = ?3,
+            current_step = ?4,
+            current_image = ?5,
+            is_finished = ?6,
+            error = ?7,
+            recovery_started_at = NULL,
+            cancel_requested = CASE WHEN ?6 = 1 THEN 0 ELSE cancel_requested END,
+            updated_at = (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            finished_at = CASE WHEN ?6 = 1
+                THEN COALESCE(finished_at, (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))
+                ELSE NULL END
+        WHERE task_id = ?1
+        "#,
+    )
+    .bind(task_id)
+    .bind(progress_percent.min(100))
+    .bind(status)
+    .bind(current_step)
+    .bind(current_image)
+    .bind(is_finished)
+    .bind(error)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 fn default_width() -> i64 {
     1024
 }
@@ -628,4 +815,183 @@ fn default_min_width() -> i64 {
 
 fn default_min_height() -> i64 {
     560
+}
+
+#[cfg(test)]
+mod install_task_tests {
+    use super::*;
+    use crate::test_support::setup_test_db;
+
+    fn task(task_id: &str, suite_id: &str) -> SuiteInstallTaskRecord {
+        SuiteInstallTaskRecord {
+            task_id: task_id.to_string(),
+            instance_id: format!("instance-{task_id}"),
+            suite_id: suite_id.to_string(),
+            node_id: "local".to_string(),
+            progress_percent: 1,
+            status: "queued".to_string(),
+            current_step: "queued".to_string(),
+            current_image: None,
+            is_finished: false,
+            error: None,
+            cancel_requested: false,
+            recovery_started_at: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            finished_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn persists_monotonic_install_progress_and_active_filter() {
+        let pool = setup_test_db().await;
+        insert_install_task(&pool, &task("task-1", "suite-1"))
+            .await
+            .unwrap();
+        update_install_task(
+            &pool,
+            "task-1",
+            40,
+            "running",
+            "start_services",
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        update_install_task(&pool, "task-1", 20, "running", "prepare", None, false, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            fetch_install_task(&pool, "task-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .progress_percent,
+            40
+        );
+        assert_eq!(
+            list_install_tasks(&pool, Some("local"), true)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        update_install_task(
+            &pool,
+            "task-1",
+            100,
+            "success",
+            "completed",
+            None,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            list_install_tasks(&pool, Some("local"), true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_active_task_for_suite_and_node() {
+        let pool = setup_test_db().await;
+        insert_install_task(&pool, &task("task-1", "suite-1"))
+            .await
+            .unwrap();
+        let error = insert_install_task(&pool, &task("task-2", "suite-1"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, sqlx::Error::Database(_)));
+    }
+
+    #[tokio::test]
+    async fn records_recovery_window_once_and_clears_it_after_progress() {
+        let pool = setup_test_db().await;
+        insert_install_task(&pool, &task("task-recovery", "suite-recovery"))
+            .await
+            .unwrap();
+
+        let pending = mark_install_task_recovery_pending(&pool, "task-recovery")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(pending.recovery_started_at.is_some());
+
+        update_install_task(
+            &pool,
+            "task-recovery",
+            20,
+            "running",
+            "pulling",
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        let recovered = fetch_install_task(&pool, "task-recovery")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(recovered.recovery_started_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn catalog_counts_instances_across_all_nodes() {
+        let pool = setup_test_db().await;
+        let manifest = serde_json::json!({
+            "apiVersion": "seclab.dev/v1",
+            "kind": "Suite",
+            "metadata": {
+                "suiteId": "suite-count",
+                "slug": "suite-count",
+                "version": "1.0.0",
+                "name": "Suite Count",
+                "icon": "icon.png"
+            },
+            "runtime": { "type": "compose", "composeFile": "compose.yaml" }
+        });
+        sqlx::query(
+            r#"
+            INSERT INTO suite_catalog_items (
+                suite_id, version, name, manifest_json, package_json, checksum
+            ) VALUES ('suite-count', '1.0.0', 'Suite Count', ?1, '{}', 'checksum')
+            "#,
+        )
+        .bind(manifest.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        for node_id in ["local", "node-2"] {
+            insert_instance(
+                &pool,
+                &SuiteInstanceSummary {
+                    instance_id: format!("instance-{node_id}"),
+                    suite_id: "suite-count".to_string(),
+                    version: "1.0.0".to_string(),
+                    node_id: node_id.to_string(),
+                    compose_project_name: format!("suite-count-{node_id}"),
+                    status: "installed".to_string(),
+                    last_error: None,
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let result = list_suites(&pool, Some("zh-CN"), Some("local"))
+            .await
+            .unwrap();
+        assert_eq!(result.instances.len(), 1);
+        assert_eq!(result.catalog[0].instance_count, 2);
+    }
 }
