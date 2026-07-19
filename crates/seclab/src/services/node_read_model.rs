@@ -9,8 +9,11 @@ use crate::models::node_sessions::{
     NodeSessionRecord, get_latest_session_by_node_id, list_sessions_by_node_id,
 };
 use crate::state::DbPool;
+use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use sqlx::Row;
+
+const HEALTH_FRESHNESS_SECONDS: i64 = 30;
 
 /// 节点列表与详情共用摘要视图。
 #[derive(Debug, Clone, Serialize)]
@@ -93,62 +96,117 @@ fn parse_json_value(raw: Option<String>) -> Option<serde_json::Value> {
     raw.and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
 }
 
-fn parse_health_status(record: Option<&NodeObservationRecord>) -> Option<String> {
-    let probe = parse_json_value(record.and_then(|item| item.probe_result.clone()))?;
-    probe
-        .get("status")
-        .and_then(|value| value.as_str())
-        .map(|value| value.to_lowercase())
+#[derive(Debug, Default)]
+struct RuntimeFacts {
+    session_status: Option<String>,
+    lease_expires_at: Option<String>,
+    session_last_seen_at: Option<String>,
+    probe_result: Option<String>,
+    observed_at: Option<String>,
+}
+
+impl RuntimeFacts {
+    fn from_records(
+        session: Option<&NodeSessionRecord>,
+        observation: Option<&NodeObservationRecord>,
+    ) -> Self {
+        Self {
+            session_status: session.map(|item| item.status.clone()),
+            lease_expires_at: session.map(|item| item.lease_expires_at.clone()),
+            session_last_seen_at: session.and_then(|item| item.last_seen_at.clone()),
+            probe_result: observation.and_then(|item| item.probe_result.clone()),
+            observed_at: observation.map(|item| item.observed_at.clone()),
+        }
+    }
+
+    fn from_joined_row(row: &sqlx::sqlite::SqliteRow) -> sqlx::Result<Self> {
+        Ok(Self {
+            session_status: row.try_get("latest_session_status")?,
+            lease_expires_at: row.try_get("latest_lease_expires_at")?,
+            session_last_seen_at: row.try_get("latest_session_last_seen_at")?,
+            probe_result: row.try_get("latest_probe_result")?,
+            observed_at: row.try_get("latest_observed_at")?,
+        })
+    }
+
+    fn has_live_session(&self, now: DateTime<Utc>) -> bool {
+        self.session_status.as_deref() == Some("active")
+            && self
+                .lease_expires_at
+                .as_deref()
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .is_some_and(|expires_at| expires_at.with_timezone(&Utc) > now)
+    }
+
+    fn runtime_status(&self, now: DateTime<Utc>) -> Option<String> {
+        match self.session_status.as_deref() {
+            Some("active") if !self.has_live_session(now) => Some("expired".to_string()),
+            _ => self.session_status.clone(),
+        }
+    }
+
+    fn fresh_health_status(&self, now: DateTime<Utc>) -> Option<String> {
+        let observed_at = self
+            .observed_at
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())?
+            .with_timezone(&Utc);
+        if now.signed_duration_since(observed_at) > Duration::seconds(HEALTH_FRESHNESS_SECONDS)
+            || observed_at > now + Duration::seconds(HEALTH_FRESHNESS_SECONDS)
+        {
+            return None;
+        }
+        let probe = parse_json_value(self.probe_result.clone())?;
+        probe
+            .get("status")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_lowercase())
+    }
+}
+
+fn parse_health_status_from_facts(facts: &RuntimeFacts, now: DateTime<Utc>) -> Option<String> {
+    facts.fresh_health_status(now)
 }
 
 fn compute_display_status(
     lifecycle_status: &str,
-    session: Option<&NodeSessionRecord>,
-    observation: Option<&NodeObservationRecord>,
+    facts: &RuntimeFacts,
+    now: DateTime<Utc>,
 ) -> String {
-    if let Some(session) = session
-        && session.status == "active"
-    {
-        return match parse_health_status(observation).as_deref() {
-            Some("offline") => "degraded".to_string(),
-            Some("degraded") => "degraded".to_string(),
+    if matches!(
+        lifecycle_status,
+        "retired" | "conflict" | "deploying" | "deploy_failed" | "awaiting_registration"
+    ) {
+        return lifecycle_status.to_string();
+    }
+
+    if facts.has_live_session(now) {
+        return match parse_health_status_from_facts(facts, now).as_deref() {
+            Some("offline" | "degraded" | "unreachable") => "degraded".to_string(),
             _ => "online".to_string(),
         };
     }
 
-    match lifecycle_status {
-        "draft"
-        | "deploying"
-        | "deploy_failed"
-        | "awaiting_registration"
-        | "conflict"
-        | "retired" => lifecycle_status.to_string(),
-        _ => "offline".to_string(),
+    if lifecycle_status == "draft" {
+        return "draft".to_string();
     }
+    "offline".to_string()
 }
 
 fn map_node_summary_row(
     row: &sqlx::sqlite::SqliteRow,
-    session: Option<&NodeSessionRecord>,
-    observation: Option<&NodeObservationRecord>,
+    facts: &RuntimeFacts,
 ) -> sqlx::Result<NodeSummaryView> {
     let metadata_raw: String = row.try_get("metadata")?;
     let labels_raw: String = row.try_get("labels")?;
     let tags = serde_json::from_str::<Vec<String>>(&labels_raw).unwrap_or_default();
     let address: Option<String> = row.try_get("ssh_addr")?;
     let lifecycle_status: String = row.try_get("status")?;
-    let runtime_status = session.map(|item| item.status.clone());
-    let health_status = parse_health_status(observation).or_else(|| {
-        if let Some(session) = session
-            && session.status == "active"
-        {
-            Some("online".to_string())
-        } else {
-            None
-        }
-    });
+    let now = Utc::now();
+    let runtime_status = facts.runtime_status(now);
+    let health_status = parse_health_status_from_facts(facts, now);
 
-    let status = compute_display_status(&lifecycle_status, session, observation);
+    let status = compute_display_status(&lifecycle_status, facts, now);
     let mut metadata = serde_json::from_str::<serde_json::Value>(&metadata_raw).ok();
 
     if status != "online"
@@ -174,8 +232,9 @@ fn map_node_summary_row(
         health_status,
         tags,
         metadata,
-        last_seen_at: session
-            .and_then(|item| item.last_seen_at.clone())
+        last_seen_at: facts
+            .session_last_seen_at
+            .clone()
             .or_else(|| row.try_get("last_seen_at").ok().flatten()),
     })
 }
@@ -214,11 +273,10 @@ async fn fetch_summary_components(
     let session = get_latest_session_by_node_id(pool, node_id).await?;
     let observation = get_latest_node_observation_by_node_id(pool, node_id).await?;
     let summary = match row {
-        Some(row) => Some(map_node_summary_row(
-            &row,
-            session.as_ref(),
-            observation.as_ref(),
-        )?),
+        Some(row) => {
+            let facts = RuntimeFacts::from_records(session.as_ref(), observation.as_ref());
+            Some(map_node_summary_row(&row, &facts)?)
+        }
         None => None,
     };
     Ok((summary, session, observation))
@@ -228,6 +286,27 @@ async fn fetch_summary_components(
 pub async fn list_node_summaries(pool: &DbPool) -> sqlx::Result<Vec<NodeSummaryView>> {
     let rows = sqlx::query(
         r#"
+        WITH latest_sessions AS (
+            SELECT
+                node_id,
+                status,
+                lease_expires_at,
+                last_seen_at,
+                ROW_NUMBER() OVER (
+                    PARTITION BY node_id ORDER BY registered_at DESC, created_at DESC
+                ) AS row_number
+            FROM node_sessions
+        ),
+        latest_observations AS (
+            SELECT
+                node_id,
+                probe_result,
+                observed_at,
+                ROW_NUMBER() OVER (
+                    PARTITION BY node_id ORDER BY observed_at DESC, created_at DESC
+                ) AS row_number
+            FROM node_observations
+        )
         SELECT
             n.node_id,
             n.name,
@@ -239,29 +318,31 @@ pub async fn list_node_summaries(pool: &DbPool) -> sqlx::Result<Vec<NodeSummaryV
             n.last_seen_at,
             p.ssh_addr,
             p.ssh_port,
-            p.expected_listen_port
+            p.expected_listen_port,
+            s.status AS latest_session_status,
+            s.lease_expires_at AS latest_lease_expires_at,
+            s.last_seen_at AS latest_session_last_seen_at,
+            o.probe_result AS latest_probe_result,
+            o.observed_at AS latest_observed_at
         FROM nodes n
         LEFT JOIN node_provisioning p
           ON p.node_id = n.node_id
+        LEFT JOIN latest_sessions s
+          ON s.node_id = n.node_id AND s.row_number = 1
+        LEFT JOIN latest_observations o
+          ON o.node_id = n.node_id AND o.row_number = 1
         ORDER BY n.created_at DESC
         "#,
     )
     .fetch_all(pool)
     .await?;
 
-    let mut items = Vec::with_capacity(rows.len());
-    for row in rows {
-        let node_id: String = row.try_get("node_id")?;
-        let session = get_latest_session_by_node_id(pool, &node_id).await?;
-        let observation = get_latest_node_observation_by_node_id(pool, &node_id).await?;
-        items.push(map_node_summary_row(
-            &row,
-            session.as_ref(),
-            observation.as_ref(),
-        )?);
-    }
-
-    Ok(items)
+    rows.into_iter()
+        .map(|row| {
+            let facts = RuntimeFacts::from_joined_row(&row)?;
+            map_node_summary_row(&row, &facts)
+        })
+        .collect()
 }
 
 /// 读取单个节点摘要视图。
@@ -456,7 +537,10 @@ pub fn spawn_local_node_monitor(state: std::sync::Arc<crate::state::AppState>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_node_detail, list_node_observation_views, list_node_session_views};
+    use super::{
+        RuntimeFacts, compute_display_status, get_node_detail, list_node_observation_views,
+        list_node_session_views, list_node_summaries,
+    };
     use crate::models::node_identities::{NodeIdentityRecord, insert_node_identity};
     use crate::models::node_observations::{NodeObservationRecord, insert_node_observation};
     use crate::models::node_provisioning::{NodeProvisioningRecord, upsert_node_provisioning};
@@ -540,6 +624,50 @@ mod tests {
         .unwrap();
 
         node_id.to_string()
+    }
+
+    #[test]
+    fn lifecycle_and_freshness_control_display_state() {
+        let now = Utc::now();
+        let live = RuntimeFacts {
+            session_status: Some("active".to_string()),
+            lease_expires_at: Some((now + Duration::minutes(1)).to_rfc3339()),
+            session_last_seen_at: Some(now.to_rfc3339()),
+            probe_result: Some(r#"{"status":"degraded"}"#.to_string()),
+            observed_at: Some(now.to_rfc3339()),
+        };
+        assert_eq!(compute_display_status("retired", &live, now), "retired");
+        assert_eq!(compute_display_status("conflict", &live, now), "conflict");
+        assert_eq!(compute_display_status("online", &live, now), "degraded");
+
+        let stale = RuntimeFacts {
+            observed_at: Some((now - Duration::seconds(31)).to_rfc3339()),
+            ..live
+        };
+        assert_eq!(stale.fresh_health_status(now), None);
+        assert_eq!(compute_display_status("online", &stale, now), "online");
+
+        let expired = RuntimeFacts {
+            lease_expires_at: Some((now - Duration::seconds(1)).to_rfc3339()),
+            ..stale
+        };
+        assert_eq!(expired.runtime_status(now).as_deref(), Some("expired"));
+        assert_eq!(compute_display_status("online", &expired, now), "offline");
+    }
+
+    #[tokio::test]
+    async fn list_summaries_joins_latest_runtime_facts() {
+        let pool = setup_test_db().await;
+        let first = Uuid::new_v4().to_string();
+        let second = Uuid::new_v4().to_string();
+        insert_test_node_with_provisioning(&pool, &first).await;
+        insert_test_node_with_provisioning(&pool, &second).await;
+
+        let items = list_node_summaries(&pool).await.unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().any(|item| item.node_id == first));
+        assert!(items.iter().any(|item| item.node_id == second));
+        assert!(items.iter().all(|item| item.status == "offline"));
     }
 
     #[tokio::test]

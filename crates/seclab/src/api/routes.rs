@@ -93,6 +93,14 @@ pub async fn create_router() -> Result<(Router, crate::state::DbPool)> {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to initialize default admin user: {}", e))?;
 
+    let interrupted_tasks = crate::models::node_tasks::fail_interrupted_tasks(&db).await?;
+    if interrupted_tasks > 0 {
+        tracing::warn!(
+            interrupted_tasks,
+            "marked interrupted node tasks as failed during startup"
+        );
+    }
+
     // 创建共享的应用状态
     let app_state = Arc::new(AppState {
         server_name: "SecLab".to_string(),

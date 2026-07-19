@@ -7,6 +7,7 @@ use crate::models::node_provisioning::{
 };
 use crate::state::DbPool;
 use chrono::Utc;
+use sqlx::{Executor, Sqlite};
 
 fn provisioning_id(node_id: &str) -> String {
     format!("provisioning-{node_id}")
@@ -113,11 +114,14 @@ pub async fn record_operation_result(
 }
 
 /// 根据节点创建载荷直接写入部署记录。
-pub async fn create_provisioning_from_payload(
-    pool: &DbPool,
+pub async fn create_provisioning_from_payload<'e, E>(
+    executor: E,
     node_id: &str,
     payload: &NodeCreatePayload,
-) -> sqlx::Result<()> {
+) -> sqlx::Result<()>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     let now = Utc::now().to_rfc3339();
     let record = NodeProvisioningRecord {
         provisioning_id: provisioning_id(node_id),
@@ -158,7 +162,37 @@ pub async fn create_provisioning_from_payload(
         created_at: now.clone(),
         updated_at: now,
     };
-    upsert_node_provisioning(pool, &record).await
+    let query = sqlx::query(
+        r#"
+        INSERT INTO node_provisioning (
+            provisioning_id, node_id, deploy_method, ssh_addr, ssh_port, ssh_user,
+            ssh_auth_mode, ssh_password_ciphertext, ssh_private_key_ciphertext,
+            ssh_private_key_passphrase_ciphertext, install_dir, systemd_service_name,
+            expected_listen_port, seclab_url, last_deploy_task_id,
+            last_deploy_result_status, last_deploy_error_summary, last_deploy_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&record.provisioning_id)
+    .bind(&record.node_id)
+    .bind(&record.deploy_method)
+    .bind(&record.ssh_addr)
+    .bind(record.ssh_port)
+    .bind(&record.ssh_user)
+    .bind(&record.ssh_auth_mode)
+    .bind(&record.ssh_password_ciphertext)
+    .bind(&record.ssh_private_key_ciphertext)
+    .bind(&record.ssh_private_key_passphrase_ciphertext)
+    .bind(&record.install_dir)
+    .bind(&record.systemd_service_name)
+    .bind(record.expected_listen_port)
+    .bind(&record.seclab_url)
+    .bind(&record.last_deploy_task_id)
+    .bind(&record.last_deploy_result_status)
+    .bind(&record.last_deploy_error_summary)
+    .bind(&record.last_deploy_at);
+    query.execute(executor).await?;
+    Ok(())
 }
 
 /// 根据节点更新载荷直接更新部署记录。
@@ -256,4 +290,59 @@ pub async fn update_node_seclab_url(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::create_provisioning_from_payload;
+    use crate::models::node_api_types::NodeCreatePayload;
+    use crate::models::nodes::{NodeStatus, get_node_by_id};
+    use crate::services::node_inventory::create_node_from_payload;
+    use crate::test_support::setup_test_db;
+    use uuid::Uuid;
+
+    fn valid_payload() -> NodeCreatePayload {
+        NodeCreatePayload {
+            agent_id: None,
+            name: Some("worker-transaction".to_string()),
+            group_id: Some("default".to_string()),
+            description: None,
+            addr: Some("192.0.2.10".to_string()),
+            port: Some("22".to_string()),
+            user: Some("root".to_string()),
+            pwd: None,
+            private_key: Some("~/.ssh/id_ed25519".to_string()),
+            private_key_passphrase: None,
+            auth_mode: Some("key".to_string()),
+            status: None,
+            version: None,
+            tags: Some(vec!["lab".to_string()]),
+            metadata: None,
+            install_dir: Some("/opt".to_string()),
+            service_port: Some("7311".to_string()),
+            sync_enabled: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_provisioning_write_rolls_back_node_creation() {
+        let pool = setup_test_db().await;
+        let node_id = Uuid::new_v4().to_string();
+        let payload = valid_payload();
+        let mut transaction = pool.begin().await.unwrap();
+        create_node_from_payload(&mut *transaction, &node_id, &payload, NodeStatus::Draft)
+            .await
+            .unwrap();
+        create_provisioning_from_payload(&mut *transaction, &node_id, &payload)
+            .await
+            .unwrap();
+        assert!(
+            create_provisioning_from_payload(&mut *transaction, &node_id, &payload)
+                .await
+                .is_err()
+        );
+        transaction.rollback().await.unwrap();
+
+        assert!(get_node_by_id(&pool, &node_id).await.unwrap().is_none());
+    }
 }

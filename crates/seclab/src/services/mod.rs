@@ -16,6 +16,7 @@ pub mod node_runtime;
 pub mod node_session_reaper;
 pub mod node_state_machine;
 pub mod node_target_guard;
+pub mod node_validation;
 pub mod runtime_logs;
 pub mod runtime_metrics;
 pub mod script_runs;

@@ -5,7 +5,7 @@ use crate::crypto::decrypt_optional;
 use crate::models::node_provisioning::get_node_provisioning_by_node_id;
 use crate::models::node_sessions::close_active_sessions;
 use crate::runtime_config;
-use crate::services::node_enrollment::issue_enrollment_token;
+use crate::services::node_enrollment::{issue_enrollment_token, revoke_failed_enrollment};
 use crate::services::node_precheck::inspect_remote_agent;
 use crate::services::node_provisioning;
 use crate::services::node_state_machine::{
@@ -263,6 +263,7 @@ async fn operate_node(
 
     if let Err(err) = deploy_node_with(input, deploy_sessions).await {
         runtime_metrics::record_deploy_result(false);
+        let _ = revoke_failed_enrollment(pool, &issued.enrollment_id).await;
         let _ = transition_to_deploy_failed(pool, node_id).await;
         let _ = node_provisioning::record_operation_result(
             pool,
@@ -515,6 +516,7 @@ pub async fn deploy_node_with(
     let password = input.password.clone();
     let private_key = input.private_key.clone();
     let private_key_passphrase = input.private_key_passphrase.clone();
+    let allow_existing_agent = input.allow_existing_agent;
     let deploy_sessions_clone = deploy_sessions.clone();
 
     let logs =
@@ -534,17 +536,32 @@ pub async fn deploy_node_with(
                 &format!("Add node [{addr_clone}] task started [START]"),
             );
             update_status(&logs, 0);
+            let session = match open_ssh_session(
+                &addr_clone,
+                Some(&ssh_port_clone),
+                &user_clone,
+                Some(&auth_mode),
+                password.as_deref(),
+                private_key.as_deref(),
+                private_key_passphrase.as_deref(),
+            ) {
+                Ok(session) => session,
+                Err(err) => {
+                    log_line(&mut logs, &format!("Task failed: {err:?}"));
+                    log_line(&mut logs, "[TASK-END]");
+                    if let Some(ref sessions) = deploy_sessions_clone
+                        && let Ok(mut map) = sessions.lock()
+                        && let Some(session) = map.get_mut(&agent_id_clone)
+                    {
+                        session.logs = logs.clone();
+                        session.is_finished = true;
+                        session.error = Some(format!("{err:?}"));
+                    }
+                    return Err((err, logs));
+                }
+            };
+            let mut remote_mutated = false;
             let result = (|| -> ApiResult<()> {
-                let session = open_ssh_session(
-                    &addr_clone,
-                    Some(&ssh_port_clone),
-                    &user_clone,
-                    Some(&auth_mode),
-                    password.as_deref(),
-                    private_key.as_deref(),
-                    private_key_passphrase.as_deref(),
-                )?;
-
                 // 强前置 Sudo 免密检验防死锁 (Sudo Safe Guard)
                 log_line(&mut logs, "Checking passwordless sudo privilege on target node");
                 let use_sudo = user_clone != "root";
@@ -566,7 +583,7 @@ pub async fn deploy_node_with(
                     return Err(ApiError::BadRequest(node_conflict_message().to_string()));
                 }
                 let remote_agent = inspect_remote_agent(&session)?;
-                if remote_agent.present && !input.allow_existing_agent {
+                if remote_agent.present && !allow_existing_agent {
                     return Err(ApiError::BadRequest(
                         "Existing seclab-agent detected; new node deployment is blocked"
                             .to_string(),
@@ -625,6 +642,7 @@ pub async fn deploy_node_with(
                         config_dir
                     ),
                 )?;
+                remote_mutated = true;
                 log_line(&mut logs, "Node directories prepared");
                 update_status(&logs, 20);
 
@@ -815,6 +833,20 @@ pub async fn deploy_node_with(
                     Ok(logs)
                 }
                 Err(err) => {
+                    if remote_mutated && !allow_existing_agent {
+                        log_line(&mut logs, "Rolling back files created by this deployment");
+                        match compensate_new_remote_deploy(
+                            &session,
+                            user_clone != "root",
+                            &install_dir_clone,
+                        ) {
+                            Ok(()) => log_line(&mut logs, "Deployment rollback completed"),
+                            Err(cleanup_err) => log_line(
+                                &mut logs,
+                                &format!("Deployment rollback was incomplete: {cleanup_err:?}"),
+                            ),
+                        }
+                    }
                     log_line(&mut logs, &format!("Task failed: {:?}", err));
                     log_line(&mut logs, "[TASK-END]");
                     if let Some(ref sessions) = deploy_sessions_clone
@@ -847,6 +879,29 @@ pub async fn deploy_node_with(
         enrollment_token: input.enrollment_token.clone(),
         logs,
     })
+}
+
+/// 清理首次部署过程中创建的远端服务、制品与配置文件。
+fn compensate_new_remote_deploy(
+    session: &Session,
+    use_sudo: bool,
+    install_dir: &str,
+) -> ApiResult<()> {
+    let base = install_dir.trim_end_matches('/');
+    let config_dir = format!("{base}/config");
+    let command = format!(
+        "{sudo}systemctl disable --now seclab-agent >/dev/null 2>&1 || true; \
+         {sudo}rm -f /etc/systemd/system/seclab-agent.service \
+         /usr/local/bin/seclab-agent /usr/bin/seclab-agent \
+         /usr/local/bin/slctl /usr/bin/slctl \
+         /tmp/seclab-agent /tmp/slctl /tmp/seclab-agent.toml \
+         /tmp/seclab-agent.install_dir; \
+         {sudo}rm -f {config}/agent.toml {config}/agent.install_dir {config}/node.role; \
+         {sudo}systemctl daemon-reload",
+        sudo = sudo_prefix(use_sudo),
+        config = shell_escape(&config_dir),
+    );
+    run_remote(session, &command)
 }
 
 /// 生成新的节点标识符。

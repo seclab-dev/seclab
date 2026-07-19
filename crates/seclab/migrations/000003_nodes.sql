@@ -208,25 +208,30 @@ END;
 CREATE TABLE IF NOT EXISTS node_tasks (
     task_id TEXT PRIMARY KEY,
     node_id TEXT NOT NULL,
-    session_id TEXT,
     task_type TEXT NOT NULL,
-    scheduled_at TEXT,
     started_at TEXT,
     finished_at TEXT,
     status TEXT NOT NULL CHECK (
-        status IN ('pending', 'dispatched', 'running', 'succeeded', 'failed', 'canceled')
+        status IN ('queued', 'running', 'cancel_requested', 'succeeded', 'failed', 'canceled')
     ),
-    payload TEXT NOT NULL DEFAULT '{}',
+    phase TEXT NOT NULL DEFAULT 'queued',
+    progress_percent INTEGER CHECK (
+        progress_percent IS NULL OR progress_percent BETWEEN 0 AND 100
+    ),
+    progress_logs TEXT NOT NULL DEFAULT '[]',
+    cancellable INTEGER NOT NULL DEFAULT 0 CHECK (cancellable IN (0, 1)),
     result_summary TEXT,
-    error_detail TEXT,
+    error_code TEXT,
+    error_summary TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    FOREIGN KEY (node_id) REFERENCES nodes(node_id) ON DELETE CASCADE,
-    FOREIGN KEY (session_id) REFERENCES node_sessions(session_id) ON DELETE SET NULL
+    FOREIGN KEY (node_id) REFERENCES nodes(node_id) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_node_tasks_node_id_status_scheduled_at ON node_tasks (node_id, status, scheduled_at);
-CREATE INDEX IF NOT EXISTS idx_node_tasks_session_id ON node_tasks (session_id);
+CREATE INDEX IF NOT EXISTS idx_node_tasks_node_id_created_at ON node_tasks (node_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_node_tasks_one_active_per_node
+    ON node_tasks (node_id)
+    WHERE status IN ('queued', 'running', 'cancel_requested');
 
 CREATE TRIGGER IF NOT EXISTS set_node_tasks_updated_at
 AFTER UPDATE ON node_tasks FOR EACH ROW

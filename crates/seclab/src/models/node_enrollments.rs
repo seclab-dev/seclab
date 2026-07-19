@@ -3,7 +3,7 @@
 use crate::state::DbPool;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
+use sqlx::{Executor, FromRow, Sqlite};
 
 /// 节点纳管记录。
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -22,10 +22,13 @@ pub struct NodeEnrollmentRecord {
 }
 
 /// 新增节点纳管记录。
-pub async fn insert_node_enrollment(
-    pool: &DbPool,
+pub async fn insert_node_enrollment<'e, E>(
+    executor: E,
     record: &NodeEnrollmentRecord,
-) -> sqlx::Result<()> {
+) -> sqlx::Result<()>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     sqlx::query(
         r#"
         INSERT INTO node_enrollments (
@@ -48,7 +51,7 @@ pub async fn insert_node_enrollment(
     .bind(&record.first_used_at)
     .bind(&record.last_used_at)
     .bind(&record.revoked_at)
-    .execute(pool)
+    .execute(executor)
     .await?;
 
     Ok(())
@@ -102,4 +105,27 @@ pub async fn mark_enrollment_used(pool: &DbPool, enrollment_id: &str) -> sqlx::R
     .await?;
 
     Ok(())
+}
+
+/// 撤销尚未被 Agent 使用的纳管令牌。
+pub async fn revoke_issued_enrollment(pool: &DbPool, enrollment_id: &str) -> sqlx::Result<bool> {
+    let now = Utc::now().to_rfc3339();
+    let result = sqlx::query(
+        r#"
+        UPDATE node_enrollments
+        SET
+            token_status = 'revoked',
+            revoked_at = ?,
+            updated_at = ?
+        WHERE enrollment_id = ?
+          AND token_status = 'issued'
+        "#,
+    )
+    .bind(&now)
+    .bind(&now)
+    .bind(enrollment_id)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected() == 1)
 }

@@ -4,6 +4,7 @@ use crate::api::auth::AuthenticatedAdmin;
 use crate::api::node_proxy::{proxy_handler_for_node, websocket_proxy_handler_for_node};
 use crate::models::logging::LogModule;
 use crate::models::node_api_types::{NodeCreatePayload, NodeUpdatePayload};
+use crate::models::node_tasks;
 use crate::models::nodes::NodeStatus;
 use crate::services::logging::{self, OperationEventBuilder};
 use crate::services::node_check::{NodeCheckResponse, check_node_health};
@@ -18,6 +19,7 @@ use crate::services::node_state_machine::{
 use crate::services::node_target_guard::{
     NodeTargetGuardInput, assert_target_not_current_host, assert_target_not_node_host,
 };
+use crate::services::node_validation::{self, NodeConnectionInput};
 use crate::services::runtime_metrics;
 use crate::services::{node_enrollment, node_inventory, node_provisioning, node_read_model};
 use crate::state::AppState;
@@ -33,12 +35,43 @@ use seclab_contracts::api::ErrorCode;
 use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeDeployCreateResult {
     pub logs: Vec<String>,
     pub node: Option<node_read_model::NodeSummaryView>,
+}
+
+/// 将内存中的实时进度持续镜像到节点任务表，终态写入后停止。
+fn spawn_deploy_progress_persistence(state: Arc<AppState>, node_id: String, task_id: String) {
+    tokio::spawn(async move {
+        loop {
+            let snapshot = state
+                .deploy_sessions
+                .lock()
+                .ok()
+                .and_then(|sessions| sessions.get(&node_id).cloned());
+            let Some(snapshot) = snapshot else {
+                return;
+            };
+            let persisted =
+                match node_tasks::update_deploy_progress(&state.metadata_db, &task_id, &snapshot)
+                    .await
+                {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!(task_id, %error, "failed to persist node deploy progress");
+                        false
+                    }
+                };
+            if snapshot.is_finished && persisted {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    });
 }
 
 /// 一步创建并部署节点所需的字段。
@@ -56,11 +89,9 @@ pub struct NodeDeployCreatePayload {
     pub private_key_passphrase: Option<String>,
     pub auth_mode: Option<String>,
     pub tags: Option<Vec<String>>,
-    pub metadata: Option<serde_json::Value>,
     pub install_dir: Option<String>,
     #[serde(rename = "servicePort", alias = "listenPort")]
     pub service_port: Option<String>,
-    pub sync_enabled: Option<bool>,
     pub listen_addr: Option<String>,
     pub seclab_url: Option<String>,
 }
@@ -181,6 +212,32 @@ pub async fn create(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<NodeCreatePayload>,
 ) -> ApiResult<Response> {
+    node_validation::validate_required_name(payload.name.as_deref())?;
+    node_validation::validate_group(payload.group_id.as_deref())?;
+    node_validation::validate_description(payload.description.as_deref())?;
+    node_validation::validate_tags(payload.tags.as_deref())?;
+    if payload.addr.is_some()
+        || payload.port.is_some()
+        || payload.user.is_some()
+        || payload.auth_mode.is_some()
+        || payload.pwd.is_some()
+        || payload.private_key.is_some()
+    {
+        node_validation::validate_connection(
+            &NodeConnectionInput {
+                host: payload.addr.as_deref(),
+                ssh_port: payload.port.as_deref(),
+                user: payload.user.as_deref(),
+                auth_mode: payload.auth_mode.as_deref(),
+                password: payload.pwd.as_deref(),
+                private_key: payload.private_key.as_deref(),
+                service_port: payload.service_port.as_deref(),
+                install_dir: payload.install_dir.as_deref(),
+                controller_url: None,
+            },
+            true,
+        )?;
+    }
     if let Some(ref name) = payload.name
         && !name.trim().is_empty()
     {
@@ -211,19 +268,18 @@ pub async fn create(
         assert_target_not_node_host(guard_input).await?;
     }
 
-    let node_id = payload
-        .agent_id
-        .clone()
-        .unwrap_or_else(|| generate_node_id().unwrap_or_else(|_| new_uuid_v7()));
-    let status = if payload.status.as_deref() == Some("ONLINE") {
-        NodeStatus::AwaitingRegistration
-    } else {
-        NodeStatus::Draft
-    };
-    node_inventory::create_node_from_payload(&state.metadata_db, &node_id, &payload, status)
+    let node_id = generate_node_id().unwrap_or_else(|_| new_uuid_v7());
+    let mut transaction = state.metadata_db.begin().await?;
+    node_inventory::create_node_from_payload(
+        &mut *transaction,
+        &node_id,
+        &payload,
+        NodeStatus::Draft,
+    )
+    .await?;
+    node_provisioning::create_provisioning_from_payload(&mut *transaction, &node_id, &payload)
         .await?;
-    node_provisioning::create_provisioning_from_payload(&state.metadata_db, &node_id, &payload)
-        .await?;
+    transaction.commit().await?;
 
     let node = node_read_model::get_node_summary(&state.metadata_db, &node_id).await?;
     Ok(ApiResponse::success_with_raw("Node created", node).into_response())
@@ -232,8 +288,7 @@ pub async fn create(
 fn should_guard_create_payload(payload: &NodeCreatePayload) -> bool {
     let has_connection = payload.addr.is_some() && payload.user.is_some();
     let has_auth = payload.pwd.is_some() || payload.private_key.is_some();
-    let looks_like_reuse_register = payload.status.as_deref() == Some("ONLINE");
-    has_connection && has_auth && looks_like_reuse_register
+    has_connection && has_auth
 }
 
 pub async fn precheck(
@@ -243,6 +298,21 @@ pub async fn precheck(
     _headers: HeaderMap,
     Json(payload): Json<NodePrecheckPayload>,
 ) -> ApiResult<Response> {
+    node_validation::validate_optional_name(payload.name.as_deref())?;
+    node_validation::validate_connection(
+        &NodeConnectionInput {
+            host: payload.addr.as_deref(),
+            ssh_port: payload.port.as_deref(),
+            user: payload.user.as_deref(),
+            auth_mode: payload.auth_mode.as_deref(),
+            password: payload.pwd.as_deref(),
+            private_key: payload.private_key.as_deref(),
+            service_port: payload.service_port.as_deref(),
+            install_dir: payload.install_dir.as_deref(),
+            controller_url: payload.seclab_url.as_deref(),
+        },
+        true,
+    )?;
     let addr = payload
         .addr
         .clone()
@@ -292,6 +362,24 @@ pub async fn deploy_create(
     headers: HeaderMap,
     Json(payload): Json<NodeDeployCreatePayload>,
 ) -> ApiResult<Response> {
+    node_validation::validate_required_name(payload.name.as_deref())?;
+    node_validation::validate_group(payload.group_id.as_deref())?;
+    node_validation::validate_description(payload.description.as_deref())?;
+    node_validation::validate_tags(payload.tags.as_deref())?;
+    node_validation::validate_connection(
+        &NodeConnectionInput {
+            host: payload.addr.as_deref(),
+            ssh_port: payload.port.as_deref(),
+            user: payload.user.as_deref(),
+            auth_mode: payload.auth_mode.as_deref(),
+            password: payload.pwd.as_deref(),
+            private_key: payload.private_key.as_deref(),
+            service_port: payload.service_port.as_deref(),
+            install_dir: payload.install_dir.as_deref(),
+            controller_url: payload.seclab_url.as_deref(),
+        },
+        true,
+    )?;
     let node_id = generate_node_id()?;
     if let Some(ref name) = payload.name
         && !name.trim().is_empty()
@@ -381,26 +469,29 @@ pub async fn deploy_create(
         status: Some("OFFLINE".to_string()),
         version: None,
         tags: payload.tags.clone(),
-        metadata: payload.metadata.clone(),
+        metadata: None,
         install_dir: payload.install_dir.clone(),
         service_port: payload.service_port.clone(),
-        sync_enabled: payload.sync_enabled,
+        sync_enabled: None,
     };
+    let mut transaction = state.metadata_db.begin().await?;
+    let task_id = new_uuid_v7();
     node_inventory::create_node_from_payload(
-        &state.metadata_db,
+        &mut *transaction,
         &node_id,
         &create_payload,
         NodeStatus::Deploying,
     )
     .await?;
     node_provisioning::create_provisioning_from_payload(
-        &state.metadata_db,
+        &mut *transaction,
         &node_id,
         &create_payload,
     )
     .await?;
-
-    let issued = node_enrollment::issue_enrollment_token(&state.metadata_db, &node_id).await?;
+    let issued = node_enrollment::issue_enrollment_token(&mut *transaction, &node_id).await?;
+    node_tasks::create_deploy_task(&mut *transaction, &task_id, &node_id).await?;
+    transaction.commit().await?;
 
     let deploy_input = NodeDeployInput {
         agent_id: node_id.clone(),
@@ -451,6 +542,7 @@ pub async fn deploy_create(
             },
         );
     }
+    spawn_deploy_progress_persistence(Arc::clone(&state), node_id.clone(), task_id);
 
     let state_clone = Arc::clone(&state);
     let node_id_clone = node_id.clone();
@@ -505,6 +597,11 @@ pub async fn deploy_create(
             }
             Err(NodeDeployError { error, .. }) => {
                 runtime_metrics::record_deploy_result(false);
+                let _ = node_enrollment::revoke_failed_enrollment(
+                    &state_clone.metadata_db,
+                    &deploy_sync.enrollment_id,
+                )
+                .await;
                 let _ = transition_to_deploy_failed(&state_clone.metadata_db, &node_id_clone).await;
                 let _ = node_provisioning::record_operation_result(
                     &state_clone.metadata_db,
@@ -536,6 +633,31 @@ pub async fn update(
 ) -> ApiResult<Response> {
     let trace_id = logging::resolve_trace_id(&headers);
     let result = async {
+        node_validation::validate_optional_name(payload.name.as_deref())?;
+        node_validation::validate_group(payload.group_id.as_deref())?;
+        node_validation::validate_description(payload.description.as_deref())?;
+        node_validation::validate_tags(payload.tags.as_deref())?;
+        if payload.addr.is_some()
+            || payload.port.is_some()
+            || payload.user.is_some()
+            || payload.auth_mode.is_some()
+            || payload.pwd.is_some()
+            || payload.private_key.is_some()
+            || payload.service_port.is_some()
+            || payload.install_dir.is_some()
+        {
+            node_validation::validate_partial_connection(&NodeConnectionInput {
+                host: payload.addr.as_deref(),
+                ssh_port: payload.port.as_deref(),
+                user: payload.user.as_deref(),
+                auth_mode: payload.auth_mode.as_deref(),
+                password: payload.pwd.as_deref(),
+                private_key: payload.private_key.as_deref(),
+                service_port: payload.service_port.as_deref(),
+                install_dir: payload.install_dir.as_deref(),
+                controller_url: payload.seclab_url.as_deref(),
+            })?;
+        }
         if let Some(ref name) = payload.name
             && !name.trim().is_empty()
         {
@@ -625,6 +747,7 @@ pub async fn update(
     }
     .await;
     let mut platform_log = OperationEventBuilder::new(&admin.username, "node_update", conn.ip())
+        .user_id(admin.id)
         .module(LogModule::System)
         .target_type("node")
         .target_id(&node_id)
@@ -652,8 +775,9 @@ pub async fn remove(
     let target_name = node_read_model::get_node_summary(&state.metadata_db, &node_id)
         .await?
         .map(|node| node.name);
-    let result = node_inventory::delete_node(&state.metadata_db, &node_id).await;
+    let result = node_inventory::delete_node_with_protection(&state.metadata_db, &node_id).await;
     let mut platform_log = OperationEventBuilder::new(&admin.username, "node_remove", conn.ip())
+        .user_id(admin.id)
         .module(LogModule::System)
         .target_type("node")
         .target_id(&node_id)
@@ -666,10 +790,7 @@ pub async fn remove(
 
     match &result {
         Ok(_) => platform_log = platform_log.set_success(),
-        Err(err) => {
-            platform_log =
-                platform_log.metadata(json!({ "error": ApiError::database(err.to_string()) }))
-        }
+        Err(err) => platform_log = platform_log.metadata(json!({ "error": err })),
     }
     platform_log.finish(&state.metadata_db);
 
@@ -687,6 +808,8 @@ pub async fn deploy(
 ) -> ApiResult<Response> {
     let client_ip = conn.ip();
     let trace_id = logging::resolve_trace_id(&headers);
+    let task_id = new_uuid_v7();
+    node_tasks::create_deploy_task(&state.metadata_db, &task_id, &node_id).await?;
 
     // 初始化 deploy_sessions 状态
     {
@@ -701,6 +824,7 @@ pub async fn deploy(
             },
         );
     }
+    spawn_deploy_progress_persistence(Arc::clone(&state), node_id.clone(), task_id);
 
     let state_clone = Arc::clone(&state);
     let node_id_clone = node_id.clone();
@@ -715,6 +839,15 @@ pub async fn deploy(
             Some(Arc::clone(&state_clone.deploy_sessions)),
         )
         .await;
+
+        if let Err(error) = &result
+            && let Ok(mut sessions) = state_clone.deploy_sessions.lock()
+            && let Some(session) = sessions.get_mut(&node_id_clone)
+            && !session.is_finished
+        {
+            session.is_finished = true;
+            session.error = Some(error.message.to_string());
+        }
 
         let mut platform_log =
             OperationEventBuilder::new(&claims_username, "node_deploy", client_ip)
@@ -741,12 +874,9 @@ pub async fn deploy_progress(
     State(state): State<Arc<AppState>>,
     Path(node_id): Path<String>,
 ) -> ApiResult<Response> {
-    let map = state.deploy_sessions.lock().unwrap();
-    if let Some(session) = map.get(&node_id) {
-        Ok(
-            ApiResponse::success_with_raw("Deploy progress fetched", Some(session.clone()))
-                .into_response(),
-        )
+    if let Some(task) = node_tasks::get_latest_deploy_task(&state.metadata_db, &node_id).await? {
+        let session = node_tasks::to_deploy_session(&task);
+        Ok(ApiResponse::success_with_raw("Deploy progress fetched", Some(session)).into_response())
     } else {
         Err(ApiError::NotFound)
     }
@@ -776,6 +906,7 @@ pub async fn repair(
     let trace_id = logging::resolve_trace_id(&headers);
     let result = repair_node(&state.metadata_db, &node_id, payload).await;
     let mut platform_log = OperationEventBuilder::new(&admin.username, "node_repair", conn.ip())
+        .user_id(admin.id)
         .module(LogModule::System)
         .target_type("node")
         .target_id(&node_id)
@@ -801,6 +932,7 @@ pub async fn retire(
     let trace_id = logging::resolve_trace_id(&headers);
     let result = retire_node(&state.metadata_db, &node_id).await;
     let mut platform_log = OperationEventBuilder::new(&admin.username, "node_retire", conn.ip())
+        .user_id(admin.id)
         .module(LogModule::System)
         .target_type("node")
         .target_id(&node_id)
@@ -826,6 +958,7 @@ pub async fn uninstall(
     let trace_id = logging::resolve_trace_id(&headers);
     let result = uninstall_node(&state.metadata_db, &node_id).await;
     let mut platform_log = OperationEventBuilder::new(&admin.username, "node_uninstall", conn.ip())
+        .user_id(admin.id)
         .module(LogModule::System)
         .target_type("node")
         .target_id(&node_id)

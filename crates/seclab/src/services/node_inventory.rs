@@ -3,7 +3,9 @@
 use crate::models::node_api_types::{NodeCreatePayload, NodeUpdatePayload};
 use crate::models::nodes::{NodeStatus, get_node_by_id};
 use crate::state::DbPool;
-use sqlx::Row;
+use crate::types::{ApiError, ApiResult};
+use seclab_contracts::api::ErrorCode;
+use sqlx::{Executor, Row, Sqlite};
 
 fn normalize_name(name: Option<&str>, node_id: &str) -> String {
     name.unwrap_or(node_id)
@@ -102,12 +104,15 @@ pub async fn get_node_summary(pool: &DbPool, node_id: &str) -> sqlx::Result<Opti
 }
 
 /// 直接根据节点创建载荷写入 `nodes` 主记录。
-pub async fn create_node_from_payload(
-    pool: &DbPool,
+pub async fn create_node_from_payload<'e, E>(
+    executor: E,
     node_id: &str,
     payload: &NodeCreatePayload,
     status: NodeStatus,
-) -> sqlx::Result<()> {
+) -> sqlx::Result<()>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     let normalized_name = normalize_name(payload.name.as_deref(), node_id);
     let group_name = payload
         .group_id
@@ -146,7 +151,7 @@ pub async fn create_node_from_payload(
     .bind(encode_metadata_from_payload(payload.metadata.clone()))
     .bind(Option::<String>::None)
     .bind(Option::<String>::None)
-    .execute(pool)
+    .execute(executor)
     .await?;
 
     Ok(())
@@ -199,18 +204,107 @@ pub async fn update_node_from_payload(
     Ok(())
 }
 
-/// 删除节点主记录。
-pub async fn delete_node(pool: &DbPool, node_id: &str) -> sqlx::Result<()> {
-    sqlx::query(
+/// 删除节点前由数据库事实计算的安全引用计数。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NodeRemovalReferences {
+    pub active_sessions: i64,
+    pub active_node_tasks: i64,
+    pub scheduled_tasks: i64,
+    pub suite_instances: i64,
+    pub active_upgrade_targets: i64,
+}
+
+impl NodeRemovalReferences {
+    fn total(self) -> i64 {
+        self.active_sessions
+            + self.active_node_tasks
+            + self.scheduled_tasks
+            + self.suite_instances
+            + self.active_upgrade_targets
+    }
+
+    fn safe_summary(self) -> String {
+        format!(
+            "activeSessions={}, activeNodeTasks={}, scheduledTasks={}, suiteInstances={}, activeUpgradeTargets={}",
+            self.active_sessions,
+            self.active_node_tasks,
+            self.scheduled_tasks,
+            self.suite_instances,
+            self.active_upgrade_targets
+        )
+    }
+}
+
+/// 在同一数据库事务内检查生命周期和引用后删除节点。
+pub async fn delete_node_with_protection(pool: &DbPool, node_id: &str) -> ApiResult<()> {
+    if node_id == "local" {
+        return Err(ApiError::forbidden(
+            ErrorCode::NodeProtected,
+            "Local Node is system managed and cannot be removed",
+        ));
+    }
+
+    let mut transaction = pool.begin().await?;
+    let status = sqlx::query_scalar::<_, String>("SELECT status FROM nodes WHERE node_id = ?")
+        .bind(node_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| ApiError::not_found(ErrorCode::NodeNotFound, "node not found"))?;
+    if !matches!(status.as_str(), "draft" | "retired") {
+        return Err(ApiError::conflict(
+            ErrorCode::NodeStateConflict,
+            "only draft or retired nodes can be removed",
+        ));
+    }
+
+    let row = sqlx::query(
         r#"
-        DELETE FROM nodes
-        WHERE node_id = ?
+        SELECT
+            (SELECT COUNT(*) FROM node_sessions
+              WHERE node_id = ? AND status = 'active'
+                AND julianday(lease_expires_at) > julianday('now')) AS active_sessions,
+            (SELECT COUNT(*) FROM node_tasks
+              WHERE node_id = ? AND status IN ('queued', 'running', 'cancel_requested')) AS active_node_tasks,
+            (SELECT COUNT(*) FROM scheduled_tasks
+              WHERE node_id = ? AND deleted_at IS NULL) AS scheduled_tasks,
+            (SELECT COUNT(*) FROM suite_instances
+              WHERE node_id = ? AND uninstalled_at IS NULL) AS suite_instances,
+            (SELECT COUNT(*) FROM upgrade_targets
+              WHERE node_id = ? AND status IN ('pending', 'deferred', 'running')) AS active_upgrade_targets
         "#,
     )
     .bind(node_id)
-    .execute(pool)
+    .bind(node_id)
+    .bind(node_id)
+    .bind(node_id)
+    .bind(node_id)
+    .fetch_one(&mut *transaction)
     .await?;
+    let references = NodeRemovalReferences {
+        active_sessions: row.try_get("active_sessions")?,
+        active_node_tasks: row.try_get("active_node_tasks")?,
+        scheduled_tasks: row.try_get("scheduled_tasks")?,
+        suite_instances: row.try_get("suite_instances")?,
+        active_upgrade_targets: row.try_get("active_upgrade_targets")?,
+    };
+    if references.total() > 0 {
+        return Err(ApiError::conflict(
+            ErrorCode::NodeInUse,
+            format!("node is still referenced: {}", references.safe_summary()),
+        ));
+    }
 
+    let result = sqlx::query("DELETE FROM nodes WHERE node_id = ?")
+        .bind(node_id)
+        .execute(&mut *transaction)
+        .await?;
+    if result.rows_affected() != 1 {
+        return Err(ApiError::not_found(
+            ErrorCode::NodeNotFound,
+            "node not found",
+        ));
+    }
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -240,4 +334,87 @@ pub async fn check_name_conflict(
 
     let row = query.fetch_optional(pool).await?;
     Ok(row.is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::delete_node_with_protection;
+    use crate::models::nodes::{NewNodeRecord, NodeStatus, insert_node, update_node_status};
+    use crate::test_support::setup_test_db;
+    use seclab_contracts::api::ErrorCode;
+    use uuid::Uuid;
+
+    async fn insert_node_with_status(pool: &crate::state::DbPool, status: NodeStatus) -> String {
+        let node_id = Uuid::new_v4().to_string();
+        insert_node(
+            pool,
+            &NewNodeRecord {
+                node_id: node_id.clone(),
+                tenant_id: None,
+                name: format!("node-{node_id}"),
+                normalized_name: format!("node-{node_id}"),
+                group_name: "default".to_string(),
+                labels: "[]".to_string(),
+                description: None,
+                desired_role: None,
+                schedulable: true,
+                metadata: "{}".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        update_node_status(pool, &node_id, status).await.unwrap();
+        node_id
+    }
+
+    #[tokio::test]
+    async fn protects_local_online_and_missing_nodes() {
+        let pool = setup_test_db().await;
+        let local = delete_node_with_protection(&pool, "local")
+            .await
+            .unwrap_err();
+        assert_eq!(local.code, ErrorCode::NodeProtected);
+
+        let online = insert_node_with_status(&pool, NodeStatus::Online).await;
+        let error = delete_node_with_protection(&pool, &online)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::NodeStateConflict);
+
+        let missing = delete_node_with_protection(&pool, "missing")
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code, ErrorCode::NodeNotFound);
+    }
+
+    #[tokio::test]
+    async fn blocks_active_references_and_removes_unreferenced_draft() {
+        let pool = setup_test_db().await;
+        let referenced = insert_node_with_status(&pool, NodeStatus::Draft).await;
+        sqlx::query(
+            r#"INSERT INTO node_tasks (task_id, node_id, task_type, status)
+               VALUES (?, ?, 'deploy', 'queued')"#,
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&referenced)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let error = delete_node_with_protection(&pool, &referenced)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::NodeInUse);
+        assert!(error.message.contains("activeNodeTasks=1"));
+
+        let removable = insert_node_with_status(&pool, NodeStatus::Draft).await;
+        delete_node_with_protection(&pool, &removable)
+            .await
+            .unwrap();
+        assert!(
+            crate::models::nodes::get_node_by_id(&pool, &removable)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 }
