@@ -10,6 +10,7 @@ Environment=SECLAB_HOME=__SECLAB_HOME__
 ExecStart=/usr/local/bin/seclab start
 Restart=always
 RestartSec=5
+TimeoutStopSec=20s
 LimitNOFILE=65535
 
 [Install]

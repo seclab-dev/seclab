@@ -18,6 +18,7 @@ use seclab_security::client::build_tls_client;
 use semver::Version;
 use shadow_rs::{formatcp, shadow};
 use std::net::SocketAddr;
+use std::time::Duration;
 use std::{fs, os::unix::fs::PermissionsExt};
 use tokio::{net::UnixListener, signal, sync::watch};
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
@@ -40,6 +41,7 @@ const DEFAULT_PRODUCTION_HOME: &str = "/opt/seclab";
 const RUNTIME_RETRY_INITIAL_DELAY_SECONDS: u64 = 3;
 const RUNTIME_RETRY_MAX_DELAY_SECONDS: u64 = 20;
 const RUNTIME_RETRY_JITTER_SECONDS: u64 = 3;
+const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 shadow!(build);
 
@@ -221,10 +223,12 @@ async fn main() {
     tokio::spawn(async move {
         shutdown_signal().await;
         tracing::info!(
+            active_connections = shutdown_handle.connection_count(),
+            graceful_timeout_seconds = GRACEFUL_SHUTDOWN_TIMEOUT.as_secs(),
             "seclab-agent remote listener received shutdown signal. Stopping runtime resources..."
         );
         let _ = runtime_stop_tx_for_signal.send(true);
-        shutdown_handle.graceful_shutdown(None);
+        shutdown_handle.graceful_shutdown(Some(GRACEFUL_SHUTDOWN_TIMEOUT));
     });
 
     if let Err(err) = axum_server::bind_rustls(listen_addr, tls_config)

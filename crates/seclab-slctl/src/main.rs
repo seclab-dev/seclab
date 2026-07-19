@@ -621,6 +621,28 @@ impl Context {
         Ok(())
     }
 
+    /// 停止服务并确认 systemd 已不再持有活动主进程。
+    fn stop_service_and_verify(&self, service: &str) -> Result<()> {
+        let stop_status = self.run_command_silent("systemctl", &["stop", service])?;
+        let active_status =
+            self.run_command_silent("systemctl", &["is-active", "--quiet", service])?;
+        let main_pid = self
+            .run_command_output("systemctl", &["show", "-p", "MainPID", "--value", service])
+            .unwrap_or_default();
+
+        if !service_has_stopped(active_status.success(), &main_pid) {
+            return Err(anyhow::anyhow!(
+                "failed to stop {service}: service is still active or MainPID is still present"
+            ));
+        }
+        if !stop_status.success() {
+            eprintln!(
+                "slctl: warning: systemctl stop {service} returned a failure, but the service is verified stopped"
+            );
+        }
+        Ok(())
+    }
+
     /// 卸载指定的服务。
     fn uninstall_service(&self, target: &str, purge: bool) -> Result<()> {
         if !command_exists("systemctl") {
@@ -630,7 +652,7 @@ impl Context {
         let service = build_service_name(target);
         println!("slctl: start uninstall {}", target);
 
-        let _ = self.run_command_silent("systemctl", &["stop", &service]);
+        self.stop_service_and_verify(&service)?;
         let _ = self.run_command_silent("systemctl", &["disable", &service]);
 
         self.remove_file_if_exists(&format!("/etc/systemd/system/{}.service", service))?;
@@ -819,6 +841,11 @@ impl Context {
     }
 }
 
+/// 根据 systemd 活动状态和主进程号判断服务是否已经完全停止。
+fn service_has_stopped(is_active: bool, main_pid: &str) -> bool {
+    !is_active && matches!(main_pid.trim(), "" | "0")
+}
+
 /// 分发并执行命令行指令。
 fn run_app(cli: Cli, context: Context) -> Result<()> {
     match cli.command {
@@ -919,7 +946,15 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_password, validate_safe_entry_value};
+    use super::{service_has_stopped, validate_password, validate_safe_entry_value};
+
+    #[test]
+    fn service_stop_verification_requires_inactive_state_and_zero_pid() {
+        assert!(service_has_stopped(false, "0\n"));
+        assert!(service_has_stopped(false, ""));
+        assert!(!service_has_stopped(true, "0"));
+        assert!(!service_has_stopped(false, "7310"));
+    }
 
     #[test]
     fn validates_safe_entry_format_and_reserved_prefixes() {

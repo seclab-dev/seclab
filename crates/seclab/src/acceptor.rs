@@ -11,6 +11,8 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 
+const PROTOCOL_SNIFF_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// 自定义 Acceptor，用于嗅探 TLS 和明文 HTTP
 #[derive(Clone)]
 pub struct HttpOrHttpsAcceptor {
@@ -37,11 +39,10 @@ where
     fn accept(&self, stream: TcpStream, service: S) -> Self::Future {
         let rustls_acceptor = self.rustls_acceptor.clone();
         Box::pin(async move {
-            let mut buf = [0u8; 1];
             // 嗅探首字节，但不从 TCP 缓冲区移除数据
-            stream.peek(&mut buf).await?;
+            let first_byte = peek_first_byte(&stream, PROTOCOL_SNIFF_TIMEOUT).await?;
 
-            if buf[0] == 0x16 {
+            if first_byte == 0x16 {
                 // 如果是 TLS 握手包，交给 rustls 进行处理
                 let (tls_stream, s) = rustls_acceptor
                     .accept(stream, service)
@@ -60,6 +61,21 @@ where
             }
         })
     }
+}
+
+/// 在限定时间内读取协议首字节，避免空闲 TCP 连接永久占用停机流程。
+async fn peek_first_byte(stream: &TcpStream, timeout: Duration) -> io::Result<u8> {
+    let mut buf = [0u8; 1];
+    let read = tokio::time::timeout(timeout, stream.peek(&mut buf))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "protocol sniff timed out"))??;
+    if read == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "connection closed before protocol sniff",
+        ));
+    }
+    Ok(buf[0])
 }
 
 /// 支持明文与加密流量的包装枚举
@@ -147,4 +163,50 @@ async fn handle_http_redirect(mut stream: TcpStream) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::peek_first_byte;
+    use std::io::ErrorKind;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// 建立一对本机 TCP 连接供协议探测测试使用。
+    async fn connected_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn protocol_sniff_reads_without_consuming_first_byte() {
+        let (mut client, server) = connected_pair().await;
+        client.write_all(&[0x16]).await.unwrap();
+
+        assert_eq!(
+            peek_first_byte(&server, Duration::from_secs(1))
+                .await
+                .unwrap(),
+            0x16
+        );
+        assert_eq!(
+            peek_first_byte(&server, Duration::from_secs(1))
+                .await
+                .unwrap(),
+            0x16
+        );
+    }
+
+    #[tokio::test]
+    async fn protocol_sniff_times_out_for_idle_forwarded_connection() {
+        let (_client, server) = connected_pair().await;
+        let error = peek_first_byte(&server, Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+    }
 }

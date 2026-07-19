@@ -6,6 +6,7 @@ use rustls::crypto::ring::default_provider;
 use shadow_rs::{formatcp, shadow};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::time::Duration;
 use tokio::signal;
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_subscriber::{fmt::time::ChronoLocal, layer::SubscriberExt, util::SubscriberInitExt};
@@ -39,6 +40,7 @@ build_env: {},{}"#,
     build::RUST_CHANNEL
 );
 const DEFAULT_PRODUCTION_HOME: &str = "/opt/seclab";
+const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Parser, Debug)]
 #[command(name = "SecLab", version = VERSION_INFO)]
@@ -228,8 +230,12 @@ async fn main() {
     let shutdown_handle = handle.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
-        tracing::info!("Controller server received shutdown signal. Stopping server...");
-        shutdown_handle.graceful_shutdown(None);
+        tracing::info!(
+            active_connections = shutdown_handle.connection_count(),
+            graceful_timeout_seconds = GRACEFUL_SHUTDOWN_TIMEOUT.as_secs(),
+            "Controller server received shutdown signal. Stopping server..."
+        );
+        shutdown_handle.graceful_shutdown(Some(GRACEFUL_SHUTDOWN_TIMEOUT));
     });
 
     let listener = match std::net::TcpListener::bind(addr) {
