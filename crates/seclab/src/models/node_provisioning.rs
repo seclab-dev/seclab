@@ -2,7 +2,7 @@
 
 use crate::state::DbPool;
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
+use sqlx::{Executor, FromRow, Sqlite};
 
 /// 节点部署记录。
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -22,6 +22,9 @@ pub struct NodeProvisioningRecord {
     pub systemd_service_name: String,
     pub expected_listen_port: Option<i64>,
     pub seclab_url: Option<String>,
+    pub revision: i64,
+    pub validated_revision: Option<i64>,
+    pub precheck_valid_until: Option<String>,
     pub last_deploy_task_id: Option<String>,
     pub last_deploy_result_status: Option<String>,
     pub last_deploy_error_summary: Option<String>,
@@ -52,11 +55,14 @@ pub async fn upsert_node_provisioning(
             systemd_service_name,
             expected_listen_port,
             seclab_url,
+            revision,
+            validated_revision,
+            precheck_valid_until,
             last_deploy_task_id,
             last_deploy_result_status,
             last_deploy_error_summary,
             last_deploy_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(node_id) DO UPDATE SET
             deploy_method = excluded.deploy_method,
             ssh_addr = excluded.ssh_addr,
@@ -70,6 +76,9 @@ pub async fn upsert_node_provisioning(
             systemd_service_name = excluded.systemd_service_name,
             expected_listen_port = excluded.expected_listen_port,
             seclab_url = excluded.seclab_url,
+            revision = excluded.revision,
+            validated_revision = excluded.validated_revision,
+            precheck_valid_until = excluded.precheck_valid_until,
             last_deploy_task_id = excluded.last_deploy_task_id,
             last_deploy_result_status = excluded.last_deploy_result_status,
             last_deploy_error_summary = excluded.last_deploy_error_summary,
@@ -90,6 +99,9 @@ pub async fn upsert_node_provisioning(
     .bind(&record.systemd_service_name)
     .bind(record.expected_listen_port)
     .bind(&record.seclab_url)
+    .bind(record.revision)
+    .bind(record.validated_revision)
+    .bind(&record.precheck_valid_until)
     .bind(&record.last_deploy_task_id)
     .bind(&record.last_deploy_result_status)
     .bind(&record.last_deploy_error_summary)
@@ -122,6 +134,9 @@ pub async fn get_node_provisioning_by_node_id(
             systemd_service_name,
             expected_listen_port,
             seclab_url,
+            revision,
+            validated_revision,
+            precheck_valid_until,
             last_deploy_task_id,
             last_deploy_result_status,
             last_deploy_error_summary,
@@ -157,6 +172,9 @@ pub async fn list_node_provisioning(pool: &DbPool) -> sqlx::Result<Vec<NodeProvi
             systemd_service_name,
             expected_listen_port,
             seclab_url,
+            revision,
+            validated_revision,
+            precheck_valid_until,
             last_deploy_task_id,
             last_deploy_result_status,
             last_deploy_error_summary,
@@ -169,4 +187,30 @@ pub async fn list_node_provisioning(pool: &DbPool) -> sqlx::Result<Vec<NodeProvi
     )
     .fetch_all(pool)
     .await
+}
+
+/// 将预检结果绑定到指定部署配置 revision。
+pub async fn mark_precheck_validated<'e, E>(
+    executor: E,
+    node_id: &str,
+    revision: i64,
+    valid_until: &str,
+) -> sqlx::Result<bool>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    let result = sqlx::query(
+        r#"
+        UPDATE node_provisioning
+        SET validated_revision = ?, precheck_valid_until = ?
+        WHERE node_id = ? AND revision = ?
+        "#,
+    )
+    .bind(revision)
+    .bind(valid_until)
+    .bind(node_id)
+    .bind(revision)
+    .execute(executor)
+    .await?;
+    Ok(result.rows_affected() == 1)
 }

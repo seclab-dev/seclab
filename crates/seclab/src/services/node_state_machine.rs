@@ -52,6 +52,9 @@ pub fn apply_node_state_transition(
         (NodeStatus::Degraded, NodeStateEvent::StartDeploy) => NodeStatus::Deploying,
         (NodeStatus::Conflict, NodeStateEvent::StartDeploy) => NodeStatus::Deploying,
         (NodeStatus::Deploying, NodeStateEvent::DeployFailed) => NodeStatus::DeployFailed,
+        (NodeStatus::AwaitingRegistration, NodeStateEvent::DeployFailed) => {
+            NodeStatus::DeployFailed
+        }
         (NodeStatus::Deploying, NodeStateEvent::DeploymentPrepared) => {
             NodeStatus::AwaitingRegistration
         }

@@ -62,6 +62,9 @@ CREATE TABLE IF NOT EXISTS node_provisioning (
     expected_listen_port INTEGER,
     -- 节点实际回连主控使用的 URL，用于多网卡、跨网段和 NAT 场景下生成节点侧制品下载地址。
     seclab_url TEXT,
+    revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
+    validated_revision INTEGER,
+    precheck_valid_until TEXT,
     last_deploy_task_id TEXT,
     last_deploy_result_status TEXT,
     last_deploy_error_summary TEXT,

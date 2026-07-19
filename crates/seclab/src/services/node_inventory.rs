@@ -158,11 +158,14 @@ where
 }
 
 /// 直接根据节点更新载荷更新 `nodes` 主记录。
-pub async fn update_node_from_payload(
-    pool: &DbPool,
+pub async fn update_node_from_payload<'e, E>(
+    executor: E,
     node_id: &str,
     payload: &NodeUpdatePayload,
-) -> sqlx::Result<()> {
+) -> sqlx::Result<()>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     let normalized_name = payload
         .name
         .as_deref()
@@ -198,7 +201,7 @@ pub async fn update_node_from_payload(
             .map(|metadata| encode_metadata_from_payload(Some(metadata))),
     )
     .bind(node_id)
-    .execute(pool)
+    .execute(executor)
     .await?;
 
     Ok(())

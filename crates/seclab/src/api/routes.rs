@@ -93,21 +93,12 @@ pub async fn create_router() -> Result<(Router, crate::state::DbPool)> {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to initialize default admin user: {}", e))?;
 
-    let interrupted_tasks = crate::models::node_tasks::fail_interrupted_tasks(&db).await?;
-    if interrupted_tasks > 0 {
-        tracing::warn!(
-            interrupted_tasks,
-            "marked interrupted node tasks as failed during startup"
-        );
-    }
-
     // 创建共享的应用状态
     let app_state = Arc::new(AppState {
         server_name: "SecLab".to_string(),
         metadata_db: db,
         captcha_service: crate::security::captcha::CaptchaService::default(),
         login_tracker: crate::security::login_tracker::LoginTracker::default(),
-        deploy_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         local_node_resource: Arc::new(tokio::sync::Mutex::new(None)),
         image_acquisition: crate::services::image_acquisition::ImageAcquisitionService::new(),
         terminal_tickets: Arc::new(
@@ -117,6 +108,7 @@ pub async fn create_router() -> Result<(Router, crate::state::DbPool)> {
     crate::services::node_session_reaper::spawn_session_reaper(Arc::clone(&app_state));
     crate::services::upgrades::spawn_upgrade_scheduler(Arc::clone(&app_state));
     crate::services::node_read_model::spawn_local_node_monitor(Arc::clone(&app_state));
+    crate::services::node_task_recovery::spawn_node_task_recovery(Arc::clone(&app_state));
     crate::services::task_sync::spawn_sync_queue_worker(Arc::clone(&app_state));
     crate::services::script_runs::spawn_worker(Arc::clone(&app_state));
     crate::services::file_task_audit::spawn_reconciler(Arc::clone(&app_state));

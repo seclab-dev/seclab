@@ -40,11 +40,11 @@ pub struct MarkDeployedInput {
 pub async fn mark_deployed(pool: &DbPool, input: &MarkDeployedInput) -> sqlx::Result<()> {
     let now = Utc::now().to_rfc3339();
     let existing = get_node_provisioning_by_node_id(pool, &input.node_id).await?;
-    let (pwd, key, passphrase) = match existing {
+    let (pwd, key, passphrase) = match existing.as_ref() {
         Some(rec) => (
-            rec.ssh_password_ciphertext,
-            rec.ssh_private_key_ciphertext,
-            rec.ssh_private_key_passphrase_ciphertext,
+            rec.ssh_password_ciphertext.clone(),
+            rec.ssh_private_key_ciphertext.clone(),
+            rec.ssh_private_key_passphrase_ciphertext.clone(),
         ),
         None => (None, None, None),
     };
@@ -64,6 +64,13 @@ pub async fn mark_deployed(pool: &DbPool, input: &MarkDeployedInput) -> sqlx::Re
         systemd_service_name: "seclab-agent.service".to_string(),
         expected_listen_port: input.service_port.parse::<i64>().ok(),
         seclab_url: Some(input.seclab_url.trim_end_matches('/').to_string()),
+        revision: existing.as_ref().map_or(1, |record| record.revision),
+        validated_revision: existing
+            .as_ref()
+            .and_then(|record| record.validated_revision),
+        precheck_valid_until: existing
+            .as_ref()
+            .and_then(|record| record.precheck_valid_until.clone()),
         last_deploy_task_id: None,
         last_deploy_result_status: Some(input.result_status.clone()),
         last_deploy_error_summary: None,
@@ -99,6 +106,9 @@ pub async fn record_operation_result(
         systemd_service_name: "seclab-agent.service".to_string(),
         expected_listen_port: None,
         seclab_url: None,
+        revision: 1,
+        validated_revision: None,
+        precheck_valid_until: None,
         last_deploy_task_id: None,
         last_deploy_result_status: None,
         last_deploy_error_summary: None,
@@ -155,6 +165,9 @@ where
         systemd_service_name: "seclab-agent.service".to_string(),
         expected_listen_port: parse_port(payload.service_port.as_deref()),
         seclab_url: None,
+        revision: 1,
+        validated_revision: None,
+        precheck_valid_until: None,
         last_deploy_task_id: None,
         last_deploy_result_status: None,
         last_deploy_error_summary: None,
@@ -169,8 +182,9 @@ where
             ssh_auth_mode, ssh_password_ciphertext, ssh_private_key_ciphertext,
             ssh_private_key_passphrase_ciphertext, install_dir, systemd_service_name,
             expected_listen_port, seclab_url, last_deploy_task_id,
+            revision, validated_revision, precheck_valid_until,
             last_deploy_result_status, last_deploy_error_summary, last_deploy_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(&record.provisioning_id)
@@ -188,6 +202,9 @@ where
     .bind(record.expected_listen_port)
     .bind(&record.seclab_url)
     .bind(&record.last_deploy_task_id)
+    .bind(record.revision)
+    .bind(record.validated_revision)
+    .bind(&record.precheck_valid_until)
     .bind(&record.last_deploy_result_status)
     .bind(&record.last_deploy_error_summary)
     .bind(&record.last_deploy_at);
@@ -196,76 +213,76 @@ where
 }
 
 /// 根据节点更新载荷直接更新部署记录。
-pub async fn update_provisioning_from_payload(
-    pool: &DbPool,
+pub async fn update_provisioning_from_payload<'e, E>(
+    executor: E,
     node_id: &str,
     payload: &NodeUpdatePayload,
-) -> sqlx::Result<()> {
-    let existing = get_node_provisioning_by_node_id(pool, node_id).await?;
-    let existing = existing.unwrap_or_else(|| NodeProvisioningRecord {
-        provisioning_id: provisioning_id(node_id),
-        node_id: node_id.to_string(),
-        deploy_method: "inventory_update".to_string(),
-        ssh_addr: None,
-        ssh_port: None,
-        ssh_user: None,
-        ssh_auth_mode: None,
-        ssh_password_ciphertext: None,
-        ssh_private_key_ciphertext: None,
-        ssh_private_key_passphrase_ciphertext: None,
-        install_dir: crate::config::DEFAULT_PRODUCTION_HOME.to_string(),
-        systemd_service_name: "seclab-agent.service".to_string(),
-        expected_listen_port: None,
-        seclab_url: None,
-        last_deploy_task_id: None,
-        last_deploy_result_status: None,
-        last_deploy_error_summary: None,
-        last_deploy_at: None,
-        created_at: Utc::now().to_rfc3339(),
-        updated_at: Utc::now().to_rfc3339(),
-    });
-
-    let record = NodeProvisioningRecord {
-        provisioning_id: existing.provisioning_id,
-        node_id: existing.node_id,
-        deploy_method: "inventory_update".to_string(),
-        ssh_addr: payload.addr.clone().or(existing.ssh_addr),
-        ssh_port: parse_port(payload.port.as_deref()).or(existing.ssh_port),
-        ssh_user: payload.user.clone().or(existing.ssh_user),
-        ssh_auth_mode: payload.auth_mode.clone().or(existing.ssh_auth_mode),
-        ssh_password_ciphertext: if payload.pwd.is_some() {
-            encrypt_optional(payload.pwd.clone()).map_err(map_crypto_err)?
-        } else {
-            existing.ssh_password_ciphertext
-        },
-        ssh_private_key_ciphertext: if payload.private_key.is_some() {
-            encrypt_optional(payload.private_key.clone()).map_err(map_crypto_err)?
-        } else {
-            existing.ssh_private_key_ciphertext
-        },
-        ssh_private_key_passphrase_ciphertext: if payload.private_key_passphrase.is_some() {
-            encrypt_optional(payload.private_key_passphrase.clone()).map_err(map_crypto_err)?
-        } else {
-            existing.ssh_private_key_passphrase_ciphertext
-        },
-        install_dir: payload.install_dir.clone().unwrap_or(existing.install_dir),
-        systemd_service_name: existing.systemd_service_name,
-        expected_listen_port: parse_port(payload.service_port.as_deref())
-            .or(existing.expected_listen_port),
-        seclab_url: payload
-            .seclab_url
-            .as_ref()
-            .map(|value| value.trim_end_matches('/').to_string())
-            .or(existing.seclab_url),
-        last_deploy_task_id: existing.last_deploy_task_id,
-        last_deploy_result_status: existing.last_deploy_result_status,
-        last_deploy_error_summary: existing.last_deploy_error_summary,
-        last_deploy_at: existing.last_deploy_at,
-        created_at: existing.created_at,
-        updated_at: Utc::now().to_rfc3339(),
-    };
-
-    upsert_node_provisioning(pool, &record).await
+) -> sqlx::Result<()>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    let connection_changed = payload.addr.is_some()
+        || payload.port.is_some()
+        || payload.user.is_some()
+        || payload.pwd.is_some()
+        || payload.private_key.is_some()
+        || payload.private_key_passphrase.is_some()
+        || payload.auth_mode.is_some()
+        || payload.install_dir.is_some()
+        || payload.service_port.is_some()
+        || payload.seclab_url.is_some();
+    let password = encrypt_optional(payload.pwd.clone()).map_err(map_crypto_err)?;
+    let private_key = encrypt_optional(payload.private_key.clone()).map_err(map_crypto_err)?;
+    let passphrase =
+        encrypt_optional(payload.private_key_passphrase.clone()).map_err(map_crypto_err)?;
+    let seclab_url = payload
+        .seclab_url
+        .as_ref()
+        .map(|value| value.trim_end_matches('/').to_string());
+    let result = sqlx::query(
+        r#"
+        UPDATE node_provisioning
+        SET
+            deploy_method = 'inventory_update',
+            ssh_addr = COALESCE(?, ssh_addr),
+            ssh_port = COALESCE(?, ssh_port),
+            ssh_user = COALESCE(?, ssh_user),
+            ssh_auth_mode = COALESCE(?, ssh_auth_mode),
+            ssh_password_ciphertext = CASE WHEN ? THEN ? ELSE ssh_password_ciphertext END,
+            ssh_private_key_ciphertext = CASE WHEN ? THEN ? ELSE ssh_private_key_ciphertext END,
+            ssh_private_key_passphrase_ciphertext = CASE WHEN ? THEN ? ELSE ssh_private_key_passphrase_ciphertext END,
+            install_dir = COALESCE(?, install_dir),
+            expected_listen_port = COALESCE(?, expected_listen_port),
+            seclab_url = COALESCE(?, seclab_url),
+            revision = revision + ?,
+            validated_revision = CASE WHEN ? THEN NULL ELSE validated_revision END,
+            precheck_valid_until = CASE WHEN ? THEN NULL ELSE precheck_valid_until END
+        WHERE node_id = ?
+        "#,
+    )
+    .bind(&payload.addr)
+    .bind(parse_port(payload.port.as_deref()))
+    .bind(&payload.user)
+    .bind(&payload.auth_mode)
+    .bind(payload.pwd.is_some())
+    .bind(password)
+    .bind(payload.private_key.is_some())
+    .bind(private_key)
+    .bind(payload.private_key_passphrase.is_some())
+    .bind(passphrase)
+    .bind(&payload.install_dir)
+    .bind(parse_port(payload.service_port.as_deref()))
+    .bind(seclab_url)
+    .bind(i64::from(connection_changed))
+    .bind(connection_changed)
+    .bind(connection_changed)
+    .bind(node_id)
+    .execute(executor)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    Ok(())
 }
 
 /// 同步节点本地配置中的主控回连地址。
@@ -281,7 +298,11 @@ pub async fn update_node_seclab_url(
     sqlx::query(
         r#"
         UPDATE node_provisioning
-        SET seclab_url = ?
+        SET
+            seclab_url = ?,
+            revision = revision + 1,
+            validated_revision = NULL,
+            precheck_valid_until = NULL
         WHERE node_id = ?
         "#,
     )
@@ -294,8 +315,11 @@ pub async fn update_node_seclab_url(
 
 #[cfg(test)]
 mod tests {
-    use super::create_provisioning_from_payload;
-    use crate::models::node_api_types::NodeCreatePayload;
+    use super::{create_provisioning_from_payload, update_provisioning_from_payload};
+    use crate::models::node_api_types::{NodeCreatePayload, NodeUpdatePayload};
+    use crate::models::node_provisioning::{
+        get_node_provisioning_by_node_id, mark_precheck_validated,
+    };
     use crate::models::nodes::{NodeStatus, get_node_by_id};
     use crate::services::node_inventory::create_node_from_payload;
     use crate::test_support::setup_test_db;
@@ -344,5 +368,61 @@ mod tests {
         transaction.rollback().await.unwrap();
 
         assert!(get_node_by_id(&pool, &node_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn connection_update_increments_revision_and_invalidates_precheck() {
+        let pool = setup_test_db().await;
+        let node_id = Uuid::new_v4().to_string();
+        let payload = valid_payload();
+        let mut transaction = pool.begin().await.unwrap();
+        create_node_from_payload(&mut *transaction, &node_id, &payload, NodeStatus::Draft)
+            .await
+            .unwrap();
+        create_provisioning_from_payload(&mut *transaction, &node_id, &payload)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+        assert!(
+            mark_precheck_validated(&pool, &node_id, 1, "2099-01-01T00:00:00Z")
+                .await
+                .unwrap()
+        );
+
+        update_provisioning_from_payload(
+            &pool,
+            &node_id,
+            &NodeUpdatePayload {
+                agent_id: None,
+                name: None,
+                group_id: None,
+                description: None,
+                addr: None,
+                port: None,
+                user: None,
+                pwd: None,
+                private_key: None,
+                private_key_passphrase: None,
+                auth_mode: None,
+                status: None,
+                version: None,
+                tags: None,
+                metadata: None,
+                install_dir: None,
+                service_port: Some("7312".to_string()),
+                sync_enabled: None,
+                seclab_url: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let record = get_node_provisioning_by_node_id(&pool, &node_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.revision, 2);
+        assert_eq!(record.validated_revision, None);
+        assert_eq!(record.precheck_valid_until, None);
     }
 }

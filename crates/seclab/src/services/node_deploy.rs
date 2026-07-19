@@ -2,11 +2,15 @@
 
 use crate::config;
 use crate::crypto::decrypt_optional;
-use crate::models::node_provisioning::get_node_provisioning_by_node_id;
-use crate::models::node_sessions::close_active_sessions;
+use crate::models::node_provisioning::{get_node_provisioning_by_node_id, mark_precheck_validated};
+use crate::models::node_sessions::{close_active_sessions, get_active_session_by_node_id};
 use crate::runtime_config;
 use crate::services::node_enrollment::{issue_enrollment_token, revoke_failed_enrollment};
+use crate::services::node_operation_guard::{
+    NodeOperation as GuardedNodeOperation, assert_node_operation,
+};
 use crate::services::node_precheck::inspect_remote_agent;
+use crate::services::node_precheck::{NodePrecheckInput, precheck_node};
 use crate::services::node_provisioning;
 use crate::services::node_state_machine::{
     transition_to_awaiting_registration, transition_to_deploy_failed, transition_to_deploying,
@@ -24,7 +28,32 @@ use serde::Serialize;
 use ssh2::Session;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::Arc;
+use std::time::{Duration as StdDuration, Instant};
+
+const REGISTRATION_TIMEOUT: StdDuration = StdDuration::from_secs(90);
+
+/// 部署执行器发送给持久任务写入器的进度事件。
+#[derive(Debug, Clone)]
+pub enum DeployProgressEvent {
+    Progress(u32),
+    Snapshot {
+        logs: Vec<String>,
+        progress_percent: Option<u32>,
+        is_finished: bool,
+        error: Option<String>,
+    },
+    Append {
+        message: String,
+        progress_percent: u32,
+        is_finished: bool,
+        error: Option<String>,
+    },
+}
+
+/// 单个持久部署任务的进度发送端。
+pub type DeployProgressSender = tokio::sync::mpsc::UnboundedSender<DeployProgressEvent>;
+type BlockingDeployOutput = (Vec<String>, Option<String>);
+type BlockingDeployResult = Result<BlockingDeployOutput, (ApiError, Vec<String>)>;
 
 /// 带进度汇报的 Reader 包装器，用于在 SFTP 传输时统计已发送的字节数与百分比。
 pub struct ProgressReader<R, F>
@@ -107,6 +136,8 @@ pub struct NodeDeployResult {
     pub enrollment_id: String,
     pub enrollment_token: String,
     pub logs: Vec<String>,
+    #[serde(skip)]
+    pub rollback_artifact: Option<String>,
 }
 
 /// 部署失败时携带错误与过程日志。
@@ -146,16 +177,14 @@ pub async fn deploy_node(
     pool: &DbPool,
     node_id: &str,
     payload: NodeDeployPayload,
-    deploy_sessions: Option<
-        Arc<std::sync::Mutex<std::collections::HashMap<String, crate::state::DeploySession>>>,
-    >,
+    progress_sender: Option<DeployProgressSender>,
 ) -> ApiResult<()> {
     operate_node(
         pool,
         node_id,
         payload,
         NodeOperation::Deploy,
-        deploy_sessions,
+        progress_sender,
     )
     .await
 }
@@ -174,8 +203,16 @@ pub async fn repair_node(
     pool: &DbPool,
     node_id: &str,
     payload: NodeDeployPayload,
+    progress_sender: Option<DeployProgressSender>,
 ) -> ApiResult<()> {
-    operate_node(pool, node_id, payload, NodeOperation::Repair, None).await
+    operate_node(
+        pool,
+        node_id,
+        payload,
+        NodeOperation::Repair,
+        progress_sender,
+    )
+    .await
 }
 
 async fn operate_node(
@@ -183,24 +220,23 @@ async fn operate_node(
     node_id: &str,
     payload: NodeDeployPayload,
     operation: NodeOperation,
-    deploy_sessions: Option<
-        Arc<std::sync::Mutex<std::collections::HashMap<String, crate::state::DeploySession>>>,
-    >,
+    progress_sender: Option<DeployProgressSender>,
 ) -> ApiResult<()> {
-    transition_to_deploying(pool, node_id).await?;
-    close_active_sessions(pool, node_id, "redeploy_requested", "closed").await?;
-    let _ = node_provisioning::record_operation_result(
+    let guarded_operation = match operation {
+        NodeOperation::Deploy | NodeOperation::Upgrade => GuardedNodeOperation::Deploy,
+        NodeOperation::Repair => GuardedNodeOperation::Reprovision,
+    };
+    assert_node_operation(
         pool,
         node_id,
-        operation.deploy_method(),
-        "running",
-        None,
+        guarded_operation,
+        matches!(operation, NodeOperation::Deploy | NodeOperation::Repair),
     )
-    .await;
-
+    .await?;
     let record = get_node_provisioning_by_node_id(pool, node_id)
         .await?
         .ok_or_else(|| ApiError::BadRequest("node deployment record does not exist".to_string()))?;
+    let provisioning_revision = record.revision;
     let agent_id = node_id.to_string();
     let addr = record
         .ssh_addr
@@ -241,6 +277,58 @@ async fn operate_node(
                 "failed to decrypt SSH private key passphrase; check key configuration".to_string(),
             )
         })?;
+    let install_parent = Path::new(&install_dir)
+        .parent()
+        .and_then(Path::to_str)
+        .unwrap_or("/opt")
+        .to_string();
+    let expected_node_id = if matches!(operation, NodeOperation::Deploy) {
+        None
+    } else {
+        Some(node_id.to_string())
+    };
+    let precheck = precheck_node(
+        pool,
+        NodePrecheckInput {
+            addr: addr.clone(),
+            port: Some(ssh_port.clone()),
+            user: user.clone(),
+            auth_mode: Some(auth_mode.clone()),
+            password: password.clone(),
+            private_key: private_key.clone(),
+            private_key_passphrase: private_key_passphrase.clone(),
+            service_port: Some(service_port.clone()),
+            install_dir: Some(install_parent),
+            seclab_url: Some(seclab_url.clone()),
+            expected_node_id,
+        },
+    )
+    .await?;
+    if !precheck.passed {
+        return Err(ApiError::conflict(
+            seclab_contracts::api::ErrorCode::NodePrecheckFailed,
+            precheck.agent_status.message,
+        ));
+    }
+    let precheck_valid_until = (Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+    if !mark_precheck_validated(pool, node_id, provisioning_revision, &precheck_valid_until).await?
+    {
+        return Err(ApiError::conflict(
+            seclab_contracts::api::ErrorCode::NodePrecheckStale,
+            "node provisioning changed after precheck",
+        ));
+    }
+
+    transition_to_deploying(pool, node_id).await?;
+    close_active_sessions(pool, node_id, "redeploy_requested", "closed").await?;
+    let _ = node_provisioning::record_operation_result(
+        pool,
+        node_id,
+        operation.deploy_method(),
+        "running",
+        None,
+    )
+    .await;
     let issued = issue_enrollment_token(pool, &agent_id).await?;
 
     let input = NodeDeployInput {
@@ -250,9 +338,9 @@ async fn operate_node(
         port: ssh_port.clone(),
         user: user.clone(),
         auth_mode: auth_mode.clone(),
-        password,
-        private_key,
-        private_key_passphrase,
+        password: password.clone(),
+        private_key: private_key.clone(),
+        private_key_passphrase: private_key_passphrase.clone(),
         install_dir: install_dir.clone(),
         service_port: service_port.clone(),
         listen_addr,
@@ -261,7 +349,74 @@ async fn operate_node(
         allow_existing_agent: !matches!(operation, NodeOperation::Deploy),
     };
 
-    if let Err(err) = deploy_node_with(input, deploy_sessions).await {
+    let registration_started_at = Utc::now();
+    let deploy_result = match deploy_node_with(input, progress_sender.clone()).await {
+        Ok(result) => result,
+        Err(err) => {
+            runtime_metrics::record_deploy_result(false);
+            let _ = revoke_failed_enrollment(pool, &issued.enrollment_id).await;
+            let _ = transition_to_deploy_failed(pool, node_id).await;
+            let _ = node_provisioning::record_operation_result(
+                pool,
+                node_id,
+                operation.deploy_method(),
+                "failed",
+                Some(format!("{:?}", err.error)),
+            )
+            .await;
+            return Err(err.error);
+        }
+    };
+    let post_deploy_result: ApiResult<()> = async {
+        node_provisioning::mark_deployed(
+            pool,
+            &node_provisioning::MarkDeployedInput {
+                node_id: node_id.to_string(),
+                deploy_method: operation.deploy_method().to_string(),
+                result_status: operation.success_status().to_string(),
+                ssh_addr: addr.clone(),
+                ssh_port: ssh_port.clone(),
+                ssh_user: user.clone(),
+                auth_mode: auth_mode.clone(),
+                install_dir: install_dir.clone(),
+                service_port: service_port.clone(),
+                seclab_url: seclab_url.clone(),
+            },
+        )
+        .await?;
+        transition_to_awaiting_registration(pool, node_id).await?;
+        wait_for_agent_registration(
+            pool,
+            node_id,
+            &issued.enrollment_id,
+            registration_started_at,
+            progress_sender,
+        )
+        .await
+    }
+    .await;
+    if let Err(error) = post_deploy_result {
+        let _ = rollback_remote_deployment(
+            &NodeDeployInput {
+                agent_id: agent_id.clone(),
+                enrollment_id: issued.enrollment_id.clone(),
+                addr: addr.clone(),
+                port: ssh_port.clone(),
+                user: user.clone(),
+                auth_mode: auth_mode.clone(),
+                password: password.clone(),
+                private_key: private_key.clone(),
+                private_key_passphrase: private_key_passphrase.clone(),
+                install_dir: install_dir.clone(),
+                service_port: service_port.clone(),
+                listen_addr: String::new(),
+                seclab_url: seclab_url.clone(),
+                enrollment_token: String::new(),
+                allow_existing_agent: !matches!(operation, NodeOperation::Deploy),
+            },
+            deploy_result.rollback_artifact.as_deref(),
+        )
+        .await;
         runtime_metrics::record_deploy_result(false);
         let _ = revoke_failed_enrollment(pool, &issued.enrollment_id).await;
         let _ = transition_to_deploy_failed(pool, node_id).await;
@@ -270,34 +425,134 @@ async fn operate_node(
             node_id,
             operation.deploy_method(),
             "failed",
-            Some(format!("{:?}", err.error)),
+            Some(error.message.to_string()),
         )
         .await;
-        return Err(err.error);
+        return Err(error);
     }
-    node_provisioning::mark_deployed(
-        pool,
-        &node_provisioning::MarkDeployedInput {
-            node_id: node_id.to_string(),
-            deploy_method: operation.deploy_method().to_string(),
-            result_status: operation.success_status().to_string(),
-            ssh_addr: addr.clone(),
-            ssh_port: ssh_port.clone(),
-            ssh_user: user.clone(),
-            auth_mode: auth_mode.clone(),
-            install_dir: install_dir.clone(),
-            service_port: service_port.clone(),
-            seclab_url: seclab_url.clone(),
+    finalize_remote_deployment(
+        &NodeDeployInput {
+            agent_id,
+            enrollment_id: issued.enrollment_id,
+            addr,
+            port: ssh_port,
+            user,
+            auth_mode,
+            password,
+            private_key,
+            private_key_passphrase,
+            install_dir,
+            service_port,
+            listen_addr: String::new(),
+            seclab_url,
+            enrollment_token: String::new(),
+            allow_existing_agent: !matches!(operation, NodeOperation::Deploy),
         },
+        deploy_result.rollback_artifact.as_deref(),
     )
     .await?;
     runtime_metrics::record_deploy_result(true);
-    transition_to_awaiting_registration(pool, node_id).await?;
     Ok(())
+}
+
+/// 等待本次 enrollment 被使用且节点建立有效租约，然后结束现有部署进度。
+pub async fn wait_for_agent_registration(
+    pool: &DbPool,
+    node_id: &str,
+    enrollment_id: &str,
+    registered_after: chrono::DateTime<Utc>,
+    progress_sender: Option<DeployProgressSender>,
+) -> ApiResult<()> {
+    update_registration_progress(
+        &progress_sender,
+        98,
+        "Waiting for Agent registration and valid lease",
+        false,
+        None,
+    );
+    let started = Instant::now();
+    loop {
+        let enrollment_status = sqlx::query_scalar::<_, String>(
+            "SELECT token_status FROM node_enrollments WHERE enrollment_id = ?",
+        )
+        .bind(enrollment_id)
+        .fetch_optional(pool)
+        .await?;
+        let session = get_active_session_by_node_id(pool, node_id).await?;
+        let now = Utc::now();
+        if registration_is_complete(
+            enrollment_status.as_deref(),
+            session.as_ref(),
+            node_id,
+            registered_after,
+            now,
+        ) {
+            update_registration_progress(
+                &progress_sender,
+                100,
+                "Agent registration completed and lease is active",
+                true,
+                None,
+            );
+            return Ok(());
+        }
+        if started.elapsed() >= REGISTRATION_TIMEOUT {
+            let message = "Agent registration timed out before a valid lease was established";
+            update_registration_progress(
+                &progress_sender,
+                98,
+                message,
+                true,
+                Some(message.to_string()),
+            );
+            return Err(ApiError::conflict(
+                seclab_contracts::api::ErrorCode::NodeDeployFailed,
+                message,
+            ));
+        }
+        tokio::time::sleep(StdDuration::from_secs(1)).await;
+    }
+}
+
+fn registration_is_complete(
+    enrollment_status: Option<&str>,
+    session: Option<&crate::models::node_sessions::NodeSessionRecord>,
+    node_id: &str,
+    registered_after: chrono::DateTime<Utc>,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    enrollment_status == Some("used")
+        && session.is_some_and(|session| {
+            session.agent_id == node_id
+                && chrono::DateTime::parse_from_rfc3339(&session.registered_at)
+                    .ok()
+                    .is_some_and(|value| value.with_timezone(&Utc) >= registered_after)
+                && chrono::DateTime::parse_from_rfc3339(&session.lease_expires_at)
+                    .ok()
+                    .is_some_and(|value| value.with_timezone(&Utc) > now)
+        })
+}
+
+fn update_registration_progress(
+    progress_sender: &Option<DeployProgressSender>,
+    progress_percent: u32,
+    message: &str,
+    is_finished: bool,
+    error: Option<String>,
+) {
+    if let Some(sender) = progress_sender {
+        let _ = sender.send(DeployProgressEvent::Append {
+            message: message.to_string(),
+            progress_percent,
+            is_finished,
+            error,
+        });
+    }
 }
 
 /// 退役节点：关闭活跃会话并切换状态。
 pub async fn retire_node(pool: &DbPool, node_id: &str) -> ApiResult<()> {
+    assert_node_operation(pool, node_id, GuardedNodeOperation::Retire, false).await?;
     close_active_sessions(pool, node_id, "retire_requested", "closed").await?;
     transition_to_retired(pool, node_id).await?;
     sqlx::query(
@@ -320,7 +575,18 @@ pub async fn retire_node(pool: &DbPool, node_id: &str) -> ApiResult<()> {
 }
 
 /// 卸载节点：通过 SSH 清理远程服务与文件后退役。
-pub async fn uninstall_node(pool: &DbPool, node_id: &str) -> ApiResult<()> {
+pub async fn uninstall_node(
+    pool: &DbPool,
+    node_id: &str,
+    ignore_active_task: bool,
+) -> ApiResult<()> {
+    assert_node_operation(
+        pool,
+        node_id,
+        GuardedNodeOperation::Uninstall,
+        ignore_active_task,
+    )
+    .await?;
     let _ =
         node_provisioning::record_operation_result(pool, node_id, "ssh_uninstall", "running", None)
             .await;
@@ -413,29 +679,49 @@ pub async fn uninstall_node(pool: &DbPool, node_id: &str) -> ApiResult<()> {
 
         let cleanup_command = if is_system_dir {
             format!(
-                "{sudo}rm -rf {install_base}/agent {install_base}/config {install_base}/database {install_base}/logs {install_base}/log {install_base}/run || true; \
+                "{sudo}rm -rf {install_base}/agent {install_base}/config {install_base}/database {install_base}/logs {install_base}/log {install_base}/run; \
                 {sudo}rmdir {install_base} >/dev/null 2>&1 || true",
                 sudo = sudo_prefix(use_sudo),
                 install_base = shell_escape(&install_base)
             )
         } else {
             format!(
-                "{sudo}rm -rf {install_base} || true",
+                "{sudo}rm -rf {install_base}",
                 sudo = sudo_prefix(use_sudo),
                 install_base = shell_escape(&install_base)
             )
         };
 
         let command = format!(
-            "sh -c '{sudo}systemctl disable --now seclab-agent >/dev/null 2>&1 || true; \
+            "{sudo}systemctl disable --now seclab-agent >/dev/null 2>&1 || true; \
             {sudo}rm -f /etc/systemd/system/seclab-agent.service \
-            /usr/local/bin/seclab-agent /usr/bin/seclab-agent /usr/local/bin/slctl /usr/bin/slctl || true; \
+            /usr/local/bin/seclab-agent /usr/bin/seclab-agent /usr/local/bin/slctl /usr/bin/slctl; \
             {cleanup_command}; \
-            {sudo}systemctl daemon-reload >/dev/null 2>&1 || true'",
+            {sudo}systemctl daemon-reload",
             sudo = sudo_prefix(use_sudo),
             cleanup_command = cleanup_command
         );
-        run_remote(&session, &command)
+        run_remote(&session, &command)?;
+
+        let install_residual_check = if is_system_dir {
+            format!(
+                "[ -e {base}/agent ] || [ -e {base}/config ] || [ -e {base}/database ] || [ -e {base}/logs ] || [ -e {base}/log ] || [ -e {base}/run ]",
+                base = shell_escape(&install_base)
+            )
+        } else {
+            format!("[ -e {} ]", shell_escape(&install_base))
+        };
+        let verify_command = format!(
+            "if {sudo}systemctl is-active --quiet seclab-agent \
+             || [ -e /etc/systemd/system/seclab-agent.service ] \
+             || [ -e /usr/local/bin/seclab-agent ] || [ -L /usr/local/bin/seclab-agent ] \
+             || [ -e /usr/bin/seclab-agent ] || [ -L /usr/bin/seclab-agent ] \
+             || [ -e /usr/local/bin/slctl ] || [ -L /usr/local/bin/slctl ] \
+             || [ -e /usr/bin/slctl ] || [ -L /usr/bin/slctl ] \
+             || {install_residual_check}; then exit 42; fi",
+            sudo = sudo_prefix(use_sudo),
+        );
+        run_remote(&session, &verify_command)
     })
     .await
     .map_err(|err| ApiError::Internal(err.to_string()))?;
@@ -454,6 +740,27 @@ pub async fn uninstall_node(pool: &DbPool, node_id: &str) -> ApiResult<()> {
     }
 
     close_active_sessions(pool, node_id, "uninstalled", "closed").await?;
+    let active_session_remains = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM node_sessions WHERE node_id = ? AND status = 'active')",
+    )
+    .bind(node_id)
+    .fetch_one(pool)
+    .await?;
+    if active_session_remains {
+        let error = ApiError::conflict(
+            seclab_contracts::api::ErrorCode::NodeOperationConflict,
+            "active node session remains after uninstall",
+        );
+        let _ = node_provisioning::record_operation_result(
+            pool,
+            node_id,
+            "ssh_uninstall",
+            "failed",
+            Some(error.message.to_string()),
+        )
+        .await;
+        return Err(error);
+    }
     transition_to_retired(pool, node_id).await?;
     sqlx::query(
         r#"
@@ -483,9 +790,7 @@ pub async fn uninstall_node(pool: &DbPool, node_id: &str) -> ApiResult<()> {
 /// 使用给定参数执行远程部署并返回部署日志。
 pub async fn deploy_node_with(
     input: NodeDeployInput,
-    deploy_sessions: Option<
-        Arc<std::sync::Mutex<std::collections::HashMap<String, crate::state::DeploySession>>>,
-    >,
+    progress_sender: Option<DeployProgressSender>,
 ) -> Result<NodeDeployResult, NodeDeployError> {
     let agent_bin = config::get().agent_binary.clone();
     if !Path::new(&agent_bin).exists() {
@@ -517,18 +822,20 @@ pub async fn deploy_node_with(
     let private_key = input.private_key.clone();
     let private_key_passphrase = input.private_key_passphrase.clone();
     let allow_existing_agent = input.allow_existing_agent;
-    let deploy_sessions_clone = deploy_sessions.clone();
+    let progress_sender_clone = progress_sender.clone();
 
-    let logs =
-        tokio::task::spawn_blocking(move || -> Result<Vec<String>, (ApiError, Vec<String>)> {
+    let logs = tokio::task::spawn_blocking(
+        move || -> BlockingDeployResult {
             let mut logs = Vec::new();
+            let mut rollback_artifact = None;
             let update_status = |logs_ref: &Vec<String>, progress: u32| {
-                if let Some(ref sessions) = deploy_sessions_clone
-                    && let Ok(mut map) = sessions.lock()
-                    && let Some(session) = map.get_mut(&agent_id_clone)
-                {
-                    session.logs = logs_ref.clone();
-                    session.progress_percent = progress;
+                if let Some(sender) = &progress_sender_clone {
+                    let _ = sender.send(DeployProgressEvent::Snapshot {
+                        logs: logs_ref.clone(),
+                        progress_percent: Some(progress),
+                        is_finished: false,
+                        error: None,
+                    });
                 }
             };
             log_line(
@@ -549,13 +856,13 @@ pub async fn deploy_node_with(
                 Err(err) => {
                     log_line(&mut logs, &format!("Task failed: {err:?}"));
                     log_line(&mut logs, "[TASK-END]");
-                    if let Some(ref sessions) = deploy_sessions_clone
-                        && let Ok(mut map) = sessions.lock()
-                        && let Some(session) = map.get_mut(&agent_id_clone)
-                    {
-                        session.logs = logs.clone();
-                        session.is_finished = true;
-                        session.error = Some(format!("{err:?}"));
+                    if let Some(sender) = &progress_sender_clone {
+                        let _ = sender.send(DeployProgressEvent::Snapshot {
+                            logs: logs.clone(),
+                            progress_percent: None,
+                            is_finished: true,
+                            error: Some(format!("{err:?}")),
+                        });
                     }
                     return Err((err, logs));
                 }
@@ -588,6 +895,16 @@ pub async fn deploy_node_with(
                         "Existing seclab-agent detected; new node deployment is blocked"
                             .to_string(),
                     ));
+                }
+                if allow_existing_agent {
+                    let artifact = format!("/tmp/seclab-reprovision-{agent_id_clone}");
+                    prepare_remote_reprovision_backup(
+                        &session,
+                        user_clone != "root",
+                        &install_dir_clone,
+                        &artifact,
+                    )?;
+                    rollback_artifact = Some(artifact);
                 }
 
                 log_line(&mut logs, "Fetching node architecture information");
@@ -655,19 +972,15 @@ pub async fn deploy_node_with(
                 log_line(&mut logs, "Uploading node binary");
                 update_status(&logs, 20);
 
-                let sessions_for_progress = deploy_sessions_clone.clone();
-                let agent_id_for_progress = agent_id_clone.clone();
+                let sender_for_progress = progress_sender_clone.clone();
                 let mut last_percent = 20u32;
                 let mut progress_reader = ProgressReader::new(local_file, total_size, move |current, total| {
                     let percent = (current as f64 / total as f64 * 50.0) as u32;
                     let actual_percent = 20 + percent;
                     if actual_percent > last_percent {
                         last_percent = actual_percent;
-                        if let Some(ref sessions) = sessions_for_progress
-                            && let Ok(mut map) = sessions.lock()
-                            && let Some(session) = map.get_mut(&agent_id_for_progress)
-                        {
-                            session.progress_percent = actual_percent;
+                        if let Some(sender) = &sender_for_progress {
+                            let _ = sender.send(DeployProgressEvent::Progress(actual_percent));
                         }
                     }
                 });
@@ -822,18 +1135,32 @@ pub async fn deploy_node_with(
 
             match result {
                 Ok(()) => {
-                    if let Some(ref sessions) = deploy_sessions_clone
-                        && let Ok(mut map) = sessions.lock()
-                        && let Some(session) = map.get_mut(&agent_id_clone)
-                    {
-                        session.logs = logs.clone();
-                        session.is_finished = true;
-                        session.progress_percent = 100;
+                    if let Some(sender) = &progress_sender_clone {
+                        let _ = sender.send(DeployProgressEvent::Snapshot {
+                            logs: logs.clone(),
+                            progress_percent: Some(96),
+                            is_finished: false,
+                            error: None,
+                        });
                     }
-                    Ok(logs)
+                    Ok((logs, rollback_artifact))
                 }
                 Err(err) => {
-                    if remote_mutated && !allow_existing_agent {
+                    if let Some(artifact) = rollback_artifact.as_deref() {
+                        log_line(&mut logs, "Restoring the previous Agent deployment");
+                        match restore_remote_reprovision_backup(
+                            &session,
+                            user_clone != "root",
+                            &install_dir_clone,
+                            artifact,
+                        ) {
+                            Ok(()) => log_line(&mut logs, "Previous Agent deployment restored"),
+                            Err(cleanup_err) => log_line(
+                                &mut logs,
+                                &format!("Deployment rollback was incomplete: {cleanup_err:?}"),
+                            ),
+                        }
+                    } else if remote_mutated {
                         log_line(&mut logs, "Rolling back files created by this deployment");
                         match compensate_new_remote_deploy(
                             &session,
@@ -849,13 +1176,13 @@ pub async fn deploy_node_with(
                     }
                     log_line(&mut logs, &format!("Task failed: {:?}", err));
                     log_line(&mut logs, "[TASK-END]");
-                    if let Some(ref sessions) = deploy_sessions_clone
-                        && let Ok(mut map) = sessions.lock()
-                        && let Some(session) = map.get_mut(&agent_id_clone)
-                    {
-                        session.logs = logs.clone();
-                        session.is_finished = true;
-                        session.error = Some(format!("{:?}", err));
+                    if let Some(sender) = &progress_sender_clone {
+                        let _ = sender.send(DeployProgressEvent::Snapshot {
+                            logs: logs.clone(),
+                            progress_percent: None,
+                            is_finished: true,
+                            error: Some(format!("{err:?}")),
+                        });
                     }
                     Err((err, logs))
                 }
@@ -867,8 +1194,8 @@ pub async fn deploy_node_with(
             logs: Vec::new(),
         })?;
 
-    let logs = match logs {
-        Ok(logs) => logs,
+    let (logs, rollback_artifact) = match logs {
+        Ok(result) => result,
         Err((error, logs)) => {
             return Err(NodeDeployError { error, logs });
         }
@@ -878,6 +1205,7 @@ pub async fn deploy_node_with(
         enrollment_id: input.enrollment_id.clone(),
         enrollment_token: input.enrollment_token.clone(),
         logs,
+        rollback_artifact,
     })
 }
 
@@ -902,6 +1230,204 @@ fn compensate_new_remote_deploy(
         config = shell_escape(&config_dir),
     );
     run_remote(session, &command)
+}
+
+fn prepare_remote_reprovision_backup(
+    session: &Session,
+    use_sudo: bool,
+    install_dir: &str,
+    artifact: &str,
+) -> ApiResult<()> {
+    let config_dir = format!("{}/config", install_dir.trim_end_matches('/'));
+    let command = format!(
+        "{sudo}rm -rf {artifact}; {sudo}mkdir -p {artifact}; \
+         [ ! -e /usr/local/bin/seclab-agent ] || {sudo}cp -a /usr/local/bin/seclab-agent {artifact}/seclab-agent; \
+         [ ! -e /usr/local/bin/slctl ] || {sudo}cp -a /usr/local/bin/slctl {artifact}/slctl; \
+         [ ! -e /etc/systemd/system/seclab-agent.service ] || {sudo}cp -a /etc/systemd/system/seclab-agent.service {artifact}/service; \
+         [ ! -e {config}/agent.toml ] || {sudo}cp -a {config}/agent.toml {artifact}/agent.toml; \
+         [ ! -e {config}/agent.install_dir ] || {sudo}cp -a {config}/agent.install_dir {artifact}/agent.install_dir; \
+         [ ! -e {config}/node.role ] || {sudo}cp -a {config}/node.role {artifact}/node.role; \
+         if {sudo}systemctl is-active --quiet seclab-agent; then {sudo}touch {artifact}/was-active; fi",
+        sudo = sudo_prefix(use_sudo),
+        artifact = shell_escape(artifact),
+        config = shell_escape(&config_dir),
+    );
+    run_remote(session, &command)
+}
+
+fn restore_remote_reprovision_backup(
+    session: &Session,
+    use_sudo: bool,
+    install_dir: &str,
+    artifact: &str,
+) -> ApiResult<()> {
+    let config_dir = format!("{}/config", install_dir.trim_end_matches('/'));
+    let command = format!(
+        "{sudo}systemctl stop seclab-agent >/dev/null 2>&1 || true; \
+         if [ -e {artifact}/seclab-agent ]; then {sudo}cp -a {artifact}/seclab-agent /usr/local/bin/seclab-agent; else {sudo}rm -f /usr/local/bin/seclab-agent /usr/bin/seclab-agent; fi; \
+         if [ -e {artifact}/slctl ]; then {sudo}cp -a {artifact}/slctl /usr/local/bin/slctl; else {sudo}rm -f /usr/local/bin/slctl /usr/bin/slctl; fi; \
+         if [ -e {artifact}/service ]; then {sudo}cp -a {artifact}/service /etc/systemd/system/seclab-agent.service; else {sudo}rm -f /etc/systemd/system/seclab-agent.service; fi; \
+         {sudo}mkdir -p {config}; \
+         for name in agent.toml agent.install_dir node.role; do if [ -e {artifact}/$name ]; then {sudo}cp -a {artifact}/$name {config}/$name; else {sudo}rm -f {config}/$name; fi; done; \
+         if [ -e /usr/local/bin/seclab-agent ]; then {sudo}ln -sf /usr/local/bin/seclab-agent /usr/bin/seclab-agent; else {sudo}rm -f /usr/bin/seclab-agent; fi; \
+         if [ -e /usr/local/bin/slctl ]; then {sudo}ln -sf /usr/local/bin/slctl /usr/bin/slctl; else {sudo}rm -f /usr/bin/slctl; fi; \
+         {sudo}systemctl daemon-reload; \
+         if [ -e {artifact}/was-active ]; then {sudo}systemctl enable seclab-agent >/dev/null 2>&1; {sudo}systemctl restart seclab-agent; fi; \
+         {sudo}rm -rf {artifact}",
+        sudo = sudo_prefix(use_sudo),
+        artifact = shell_escape(artifact),
+        config = shell_escape(&config_dir),
+    );
+    run_remote(session, &command)
+}
+
+/// 注册失败后重新连接远端并回滚本次部署。
+pub async fn rollback_remote_deployment(
+    input: &NodeDeployInput,
+    rollback_artifact: Option<&str>,
+) -> ApiResult<()> {
+    let addr = input.addr.clone();
+    let port = input.port.clone();
+    let user = input.user.clone();
+    let auth_mode = input.auth_mode.clone();
+    let password = input.password.clone();
+    let private_key = input.private_key.clone();
+    let passphrase = input.private_key_passphrase.clone();
+    let install_dir = input.install_dir.clone();
+    let artifact = rollback_artifact.map(str::to_string);
+    tokio::task::spawn_blocking(move || {
+        let session = open_ssh_session(
+            &addr,
+            Some(&port),
+            &user,
+            Some(&auth_mode),
+            password.as_deref(),
+            private_key.as_deref(),
+            passphrase.as_deref(),
+        )?;
+        if let Some(artifact) = artifact {
+            restore_remote_reprovision_backup(&session, user != "root", &install_dir, &artifact)
+        } else {
+            compensate_new_remote_deploy(&session, user != "root", &install_dir)
+        }
+    })
+    .await
+    .map_err(|error| ApiError::Internal(error.to_string()))?
+}
+
+/// 注册成功后删除重新部署使用的临时备份。
+pub async fn finalize_remote_deployment(
+    input: &NodeDeployInput,
+    rollback_artifact: Option<&str>,
+) -> ApiResult<()> {
+    let Some(artifact) = rollback_artifact.map(str::to_string) else {
+        return Ok(());
+    };
+    let addr = input.addr.clone();
+    let port = input.port.clone();
+    let user = input.user.clone();
+    let auth_mode = input.auth_mode.clone();
+    let password = input.password.clone();
+    let private_key = input.private_key.clone();
+    let passphrase = input.private_key_passphrase.clone();
+    tokio::task::spawn_blocking(move || {
+        let session = open_ssh_session(
+            &addr,
+            Some(&port),
+            &user,
+            Some(&auth_mode),
+            password.as_deref(),
+            private_key.as_deref(),
+            passphrase.as_deref(),
+        )?;
+        run_remote(
+            &session,
+            &format!(
+                "{}rm -rf {}",
+                sudo_prefix(user != "root"),
+                shell_escape(&artifact)
+            ),
+        )
+    })
+    .await
+    .map_err(|error| ApiError::Internal(error.to_string()))?
+}
+
+/// 启动恢复前清理首次部署残留，或恢复重新部署留下的原版本备份。
+pub async fn recover_interrupted_remote_operation(
+    pool: &DbPool,
+    node_id: &str,
+    reprovision: bool,
+) -> ApiResult<()> {
+    let record = get_node_provisioning_by_node_id(pool, node_id)
+        .await?
+        .ok_or_else(|| ApiError::BadRequest("node deployment record does not exist".to_string()))?;
+    let addr = record
+        .ssh_addr
+        .ok_or_else(|| ApiError::BadRequest("node address must not be empty".to_string()))?;
+    let port = record
+        .ssh_port
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| DEFAULT_SSH_PORT.to_string());
+    let user = record
+        .ssh_user
+        .ok_or_else(|| ApiError::BadRequest("SSH user must not be empty".to_string()))?;
+    let auth_mode = record
+        .ssh_auth_mode
+        .unwrap_or_else(|| "password".to_string());
+    let password = decrypt_optional(record.ssh_password_ciphertext)
+        .map_err(|_| ApiError::Internal("failed to decrypt SSH password".to_string()))?;
+    let private_key = decrypt_optional(record.ssh_private_key_ciphertext)
+        .map_err(|_| ApiError::Internal("failed to decrypt SSH private key".to_string()))?;
+    let passphrase = decrypt_optional(record.ssh_private_key_passphrase_ciphertext)
+        .map_err(|_| ApiError::Internal("failed to decrypt SSH key passphrase".to_string()))?;
+    let install_dir = record.install_dir;
+    let node_id = node_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let session = open_ssh_session(
+            &addr,
+            Some(&port),
+            &user,
+            Some(&auth_mode),
+            password.as_deref(),
+            private_key.as_deref(),
+            passphrase.as_deref(),
+        )?;
+        if reprovision {
+            let artifact = format!("/tmp/seclab-reprovision-{node_id}");
+            let exists = run_remote_capture(
+                &session,
+                &format!(
+                    "if [ -d {} ]; then echo yes; else echo no; fi",
+                    shell_escape(&artifact)
+                ),
+            )?;
+            if exists.trim() == "yes" {
+                restore_remote_reprovision_backup(
+                    &session,
+                    user != "root",
+                    &install_dir,
+                    &artifact,
+                )?;
+            }
+            return Ok(());
+        }
+
+        let remote_agent = inspect_remote_agent(&session)?;
+        if remote_agent
+            .agent_id
+            .as_deref()
+            .is_some_and(|agent_id| agent_id != node_id)
+        {
+            return Err(ApiError::conflict(
+                seclab_contracts::api::ErrorCode::NodeInvalidTarget,
+                "interrupted deployment target now belongs to another node",
+            ));
+        }
+        compensate_new_remote_deploy(&session, user != "root", &install_dir)
+    })
+    .await
+    .map_err(|error| ApiError::Internal(error.to_string()))?
 }
 
 /// 生成新的节点标识符。
@@ -1099,7 +1625,9 @@ fn is_private_v4(ip: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{generate_node_id, resolve_seclab_url_override};
+    use super::{generate_node_id, registration_is_complete, resolve_seclab_url_override};
+    use crate::models::node_sessions::NodeSessionRecord;
+    use chrono::{Duration, Utc};
 
     #[test]
     fn generate_node_id_uses_uuid_v7() {
@@ -1136,5 +1664,52 @@ mod tests {
         let resolved = resolve_seclab_url_override(Some("https://controller.example.com:9443/"))
             .expect("valid callback URL should be accepted");
         assert_eq!(resolved, "https://controller.example.com:9443");
+    }
+
+    #[test]
+    fn registration_requires_used_enrollment_and_fresh_matching_lease() {
+        let now = Utc::now();
+        let registered_after = now - Duration::seconds(5);
+        let session = NodeSessionRecord {
+            session_id: "session-1".to_string(),
+            node_id: "node-1".to_string(),
+            agent_id: "node-1".to_string(),
+            lease_id: "lease-1".to_string(),
+            advertise_addr: None,
+            listen_addr: None,
+            listen_port: None,
+            server_name: None,
+            registered_at: now.to_rfc3339(),
+            lease_expires_at: (now + Duration::seconds(20)).to_rfc3339(),
+            last_heartbeat_at: None,
+            heartbeat_sequence: 0,
+            last_seen_at: None,
+            status: "active".to_string(),
+            close_reason: None,
+            closed_at: None,
+            created_at: now.to_rfc3339(),
+            updated_at: now.to_rfc3339(),
+        };
+        assert!(registration_is_complete(
+            Some("used"),
+            Some(&session),
+            "node-1",
+            registered_after,
+            now,
+        ));
+        assert!(!registration_is_complete(
+            Some("issued"),
+            Some(&session),
+            "node-1",
+            registered_after,
+            now,
+        ));
+        assert!(!registration_is_complete(
+            Some("used"),
+            Some(&session),
+            "other-node",
+            registered_after,
+            now,
+        ));
     }
 }

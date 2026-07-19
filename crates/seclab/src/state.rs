@@ -1,7 +1,6 @@
 //! 应用状态：共享依赖（单库、缓存、配置）聚合。
 
 pub use seclab_contracts::DbPool;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// 节点部署会话状态，用于实时向前端反馈部署进度与日志。
@@ -28,7 +27,6 @@ pub struct AppState {
     pub metadata_db: DbPool,
     pub captcha_service: crate::security::captcha::CaptchaService,
     pub login_tracker: crate::security::login_tracker::LoginTracker,
-    pub deploy_sessions: Arc<std::sync::Mutex<HashMap<String, DeploySession>>>,
     pub local_node_resource: Arc<tokio::sync::Mutex<Option<serde_json::Value>>>,
     pub image_acquisition: crate::services::image_acquisition::ImageAcquisitionService,
     pub terminal_tickets: Arc<crate::services::terminal_ticket::TerminalTicketStore>,

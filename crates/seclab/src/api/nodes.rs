@@ -9,9 +9,11 @@ use crate::models::nodes::NodeStatus;
 use crate::services::logging::{self, OperationEventBuilder};
 use crate::services::node_check::{NodeCheckResponse, check_node_health};
 use crate::services::node_deploy::{
-    NodeDeployError, NodeDeployInput, NodeDeployPayload, deploy_node, deploy_node_with,
-    generate_node_id, repair_node, retire_node, uninstall_node,
+    DeployProgressEvent, NodeDeployInput, NodeDeployPayload, deploy_node, deploy_node_with,
+    finalize_remote_deployment, generate_node_id, repair_node, retire_node,
+    rollback_remote_deployment, uninstall_node, wait_for_agent_registration,
 };
+use crate::services::node_operation_guard::{NodeOperation, assert_node_operation};
 use crate::services::node_precheck::{NodePrecheckInput, NodePrecheckResponse, precheck_node};
 use crate::services::node_state_machine::{
     transition_to_awaiting_registration, transition_to_deploy_failed,
@@ -35,7 +37,6 @@ use seclab_contracts::api::ErrorCode;
 use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,34 +45,83 @@ pub struct NodeDeployCreateResult {
     pub node: Option<node_read_model::NodeSummaryView>,
 }
 
-/// 将内存中的实时进度持续镜像到节点任务表，终态写入后停止。
-fn spawn_deploy_progress_persistence(state: Arc<AppState>, node_id: String, task_id: String) {
+/// 串行消费部署事件并将数据库作为唯一进度事实来源。
+fn spawn_deploy_progress_persistence(
+    pool: crate::state::DbPool,
+    task_id: String,
+    mut receiver: tokio::sync::mpsc::UnboundedReceiver<DeployProgressEvent>,
+) {
     tokio::spawn(async move {
-        loop {
-            let snapshot = state
-                .deploy_sessions
-                .lock()
-                .ok()
-                .and_then(|sessions| sessions.get(&node_id).cloned());
-            let Some(snapshot) = snapshot else {
-                return;
-            };
-            let persisted =
-                match node_tasks::update_deploy_progress(&state.metadata_db, &task_id, &snapshot)
-                    .await
-                {
-                    Ok(()) => true,
-                    Err(error) => {
-                        tracing::warn!(task_id, %error, "failed to persist node deploy progress");
-                        false
+        let mut snapshot = crate::state::DeploySession {
+            progress_percent: 0,
+            logs: vec!["Deploy task created".to_string()],
+            is_finished: false,
+            error: None,
+        };
+        while let Some(event) = receiver.recv().await {
+            match event {
+                DeployProgressEvent::Progress(progress) => snapshot.progress_percent = progress,
+                DeployProgressEvent::Snapshot {
+                    logs,
+                    progress_percent,
+                    is_finished,
+                    error,
+                } => {
+                    snapshot.logs = logs;
+                    if let Some(progress) = progress_percent {
+                        snapshot.progress_percent = progress;
                     }
-                };
-            if snapshot.is_finished && persisted {
+                    snapshot.is_finished = is_finished;
+                    snapshot.error = error;
+                }
+                DeployProgressEvent::Append {
+                    message,
+                    progress_percent,
+                    is_finished,
+                    error,
+                } => {
+                    let timestamp = chrono::Local::now().format("%Y/%m/%d %H:%M:%S");
+                    snapshot.logs.push(format!("{timestamp} {message}"));
+                    snapshot.progress_percent = progress_percent;
+                    snapshot.is_finished = is_finished;
+                    snapshot.error = error;
+                }
+            }
+            if let Err(error) = node_tasks::update_deploy_progress(&pool, &task_id, &snapshot).await
+            {
+                tracing::warn!(task_id, %error, "failed to persist node deploy progress");
+            }
+            if snapshot.is_finished {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        if !snapshot.is_finished {
+            snapshot.is_finished = true;
+            snapshot.error = Some("Deployment task ended unexpectedly".to_string());
+            let _ = node_tasks::update_deploy_progress(&pool, &task_id, &snapshot).await;
         }
     });
+}
+
+async fn persist_internal_task_state(
+    pool: &crate::state::DbPool,
+    task_id: &str,
+    progress_percent: u32,
+    is_finished: bool,
+    message: &str,
+    error: Option<String>,
+) {
+    let _ = node_tasks::update_deploy_progress(
+        pool,
+        task_id,
+        &crate::state::DeploySession {
+            progress_percent,
+            logs: vec![message.to_string()],
+            is_finished,
+            error,
+        },
+    )
+    .await;
 }
 
 /// 一步创建并部署节点所需的字段。
@@ -334,6 +384,7 @@ pub async fn precheck(
         service_port: payload.service_port,
         install_dir: payload.install_dir,
         seclab_url: payload.seclab_url,
+        expected_node_id: None,
     };
 
     let result: Result<NodePrecheckResponse, ApiError> = async {
@@ -445,6 +496,7 @@ pub async fn deploy_create(
             service_port: payload.service_port.clone(),
             install_dir: payload.install_dir.clone(),
             seclab_url: payload.seclab_url.clone(),
+            expected_node_id: None,
         },
     )
     .await?;
@@ -489,6 +541,19 @@ pub async fn deploy_create(
         &create_payload,
     )
     .await?;
+    let precheck_valid_until = (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+    if !crate::models::node_provisioning::mark_precheck_validated(
+        &mut *transaction,
+        &node_id,
+        1,
+        &precheck_valid_until,
+    )
+    .await?
+    {
+        return Err(ApiError::internal(
+            "failed to bind node precheck to provisioning revision",
+        ));
+    }
     let issued = node_enrollment::issue_enrollment_token(&mut *transaction, &node_id).await?;
     node_tasks::create_deploy_task(&mut *transaction, &task_id, &node_id).await?;
     transaction.commit().await?;
@@ -529,20 +594,12 @@ pub async fn deploy_create(
         enrollment_token: deploy_input.enrollment_token.clone(),
         allow_existing_agent: deploy_input.allow_existing_agent,
     };
-    // 初始化 deploy_sessions 状态
-    {
-        let mut map = state.deploy_sessions.lock().unwrap();
-        map.insert(
-            node_id.clone(),
-            crate::state::DeploySession {
-                progress_percent: 0,
-                logs: vec!["Deploy task created".to_string()],
-                is_finished: false,
-                error: None,
-            },
-        );
-    }
-    spawn_deploy_progress_persistence(Arc::clone(&state), node_id.clone(), task_id);
+    let (progress_sender, progress_receiver) = tokio::sync::mpsc::unbounded_channel();
+    spawn_deploy_progress_persistence(
+        state.metadata_db.clone(),
+        task_id.clone(),
+        progress_receiver,
+    );
 
     let state_clone = Arc::clone(&state);
     let node_id_clone = node_id.clone();
@@ -552,33 +609,15 @@ pub async fn deploy_create(
     let trace_id = logging::resolve_trace_id(&headers);
 
     tokio::spawn(async move {
-        let result =
-            deploy_node_with(deploy_input, Some(Arc::clone(&state_clone.deploy_sessions))).await;
-
-        let mut platform_log =
-            OperationEventBuilder::new(&claims_username, "node_deploy_create", client_ip)
-                .user_id(actor_user_id)
-                .module(LogModule::System)
-                .target_type("node")
-                .target_id(&node_id_clone)
-                .trace_id(&trace_id)
-                .source("seclab_api")
-                .request("POST", "/api/v1/nodes/deploy");
-
-        if let Err(err) = &result {
-            platform_log = platform_log.metadata(json!({ "error": err.error }));
-        } else {
-            platform_log = platform_log.set_success();
-        }
-        platform_log.finish(&state_clone.metadata_db);
-
-        match result {
-            Ok(_) => {
-                runtime_metrics::record_deploy_result(true);
-                let _ =
-                    transition_to_awaiting_registration(&state_clone.metadata_db, &node_id_clone)
-                        .await;
-                let _ = node_provisioning::mark_deployed(
+        let registration_started_at = chrono::Utc::now();
+        let result: ApiResult<()> = async {
+            let deploy_result = deploy_node_with(deploy_input, Some(progress_sender.clone()))
+                .await
+                .map_err(|error| error.error)?;
+            let post_deploy_result: ApiResult<()> = async {
+                transition_to_awaiting_registration(&state_clone.metadata_db, &node_id_clone)
+                    .await?;
+                node_provisioning::mark_deployed(
                     &state_clone.metadata_db,
                     &node_provisioning::MarkDeployedInput {
                         node_id: node_id_clone.clone(),
@@ -593,9 +632,57 @@ pub async fn deploy_create(
                         seclab_url: deploy_sync.seclab_url.clone(),
                     },
                 )
-                .await;
+                .await?;
+                wait_for_agent_registration(
+                    &state_clone.metadata_db,
+                    &node_id_clone,
+                    &deploy_sync.enrollment_id,
+                    registration_started_at,
+                    Some(progress_sender.clone()),
+                )
+                .await
             }
-            Err(NodeDeployError { error, .. }) => {
+            .await;
+            if let Err(error) = post_deploy_result {
+                let _ = rollback_remote_deployment(
+                    &deploy_sync,
+                    deploy_result.rollback_artifact.as_deref(),
+                )
+                .await;
+                return Err(error);
+            }
+            finalize_remote_deployment(&deploy_sync, deploy_result.rollback_artifact.as_deref())
+                .await
+        }
+        .await;
+
+        let mut platform_log =
+            OperationEventBuilder::new(&claims_username, "node_deploy_create", client_ip)
+                .user_id(actor_user_id)
+                .module(LogModule::System)
+                .target_type("node")
+                .target_id(&node_id_clone)
+                .task_id(&task_id)
+                .trace_id(&trace_id)
+                .source("seclab_api")
+                .request("POST", "/api/v1/nodes/deploy");
+
+        if let Err(err) = &result {
+            platform_log = platform_log.metadata(json!({ "error": err }));
+        } else {
+            platform_log = platform_log.set_success();
+        }
+        platform_log.finish(&state_clone.metadata_db);
+
+        match result {
+            Ok(()) => runtime_metrics::record_deploy_result(true),
+            Err(error) => {
+                let _ = progress_sender.send(DeployProgressEvent::Append {
+                    message: error.message.to_string(),
+                    progress_percent: 98,
+                    is_finished: true,
+                    error: Some(error.message.to_string()),
+                });
                 runtime_metrics::record_deploy_result(false);
                 let _ = node_enrollment::revoke_failed_enrollment(
                     &state_clone.metadata_db,
@@ -608,7 +695,7 @@ pub async fn deploy_create(
                     &node_id_clone,
                     "ssh_push",
                     "failed",
-                    Some(format!("{error:?}")),
+                    Some(error.message.to_string()),
                 )
                 .await;
             }
@@ -633,6 +720,7 @@ pub async fn update(
 ) -> ApiResult<Response> {
     let trace_id = logging::resolve_trace_id(&headers);
     let result = async {
+        assert_node_operation(&state.metadata_db, &node_id, NodeOperation::Update, false).await?;
         node_validation::validate_optional_name(payload.name.as_deref())?;
         node_validation::validate_group(payload.group_id.as_deref())?;
         node_validation::validate_description(payload.description.as_deref())?;
@@ -738,9 +826,11 @@ pub async fn update(
             payload.seclab_url = Some(trimmed_url);
         }
 
-        node_inventory::update_node_from_payload(&state.metadata_db, &node_id, &payload).await?;
-        node_provisioning::update_provisioning_from_payload(&state.metadata_db, &node_id, &payload)
+        let mut transaction = state.metadata_db.begin().await?;
+        node_inventory::update_node_from_payload(&mut *transaction, &node_id, &payload).await?;
+        node_provisioning::update_provisioning_from_payload(&mut *transaction, &node_id, &payload)
             .await?;
+        transaction.commit().await?;
         node_read_model::get_node_summary(&state.metadata_db, &node_id)
             .await?
             .ok_or(ApiError::NotFound)
@@ -808,23 +898,16 @@ pub async fn deploy(
 ) -> ApiResult<Response> {
     let client_ip = conn.ip();
     let trace_id = logging::resolve_trace_id(&headers);
+    assert_node_operation(&state.metadata_db, &node_id, NodeOperation::Deploy, false).await?;
     let task_id = new_uuid_v7();
     node_tasks::create_deploy_task(&state.metadata_db, &task_id, &node_id).await?;
 
-    // 初始化 deploy_sessions 状态
-    {
-        let mut map = state.deploy_sessions.lock().unwrap();
-        map.insert(
-            node_id.clone(),
-            crate::state::DeploySession {
-                progress_percent: 0,
-                logs: vec!["Deploy task created".to_string()],
-                is_finished: false,
-                error: None,
-            },
-        );
-    }
-    spawn_deploy_progress_persistence(Arc::clone(&state), node_id.clone(), task_id);
+    let (progress_sender, progress_receiver) = tokio::sync::mpsc::unbounded_channel();
+    spawn_deploy_progress_persistence(
+        state.metadata_db.clone(),
+        task_id.clone(),
+        progress_receiver,
+    );
 
     let state_clone = Arc::clone(&state);
     let node_id_clone = node_id.clone();
@@ -836,17 +919,17 @@ pub async fn deploy(
             &state_clone.metadata_db,
             &node_id_clone,
             payload,
-            Some(Arc::clone(&state_clone.deploy_sessions)),
+            Some(progress_sender.clone()),
         )
         .await;
 
-        if let Err(error) = &result
-            && let Ok(mut sessions) = state_clone.deploy_sessions.lock()
-            && let Some(session) = sessions.get_mut(&node_id_clone)
-            && !session.is_finished
-        {
-            session.is_finished = true;
-            session.error = Some(error.message.to_string());
+        if let Err(error) = &result {
+            let _ = progress_sender.send(DeployProgressEvent::Append {
+                message: error.message.to_string(),
+                progress_percent: 98,
+                is_finished: true,
+                error: Some(error.message.to_string()),
+            });
         }
 
         let mut platform_log =
@@ -855,6 +938,7 @@ pub async fn deploy(
                 .module(LogModule::System)
                 .target_type("node")
                 .target_id(&node_id_clone)
+                .task_id(&task_id)
                 .trace_id(&trace_id)
                 .source("seclab_api")
                 .request("POST", "/api/v1/node/{node_id}/deploy");
@@ -889,8 +973,42 @@ pub async fn check(
     _headers: HeaderMap,
     Path(node_id): Path<String>,
 ) -> ApiResult<Response> {
-    let result: Result<NodeCheckResponse, ApiError> =
-        check_node_health(&state.metadata_db, &node_id).await;
+    assert_node_operation(&state.metadata_db, &node_id, NodeOperation::Check, false).await?;
+    let task_id = new_uuid_v7();
+    node_tasks::create_node_task(&state.metadata_db, &task_id, &node_id, "check").await?;
+    let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+    let state_clone = Arc::clone(&state);
+    tokio::spawn(async move {
+        persist_internal_task_state(
+            &state_clone.metadata_db,
+            &task_id,
+            10,
+            false,
+            "Node check started",
+            None,
+        )
+        .await;
+        let result: Result<NodeCheckResponse, ApiError> =
+            check_node_health(&state_clone.metadata_db, &node_id).await;
+        let error = result.as_ref().err().map(|error| error.message.to_string());
+        persist_internal_task_state(
+            &state_clone.metadata_db,
+            &task_id,
+            if error.is_some() { 90 } else { 100 },
+            true,
+            if error.is_some() {
+                "Node check failed"
+            } else {
+                "Node check completed"
+            },
+            error,
+        )
+        .await;
+        let _ = result_sender.send(result);
+    });
+    let result = result_receiver
+        .await
+        .map_err(|_| ApiError::internal("node check task ended unexpectedly"))?;
 
     Ok(ApiResponse::success_with_raw("Node check completed", Some(result?)).into_response())
 }
@@ -904,20 +1022,61 @@ pub async fn repair(
     Json(payload): Json<NodeDeployPayload>,
 ) -> ApiResult<Response> {
     let trace_id = logging::resolve_trace_id(&headers);
-    let result = repair_node(&state.metadata_db, &node_id, payload).await;
-    let mut platform_log = OperationEventBuilder::new(&admin.username, "node_repair", conn.ip())
-        .user_id(admin.id)
-        .module(LogModule::System)
-        .target_type("node")
-        .target_id(&node_id)
-        .trace_id(&trace_id)
-        .source("seclab_api")
-        .request("POST", "/api/v1/node/{node_id}/repair");
-    match &result {
-        Ok(_) => platform_log = platform_log.set_success(),
-        Err(err) => platform_log = platform_log.metadata(json!({ "error": err })),
-    }
-    platform_log.finish(&state.metadata_db);
+    assert_node_operation(
+        &state.metadata_db,
+        &node_id,
+        NodeOperation::Reprovision,
+        false,
+    )
+    .await?;
+    let task_id = new_uuid_v7();
+    node_tasks::create_node_task(&state.metadata_db, &task_id, &node_id, "reprovision").await?;
+    let (progress_sender, progress_receiver) = tokio::sync::mpsc::unbounded_channel();
+    spawn_deploy_progress_persistence(
+        state.metadata_db.clone(),
+        task_id.clone(),
+        progress_receiver,
+    );
+    let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+    let state_clone = Arc::clone(&state);
+    let username = admin.username.clone();
+    let user_id = admin.id;
+    let client_ip = conn.ip();
+    tokio::spawn(async move {
+        let result = repair_node(
+            &state_clone.metadata_db,
+            &node_id,
+            payload,
+            Some(progress_sender.clone()),
+        )
+        .await;
+        if let Err(error) = &result {
+            let _ = progress_sender.send(DeployProgressEvent::Append {
+                message: error.message.to_string(),
+                progress_percent: 98,
+                is_finished: true,
+                error: Some(error.message.to_string()),
+            });
+        }
+        let mut platform_log = OperationEventBuilder::new(&username, "node_repair", client_ip)
+            .user_id(user_id)
+            .module(LogModule::System)
+            .target_type("node")
+            .target_id(&node_id)
+            .task_id(&task_id)
+            .trace_id(&trace_id)
+            .source("seclab_api")
+            .request("POST", "/api/v1/node/{node_id}/repair");
+        match &result {
+            Ok(_) => platform_log = platform_log.set_success(),
+            Err(err) => platform_log = platform_log.metadata(json!({ "error": err })),
+        }
+        platform_log.finish(&state_clone.metadata_db);
+        let _ = result_sender.send(result);
+    });
+    let result = result_receiver
+        .await
+        .map_err(|_| ApiError::internal("node reprovision task ended unexpectedly"))?;
     result?;
     Ok(ApiResponse::success_with_raw("Node repair submitted", Some(true)).into_response())
 }
@@ -956,20 +1115,64 @@ pub async fn uninstall(
     Path(node_id): Path<String>,
 ) -> ApiResult<Response> {
     let trace_id = logging::resolve_trace_id(&headers);
-    let result = uninstall_node(&state.metadata_db, &node_id).await;
-    let mut platform_log = OperationEventBuilder::new(&admin.username, "node_uninstall", conn.ip())
-        .user_id(admin.id)
-        .module(LogModule::System)
-        .target_type("node")
-        .target_id(&node_id)
-        .trace_id(&trace_id)
-        .source("seclab_api")
-        .request("POST", "/api/v1/node/{node_id}/uninstall");
-    match &result {
-        Ok(_) => platform_log = platform_log.set_success(),
-        Err(err) => platform_log = platform_log.metadata(json!({ "error": err })),
-    }
-    platform_log.finish(&state.metadata_db);
+    assert_node_operation(
+        &state.metadata_db,
+        &node_id,
+        NodeOperation::Uninstall,
+        false,
+    )
+    .await?;
+    let task_id = new_uuid_v7();
+    node_tasks::create_node_task(&state.metadata_db, &task_id, &node_id, "uninstall").await?;
+    let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+    let state_clone = Arc::clone(&state);
+    let username = admin.username.clone();
+    let user_id = admin.id;
+    let client_ip = conn.ip();
+    tokio::spawn(async move {
+        persist_internal_task_state(
+            &state_clone.metadata_db,
+            &task_id,
+            10,
+            false,
+            "Node uninstall started",
+            None,
+        )
+        .await;
+        let result = uninstall_node(&state_clone.metadata_db, &node_id, true).await;
+        let error = result.as_ref().err().map(|error| error.message.to_string());
+        persist_internal_task_state(
+            &state_clone.metadata_db,
+            &task_id,
+            if error.is_some() { 90 } else { 100 },
+            true,
+            if error.is_some() {
+                "Node uninstall failed"
+            } else {
+                "Node uninstall completed"
+            },
+            error,
+        )
+        .await;
+        let mut platform_log = OperationEventBuilder::new(&username, "node_uninstall", client_ip)
+            .user_id(user_id)
+            .module(LogModule::System)
+            .target_type("node")
+            .target_id(&node_id)
+            .task_id(&task_id)
+            .trace_id(&trace_id)
+            .source("seclab_api")
+            .request("POST", "/api/v1/node/{node_id}/uninstall");
+        match &result {
+            Ok(_) => platform_log = platform_log.set_success(),
+            Err(err) => platform_log = platform_log.metadata(json!({ "error": err })),
+        }
+        platform_log.finish(&state_clone.metadata_db);
+        let _ = result_sender.send(result);
+    });
+    let result = result_receiver
+        .await
+        .map_err(|_| ApiError::internal("node uninstall task ended unexpectedly"))?;
     result?;
     Ok(ApiResponse::success_with_raw("Node uninstalled", Some(true)).into_response())
 }

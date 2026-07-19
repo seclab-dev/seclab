@@ -194,6 +194,7 @@ pub struct NodePrecheckInput {
     pub service_port: Option<String>,
     pub install_dir: Option<String>,
     pub seclab_url: Option<String>,
+    pub expected_node_id: Option<String>,
 }
 
 struct RemotePrecheckCore {
@@ -215,6 +216,8 @@ pub async fn precheck_node(
     pool: &DbPool,
     input: NodePrecheckInput,
 ) -> ApiResult<NodePrecheckResponse> {
+    let expected_node_id = input.expected_node_id.clone();
+    let allow_existing_agent = expected_node_id.is_some();
     let addr = input.addr.clone();
     let port = input
         .port
@@ -336,8 +339,8 @@ pub async fn precheck_node(
         let service_inspection_error = agent_inspection_error.or(controller_inspection_error);
         if let Some(err) = service_inspection_error {
             let service_detail = failed_precheck_detail(&err, "Failed to inspect existing service");
-            let port_detail =
-                check_port_available(&session, &service_port, false).unwrap_or_else(|err| {
+            let port_detail = check_port_available(&session, &service_port, allow_existing_agent)
+                .unwrap_or_else(|err| {
                     failed_precheck_detail(&err, "Failed to inspect service port")
                 });
             return Ok(RemotePrecheckCore {
@@ -356,8 +359,8 @@ pub async fn precheck_node(
         }
         if seclab_conflict {
             let blocked_detail = NodePrecheckDetail::failed(node_conflict_message());
-            let port_detail =
-                check_port_available(&session, &service_port, false).unwrap_or_else(|err| {
+            let port_detail = check_port_available(&session, &service_port, allow_existing_agent)
+                .unwrap_or_else(|err| {
                     failed_precheck_detail(&err, "Failed to inspect service port")
                 });
             return Ok(RemotePrecheckCore {
@@ -374,8 +377,12 @@ pub async fn precheck_node(
                 controller_conflict: true,
             });
         }
-        let service_detail = check_agent_absence(&remote_agent);
-        let port_detail = check_port_available(&session, &service_port, false)
+        let service_detail = if allow_existing_agent && remote_agent.present {
+            NodePrecheckDetail::warning("Existing managed seclab-agent will be replaced")
+        } else {
+            check_agent_absence(&remote_agent)
+        };
+        let port_detail = check_port_available(&session, &service_port, allow_existing_agent)
             .unwrap_or_else(|err| failed_precheck_detail(&err, "Failed to inspect service port"));
 
         Ok(RemotePrecheckCore {
@@ -407,6 +414,9 @@ pub async fn precheck_node(
         &version_compatibility,
     )
     .await?;
+    let expected_existing_agent = expected_node_id.is_some()
+        && agent_status.kind == AgentStatusKind::CurrentController
+        && agent_status.existing_node_id.as_deref() == expected_node_id.as_deref();
     let passed = !core.ssh.is_failed()
         && !core.os.is_failed()
         && !core.permission.is_failed()
@@ -415,7 +425,7 @@ pub async fn precheck_node(
         && !core.directory.is_failed()
         && !core.port.is_failed()
         && !core.callback.is_failed()
-        && !agent_status.blocking;
+        && (!agent_status.blocking || expected_existing_agent);
 
     Ok(NodePrecheckResponse {
         passed,

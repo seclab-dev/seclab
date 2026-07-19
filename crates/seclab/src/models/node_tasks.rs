@@ -33,15 +33,29 @@ pub async fn create_deploy_task<'e, E>(executor: E, task_id: &str, node_id: &str
 where
     E: Executor<'e, Database = Sqlite>,
 {
+    create_node_task(executor, task_id, node_id, "deploy").await
+}
+
+/// 新建任意节点操作任务；同一节点只允许一个活动任务。
+pub async fn create_node_task<'e, E>(
+    executor: E,
+    task_id: &str,
+    node_id: &str,
+    task_type: &str,
+) -> ApiResult<()>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     let result = sqlx::query(
         r#"
         INSERT INTO node_tasks (
             task_id, node_id, task_type, status, phase, progress_percent, progress_logs
-        ) VALUES (?, ?, 'deploy', 'queued', 'queued', 0, '["Deploy task created"]')
+        ) VALUES (?, ?, ?, 'queued', 'queued', 0, '["Node task created"]')
         "#,
     )
     .bind(task_id)
     .bind(node_id)
+    .bind(task_type)
     .execute(executor)
     .await;
 
@@ -157,25 +171,21 @@ pub async fn get_latest_deploy_task(
     .await
 }
 
-/// 启动时把无法继续执行的旧进程任务收敛为可追踪失败终态。
-pub async fn fail_interrupted_tasks(pool: &DbPool) -> sqlx::Result<u64> {
-    let now = Utc::now().to_rfc3339();
-    let result = sqlx::query(
+/// 读取控制服务重启时尚未终结的节点任务。
+pub async fn list_interrupted_tasks(pool: &DbPool) -> sqlx::Result<Vec<NodeTaskRecord>> {
+    sqlx::query_as::<_, NodeTaskRecord>(
         r#"
-        UPDATE node_tasks
-        SET
-            status = 'failed',
-            phase = 'failed',
-            finished_at = ?,
-            error_code = 'NODE_OPERATION_INTERRUPTED',
-            error_summary = '控制服务重启，任务执行已中断'
+        SELECT
+            task_id, node_id, task_type, started_at, finished_at, status, phase,
+            progress_percent, progress_logs, cancellable, result_summary,
+            error_code, error_summary, created_at, updated_at
+        FROM node_tasks
         WHERE status IN ('queued', 'running', 'cancel_requested')
+        ORDER BY created_at ASC, task_id ASC
         "#,
     )
-    .bind(now)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
+    .fetch_all(pool)
+    .await
 }
 
 /// 将持久任务转换为现有前端部署进度契约。
@@ -192,7 +202,7 @@ pub fn to_deploy_session(task: &NodeTaskRecord) -> DeploySession {
 #[cfg(test)]
 mod tests {
     use super::{
-        create_deploy_task, fail_interrupted_tasks, get_latest_deploy_task, to_deploy_session,
+        create_deploy_task, get_latest_deploy_task, list_interrupted_tasks, to_deploy_session,
         update_deploy_progress,
     };
     use crate::models::nodes::{NewNodeRecord, insert_node};
@@ -289,23 +299,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_recovery_marks_active_tasks_failed() {
+    async fn startup_recovery_lists_active_tasks() {
         let pool = setup_test_db().await;
         let node_id = insert_test_node(&pool).await;
         create_deploy_task(&pool, &Uuid::new_v4().to_string(), &node_id)
             .await
             .unwrap();
 
-        assert_eq!(fail_interrupted_tasks(&pool).await.unwrap(), 1);
-        let stored = get_latest_deploy_task(&pool, &node_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(stored.status, "failed");
-        assert_eq!(
-            stored.error_code.as_deref(),
-            Some("NODE_OPERATION_INTERRUPTED")
-        );
-        assert!(to_deploy_session(&stored).is_finished);
+        let tasks = list_interrupted_tasks(&pool).await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].node_id, node_id);
+        assert_eq!(tasks[0].status, "queued");
     }
 }
