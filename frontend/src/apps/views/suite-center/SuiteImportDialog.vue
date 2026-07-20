@@ -2,6 +2,7 @@
 import { ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { SecLabButton, SecLabDialog } from '@/components/ui'
+import SecLabIcon from '@/components/icons/SecLabIcon.vue'
 import { validateSuitePackage } from './useSuiteCenter'
 
 const props = defineProps<{
@@ -28,6 +29,10 @@ function reset() {
 function handleClose() {
   if (props.busy) return
   emit('close')
+}
+
+function openFilePicker() {
+  if (!props.busy) fileInput.value?.click()
 }
 
 function handleFile(event: Event) {
@@ -61,20 +66,33 @@ watch(
     @close="handleClose"
   >
     <div class="import-dialog" data-ui="suite-import-dialog">
-      <label class="import-dialog__picker" for="suite-package-file">
-        <span class="import-dialog__label">{{ t('app.suiteCenter.selectPackage') }}</span>
-        <span class="import-dialog__hint">{{ t('app.suiteCenter.importFormatHint') }}</span>
+      <div class="import-dialog__picker" data-slot="package-picker">
+        <div class="import-dialog__info">
+          <div class="import-dialog__filename" data-slot="selected-package">
+            {{ selectedFile?.name || t('app.suiteCenter.noPackageSelected') }}
+          </div>
+          <div class="import-dialog__hint">{{ t('app.suiteCenter.importFormatHint') }}</div>
+        </div>
         <input
           id="suite-package-file"
           ref="fileInput"
+          class="import-dialog__native-input"
+          name="suitePackageFile"
           type="file"
           accept=".slsp"
           :disabled="busy"
+          :aria-label="t('app.suiteCenter.selectPackage')"
           @change="handleFile"
         />
-      </label>
-      <div v-if="selectedFile" class="import-dialog__file" data-slot="selected-package">
-        {{ selectedFile.name }}
+        <SecLabButton
+          class="import-dialog__select-button"
+          :disabled="busy"
+          data-ui="suite-file-select"
+          @click="openFilePicker"
+        >
+          <SecLabIcon name="package" :size="14" />
+          {{ t('app.suiteCenter.selectPackage') }}
+        </SecLabButton>
       </div>
       <div v-if="validationError" class="import-dialog__error" role="alert">
         {{ validationError }}
@@ -91,7 +109,7 @@ watch(
         data-ui="suite-confirm-import"
         @click="submit"
       >
-        {{ t('app.suiteCenter.confirmImport') }}
+        {{ t('common.import') }}
       </SecLabButton>
     </template>
   </SecLabDialog>
@@ -105,32 +123,62 @@ watch(
 
 .import-dialog__picker {
   display: grid;
-  gap: var(--sdl-space-2);
-  padding: var(--sdl-space-5);
-  border: 1px dashed var(--sdl-border-strong);
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--sdl-space-3);
+  min-width: 0;
+  padding: var(--sdl-space-3);
+  border: 1px solid var(--sdl-border-subtle);
   border-radius: var(--sdl-radius-md);
   background: var(--sdl-bg-muted);
-  cursor: pointer;
 }
 
-.import-dialog__label {
+.import-dialog__info {
+  min-width: 0;
+}
+
+.import-dialog__filename {
+  overflow: hidden;
   color: var(--sdl-text-primary);
-  font: var(--sdl-font-subtitle);
+  font: var(--sdl-font-body);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.import-dialog__select-button :deep(.sl-button-content) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sdl-space-2);
+  line-height: 1;
+}
+
+.import-dialog__native-input {
+  display: none;
 }
 
 .import-dialog__hint,
-.import-dialog__file,
 .import-dialog__error {
   color: var(--sdl-text-muted);
   font: var(--sdl-font-body-sm);
 }
 
-.import-dialog__file {
-  overflow-wrap: anywhere;
-  color: var(--sdl-text-secondary);
+.import-dialog__hint {
+  margin-top: var(--sdl-space-1);
 }
 
 .import-dialog__error {
   color: var(--sdl-danger);
+}
+
+@media (max-width: 30rem) {
+  .import-dialog__picker {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .import-dialog__select-button {
+    width: 100%;
+  }
 }
 </style>

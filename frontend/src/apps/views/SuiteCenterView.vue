@@ -241,26 +241,39 @@ watch(catalog, () => {
           data-slot="suite-status-filter"
         />
         <SecLabButton
+          class="suite-toolbar__action"
           type="secondary"
-          :loading="refreshing"
+          :disabled="refreshing"
           data-ui="suite-refresh"
           @click="refreshSuites()"
         >
           <SecLabIcon name="refresh" :size="14" />
           {{ t('common.refresh') }}
         </SecLabButton>
-        <SecLabButton type="primary" data-ui="suite-import" @click="importDialogVisible = true">
+        <SecLabButton
+          class="suite-toolbar__action"
+          type="primary"
+          data-ui="suite-import"
+          @click="importDialogVisible = true"
+        >
           <SecLabIcon name="plus" :size="14" />
-          {{ t('app.suiteCenter.import') }}
+          {{ t('common.import') }}
         </SecLabButton>
       </div>
 
-      <div class="suite-results" data-slot="suite-results">
-        <SecLabLoading
-          v-if="phase === 'loading'"
-          :loading="true"
-          :text="t('app.suiteCenter.loading')"
-        />
+      <div
+        class="suite-results"
+        data-slot="suite-results"
+        :aria-busy="refreshing || phase === 'loading'"
+      >
+        <div
+          v-if="refreshing || phase === 'loading'"
+          class="suite-state suite-state--loading"
+          data-ui="suite-results-loading"
+          aria-live="polite"
+        >
+          <SecLabLoading :loading="true" :text="t('app.suiteCenter.loading')" />
+        </div>
         <div v-else-if="currentNodeUnavailable" class="suite-state" data-ui="node-unavailable">
           <SecLabEmpty :description="t('app.suiteCenter.nodeUnavailable')" icon="server" />
         </div>
@@ -270,18 +283,16 @@ watch(catalog, () => {
             t('common.retry')
           }}</SecLabButton>
         </div>
-        <SecLabEmpty
-          v-else-if="phase === 'empty'"
-          :description="t('app.suiteCenter.empty')"
-          icon="package"
-          data-ui="suite-empty-catalog"
-        />
-        <SecLabEmpty
+        <div v-else-if="phase === 'empty'" class="suite-state" data-ui="suite-empty-catalog">
+          <SecLabEmpty :description="t('app.suiteCenter.empty')" icon="package" />
+        </div>
+        <div
           v-else-if="filteredCards.length === 0"
-          :description="t('app.suiteCenter.emptyFilter')"
-          icon="search"
+          class="suite-state"
           data-ui="suite-empty-filter"
-        />
+        >
+          <SecLabEmpty :description="t('app.suiteCenter.emptyFilter')" icon="search" />
+        </div>
         <div v-else class="suite-grid">
           <SuiteCard
             v-for="card in filteredCards"
@@ -432,7 +443,16 @@ watch(catalog, () => {
   background: var(--sdl-bg-panel);
 }
 
+.suite-toolbar__action :deep(.sl-button-content) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sdl-space-2);
+  line-height: 1;
+}
+
 .suite-results {
+  position: relative;
   min-height: 0;
   flex: 1;
   overflow: auto;
@@ -449,7 +469,12 @@ watch(catalog, () => {
   display: grid;
   place-items: center;
   gap: var(--sdl-space-3);
+  height: 100%;
   min-height: 16rem;
+}
+
+.suite-state--loading {
+  place-items: stretch;
 }
 
 @media (max-width: 680px) {

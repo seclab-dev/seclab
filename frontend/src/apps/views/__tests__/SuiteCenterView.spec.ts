@@ -113,6 +113,24 @@ describe('SuiteCenterView', () => {
 
     phase.value = 'empty'
     await nextTick()
-    expect(wrapper.find('[data-ui="suite-empty-catalog"]').exists()).toBe(true)
+    const emptyState = wrapper.find('[data-ui="suite-empty-catalog"]')
+    expect(emptyState.classes()).toContain('suite-state')
+    expect(emptyState.find('.sl-empty-description').exists()).toBe(true)
+  })
+
+  it('刷新时由整个结果区域显示加载状态', async () => {
+    const wrapper = mountView()
+    const refreshing = state.value.refreshing as ReturnType<typeof ref<boolean>>
+
+    refreshing.value = true
+    await nextTick()
+
+    const results = wrapper.find('[data-slot="suite-results"]')
+    expect(results.attributes('aria-busy')).toBe('true')
+    expect(results.find('[data-ui="suite-results-loading"]').classes()).toContain(
+      'suite-state--loading',
+    )
+    expect(results.find('.suite-grid').exists()).toBe(false)
+    expect(wrapper.find('[data-ui="suite-refresh"]').attributes('disabled')).toBeDefined()
   })
 })
