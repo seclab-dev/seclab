@@ -3,7 +3,11 @@ import { createPinia } from 'pinia'
 import { createI18n } from 'vue-i18n'
 import { mount } from '@vue/test-utils'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { SuiteCatalogItem, SuiteInstanceSummary } from '@/api/interface/suites'
+import type {
+  SuiteCatalogItem,
+  SuiteInstallTaskResponse,
+  SuiteInstanceSummary,
+} from '@/api/interface/suites'
 import en from '@/locales/en'
 import zh from '@/locales/zh'
 import SuiteCenterView from '@/apps/views/SuiteCenterView.vue'
@@ -38,6 +42,20 @@ const installed: SuiteInstanceSummary = {
   nodeId: 'local',
   composeProjectName: 'protocol',
   status: 'enabled',
+  createdAt: '',
+  updatedAt: '',
+}
+
+const installingTask: SuiteInstallTaskResponse = {
+  taskId: 'task-scanner',
+  instanceId: 'instance-scanner',
+  suiteId: 'scanner',
+  nodeId: 'local',
+  progressPercent: 48,
+  status: 'running',
+  currentStep: 'pull_registry_image',
+  isFinished: false,
+  cancelRequested: false,
   createdAt: '',
   updatedAt: '',
 }
@@ -132,5 +150,17 @@ describe('SuiteCenterView', () => {
     )
     expect(results.find('.suite-grid').exists()).toBe(false)
     expect(wrapper.find('[data-ui="suite-refresh"]').attributes('disabled')).toBeDefined()
+  })
+
+  it('安装任务仅在详情抽屉展示进度', async () => {
+    state.value.tasksById = ref({ [installingTask.taskId]: installingTask })
+    const wrapper = mountView()
+
+    expect(wrapper.find('[data-slot="scanner"] [data-ui="suite-install-task"]').exists()).toBe(
+      false,
+    )
+
+    await wrapper.find('[data-slot="scanner"] .suite-card__main').trigger('click')
+    expect(document.body.querySelector('[data-ui="suite-install-task"]')).not.toBeNull()
   })
 })

@@ -1,26 +1,17 @@
 <script setup lang="ts">
-import type {
-  SuiteCatalogItem,
-  SuiteInstallTaskResponse,
-  SuiteInstanceSummary,
-} from '@/api/interface/suites'
+import type { SuiteCatalogItem, SuiteInstanceSummary } from '@/api/interface/suites'
 import { SecLabTag } from '@/components/ui'
 import AppIcon from '@/components/icons/AppIcon.vue'
-import SuiteInstallProgress from './SuiteInstallProgress.vue'
 
 defineProps<{
   suite: SuiteCatalogItem
   instance?: SuiteInstanceSummary
-  task?: SuiteInstallTaskResponse
   statusLabel: string
   statusType: 'primary' | 'success' | 'warning' | 'danger' | 'info' | 'default'
-  pollingError?: string
 }>()
 
 defineEmits<{
   select: []
-  cancel: [taskId: string]
-  retry: [taskId: string]
 }>()
 </script>
 
@@ -45,13 +36,6 @@ defineEmits<{
         {{ instance.lastError }}
       </div>
     </button>
-    <SuiteInstallProgress
-      v-if="task"
-      :task="task"
-      :error="pollingError"
-      @cancel="$emit('cancel', task.taskId)"
-      @retry="$emit('retry', task.taskId)"
-    />
   </article>
 </template>
 

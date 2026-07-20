@@ -299,13 +299,9 @@ watch(catalog, () => {
             :key="card.suite.suiteId"
             :suite="card.suite"
             :instance="card.instance"
-            :task="card.task"
             :status-label="statusLabel(card.status)"
             :status-type="statusType(card.status)"
-            :polling-error="card.task ? pollingErrors[card.task.taskId] : undefined"
             @select="selectedSuiteId = card.suite.suiteId"
-            @cancel="cancelInstall"
-            @retry="retryInstallPolling"
           />
         </div>
       </div>
