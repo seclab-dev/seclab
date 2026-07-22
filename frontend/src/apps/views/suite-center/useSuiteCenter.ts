@@ -37,6 +37,11 @@ export interface SuitePackageValidation {
   reason?: 'extension' | 'size'
 }
 
+interface RefreshSuitesOptions {
+  clearInstances?: boolean
+  showLoading?: boolean
+}
+
 /** 校验套件包扩展名与前端允许的体积上限。 */
 export function validateSuitePackage(file: File): SuitePackageValidation {
   if (!file.name.toLowerCase().endsWith('.slsp')) return { valid: false, reason: 'extension' }
@@ -78,6 +83,7 @@ export function useSuiteCenter() {
   const loadError = ref('')
   const refreshing = ref(false)
   const requestSequence = ref(0)
+  const visibleRefreshSequence = ref<number | null>(null)
   const pollTimers = sharedPollTimers
   const pollingTasks = sharedPollingTasks
 
@@ -115,19 +121,25 @@ export function useSuiteCenter() {
   }
 
   /** 加载当前节点目录，忽略节点或语言切换产生的过期响应。 */
-  async function refreshSuites(options: { clearInstances?: boolean } = {}) {
+  async function refreshSuites(options: RefreshSuitesOptions = {}) {
     const sequence = ++requestSequence.value
     const targetNodeId = currentNodeId.value
+    const showLoading = options.showLoading ?? true
     if (options.clearInstances) instances.value = []
-    refreshing.value = true
-    if (catalog.value.length === 0) phase.value = 'loading'
-    loadError.value = ''
+    if (showLoading) {
+      visibleRefreshSequence.value = sequence
+      refreshing.value = true
+      if (catalog.value.length === 0) phase.value = 'loading'
+      loadError.value = ''
+    }
     try {
       const response = await suitesApi.fetchSuites(targetNodeId)
       if (sequence !== requestSequence.value || targetNodeId !== currentNodeId.value) return
       if (!response.success || !response.data) {
-        loadError.value = response.message || t('app.suiteCenter.messages.loadFailed')
-        phase.value = 'error'
+        if (showLoading || catalog.value.length === 0) {
+          loadError.value = response.message || t('app.suiteCenter.messages.loadFailed')
+          phase.value = 'error'
+        }
         return
       }
       catalog.value = response.data.catalog
@@ -136,10 +148,15 @@ export function useSuiteCenter() {
     } catch (error) {
       if (sequence !== requestSequence.value || targetNodeId !== currentNodeId.value) return
       console.error('Failed to load suites', error)
-      loadError.value = t('app.suiteCenter.messages.loadFailed')
-      phase.value = 'error'
+      if (showLoading || catalog.value.length === 0) {
+        loadError.value = t('app.suiteCenter.messages.loadFailed')
+        phase.value = 'error'
+      }
     } finally {
-      if (sequence === requestSequence.value) refreshing.value = false
+      if (visibleRefreshSequence.value === sequence) {
+        visibleRefreshSequence.value = null
+        refreshing.value = false
+      }
     }
   }
 
@@ -322,6 +339,21 @@ export function useSuiteCenter() {
     removeData = false,
   ) {
     if (isOperating(suite.suiteId, instance.nodeId)) return false
+    const pendingStatus: Record<typeof action, SuiteInstanceStatus> = {
+      enable: 'enabling',
+      disable: 'disabling',
+      uninstall: 'uninstalling',
+    }
+    const previousInstance =
+      instances.value.find((item) => item.instanceId === instance.instanceId) ?? instance
+    const restorePreviousStatus = () => {
+      instances.value = instances.value.map((item) =>
+        item.instanceId === previousInstance.instanceId ? previousInstance : item,
+      )
+    }
+    instances.value = instances.value.map((item) =>
+      item.instanceId === instance.instanceId ? { ...item, status: pendingStatus[action] } : item,
+    )
     setOperating(suite.suiteId, instance.nodeId, true)
     try {
       const response =
@@ -331,15 +363,25 @@ export function useSuiteCenter() {
             ? await suitesApi.disableInstance(instance.instanceId)
             : await suitesApi.uninstallInstance(instance.instanceId, { removeData })
       if (!response.success) {
+        restorePreviousStatus()
         toastStore.error(response.message || t(`app.suiteCenter.messages.${action}Failed`))
         return false
       }
       toastStore.success(t(`app.suiteCenter.messages.${action}Success`))
       if (action !== 'enable') windowStore.closeWindowsBySuiteInstanceId(instance.instanceId)
-      await refreshSuites()
+      if (action === 'uninstall') {
+        instances.value = instances.value.filter((item) => item.instanceId !== instance.instanceId)
+      } else {
+        const completedStatus: SuiteInstanceStatus = action === 'enable' ? 'enabled' : 'disabled'
+        instances.value = instances.value.map((item) =>
+          item.instanceId === instance.instanceId ? { ...item, status: completedStatus } : item,
+        )
+      }
+      await refreshSuites({ showLoading: false })
       await windowStore.refreshDesktopState()
       return true
     } catch (error) {
+      restorePreviousStatus()
       console.error(`Failed to ${action} suite instance`, error)
       toastStore.error(t(`app.suiteCenter.messages.${action}Failed`))
       return false
@@ -370,7 +412,7 @@ export function useSuiteCenter() {
   }
 
   const refreshCompletedTaskNode = async (nodeId: string) => {
-    if (nodeId === currentNodeId.value) await refreshSuites()
+    if (nodeId === currentNodeId.value) await refreshSuites({ showLoading: false })
   }
 
   onMounted(() => {

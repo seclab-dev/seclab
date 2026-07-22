@@ -189,9 +189,17 @@ describe('useSuiteCenter', () => {
     await flushPromises()
     expect(api.fetchInstallProgress).toHaveBeenCalledTimes(1)
 
+    const silentRefresh = deferred<ReturnType<typeof response<SuiteListResponse>>>()
+    api.fetchSuites.mockImplementationOnce(() => silentRefresh.promise)
     progressRequest.resolve(response(task('task-1', true)))
     await flushPromises()
     expect(second.vm.tasksById['task-1'].isFinished).toBe(true)
+    expect(second.vm.refreshing).toBe(false)
+
+    silentRefresh.resolve(
+      response({ catalog: [suite('suite-1')], instances: [instance('suite-1')] }),
+    )
+    await flushPromises()
     expect(windowManager.finishGlobalOperation).toHaveBeenCalledWith('suite-install:task-1')
     second.unmount()
   })
@@ -227,6 +235,56 @@ describe('useSuiteCenter', () => {
     await first
     await second
     expect(wrapper.vm.isOperating('suite-1')).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('卸载期间仅更新实例状态并静默同步目录', async () => {
+    const installedSuite = suite('suite-1', 1)
+    const installedInstance = instance('suite-1')
+    api.fetchSuites
+      .mockResolvedValueOnce(
+        response<SuiteListResponse>({
+          catalog: [installedSuite],
+          instances: [installedInstance],
+        }),
+      )
+      .mockResolvedValueOnce(
+        response<SuiteListResponse>({ catalog: [suite('suite-1')], instances: [] }),
+      )
+    const uninstallRequest = deferred<ReturnType<typeof response<null>>>()
+    api.uninstallInstance.mockImplementationOnce(() => uninstallRequest.promise)
+    const { wrapper } = mountHarness()
+    await flushPromises()
+
+    const uninstall = wrapper.vm.runInstanceAction(installedSuite, installedInstance, 'uninstall')
+    await flushPromises()
+    expect(wrapper.vm.instances[0]?.status).toBe('uninstalling')
+    expect(wrapper.vm.refreshing).toBe(false)
+
+    uninstallRequest.resolve(response(null))
+    expect(await uninstall).toBe(true)
+    expect(wrapper.vm.instances).toEqual([])
+    expect(wrapper.vm.refreshing).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('实例操作失败后恢复原状态', async () => {
+    const installedSuite = suite('suite-1', 1)
+    const installedInstance = instance('suite-1')
+    api.fetchSuites.mockResolvedValueOnce(
+      response<SuiteListResponse>({
+        catalog: [installedSuite],
+        instances: [installedInstance],
+      }),
+    )
+    api.enableInstance.mockResolvedValueOnce(failedResponse)
+    const { wrapper } = mountHarness()
+    await flushPromises()
+
+    expect(await wrapper.vm.runInstanceAction(installedSuite, installedInstance, 'enable')).toBe(
+      false,
+    )
+    expect(wrapper.vm.instances[0]?.status).toBe('installed')
     wrapper.unmount()
   })
 
