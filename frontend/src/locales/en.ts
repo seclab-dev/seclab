@@ -1603,7 +1603,7 @@ const en = {
         readState: 'Read State',
         archiveScope: 'Scope',
         category: 'Category',
-        severity: 'Severity',
+        attentionLevel: 'Attention Level',
         module: 'Module',
         from: 'From',
         to: 'To',
@@ -1615,12 +1615,13 @@ const en = {
       },
       columns: {
         time: 'Time',
-        severity: 'Severity',
+        attentionLevel: 'Attention Level',
+        outcome: 'Outcome',
         content: 'Notification',
         source: 'Source / Target',
         actions: 'Actions',
       },
-      severity: { success: 'Success', info: 'Info', warning: 'Warning', error: 'Error' },
+      attentionLevel: { info: 'Info', warning: 'Warning', critical: 'Critical' },
       category: { task: 'Task', security: 'Security', system: 'System' },
       outcome: {
         success: 'Success',
@@ -1639,7 +1640,7 @@ const en = {
       detail: {
         createdAt: 'Occurred At',
         category: 'Category',
-        severity: 'Severity',
+        attentionLevel: 'Attention Level',
         outcome: 'Outcome',
         module: 'Source Module',
         node: 'Node',

@@ -11,7 +11,7 @@ use seclab_contracts::logging::{
     OperationParameterValue, OperationTarget,
 };
 use seclab_contracts::notification::{
-    NotificationCategory, NotificationCode, NotificationSeverity,
+    NotificationAttentionLevel, NotificationCategory, NotificationCode,
 };
 use serde_json::Value;
 use sqlx::{FromRow, QueryBuilder, Sqlite, Transaction};
@@ -493,8 +493,16 @@ enum NotificationRecipientPolicy {
 struct NotificationRegistration {
     code: NotificationCode,
     category: NotificationCategory,
+    attention: NotificationAttentionPolicy,
+    include_outcome: bool,
     recipients: NotificationRecipientPolicy,
     allowed_parameters: &'static [&'static str],
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NotificationAttentionPolicy {
+    OutcomeBased,
+    Fixed(NotificationAttentionLevel),
 }
 
 /// 在操作事件事务内按严格注册表创建个人通知投影。
@@ -517,14 +525,15 @@ async fn project_notification(
             .filter(|(key, _)| registration.allowed_parameters.contains(&key.as_str()))
             .collect::<BTreeMap<_, _>>();
     let parameters_json = serde_json::to_string(&parameters).unwrap_or_else(|_| "{}".to_string());
-    let severity = notification_severity(event.outcome);
+    let attention_level = notification_attention_level(registration.attention, event.outcome);
+    let outcome = registration.include_outcome.then(|| event.outcome.as_str());
     for recipient_user_id in recipients {
         let notification_id = new_uuid_v7();
         sqlx::query(
             r#"
             INSERT OR IGNORE INTO user_notifications (
                 notification_id, recipient_user_id, operation_event_id, created_at,
-                code, category, severity, outcome, source_module, source_node_id,
+                code, category, attention_level, outcome, source_module, source_node_id,
                 source_node_name, subject_kind, subject_id, subject_display_name,
                 task_id, parameters_json, error_code, error_summary, trace_id,
                 read_at, archived_at, state_changed_at
@@ -537,8 +546,8 @@ async fn project_notification(
         .bind(&event.occurred_at)
         .bind(registration.code.as_str())
         .bind(registration.category.as_str())
-        .bind(severity.as_str())
-        .bind(event.outcome.as_str())
+        .bind(attention_level.as_str())
+        .bind(outcome)
         .bind(event.module.as_str())
         .bind(&event.origin_node_id)
         .bind(&event.origin_node_name)
@@ -584,6 +593,8 @@ fn notification_registration(event: &StoredOperationEvent) -> Option<Notificatio
     let task = |code, recipients| NotificationRegistration {
         code,
         category: NotificationCategory::Task,
+        attention: NotificationAttentionPolicy::OutcomeBased,
+        include_outcome: true,
         recipients,
         allowed_parameters: TASK_PARAMETERS,
     };
@@ -613,18 +624,24 @@ fn notification_registration(event: &StoredOperationEvent) -> Option<Notificatio
         "node_offline" => Some(NotificationRegistration {
             code: NotificationCode::NodeOffline,
             category: NotificationCategory::System,
+            attention: NotificationAttentionPolicy::Fixed(NotificationAttentionLevel::Warning),
+            include_outcome: false,
             recipients: NotificationRecipientPolicy::AllActiveAdmins,
             allowed_parameters: SYSTEM_PARAMETERS,
         }),
         "node_recovered" => Some(NotificationRegistration {
             code: NotificationCode::NodeRecovered,
             category: NotificationCategory::System,
+            attention: NotificationAttentionPolicy::Fixed(NotificationAttentionLevel::Info),
+            include_outcome: false,
             recipients: NotificationRecipientPolicy::AllActiveAdmins,
             allowed_parameters: SYSTEM_PARAMETERS,
         }),
         "login_lockout" => Some(NotificationRegistration {
             code: NotificationCode::LoginLockout,
             category: NotificationCategory::Security,
+            attention: NotificationAttentionPolicy::Fixed(NotificationAttentionLevel::Warning),
+            include_outcome: false,
             recipients: NotificationRecipientPolicy::AllActiveAdmins,
             allowed_parameters: SECURITY_PARAMETERS,
         }),
@@ -707,12 +724,20 @@ async fn notification_recipients(
     }
 }
 
-const fn notification_severity(outcome: OperationOutcome) -> NotificationSeverity {
-    match outcome {
-        OperationOutcome::Success => NotificationSeverity::Success,
-        OperationOutcome::Failure | OperationOutcome::TimedOut => NotificationSeverity::Error,
-        OperationOutcome::Partial => NotificationSeverity::Warning,
-        OperationOutcome::Canceled => NotificationSeverity::Info,
+const fn notification_attention_level(
+    policy: NotificationAttentionPolicy,
+    outcome: OperationOutcome,
+) -> NotificationAttentionLevel {
+    match policy {
+        NotificationAttentionPolicy::Fixed(level) => level,
+        NotificationAttentionPolicy::OutcomeBased => match outcome {
+            OperationOutcome::Success | OperationOutcome::Canceled => {
+                NotificationAttentionLevel::Info
+            }
+            OperationOutcome::Failure | OperationOutcome::Partial | OperationOutcome::TimedOut => {
+                NotificationAttentionLevel::Warning
+            }
+        },
     }
 }
 
@@ -1388,8 +1413,14 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        let (recipient, code, parameters): (i64, String, String) = sqlx::query_as(
-            "SELECT recipient_user_id, code, parameters_json FROM user_notifications",
+        let (recipient, code, attention_level, outcome, parameters): (
+            i64,
+            String,
+            String,
+            Option<String>,
+            String,
+        ) = sqlx::query_as(
+            "SELECT recipient_user_id, code, attention_level, outcome, parameters_json FROM user_notifications",
         )
         .fetch_one(&pool)
         .await
@@ -1398,9 +1429,36 @@ mod tests {
         assert_eq!(notification_count, 1);
         assert_eq!(recipient, 1);
         assert_eq!(code, "scriptRunFinished");
+        assert_eq!(attention_level, "info");
+        assert_eq!(outcome.as_deref(), Some("success"));
         assert!(parameters.contains("Safe Script"));
         assert!(!parameters.contains("token"));
         assert!(!parameters.contains("unregistered"));
+    }
+
+    #[test]
+    fn notification_attention_is_independent_from_operation_outcome() {
+        assert_eq!(
+            notification_attention_level(
+                NotificationAttentionPolicy::OutcomeBased,
+                OperationOutcome::Success,
+            ),
+            NotificationAttentionLevel::Info
+        );
+        assert_eq!(
+            notification_attention_level(
+                NotificationAttentionPolicy::OutcomeBased,
+                OperationOutcome::Failure,
+            ),
+            NotificationAttentionLevel::Warning
+        );
+        assert_eq!(
+            notification_attention_level(
+                NotificationAttentionPolicy::Fixed(NotificationAttentionLevel::Critical),
+                OperationOutcome::Success,
+            ),
+            NotificationAttentionLevel::Critical
+        );
     }
 
     #[tokio::test]
@@ -1430,6 +1488,16 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(recipients, vec![1, 2]);
+        let projections = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT attention_level, outcome FROM user_notifications ORDER BY recipient_user_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            projections,
+            vec![("warning".to_string(), None), ("warning".to_string(), None)]
+        );
     }
 
     #[tokio::test]

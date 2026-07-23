@@ -12,9 +12,9 @@ use seclab_contracts::{
     monitoring::{SystemMonitoringOverview, SystemMonitoringSeriesPage, SystemMonitoringSettings},
     notification::{
         NotificationAction, NotificationArchiveScope, NotificationArchiveStateRequest,
-        NotificationBatchArchiveStateRequest, NotificationCapabilities, NotificationCategory,
-        NotificationCode, NotificationDetail, NotificationPage, NotificationQuery,
-        NotificationReadFilter, NotificationReadStateRequest, NotificationSeverity,
+        NotificationAttentionLevel, NotificationBatchArchiveStateRequest, NotificationCapabilities,
+        NotificationCategory, NotificationCode, NotificationDetail, NotificationPage,
+        NotificationQuery, NotificationReadFilter, NotificationReadStateRequest,
         NotificationSource, NotificationSubject, NotificationSummary, NotificationUnreadSummary,
     },
     process::{
@@ -90,7 +90,7 @@ fn export_contract_bindings() {
     export_type::<SystemMonitoringSettings>(&cfg);
     export_type::<NotificationCode>(&cfg);
     export_type::<NotificationCategory>(&cfg);
-    export_type::<NotificationSeverity>(&cfg);
+    export_type::<NotificationAttentionLevel>(&cfg);
     export_type::<NotificationArchiveScope>(&cfg);
     export_type::<NotificationReadFilter>(&cfg);
     export_type::<NotificationSource>(&cfg);

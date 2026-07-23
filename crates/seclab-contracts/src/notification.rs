@@ -71,25 +71,23 @@ impl NotificationCategory {
     }
 }
 
-/// 通知严重度。
+/// 通知需要用户关注的程度，与操作结果相互独立。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "notification/")]
-pub enum NotificationSeverity {
-    Success,
+pub enum NotificationAttentionLevel {
     Info,
     Warning,
-    Error,
+    Critical,
 }
 
-impl NotificationSeverity {
+impl NotificationAttentionLevel {
     /// 返回数据库使用的稳定值。
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Success => "success",
             Self::Info => "info",
             Self::Warning => "warning",
-            Self::Error => "error",
+            Self::Critical => "critical",
         }
     }
 }
@@ -166,7 +164,7 @@ pub struct NotificationSummary {
     pub created_at: String,
     pub code: NotificationCode,
     pub category: NotificationCategory,
-    pub severity: NotificationSeverity,
+    pub attention_level: NotificationAttentionLevel,
     pub outcome: Option<OperationOutcome>,
     pub source: NotificationSource,
     pub subject: Option<NotificationSubject>,
@@ -206,7 +204,7 @@ pub struct NotificationQuery {
     #[serde(default = "default_read_filter")]
     pub read_filter: NotificationReadFilter,
     pub categories: Option<Vec<NotificationCategory>>,
-    pub severities: Option<Vec<NotificationSeverity>>,
+    pub attention_levels: Option<Vec<NotificationAttentionLevel>>,
     pub modules: Option<Vec<OperationModule>>,
     pub codes: Option<Vec<NotificationCode>>,
     pub created_from: Option<String>,

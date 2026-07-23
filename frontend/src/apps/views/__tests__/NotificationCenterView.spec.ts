@@ -33,7 +33,7 @@ const response = (notificationId: string) => ({
         createdAt: '2026-07-18T00:00:00Z',
         code: 'scriptRunFinished' as const,
         category: 'task' as const,
-        severity: 'success' as const,
+        attentionLevel: 'info' as const,
         outcome: 'success' as const,
         source: { module: 'scripts' as const, nodeName: 'Node A' },
         subject: { kind: 'script', id: 'script-1', displayName: notificationId },
@@ -111,6 +111,10 @@ describe('NotificationCenterView', () => {
     vi.mocked(notificationsApi.query).mockReset().mockResolvedValue(response('selectable'))
     const wrapper = mountView()
     await flushPromises()
+    expect(wrapper.text()).toContain('关注级别')
+    expect(wrapper.text()).toContain('提示')
+    expect(wrapper.text()).toContain('结果')
+    expect(wrapper.text()).toContain('成功')
 
     await wrapper.get('[data-ui="table-select-all"] input').setValue(true)
     await flushPromises()

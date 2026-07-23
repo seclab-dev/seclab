@@ -14,9 +14,9 @@ use seclab_contracts::{
     logging::{OperationModule, OperationOutcome, OperationParameterValue},
     notification::{
         NotificationAction, NotificationArchiveScope, NotificationArchiveStateRequest,
-        NotificationBatchArchiveStateRequest, NotificationCapabilities, NotificationCategory,
-        NotificationCode, NotificationDetail, NotificationPage, NotificationQuery,
-        NotificationReadFilter, NotificationReadStateRequest, NotificationSeverity,
+        NotificationAttentionLevel, NotificationBatchArchiveStateRequest, NotificationCapabilities,
+        NotificationCategory, NotificationCode, NotificationDetail, NotificationPage,
+        NotificationQuery, NotificationReadFilter, NotificationReadStateRequest,
         NotificationSource, NotificationSubject, NotificationSummary, NotificationUnreadSummary,
     },
 };
@@ -296,7 +296,7 @@ struct NotificationRow {
     created_at: String,
     code: String,
     category: String,
-    severity: String,
+    attention_level: String,
     outcome: Option<String>,
     source_module: String,
     source_node_id: Option<String>,
@@ -347,7 +347,7 @@ impl NotificationRow {
             created_at: self.created_at,
             code,
             category: parse_category(&self.category)?,
-            severity: parse_severity(&self.severity)?,
+            attention_level: parse_attention_level(&self.attention_level)?,
             outcome: self.outcome.as_deref().map(parse_outcome).transpose()?,
             source: NotificationSource {
                 module: parse_module(&self.source_module)?,
@@ -448,7 +448,7 @@ fn validate_query(query: &NotificationQuery) -> Result<(), ApiError> {
     }
     for count in [
         query.categories.as_ref().map_or(0, Vec::len),
-        query.severities.as_ref().map_or(0, Vec::len),
+        query.attention_levels.as_ref().map_or(0, Vec::len),
         query.modules.as_ref().map_or(0, Vec::len),
         query.codes.as_ref().map_or(0, Vec::len),
     ] {
@@ -495,9 +495,12 @@ fn push_query_filters<'a>(
     push_list_filter(builder, "category", query.categories.as_deref(), |v| {
         v.as_str()
     });
-    push_list_filter(builder, "severity", query.severities.as_deref(), |v| {
-        v.as_str()
-    });
+    push_list_filter(
+        builder,
+        "attention_level",
+        query.attention_levels.as_deref(),
+        |v| v.as_str(),
+    );
     push_list_filter(builder, "source_module", query.modules.as_deref(), |v| {
         v.as_str()
     });
@@ -610,13 +613,12 @@ fn parse_category(value: &str) -> Result<NotificationCategory, ApiError> {
     }
 }
 
-fn parse_severity(value: &str) -> Result<NotificationSeverity, ApiError> {
+fn parse_attention_level(value: &str) -> Result<NotificationAttentionLevel, ApiError> {
     match value {
-        "success" => Ok(NotificationSeverity::Success),
-        "info" => Ok(NotificationSeverity::Info),
-        "warning" => Ok(NotificationSeverity::Warning),
-        "error" => Ok(NotificationSeverity::Error),
-        _ => Err(ApiError::internal("invalid notification severity")),
+        "info" => Ok(NotificationAttentionLevel::Info),
+        "warning" => Ok(NotificationAttentionLevel::Warning),
+        "critical" => Ok(NotificationAttentionLevel::Critical),
+        _ => Err(ApiError::internal("invalid notification attention level")),
     }
 }
 
@@ -661,7 +663,7 @@ mod tests {
             archive_scope: NotificationArchiveScope::Active,
             read_filter: NotificationReadFilter::All,
             categories: None,
-            severities: None,
+            attention_levels: None,
             modules: None,
             codes: None,
             created_from: None,
@@ -695,7 +697,7 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO user_notifications (notification_id, recipient_user_id, operation_event_id, created_at, code, category, severity, outcome, source_module, subject_kind, subject_id, subject_display_name, parameters_json, trace_id, read_at, archived_at, state_changed_at) VALUES (?, ?, ?, ?, 'scriptRunFinished', 'task', 'success', 'success', 'scripts', 'script', 'script-1', ?, '{}', 'trace', ?, ?, ?)")
+        sqlx::query("INSERT INTO user_notifications (notification_id, recipient_user_id, operation_event_id, created_at, code, category, attention_level, outcome, source_module, subject_kind, subject_id, subject_display_name, parameters_json, trace_id, read_at, archived_at, state_changed_at) VALUES (?, ?, ?, ?, 'scriptRunFinished', 'task', 'info', 'success', 'scripts', 'script', 'script-1', ?, '{}', 'trace', ?, ?, ?)")
             .bind(notification_id)
             .bind(recipient_user_id)
             .bind(event_id)
@@ -761,6 +763,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 1);
+
+        value.attention_levels = Some(vec![NotificationAttentionLevel::Warning]);
+        let mut builder = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM user_notifications");
+        push_query_filters(&mut builder, 1, &value);
+        let count = builder
+            .build_query_scalar::<i64>()
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[tokio::test]

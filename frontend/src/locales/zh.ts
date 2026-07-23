@@ -1578,7 +1578,7 @@ const zh: typeof en = {
         readState: '读取状态',
         archiveScope: '通知范围',
         category: '类别',
-        severity: '级别',
+        attentionLevel: '关注级别',
         module: '模块',
         from: '开始时间',
         to: '结束时间',
@@ -1590,12 +1590,13 @@ const zh: typeof en = {
       },
       columns: {
         time: '时间',
-        severity: '级别',
+        attentionLevel: '关注级别',
+        outcome: '结果',
         content: '通知内容',
         source: '来源 / 目标',
         actions: '操作',
       },
-      severity: { success: '成功', info: '提醒', warning: '警告', error: '错误' },
+      attentionLevel: { info: '提示', warning: '警告', critical: '严重' },
       category: { task: '任务', security: '安全', system: '系统' },
       outcome: {
         success: '成功',
@@ -1614,7 +1615,7 @@ const zh: typeof en = {
       detail: {
         createdAt: '发生时间',
         category: '类别',
-        severity: '级别',
+        attentionLevel: '关注级别',
         outcome: '结果',
         module: '来源模块',
         node: '节点',

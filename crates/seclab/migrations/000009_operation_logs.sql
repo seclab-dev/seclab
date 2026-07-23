@@ -43,7 +43,7 @@ CREATE TABLE user_notifications (
     created_at TEXT NOT NULL,
     code TEXT NOT NULL,
     category TEXT NOT NULL CHECK (category IN ('task', 'security', 'system')),
-    severity TEXT NOT NULL CHECK (severity IN ('success', 'info', 'warning', 'error')),
+    attention_level TEXT NOT NULL CHECK (attention_level IN ('info', 'warning', 'critical')),
     outcome TEXT CHECK (outcome IS NULL OR outcome IN ('success', 'failure', 'partial', 'canceled', 'timedOut')),
     source_module TEXT NOT NULL,
     source_node_id TEXT,

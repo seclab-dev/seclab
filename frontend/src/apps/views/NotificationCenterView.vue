@@ -3,11 +3,11 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type {
   NotificationArchiveScope,
+  NotificationAttentionLevel,
   NotificationCategory,
   NotificationCode,
   NotificationDetail,
   NotificationReadFilter,
-  NotificationSeverity,
   NotificationSummary,
   OperationModule,
 } from '@/api/generated'
@@ -52,7 +52,7 @@ const items = ref<NotificationSummary[]>([])
 const archiveScope = ref<NotificationArchiveScope>('active')
 const readFilter = ref<NotificationReadFilter>('all')
 const category = ref<'all' | NotificationCategory>('all')
-const severity = ref<'all' | NotificationSeverity>('all')
+const attentionLevel = ref<'all' | NotificationAttentionLevel>('all')
 const module = ref<'all' | OperationModule>('all')
 const keyword = ref('')
 const createdFrom = ref('')
@@ -96,10 +96,10 @@ const categoryOptions = computed(() => [
     value,
   })),
 ])
-const severityOptions = computed(() => [
+const attentionLevelOptions = computed(() => [
   { label: t('app.notificationCenter.filters.all'), value: 'all' },
-  ...(['success', 'info', 'warning', 'error'] as NotificationSeverity[]).map((value) => ({
-    label: t(`app.notificationCenter.severity.${value}`),
+  ...(['info', 'warning', 'critical'] as NotificationAttentionLevel[]).map((value) => ({
+    label: t(`app.notificationCenter.attentionLevel.${value}`),
     value,
   })),
 ])
@@ -127,9 +127,15 @@ const moduleOptions = computed(() => [
 const tableColumns = computed<SecLabTableColumn[]>(() => [
   { label: t('app.notificationCenter.columns.time'), width: 176, slot: 'time', align: 'center' },
   {
-    label: t('app.notificationCenter.columns.severity'),
+    label: t('app.notificationCenter.columns.attentionLevel'),
     width: 92,
-    slot: 'severity',
+    slot: 'attentionLevel',
+    align: 'center',
+  },
+  {
+    label: t('app.notificationCenter.columns.outcome'),
+    width: 104,
+    slot: 'outcome',
     align: 'center',
   },
   {
@@ -152,7 +158,7 @@ const hasQueryFilters = computed(
   () =>
     readFilter.value !== 'all' ||
     category.value !== 'all' ||
-    severity.value !== 'all' ||
+    attentionLevel.value !== 'all' ||
     module.value !== 'all' ||
     keyword.value.trim() !== '' ||
     createdFrom.value !== '' ||
@@ -179,8 +185,8 @@ const detailItems = computed(() => {
       value: t(`app.notificationCenter.category.${current.category}`),
     },
     {
-      label: t('app.notificationCenter.detail.severity'),
-      value: t(`app.notificationCenter.severity.${current.severity}`),
+      label: t('app.notificationCenter.detail.attentionLevel'),
+      value: t(`app.notificationCenter.attentionLevel.${current.attentionLevel}`),
     },
     current.outcome
       ? {
@@ -241,7 +247,7 @@ function buildQuery() {
     archiveScope: archiveScope.value,
     readFilter: readFilter.value,
     categories: category.value === 'all' ? undefined : [category.value],
-    severities: severity.value === 'all' ? undefined : [severity.value],
+    attentionLevels: attentionLevel.value === 'all' ? undefined : [attentionLevel.value],
     modules: module.value === 'all' ? undefined : [module.value],
     createdFrom: createdFrom.value ? new Date(createdFrom.value).toISOString() : undefined,
     createdTo: createdTo.value ? new Date(createdTo.value).toISOString() : undefined,
@@ -450,9 +456,18 @@ function sourceText(item: NotificationSummary) {
   return subject ? `${source} · ${subject}` : source
 }
 
-function severityTagType(value: NotificationSeverity): 'success' | 'info' | 'warning' | 'danger' {
-  if (value === 'error') return 'danger'
+function attentionLevelTagType(value: NotificationAttentionLevel): 'info' | 'warning' | 'danger' {
+  if (value === 'critical') return 'danger'
   return value
+}
+
+function outcomeTagType(
+  value: NonNullable<NotificationSummary['outcome']>,
+): 'success' | 'info' | 'warning' | 'danger' {
+  if (value === 'success') return 'success'
+  if (value === 'canceled') return 'info'
+  if (value === 'partial') return 'warning'
+  return 'danger'
 }
 
 watch([page, pageSize], () => void loadNotifications())
@@ -562,15 +577,15 @@ onBeforeUnmount(() => {
         />
       </SecLabFormItem>
       <SecLabFormItem
-        :label="t('app.notificationCenter.filters.severity')"
-        for="notification-severity-filter"
+        :label="t('app.notificationCenter.filters.attentionLevel')"
+        for="notification-attention-level-filter"
       >
         <SecLabSelect
-          id="notification-severity-filter"
-          v-model="severity"
-          name="notificationSeverity"
-          :aria-label="t('app.notificationCenter.filters.severity')"
-          :options="severityOptions"
+          id="notification-attention-level-filter"
+          v-model="attentionLevel"
+          name="notificationAttentionLevel"
+          :aria-label="t('app.notificationCenter.filters.attentionLevel')"
+          :options="attentionLevelOptions"
         />
       </SecLabFormItem>
       <SecLabFormItem
@@ -664,9 +679,14 @@ onBeforeUnmount(() => {
         <template #time="{ row }: { row: NotificationSummary }">
           <span class="time-cell">{{ formatDateTime(row.createdAt) }}</span>
         </template>
-        <template #severity="{ row }: { row: NotificationSummary }">
-          <SecLabTag :type="severityTagType(row.severity)" size="small">
-            {{ t(`app.notificationCenter.severity.${row.severity}`) }}
+        <template #attentionLevel="{ row }: { row: NotificationSummary }">
+          <SecLabTag :type="attentionLevelTagType(row.attentionLevel)" size="small">
+            {{ t(`app.notificationCenter.attentionLevel.${row.attentionLevel}`) }}
+          </SecLabTag>
+        </template>
+        <template #outcome="{ row }: { row: NotificationSummary }">
+          <SecLabTag v-if="row.outcome" :type="outcomeTagType(row.outcome)" size="small">
+            {{ t(`app.notificationCenter.outcome.${row.outcome}`) }}
           </SecLabTag>
         </template>
         <template #content="{ row }: { row: NotificationSummary }">
