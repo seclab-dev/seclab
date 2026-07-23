@@ -21,7 +21,6 @@ import {
   SecLabActionMenu,
   SecLabAlert,
   SecLabButton,
-  SecLabCheckbox,
   SecLabDescriptions,
   SecLabDrawer,
   SecLabEmpty,
@@ -30,6 +29,7 @@ import {
   SecLabLoading,
   SecLabPagination,
   SecLabSelect,
+  SecLabSelectionBar,
   SecLabTable,
   SecLabTag,
 } from '@/components/ui'
@@ -125,13 +125,18 @@ const moduleOptions = computed(() => [
 ])
 
 const tableColumns = computed<SecLabTableColumn[]>(() => [
-  { label: t('app.notificationCenter.columns.state'), width: 84, align: 'center', slot: 'state' },
-  { label: t('app.notificationCenter.columns.time'), width: 176, slot: 'time' },
-  { label: t('app.notificationCenter.columns.severity'), width: 92, slot: 'severity' },
+  { label: t('app.notificationCenter.columns.time'), width: 176, slot: 'time', align: 'center' },
+  {
+    label: t('app.notificationCenter.columns.severity'),
+    width: 92,
+    slot: 'severity',
+    align: 'center',
+  },
   {
     label: t('app.notificationCenter.columns.content'),
     minWidth: 260,
     slot: 'content',
+    align: 'center',
   },
   { label: t('app.notificationCenter.columns.source'), minWidth: 190, slot: 'source' },
   {
@@ -167,6 +172,7 @@ const detailItems = computed(() => {
     {
       label: t('app.notificationCenter.detail.createdAt'),
       value: formatDateTime(current.createdAt),
+      span: 2,
     },
     {
       label: t('app.notificationCenter.detail.category'),
@@ -204,13 +210,18 @@ const detailItems = computed(() => {
     {
       label: t('app.notificationCenter.detail.operationEventId'),
       value: current.operationEventId,
+      span: 2,
     },
-    { label: t('app.notificationCenter.detail.traceId'), value: current.traceId },
+    { label: t('app.notificationCenter.detail.traceId'), value: current.traceId, span: 2 },
     current.errorCode
       ? { label: t('app.notificationCenter.detail.errorCode'), value: current.errorCode }
       : null,
     current.errorSummary
-      ? { label: t('app.notificationCenter.detail.errorSummary'), value: current.errorSummary }
+      ? {
+          label: t('app.notificationCenter.detail.errorSummary'),
+          value: current.errorSummary,
+          span: 2,
+        }
       : null,
     Object.keys(current.parameters).length > 0
       ? {
@@ -277,10 +288,9 @@ function applyFilters() {
   void loadNotifications()
 }
 
-function toggleSelection(notificationId: string) {
-  selectedIds.value = selectedIds.value.includes(notificationId)
-    ? selectedIds.value.filter((id) => id !== notificationId)
-    : [...selectedIds.value, notificationId]
+/** 返回通知行选择控件的本地化无障碍名称。 */
+function selectionRowLabel(row: NotificationSummary) {
+  return t('app.notificationCenter.selection.row', { name: notificationTitle(row.code) })
 }
 
 function setPending(notificationId: string, pending: boolean) {
@@ -622,8 +632,16 @@ onBeforeUnmount(() => {
     />
 
     <div class="table-shell" data-slot="notification-list">
-      <div v-if="selectedIds.length" class="selection-bar" data-slot="batch-actions">
-        <span>{{ selectedIds.length }}</span>
+      <SecLabSelectionBar
+        v-if="selectedIds.length"
+        class="selection-bar"
+        :count="selectedIds.length"
+        :label="t('app.notificationCenter.selection.selected')"
+        :clear-label="t('app.notificationCenter.selection.clear')"
+        :aria-label="t('app.notificationCenter.selection.summary', { count: selectedIds.length })"
+        data-slot="batch-actions"
+        @clear="selectedIds = []"
+      >
         <SecLabButton :loading="batchPending" @click="updateSelectedArchiveState">
           {{
             archiveScope === 'active'
@@ -631,34 +649,18 @@ onBeforeUnmount(() => {
               : t('app.notificationCenter.restoreSelected')
           }}
         </SecLabButton>
-      </div>
+      </SecLabSelectionBar>
       <SecLabTable
+        v-model:selected-row-keys="selectedIds"
         :data="items"
         :columns="tableColumns"
         row-key="notificationId"
+        selectable
+        :select-all-label="t('app.notificationCenter.selection.all')"
+        :select-row-label="selectionRowLabel"
         border
         data-ui="notification-table"
       >
-        <template #state="{ row }: { row: NotificationSummary }">
-          <div class="state-cell">
-            <SecLabCheckbox
-              :id="`notification-select-${row.notificationId}`"
-              :model-value="selectedIds.includes(row.notificationId)"
-              :name="`notificationSelect-${row.notificationId}`"
-              :aria-label="notificationTitle(row.code)"
-              @change="toggleSelection(row.notificationId)"
-            />
-            <span
-              class="read-indicator"
-              :class="{ unread: !row.readAt }"
-              :title="
-                row.readAt
-                  ? t('app.notificationCenter.readLabel')
-                  : t('app.notificationCenter.unreadLabel')
-              "
-            />
-          </div>
-        </template>
         <template #time="{ row }: { row: NotificationSummary }">
           <span class="time-cell">{{ formatDateTime(row.createdAt) }}</span>
         </template>
@@ -668,9 +670,14 @@ onBeforeUnmount(() => {
           </SecLabTag>
         </template>
         <template #content="{ row }: { row: NotificationSummary }">
-          <button class="content-button" type="button" @click="openDetail(row)">
+          <button
+            class="content-button"
+            :class="{ 'is-read': Boolean(row.readAt) }"
+            type="button"
+            :aria-label="`${notificationTitle(row.code)} · ${row.readAt ? t('app.notificationCenter.readLabel') : t('app.notificationCenter.unreadLabel')}`"
+            @click="openDetail(row)"
+          >
             <strong>{{ notificationTitle(row.code) }}</strong>
-            <span v-if="row.outcome">{{ t(`app.notificationCenter.outcome.${row.outcome}`) }}</span>
           </button>
         </template>
         <template #source="{ row }: { row: NotificationSummary }">
@@ -766,13 +773,19 @@ onBeforeUnmount(() => {
 }
 
 .toolbar {
+  align-items: flex-end;
   justify-content: space-between;
   flex: 0 0 auto;
 }
 
 .toolbar-filters {
+  align-items: flex-end;
   flex: 1 1 420px;
   min-width: 0;
+}
+
+.toolbar-filters :deep(.sl-form-item) {
+  margin-bottom: 0;
 }
 
 .toolbar-filters :deep(.sl-form-item:first-child) {
@@ -785,6 +798,8 @@ onBeforeUnmount(() => {
 }
 
 .toolbar-actions {
+  align-self: flex-end;
+  align-items: center;
   justify-content: flex-end;
   flex: 0 0 auto;
 }
@@ -811,38 +826,23 @@ onBeforeUnmount(() => {
 
 .table-shell {
   position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sdl-space-2);
   flex: 1 1 auto;
   min-height: 0;
-  overflow: auto;
+  overflow: hidden;
   border-radius: var(--sdl-radius-md);
 }
 
 .selection-bar {
-  position: sticky;
-  top: 0;
-  z-index: 2;
-  justify-content: flex-end;
-  align-items: center;
-  padding: var(--sdl-space-2) var(--sdl-space-3);
-  background: var(--sdl-bg-surface);
-  border: 1px solid var(--sdl-border-subtle);
+  flex: 0 0 auto;
 }
 
-.state-cell {
-  align-items: center;
-  justify-content: center;
-  gap: var(--sdl-space-2);
-}
-
-.read-indicator {
-  width: 8px;
-  height: 8px;
-  border-radius: var(--sdl-radius-pill);
-  background: var(--sdl-text-muted);
-}
-
-.read-indicator.unread {
-  background: var(--sdl-primary);
+.table-shell :deep(.sl-table-container) {
+  flex: 1 1 auto;
+  height: auto;
+  min-height: 0;
 }
 
 .time-cell {
@@ -856,14 +856,22 @@ onBeforeUnmount(() => {
   width: 100%;
   display: flex;
   flex-direction: column;
-  align-items: flex-start;
+  align-items: center;
   gap: var(--sdl-space-1);
   padding: 0;
   color: var(--sdl-text-primary);
   border: 0;
   background: transparent;
-  text-align: left;
+  text-align: center;
   cursor: pointer;
+}
+
+.content-button.is-read {
+  color: var(--sdl-text-muted);
+}
+
+.content-button.is-read strong {
+  font-weight: 500;
 }
 
 .content-button span,
@@ -900,6 +908,11 @@ onBeforeUnmount(() => {
   margin: 0 0 var(--sdl-space-4);
   color: var(--sdl-text-primary);
   font-size: var(--sdl-font-title);
+}
+
+.detail-content :deep(.sl-descriptions-content) {
+  word-break: normal;
+  overflow-wrap: anywhere;
 }
 
 @media (max-width: 760px) {

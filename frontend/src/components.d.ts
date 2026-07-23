@@ -39,6 +39,7 @@ declare module 'vue' {
     SecLabModal: typeof import('./components/ui/SecLabModal.vue')['default']
     SecLabPagination: typeof import('./components/ui/SecLabPagination.vue')['default']
     SecLabSelect: typeof import('./components/ui/SecLabSelect.vue')['default']
+    SecLabSelectionBar: typeof import('./components/ui/SecLabSelectionBar.vue')['default']
     SecLabSwitch: typeof import('./components/ui/SecLabSwitch.vue')['default']
     SecLabTable: typeof import('./components/ui/SecLabTable.vue')['default']
     SecLabTabs: typeof import('./components/ui/SecLabTabs.vue')['default']

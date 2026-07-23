@@ -1592,6 +1592,13 @@ const en = {
       details: 'Notification Details',
       unreadLabel: 'Unread',
       readLabel: 'Read',
+      selection: {
+        selected: 'Selected',
+        summary: '{count} notifications selected',
+        clear: 'Clear Selection',
+        all: 'Select all notifications on this page',
+        row: 'Select notification “{name}”',
+      },
       filters: {
         readState: 'Read State',
         archiveScope: 'Scope',
@@ -1607,7 +1614,6 @@ const en = {
         read: 'Read',
       },
       columns: {
-        state: 'State',
         time: 'Time',
         severity: 'Severity',
         content: 'Notification',

@@ -1567,6 +1567,13 @@ const zh: typeof en = {
       details: '通知详情',
       unreadLabel: '未读',
       readLabel: '已读',
+      selection: {
+        selected: '已选择',
+        summary: '已选择 {count} 项通知',
+        clear: '清除选择',
+        all: '选择当前页全部通知',
+        row: '选择通知“{name}”',
+      },
       filters: {
         readState: '读取状态',
         archiveScope: '通知范围',
@@ -1582,7 +1589,6 @@ const zh: typeof en = {
         read: '已读',
       },
       columns: {
-        state: '状态',
         time: '时间',
         severity: '级别',
         content: '通知内容',

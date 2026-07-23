@@ -106,4 +106,21 @@ describe('NotificationCenterView', () => {
     expect(wrapper.find('[data-slot="refresh-warning"]').exists()).toBe(true)
     wrapper.unmount()
   })
+
+  it('使用表格当前页全选并通过选择栏清除选择', async () => {
+    vi.mocked(notificationsApi.query).mockReset().mockResolvedValue(response('selectable'))
+    const wrapper = mountView()
+    await flushPromises()
+
+    await wrapper.get('[data-ui="table-select-all"] input').setValue(true)
+    await flushPromises()
+    expect(wrapper.get('[data-ui="selection-bar"] .sl-selection-count').text()).toBe('1')
+    expect(wrapper.get('[data-ui="table-row-selection"] input').element.checked).toBe(true)
+
+    await wrapper.get('[data-ui="clear-selection"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[data-ui="selection-bar"]').exists()).toBe(false)
+    expect(wrapper.get('[data-ui="table-row-selection"] input').element.checked).toBe(false)
+    wrapper.unmount()
+  })
 })

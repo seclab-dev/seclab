@@ -5,6 +5,7 @@
 
 export { default as SecLabButton } from './SecLabButton.vue'
 export { default as SecLabTable } from './SecLabTable.vue'
+export { default as SecLabSelectionBar } from './SecLabSelectionBar.vue'
 export { default as SecLabCard } from './SecLabCard.vue'
 export { default as SecLabTag } from './SecLabTag.vue'
 export { default as SecLabSelect } from './SecLabSelect.vue'
