@@ -19,6 +19,8 @@ const monacoMock = vi.hoisted(() => ({
   saveViewState: vi.fn(() => ({ cursorState: [], viewState: {} })),
   restoreViewState: vi.fn(),
   setModelLanguage: vi.fn(),
+  updateOptions: vi.fn(),
+  createOptions: null as Record<string, unknown> | null,
   editorRoot: null as HTMLDivElement | null,
 }))
 
@@ -59,6 +61,7 @@ vi.mock('../monaco-workers', () => {
     createModel: monacoMock.createModel,
     create: vi.fn((_container: HTMLElement, options: { model: typeof activeModel }) => {
       activeModel = options.model
+      monacoMock.createOptions = options
       return {
         addCommand: vi.fn(),
         onDidChangeModelContent: vi.fn(),
@@ -72,7 +75,7 @@ vi.mock('../monaco-workers', () => {
         saveViewState: monacoMock.saveViewState,
         restoreViewState: monacoMock.restoreViewState,
         getDomNode: () => root,
-        updateOptions: vi.fn(),
+        updateOptions: monacoMock.updateOptions,
         layout: vi.fn(),
         focus: vi.fn(),
         dispose: vi.fn(),
@@ -101,6 +104,44 @@ describe('MonacoEditor 多文档模型', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     monacoMock.models.length = 0
+    monacoMock.createOptions = null
+  })
+
+  it('初始化并动态同步高级视图配置', async () => {
+    const wrapper = mount(MonacoEditor, {
+      props: {
+        modelValue: '中文，content',
+        documentKey: 'node-a:/unicode.txt',
+      },
+      global: {
+        plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })],
+      },
+    })
+
+    expect(monacoMock.createOptions?.unicodeHighlight).toEqual({
+      ambiguousCharacters: true,
+      invisibleCharacters: true,
+    })
+    expect(monacoMock.createOptions?.minimap).toEqual({ enabled: true })
+    expect(monacoMock.createOptions?.stickyScroll).toEqual({ enabled: true })
+    expect(monacoMock.createOptions?.renderWhitespace).toBe('selection')
+
+    await wrapper.setProps({
+      highlightAmbiguousUnicode: false,
+      minimap: false,
+      stickyScroll: false,
+      renderWhitespace: 'all',
+    })
+    expect(monacoMock.updateOptions).toHaveBeenCalledWith({
+      unicodeHighlight: {
+        ambiguousCharacters: false,
+        invisibleCharacters: true,
+      },
+    })
+    expect(monacoMock.updateOptions).toHaveBeenCalledWith({ minimap: { enabled: false } })
+    expect(monacoMock.updateOptions).toHaveBeenCalledWith({ stickyScroll: { enabled: false } })
+    expect(monacoMock.updateOptions).toHaveBeenCalledWith({ renderWhitespace: 'all' })
+    wrapper.unmount()
   })
 
   it('按 documentKey 隔离模型并恢复视图状态', async () => {

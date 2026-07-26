@@ -246,7 +246,10 @@ const openEntry = async (entry: FsEntry) => {
   windowStore.openWindowWithPayload(
     'file-editor',
     { path: entry.path, nodeId: targetNodeId.value },
-    { title: t('app.fileEditor.appName') },
+    {
+      title: t('app.fileEditor.appName'),
+      i18nTitleKey: 'app.fileEditor.appName',
+    },
   )
 }
 

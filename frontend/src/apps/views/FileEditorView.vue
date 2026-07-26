@@ -5,11 +5,14 @@
  */
 import { computed, nextTick, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { storeToRefs } from 'pinia'
+import EditorMenuBar from '@/apps/views/file-editor/EditorMenuBar.vue'
 import MonacoEditor from '@/components/editor/MonacoEditor.vue'
 import { useFileEditor, type EditorTab } from '@/composables/useFileEditor'
+import { useFileEditorPreferencesStore } from '@/stores/file-editor-preferences'
 import { useWindowManagerStore } from '@/stores/window-manager'
 import { useNodeStore } from '@/stores/node'
-import { SecLabButton, SecLabTag, SecLabSwitch, SecLabDialog } from '@/components/ui'
+import { SecLabButton, SecLabTag, SecLabDialog, SecLabTooltip } from '@/components/ui'
 import SecLabIcon from '@/components/icons/SecLabIcon.vue'
 
 const props = defineProps<{
@@ -23,13 +26,14 @@ const props = defineProps<{
 const { t } = useI18n()
 const windowStore = useWindowManagerStore()
 const nodeStore = useNodeStore()
+const editorPreferencesStore = useFileEditorPreferencesStore()
+const { wordWrap, fontSize, highlightAmbiguousUnicode, minimap, stickyScroll, renderWhitespace } =
+  storeToRefs(editorPreferencesStore)
 const targetNodeId = ref(props.payload?.nodeId || nodeStore.currentNodeId)
 const { loadFileContent, saveFileContent } = useFileEditor(targetNodeId)
 
 const tabs = ref<EditorTab[]>([])
 const activePath = ref('')
-const isWrap = ref(false)
-const fontSize = ref(14)
 const editorRef = ref<{ disposeDocument: (documentKey: string) => void } | null>(null)
 
 const confirmDialogVisible = ref(false)
@@ -213,6 +217,11 @@ const adjustFont = (delta: number) => {
   fontSize.value = Math.min(24, Math.max(10, fontSize.value + delta))
 }
 
+/** 将编辑器字号恢复为默认值。 */
+const resetFont = () => {
+  fontSize.value = 14
+}
+
 const handleTabKeydown = async (event: KeyboardEvent, tab: EditorTab) => {
   const currentIndex = tabs.value.indexOf(tab)
   if (currentIndex < 0) return
@@ -264,6 +273,35 @@ watch(
     data-seclab-app="file-editor"
     :data-node-id="targetNodeId"
   >
+    <EditorMenuBar
+      :menu-id="`file-editor-${editorScopeId}`"
+      :word-wrap="wordWrap"
+      :minimap="minimap"
+      :sticky-scroll="stickyScroll"
+      :highlight-ambiguous-unicode="highlightAmbiguousUnicode"
+      :render-whitespace="renderWhitespace"
+      :font-size="fontSize"
+      :reload-disabled="!activeTab || isLoadBusy(activeTab) || isSaveBusy(activeTab)"
+      :save-disabled="
+        !activeTab ||
+        !activeTab.isDirty ||
+        isLoadBusy(activeTab) ||
+        isSaveBusy(activeTab) ||
+        activeTab.saveState === 'conflict' ||
+        activeTab.capabilities?.canWrite === false
+      "
+      @reload="reloadTab()"
+      @save="handleSave()"
+      @update:word-wrap="wordWrap = $event"
+      @update:minimap="minimap = $event"
+      @update:sticky-scroll="stickyScroll = $event"
+      @update:highlight-ambiguous-unicode="highlightAmbiguousUnicode = $event"
+      @update:render-whitespace="renderWhitespace = $event"
+      @adjust-font="adjustFont"
+      @reset-font="resetFont"
+      @reset-preferences="editorPreferencesStore.resetPreferences()"
+    />
+
     <!-- Tab 栏 -->
     <div
       v-if="tabs.length > 0"
@@ -291,7 +329,14 @@ watch(
           @keydown="handleTabKeydown($event, tab)"
         >
           <span class="tab-status" :class="{ 'is-dirty': tab.isDirty }" aria-hidden="true"></span>
-          <span class="tab-name" :title="tab.path">{{ tab.name }}</span>
+          <SecLabTooltip
+            class="tab-name-tooltip"
+            :text="tab.path"
+            :disabled="activePath === tab.path"
+            position="bottom"
+          >
+            <span class="tab-name">{{ tab.name }}</span>
+          </SecLabTooltip>
         </button>
         <button
           type="button"
@@ -301,52 +346,6 @@ watch(
         >
           <SecLabIcon name="error" :size="14" />
         </button>
-      </div>
-    </div>
-
-    <!-- 工具栏 -->
-    <div class="editor-toolbar" data-ui="editor-toolbar" data-slot="toolbar">
-      <div class="toolbar-left" data-slot="path">
-        <span v-if="activeTab" class="current-path">{{ activeTab.path }}</span>
-      </div>
-      <div class="toolbar-right" data-slot="actions">
-        <SecLabTag
-          v-if="activeTab"
-          :type="statusType(activeTab)"
-          :title="activeTab.refreshWarning || activeTab.saveError"
-        >
-          {{ statusLabel(activeTab) }}
-        </SecLabTag>
-        <SecLabSwitch
-          v-model="isWrap"
-          :active-text="isWrap ? t('app.fileEditor.wrapOn') : t('app.fileEditor.wrapOff')"
-        />
-        <SecLabButton size="small" @click="adjustFont(1)">A+</SecLabButton>
-        <SecLabButton size="small" @click="adjustFont(-1)">A-</SecLabButton>
-        <SecLabButton
-          size="small"
-          data-ui="editor-reload"
-          :disabled="!activeTab || isLoadBusy(activeTab) || isSaveBusy(activeTab)"
-          @click="reloadTab()"
-        >
-          {{ t('app.fileEditor.reload') }}
-        </SecLabButton>
-        <SecLabButton
-          type="primary"
-          size="small"
-          data-ui="editor-save"
-          :disabled="
-            !activeTab ||
-            !activeTab.isDirty ||
-            isLoadBusy(activeTab) ||
-            isSaveBusy(activeTab) ||
-            activeTab.saveState === 'conflict' ||
-            activeTab.capabilities?.canWrite === false
-          "
-          @click="handleSave()"
-        >
-          {{ t('app.fileEditor.save') }}
-        </SecLabButton>
       </div>
     </div>
 
@@ -373,7 +372,11 @@ watch(
           :document-key="activeTab.documentKey"
           :file-path="activeTab.path"
           :read-only="activeTab.capabilities?.canWrite === false"
-          :word-wrap="isWrap"
+          :word-wrap="wordWrap"
+          :minimap="minimap"
+          :sticky-scroll="stickyScroll"
+          :highlight-ambiguous-unicode="highlightAmbiguousUnicode"
+          :render-whitespace="renderWhitespace"
           :font-size="fontSize"
           :id="editorInputId"
           name="fileContent"
@@ -386,6 +389,27 @@ watch(
         <SecLabIcon name="file" :size="48" class="empty-icon" />
         <p>{{ t('app.fileEditor.selectFile') }}</p>
       </div>
+    </div>
+
+    <div class="editor-status-bar" data-ui="editor-status-bar" data-slot="status-bar">
+      <span
+        v-if="activeTab"
+        class="current-path"
+        data-slot="path"
+        dir="ltr"
+        :title="activeTab.path"
+      >
+        {{ activeTab.path }}
+      </span>
+      <span v-else class="status-bar-spacer"></span>
+      <SecLabTag
+        v-if="activeTab"
+        data-slot="file-status"
+        :type="statusType(activeTab)"
+        :title="activeTab.refreshWarning || activeTab.saveError"
+      >
+        {{ statusLabel(activeTab) }}
+      </SecLabTag>
     </div>
 
     <!-- 关闭确认对话框 -->
@@ -493,10 +517,16 @@ watch(
 }
 
 .tab-name {
+  display: block;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.tab-name-tooltip {
   flex: 1;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .tab-close {
@@ -535,24 +565,22 @@ watch(
   font-size: var(--sdl-font-body-sm);
 }
 
-.editor-toolbar {
+.editor-status-bar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: var(--sdl-space-2) var(--sdl-space-3);
+  gap: var(--sdl-space-3);
+  min-height: 30px;
+  padding: 0 var(--sdl-space-3);
   background: var(--sdl-bg-panel);
-  border-bottom: 1px solid var(--sdl-border-subtle);
+  border-top: 1px solid var(--sdl-border-subtle);
   flex-shrink: 0;
 }
 
-.toolbar-left {
-  display: flex;
-  align-items: center;
-  overflow: hidden;
-}
-
 .current-path {
+  min-width: 0;
   font-size: var(--sdl-font-caption);
+  font-family: var(--sdl-font-mono);
   color: var(--sdl-text-muted);
   white-space: nowrap;
   overflow: hidden;
@@ -560,11 +588,8 @@ watch(
   text-align: left;
 }
 
-.toolbar-right {
-  display: flex;
-  align-items: center;
-  gap: var(--sdl-space-2);
-  flex-shrink: 0;
+.status-bar-spacer {
+  min-width: 0;
 }
 
 .editor-body {

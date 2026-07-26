@@ -9,6 +9,7 @@ const api = vi.hoisted(() => ({
   home: vi.fn(),
   listEntries: vi.fn(),
   forNode: vi.fn(),
+  openWindowWithPayload: vi.fn(),
 }))
 
 vi.mock('@/api/modules/fs', () => ({ fsApi: { forNode: api.forNode } }))
@@ -18,7 +19,7 @@ vi.mock('@/stores/node', () => ({
 vi.mock('@/stores/window-manager', () => ({
   useWindowManagerStore: () => ({
     updateWindowRuntimeState: vi.fn(),
-    openWindowWithPayload: vi.fn(),
+    openWindowWithPayload: api.openWindowWithPayload,
   }),
 }))
 vi.mock('@/stores/toast', () => ({
@@ -121,6 +122,31 @@ describe('FileManagerView', () => {
 
     expect(wrapper.text()).toContain('fast.txt')
     expect(wrapper.text()).not.toContain('slow.txt')
+    wrapper.unmount()
+  })
+
+  it('打开文件编辑器时保留可响应语言变化的标题键', async () => {
+    api.listEntries.mockResolvedValue(
+      response(page('/home', [entry('notes.txt', '/home/notes.txt')])),
+    )
+    const wrapper = mount(FileManagerView, {
+      props: { payload: { nodeId: 'node-a' } },
+      global: {
+        plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })],
+      },
+    })
+    await flushPromises()
+
+    await wrapper.get('.entry-name').trigger('dblclick')
+
+    expect(api.openWindowWithPayload).toHaveBeenCalledWith(
+      'file-editor',
+      { path: '/home/notes.txt', nodeId: 'node-a' },
+      {
+        title: '文件编辑',
+        i18nTitleKey: 'app.fileEditor.appName',
+      },
+    )
     wrapper.unmount()
   })
 

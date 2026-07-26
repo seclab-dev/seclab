@@ -37,8 +37,14 @@ interface Props {
   fontSize?: number
   /** 是否自动换行 */
   wordWrap?: boolean
+  /** 是否高亮易与基础 ASCII 混淆的 Unicode 字符 */
+  highlightAmbiguousUnicode?: boolean
   /** 是否显示 minimap */
   minimap?: boolean
+  /** 是否启用 Sticky Scroll */
+  stickyScroll?: boolean
+  /** 空白字符显示方式 */
+  renderWhitespace?: 'none' | 'selection' | 'all'
   /** 传递到 Monaco 可聚焦编辑区的可访问名称 */
   ariaLabel?: string
   /** 传递到 Monaco 可聚焦编辑区的可访问名称元素 ID */
@@ -55,7 +61,10 @@ const props = withDefaults(defineProps<Props>(), {
   readOnly: false,
   fontSize: 13,
   wordWrap: true,
+  highlightAmbiguousUnicode: true,
   minimap: true,
+  stickyScroll: true,
+  renderWhitespace: 'selection',
   ariaLabel: '',
   ariaLabelledby: '',
 })
@@ -276,7 +285,13 @@ function createEditor() {
     fontFamily: 'var(--sdl-font-mono)',
     lineHeight: 1.6,
     wordWrap: props.wordWrap ? 'on' : 'off',
+    unicodeHighlight: {
+      ambiguousCharacters: props.highlightAmbiguousUnicode,
+      invisibleCharacters: true,
+    },
     minimap: { enabled: props.minimap },
+    stickyScroll: { enabled: props.stickyScroll },
+    renderWhitespace: props.renderWhitespace,
     ariaLabel: props.ariaLabelledby ? '' : props.ariaLabel || t('common.editor'),
     automaticLayout: false,
     scrollBeyondLastLine: false,
@@ -382,11 +397,40 @@ watch(
   },
 )
 
+/** 易混淆 Unicode 字符高亮变更 */
+watch(
+  () => props.highlightAmbiguousUnicode,
+  (val) => {
+    editorInstance.value?.updateOptions({
+      unicodeHighlight: {
+        ambiguousCharacters: val,
+        invisibleCharacters: true,
+      },
+    })
+  },
+)
+
 /** minimap 变更 */
 watch(
   () => props.minimap,
   (val) => {
     editorInstance.value?.updateOptions({ minimap: { enabled: val } })
+  },
+)
+
+/** Sticky Scroll 变更 */
+watch(
+  () => props.stickyScroll,
+  (val) => {
+    editorInstance.value?.updateOptions({ stickyScroll: { enabled: val } })
+  },
+)
+
+/** 空白字符显示方式变更 */
+watch(
+  () => props.renderWhitespace,
+  (val) => {
+    editorInstance.value?.updateOptions({ renderWhitespace: val })
   },
 )
 
