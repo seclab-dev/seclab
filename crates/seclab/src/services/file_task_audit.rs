@@ -10,9 +10,10 @@ use crate::{
     types::ApiResult,
 };
 use seclab_contracts::files::{
-    FileOperation, FileOperationTask, FileTaskStatus, FileTransfer, FileTransferDirection,
-    FileTransferStatus,
+    FileOperation, FileOperationTask, FileTaskItemStatus, FileTaskStatus, FileTransfer,
+    FileTransferDirection, FileTransferStatus,
 };
+use seclab_contracts::logging::{OperationItemStatus, OperationLogItem, OperationTarget};
 use serde_json::json;
 use sqlx::Row;
 use std::{net::IpAddr, sync::Arc, time::Duration};
@@ -259,19 +260,59 @@ fn record_terminal(
         "nodeId": node_id,
         "operation": operation_text(task.operation),
         "result": status_text(task.status),
+        "totalItemCount": task.total_item_count,
         "completedItemCount": task.completed_item_count,
         "failedItemCount": task.failed_item_count,
-        "targetPath": task.items.first().map(|item| item.target_path.as_deref().unwrap_or(&item.path)),
         "errorSummary": task.error_summary,
         "cleanupWarning": task.cleanup_warning,
     }))
-    .outcome(match task.status {
-        FileTaskStatus::Cancelled => seclab_contracts::logging::OperationOutcome::Canceled,
-        FileTaskStatus::Failed => seclab_contracts::logging::OperationOutcome::Failure,
-        _ => seclab_contracts::logging::OperationOutcome::Success,
-    })
+    .items(operation_log_items(task))
+    .outcome(file_task_outcome(task))
     .level(level)
     .finish(&state.metadata_db);
+}
+
+/// 将 Agent 文件任务结果转换为 Master 长期保存的逐项审计事实。
+fn operation_log_items(task: &FileOperationTask) -> Vec<OperationLogItem> {
+    task.items
+        .iter()
+        .take(500)
+        .enumerate()
+        .map(|(index, item)| OperationLogItem {
+            sequence: u32::try_from(index + 1).unwrap_or(500),
+            source: file_target(&item.path),
+            destination: item.target_path.as_deref().map(file_target),
+            status: match item.status {
+                FileTaskItemStatus::Pending => OperationItemStatus::Pending,
+                FileTaskItemStatus::Running => OperationItemStatus::Running,
+                FileTaskItemStatus::Succeeded => OperationItemStatus::Succeeded,
+                FileTaskItemStatus::Failed => OperationItemStatus::Failed,
+                FileTaskItemStatus::Cancelled => OperationItemStatus::Canceled,
+            },
+            error_code: item.error_code.clone(),
+            error_summary: item.error_summary.clone(),
+        })
+        .collect()
+}
+
+fn file_task_outcome(task: &FileOperationTask) -> seclab_contracts::logging::OperationOutcome {
+    match task.status {
+        FileTaskStatus::Cancelled => seclab_contracts::logging::OperationOutcome::Canceled,
+        FileTaskStatus::Failed if task.completed_item_count > 0 && task.failed_item_count > 0 => {
+            seclab_contracts::logging::OperationOutcome::Partial
+        }
+        FileTaskStatus::Failed => seclab_contracts::logging::OperationOutcome::Failure,
+        _ => seclab_contracts::logging::OperationOutcome::Success,
+    }
+}
+
+fn file_target(path: &str) -> OperationTarget {
+    OperationTarget {
+        kind: "file".to_string(),
+        id: path.to_string(),
+        display_name: Some(path.to_string()),
+        ownership: None,
+    }
 }
 
 fn record_transfer_terminal(
@@ -389,6 +430,7 @@ fn status_text(status: FileTaskStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use seclab_contracts::files::{FileOperationItemResult, FileTaskStage};
 
     #[test]
     fn terminal_states_are_explicit() {
@@ -399,5 +441,91 @@ mod tests {
         assert!(is_transfer_terminal(FileTransferStatus::Completed));
         assert!(is_transfer_terminal(FileTransferStatus::Expired));
         assert!(!is_transfer_terminal(FileTransferStatus::Streaming));
+    }
+
+    #[test]
+    fn file_task_items_preserve_sources_destinations_and_terminal_states() {
+        let task = FileOperationTask {
+            task_id: "task-1".to_string(),
+            node_id: "local".to_string(),
+            operation: FileOperation::Move,
+            status: FileTaskStatus::Failed,
+            stage: FileTaskStage::Failed,
+            progress_percent: 100,
+            total_item_count: 2,
+            completed_item_count: 1,
+            failed_item_count: 1,
+            total_bytes: 0,
+            processed_bytes: 0,
+            items: vec![
+                FileOperationItemResult {
+                    path: "/source/a".to_string(),
+                    target_path: Some("/target/a".to_string()),
+                    status: FileTaskItemStatus::Succeeded,
+                    error_code: None,
+                    error_summary: None,
+                },
+                FileOperationItemResult {
+                    path: "/source/b".to_string(),
+                    target_path: Some("/target/b".to_string()),
+                    status: FileTaskItemStatus::Cancelled,
+                    error_code: Some("MOVE_CANCELLED".to_string()),
+                    error_summary: Some("cancelled safely".to_string()),
+                },
+            ],
+            error_summary: Some("partial failure".to_string()),
+            cleanup_warning: None,
+            created_at: "2026-07-27T00:00:00Z".to_string(),
+            started_at: Some("2026-07-27T00:00:01Z".to_string()),
+            finished_at: Some("2026-07-27T00:00:02Z".to_string()),
+        };
+
+        let items = operation_log_items(&task);
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].source.id, "/source/a");
+        assert_eq!(
+            items[0].destination.as_ref().map(|value| value.id.as_str()),
+            Some("/target/a")
+        );
+        assert_eq!(items[0].status, OperationItemStatus::Succeeded);
+        assert_eq!(items[1].status, OperationItemStatus::Canceled);
+        assert_eq!(items[1].error_code.as_deref(), Some("MOVE_CANCELLED"));
+        assert_eq!(
+            file_task_outcome(&task),
+            seclab_contracts::logging::OperationOutcome::Partial
+        );
+    }
+
+    #[test]
+    fn operation_log_items_are_bounded_to_five_hundred() {
+        let item = FileOperationItemResult {
+            path: "/source".to_string(),
+            target_path: None,
+            status: FileTaskItemStatus::Pending,
+            error_code: None,
+            error_summary: None,
+        };
+        let task = FileOperationTask {
+            task_id: "task-1".to_string(),
+            node_id: "local".to_string(),
+            operation: FileOperation::Remove,
+            status: FileTaskStatus::Cancelled,
+            stage: FileTaskStage::Cancelled,
+            progress_percent: 0,
+            total_item_count: 501,
+            completed_item_count: 0,
+            failed_item_count: 0,
+            total_bytes: 0,
+            processed_bytes: 0,
+            items: vec![item; 501],
+            error_summary: None,
+            cleanup_warning: None,
+            created_at: "2026-07-27T00:00:00Z".to_string(),
+            started_at: None,
+            finished_at: Some("2026-07-27T00:00:01Z".to_string()),
+        };
+
+        assert_eq!(operation_log_items(&task).len(), 500);
     }
 }

@@ -9,10 +9,10 @@ use std::{
 use axum::http::HeaderMap;
 use chrono::{DateTime, Duration, Utc};
 use seclab_contracts::logging::{
-    AgentOperationEvent, OperationActor, OperationActorKind, OperationImpact,
-    OperationLogCapabilities, OperationLogDetail, OperationLogPage, OperationLogQuery,
-    OperationLogSummary, OperationModule, OperationOrigin, OperationOriginKind, OperationOutcome,
-    OperationParameterValue, OperationTarget,
+    AgentOperationEvent, OperationActor, OperationActorKind, OperationImpact, OperationItemStatus,
+    OperationLogCapabilities, OperationLogDetail, OperationLogItem, OperationLogPage,
+    OperationLogQuery, OperationLogSummary, OperationModule, OperationOrigin, OperationOriginKind,
+    OperationOutcome, OperationParameterValue, OperationTarget,
 };
 use seclab_contracts::notification::{
     NotificationAttentionLevel, NotificationCategory, NotificationCode,
@@ -130,6 +130,7 @@ impl OperationEventBuilder {
                 request_method: None,
                 route_template: None,
                 parameters_json: "{}".to_string(),
+                items: Vec::new(),
                 error_code: None,
                 error_summary: None,
             },
@@ -171,6 +172,15 @@ impl OperationEventBuilder {
         if !value.trim().is_empty() {
             self.event.trace_id = truncate(value.trim(), 128);
         }
+        self
+    }
+    /// 附加最多 500 个结构化逐项执行事实。
+    pub fn items(mut self, items: Vec<OperationLogItem>) -> Self {
+        self.event.items = items
+            .into_iter()
+            .take(500)
+            .map(sanitize_operation_item)
+            .collect();
         self
     }
     pub fn source(mut self, value: &str) -> Self {
@@ -535,7 +545,19 @@ pub async fn get_operation_log(
             .bind(event_id)
             .fetch_optional(pool)
             .await?;
-    row.map(OperationLogRow::into_detail).transpose()
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let items = sqlx::query_as::<_, OperationLogItemRow>(
+        "SELECT * FROM operation_log_items WHERE event_id = ? ORDER BY sequence",
+    )
+    .bind(event_id)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(OperationLogItemRow::into_item)
+    .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(row.into_detail(items)?))
 }
 
 /// 以机器认证得到的节点身份幂等接收 Agent 事件。
@@ -577,6 +599,7 @@ pub async fn store_agent_event(
         request_method: None,
         route_template: None,
         parameters_json: serde_json::to_string(&parameters).unwrap_or_else(|_| "{}".to_string()),
+        items: Vec::new(),
         error_code: event.error_code.map(|v| truncate(&v, 128)),
         error_summary: event.error_summary.map(|v| redact_error(&v)),
     };
@@ -693,6 +716,7 @@ struct StoredOperationEvent {
     request_method: Option<String>,
     route_template: Option<String>,
     parameters_json: String,
+    items: Vec<OperationLogItem>,
     error_code: Option<String>,
     error_summary: Option<String>,
 }
@@ -723,6 +747,48 @@ struct OperationLogRow {
     parameters_json: String,
     error_code: Option<String>,
     error_summary: Option<String>,
+}
+
+#[derive(Debug, FromRow)]
+struct OperationLogItemRow {
+    sequence: i64,
+    source_kind: String,
+    source_id: String,
+    source_display_name: Option<String>,
+    destination_kind: Option<String>,
+    destination_id: Option<String>,
+    destination_display_name: Option<String>,
+    status: String,
+    error_code: Option<String>,
+    error_summary: Option<String>,
+}
+
+impl OperationLogItemRow {
+    fn into_item(self) -> Result<OperationLogItem, ApiError> {
+        let destination = match (self.destination_kind, self.destination_id) {
+            (Some(kind), Some(id)) => Some(OperationTarget {
+                kind,
+                id,
+                display_name: self.destination_display_name,
+                ownership: None,
+            }),
+            _ => None,
+        };
+        Ok(OperationLogItem {
+            sequence: u32::try_from(self.sequence)
+                .map_err(|_| ApiError::internal("invalid operation item sequence"))?,
+            source: OperationTarget {
+                kind: self.source_kind,
+                id: self.source_id,
+                display_name: self.source_display_name,
+                ownership: None,
+            },
+            destination,
+            status: parse_item_status(&self.status)?,
+            error_code: self.error_code,
+            error_summary: self.error_summary,
+        })
+    }
 }
 
 impl OperationLogRow {
@@ -762,7 +828,7 @@ impl OperationLogRow {
             },
         })
     }
-    fn into_detail(self) -> Result<OperationLogDetail, ApiError> {
+    fn into_detail(self, items: Vec<OperationLogItem>) -> Result<OperationLogDetail, ApiError> {
         let request_method = self.request_method.clone();
         let route_template = self.route_template.clone();
         let error_code = self.error_code.clone();
@@ -773,6 +839,7 @@ impl OperationLogRow {
             request_method,
             route_template,
             parameters,
+            items,
             error_code,
             error_summary,
         })
@@ -789,6 +856,32 @@ async fn insert_event(pool: &DbPool, event: &StoredOperationEvent) -> Result<(),
         .bind(&event.trace_id).bind(&event.task_id).bind(&event.client_ip).bind(&event.request_method).bind(&event.route_template)
         .bind(&event.parameters_json).bind(&event.error_code).bind(&event.error_summary).execute(&mut *transaction).await?;
     let recipients = if result.rows_affected() > 0 {
+        for item in &event.items {
+            sqlx::query(
+                "INSERT INTO operation_log_items (
+                    event_id, sequence, source_kind, source_id, source_display_name,
+                    destination_kind, destination_id, destination_display_name,
+                    status, error_code, error_summary
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&event.event_id)
+            .bind(i64::from(item.sequence))
+            .bind(&item.source.kind)
+            .bind(&item.source.id)
+            .bind(&item.source.display_name)
+            .bind(item.destination.as_ref().map(|value| &value.kind))
+            .bind(item.destination.as_ref().map(|value| &value.id))
+            .bind(
+                item.destination
+                    .as_ref()
+                    .and_then(|value| value.display_name.as_ref()),
+            )
+            .bind(item.status.as_str())
+            .bind(&item.error_code)
+            .bind(&item.error_summary)
+            .execute(&mut *transaction)
+            .await?;
+        }
         project_notification(&mut transaction, event).await?
     } else {
         Vec::new()
@@ -813,6 +906,8 @@ struct NotificationRegistration {
     category: NotificationCategory,
     attention: NotificationAttentionPolicy,
     include_outcome: bool,
+    include_subject: bool,
+    include_error_details: bool,
     recipients: NotificationRecipientPolicy,
     allowed_parameters: &'static [&'static str],
 }
@@ -845,6 +940,26 @@ async fn project_notification(
     let parameters_json = serde_json::to_string(&parameters).unwrap_or_else(|_| "{}".to_string());
     let attention_level = notification_attention_level(registration.attention, event.outcome);
     let outcome = registration.include_outcome.then(|| event.outcome.as_str());
+    let subject_kind = registration
+        .include_subject
+        .then_some(event.target_kind.as_deref())
+        .flatten();
+    let subject_id = registration
+        .include_subject
+        .then_some(event.target_id.as_deref())
+        .flatten();
+    let subject_display_name = registration
+        .include_subject
+        .then_some(event.target_display_name.as_deref())
+        .flatten();
+    let error_code = registration
+        .include_error_details
+        .then_some(event.error_code.as_deref())
+        .flatten();
+    let error_summary = registration
+        .include_error_details
+        .then_some(event.error_summary.as_deref())
+        .flatten();
     let mut inserted_recipients = Vec::with_capacity(recipients.len());
     for recipient_user_id in recipients {
         let notification_id = new_uuid_v7();
@@ -870,13 +985,13 @@ async fn project_notification(
         .bind(event.module.as_str())
         .bind(&event.origin_node_id)
         .bind(&event.origin_node_name)
-        .bind(&event.target_kind)
-        .bind(&event.target_id)
-        .bind(&event.target_display_name)
+        .bind(subject_kind)
+        .bind(subject_id)
+        .bind(subject_display_name)
         .bind(&event.task_id)
         .bind(&parameters_json)
-        .bind(&event.error_code)
-        .bind(&event.error_summary)
+        .bind(error_code)
+        .bind(error_summary)
         .bind(&event.trace_id)
         .bind(&event.occurred_at)
         .execute(&mut **transaction)
@@ -911,12 +1026,20 @@ fn notification_registration(event: &StoredOperationEvent) -> Option<Notificatio
     ];
     const SYSTEM_PARAMETERS: &[&str] = &["nodeId", "nodeName", "reason"];
     const SECURITY_PARAMETERS: &[&str] = &["username", "clientIp", "lockoutSeconds"];
+    const FILE_TASK_PARAMETERS: &[&str] = &[
+        "operation",
+        "totalItemCount",
+        "completedItemCount",
+        "failedItemCount",
+    ];
     let event_code = event.event_code.as_str();
     let task = |code, recipients| NotificationRegistration {
         code,
         category: NotificationCategory::Task,
         attention: NotificationAttentionPolicy::OutcomeBased,
         include_outcome: true,
+        include_subject: true,
+        include_error_details: true,
         recipients,
         allowed_parameters: TASK_PARAMETERS,
     };
@@ -948,6 +1071,8 @@ fn notification_registration(event: &StoredOperationEvent) -> Option<Notificatio
             category: NotificationCategory::System,
             attention: NotificationAttentionPolicy::Fixed(NotificationAttentionLevel::Warning),
             include_outcome: false,
+            include_subject: true,
+            include_error_details: true,
             recipients: NotificationRecipientPolicy::AllActiveAdmins,
             allowed_parameters: SYSTEM_PARAMETERS,
         }),
@@ -956,6 +1081,8 @@ fn notification_registration(event: &StoredOperationEvent) -> Option<Notificatio
             category: NotificationCategory::System,
             attention: NotificationAttentionPolicy::Fixed(NotificationAttentionLevel::Info),
             include_outcome: false,
+            include_subject: true,
+            include_error_details: true,
             recipients: NotificationRecipientPolicy::AllActiveAdmins,
             allowed_parameters: SYSTEM_PARAMETERS,
         }),
@@ -964,6 +1091,8 @@ fn notification_registration(event: &StoredOperationEvent) -> Option<Notificatio
             category: NotificationCategory::Security,
             attention: NotificationAttentionPolicy::Fixed(NotificationAttentionLevel::Warning),
             include_outcome: false,
+            include_subject: true,
+            include_error_details: true,
             recipients: NotificationRecipientPolicy::AllActiveAdmins,
             allowed_parameters: SECURITY_PARAMETERS,
         }),
@@ -978,10 +1107,16 @@ fn notification_registration(event: &StoredOperationEvent) -> Option<Notificatio
             ))
         }
         _ if event_code.starts_with("file_task_") && !event_code.ends_with("_submitted") => {
-            Some(task(
-                NotificationCode::FileTaskFinished,
-                NotificationRecipientPolicy::Actor,
-            ))
+            Some(NotificationRegistration {
+                code: NotificationCode::FileTaskFinished,
+                category: NotificationCategory::Task,
+                attention: NotificationAttentionPolicy::OutcomeBased,
+                include_outcome: true,
+                include_subject: false,
+                include_error_details: false,
+                recipients: NotificationRecipientPolicy::Actor,
+                allowed_parameters: FILE_TASK_PARAMETERS,
+            })
         }
         _ if event_code.starts_with("file_transfer_") && !event_code.ends_with("_submitted") => {
             Some(task(
@@ -1341,6 +1476,25 @@ fn parameter_from_json(value: Value) -> Option<OperationParameterValue> {
     }
 }
 
+fn sanitize_operation_item(mut item: OperationLogItem) -> OperationLogItem {
+    item.source.kind = truncate(&item.source.kind, 64);
+    item.source.id = truncate(&item.source.id, 4096);
+    item.source.display_name = item.source.display_name.map(|value| truncate(&value, 4096));
+    item.source.ownership = None;
+    if let Some(destination) = &mut item.destination {
+        destination.kind = truncate(&destination.kind, 64);
+        destination.id = truncate(&destination.id, 4096);
+        destination.display_name = destination
+            .display_name
+            .take()
+            .map(|value| truncate(&value, 4096));
+        destination.ownership = None;
+    }
+    item.error_code = item.error_code.map(|value| truncate(&value, 128));
+    item.error_summary = item.error_summary.map(|value| redact_error(&value));
+    item
+}
+
 fn normalize_operation_target(
     event: &mut StoredOperationEvent,
     parameters: &BTreeMap<String, OperationParameterValue>,
@@ -1356,7 +1510,8 @@ fn normalize_operation_target(
         Some("fileTask" | "fileTransfer" | "disk_operation" | "imagePullTask")
     ) {
         let resource_kind = match event.target_kind.as_deref() {
-            Some("fileTask" | "fileTransfer") => Some("file"),
+            Some("fileTask") => None,
+            Some("fileTransfer") => Some("file"),
             Some("disk_operation") => Some("disk"),
             _ => None,
         };
@@ -1523,6 +1678,16 @@ fn parse_impact(value: &str) -> Result<OperationImpact, ApiError> {
         "warning" => Ok(OperationImpact::Warning),
         "error" => Ok(OperationImpact::Error),
         _ => Err(ApiError::Internal("invalid operation impact".to_string())),
+    }
+}
+fn parse_item_status(value: &str) -> Result<OperationItemStatus, ApiError> {
+    match value {
+        "pending" => Ok(OperationItemStatus::Pending),
+        "running" => Ok(OperationItemStatus::Running),
+        "succeeded" => Ok(OperationItemStatus::Succeeded),
+        "failed" => Ok(OperationItemStatus::Failed),
+        "canceled" => Ok(OperationItemStatus::Canceled),
+        _ => Err(ApiError::internal("invalid operation item status")),
     }
 }
 fn parse_actor_kind(value: &str) -> Result<OperationActorKind, ApiError> {
@@ -1857,6 +2022,7 @@ mod tests {
                     request_method: Some("PATCH".to_string()),
                     route_template: Some("/api/v1/node/{node_id}".to_string()),
                     parameters_json: "{}".to_string(),
+                    items: Vec::new(),
                     error_code: None,
                     error_summary: None,
                 },
@@ -2054,6 +2220,114 @@ mod tests {
         assert!(parameters.contains("Safe Script"));
         assert!(!parameters.contains("token"));
         assert!(!parameters.contains("unregistered"));
+    }
+
+    #[tokio::test]
+    async fn file_task_items_are_audited_but_not_projected_into_notification_content() {
+        let pool = setup_test_db().await;
+        let recipient_user_id = 700_003;
+        sqlx::query("INSERT INTO users (id, username, password_hash) VALUES (?, 'admin', 'hash')")
+            .bind(recipient_user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let items = vec![
+            OperationLogItem {
+                sequence: 1,
+                source: OperationTarget {
+                    kind: "file".to_string(),
+                    id: "/root/cc".to_string(),
+                    display_name: Some("/root/cc".to_string()),
+                    ownership: None,
+                },
+                destination: None,
+                status: OperationItemStatus::Succeeded,
+                error_code: None,
+                error_summary: None,
+            },
+            OperationLogItem {
+                sequence: 2,
+                source: OperationTarget {
+                    kind: "file".to_string(),
+                    id: "/root/bb".to_string(),
+                    display_name: Some("/root/bb".to_string()),
+                    ownership: None,
+                },
+                destination: None,
+                status: OperationItemStatus::Failed,
+                error_code: Some("REMOVE_FAILED".to_string()),
+                error_summary: Some("safe failure".to_string()),
+            },
+        ];
+        let mut builder =
+            OperationEventBuilder::new("admin", "file_task_failed", "127.0.0.1".parse().unwrap())
+                .user_id(recipient_user_id)
+                .origin_node("local", None)
+                .target_type("fileTask")
+                .target_id("file-task-1")
+                .metadata(serde_json::json!({
+                    "operation": "remove",
+                    "result": "failed",
+                    "totalItemCount": 2,
+                    "completedItemCount": 1,
+                    "failedItemCount": 1,
+                    "targetPath": "/root/cc",
+                    "errorCode": "TASK_FAILED",
+                    "errorSummary": "task failure",
+                }))
+                .items(items)
+                .outcome(OperationOutcome::Partial);
+        builder.prepare_for_storage();
+        let event = builder.event;
+        assert!(event.target_kind.is_none());
+        assert_eq!(event.task_id.as_deref(), Some("file-task-1"));
+
+        insert_event(&pool, &event).await.unwrap();
+
+        let detail = get_operation_log(&pool, &event.event_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.items.len(), 2);
+        assert_eq!(detail.items[0].source.id, "/root/cc");
+        assert_eq!(detail.items[1].source.id, "/root/bb");
+        assert_eq!(detail.items[1].status, OperationItemStatus::Failed);
+        assert_eq!(
+            detail.items[1].error_summary.as_deref(),
+            Some("safe failure")
+        );
+
+        let notification: (Option<String>, Option<String>, Option<String>, String) =
+            sqlx::query_as(
+                "SELECT subject_id, error_code, error_summary, parameters_json
+             FROM user_notifications WHERE recipient_user_id = ?",
+            )
+            .bind(recipient_user_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(notification.0.is_none());
+        assert!(notification.1.is_none());
+        assert!(notification.2.is_none());
+        let parameters: Value = serde_json::from_str(&notification.3).unwrap();
+        assert_eq!(parameters["totalItemCount"].as_f64(), Some(2.0));
+        assert_eq!(parameters["completedItemCount"].as_f64(), Some(1.0));
+        assert_eq!(parameters["failedItemCount"].as_f64(), Some(1.0));
+        assert!(parameters.get("targetPath").is_none());
+        assert!(parameters.get("result").is_none());
+
+        sqlx::query("DELETE FROM operation_logs WHERE event_id = ?")
+            .bind(&event.event_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let item_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM operation_log_items WHERE event_id = ?")
+                .bind(&event.event_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(item_count, 0);
     }
 
     #[tokio::test]

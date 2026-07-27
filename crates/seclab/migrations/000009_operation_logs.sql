@@ -37,6 +37,21 @@ CREATE INDEX idx_operation_logs_origin_occurred
     ON operation_logs (origin_node_id, occurred_at DESC, event_id DESC)
     WHERE origin_node_id IS NOT NULL;
 
+CREATE TABLE operation_log_items (
+    event_id TEXT NOT NULL REFERENCES operation_logs(event_id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL CHECK (sequence >= 1 AND sequence <= 500),
+    source_kind TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    source_display_name TEXT,
+    destination_kind TEXT,
+    destination_id TEXT,
+    destination_display_name TEXT,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'succeeded', 'failed', 'canceled')),
+    error_code TEXT,
+    error_summary TEXT,
+    PRIMARY KEY (event_id, sequence)
+);
+
 CREATE TABLE user_notifications (
     notification_id TEXT PRIMARY KEY,
     recipient_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,

@@ -452,6 +452,12 @@ function notificationTitle(code: NotificationCode) {
 }
 
 function targetText(item: NotificationSummary) {
+  if (item.code === 'fileTaskFinished') {
+    const totalItemCount = item.parameters.totalItemCount
+    const count =
+      typeof totalItemCount === 'number' && Number.isFinite(totalItemCount) ? totalItemCount : 0
+    return t('app.notificationCenter.fileTaskItemCount', { count })
+  }
   return item.subject?.displayName ?? item.subject?.id ?? t('common.none')
 }
 
@@ -759,7 +765,7 @@ onBeforeUnmount(() => {
       </div>
       <template #footer>
         <SecLabButton v-if="detail?.action" type="primary" @click="openTarget(detail)">
-          {{ t('app.notificationCenter.openTarget') }}
+          {{ t(detail.action.labelKey) }}
         </SecLabButton>
       </template>
     </SecLabDrawer>

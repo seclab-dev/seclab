@@ -3,7 +3,9 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type {
   OperationImpact,
+  OperationItemStatus,
   OperationLogDetail,
+  OperationLogItem,
   OperationLogQuery,
   OperationLogSummary,
   OperationModule,
@@ -14,7 +16,7 @@ import {
   SecLabAlert,
   SecLabButton,
   SecLabDescriptions,
-  SecLabDrawer,
+  SecLabDialog,
   SecLabEmpty,
   SecLabFormItem,
   SecLabInput,
@@ -27,7 +29,12 @@ import {
 import type { SecLabTableColumn } from '@/components/ui/SecLabTable.vue'
 
 const { t, te } = useI18n()
-const props = defineProps<{ module?: OperationModule; nodeId?: string; embedded?: boolean }>()
+const props = defineProps<{
+  module?: OperationModule
+  nodeId?: string
+  embedded?: boolean
+  payload?: Record<string, unknown>
+}>()
 const PAGE_SIZE = 20
 const items = ref<OperationLogSummary[]>([])
 const total = ref(0)
@@ -70,6 +77,13 @@ const columns = computed<SecLabTableColumn[]>(() => [
   },
   { label: t('app.operationLog.columns.outcome'), width: 110, slot: 'outcome', align: 'center' },
   { label: t('common.actions'), width: 90, slot: 'actions', align: 'center' },
+])
+const itemColumns = computed<SecLabTableColumn[]>(() => [
+  { label: t('app.operationLog.items.sequence'), width: 64, prop: 'sequence', align: 'center' },
+  { label: t('app.operationLog.items.source'), minWidth: 210, slot: 'itemSource' },
+  { label: t('app.operationLog.items.destination'), minWidth: 210, slot: 'itemDestination' },
+  { label: t('app.operationLog.items.status'), width: 104, slot: 'itemStatus', align: 'center' },
+  { label: t('app.operationLog.items.errorSummary'), minWidth: 180, slot: 'itemError' },
 ])
 
 const rangeOptions = computed(() => [
@@ -226,7 +240,7 @@ function applyFilters() {
   page.value = 1
   void load()
 }
-async function openDetail(row: OperationLogSummary) {
+async function openDetailById(eventId: string) {
   const sequence = ++detailSequence
   detailController?.abort()
   detailController = new AbortController()
@@ -235,7 +249,7 @@ async function openDetail(row: OperationLogSummary) {
   detailError.value = ''
   detailLoading.value = true
   try {
-    const response = await operationLogApi.detail(row.eventId, detailController.signal)
+    const response = await operationLogApi.detail(eventId, detailController.signal)
     if (sequence !== detailSequence) return
     if (!response.success || !response.data) throw new Error(response.message)
     detail.value = response.data
@@ -251,6 +265,16 @@ async function openDetail(row: OperationLogSummary) {
     if (sequence === detailSequence) detailLoading.value = false
   }
 }
+async function openDetail(row: OperationLogSummary) {
+  await openDetailById(row.eventId)
+}
+function closeDetail() {
+  detailOpen.value = false
+  detailSequence += 1
+  detailController?.abort()
+  detailController = undefined
+  detailLoading.value = false
+}
 function impactTag(value: OperationImpact) {
   return value === 'error' ? 'danger' : value === 'warning' ? 'warning' : 'info'
 }
@@ -263,11 +287,28 @@ function outcomeTag(value: OperationOutcome) {
         ? 'success'
         : 'info'
 }
+function itemStatusTag(value: OperationItemStatus): 'success' | 'info' | 'warning' | 'danger' {
+  if (value === 'succeeded') return 'success'
+  if (value === 'failed') return 'danger'
+  if (value === 'canceled') return 'warning'
+  return 'info'
+}
+function itemPath(item: OperationLogItem['source']) {
+  return item.displayName ?? item.id
+}
 function poll() {
   if (document.visibilityState === 'visible' && !initialLoading.value && !refreshing.value)
     void load({ silent: true })
 }
 watch(page, () => void load())
+watch(
+  () => props.payload,
+  (payload) => {
+    const eventId = payload?.eventId
+    if (typeof eventId === 'string' && eventId.trim()) void openDetailById(eventId)
+  },
+  { immediate: true },
+)
 onMounted(() => {
   void load()
   pollTimer = window.setInterval(poll, 30_000)
@@ -433,11 +474,12 @@ onBeforeUnmount(() => {
       @page-change="(value) => (page = value)"
     />
 
-    <SecLabDrawer
-      v-model="detailOpen"
+    <SecLabDialog
+      :visible="detailOpen"
       data-ui="detail"
       :title="t('app.operationLog.detail.title')"
-      width="680px"
+      width="min(1120px, 92vw)"
+      @close="closeDetail"
     >
       <div class="detail-content" data-slot="detail">
         <SecLabAlert
@@ -451,15 +493,43 @@ onBeforeUnmount(() => {
           <SecLabDescriptions :items="detailItems" :column="2" border />
           <SecLabDescriptions
             v-if="parameterItems.length"
+            class="parameter-descriptions"
             :items="parameterItems"
             :column="2"
             border
             data-ui="parameters"
           />
+          <div v-if="detail.items.length" class="operation-items" data-slot="operation-items">
+            <h3>{{ t('app.operationLog.items.title') }}</h3>
+            <SecLabTable
+              class="operation-items-table"
+              :data="detail.items"
+              :columns="itemColumns"
+              border
+              data-ui="operation-log-items"
+            >
+              <template #itemSource="{ row }: { row: OperationLogItem }">
+                <span class="item-path">{{ itemPath(row.source) }}</span>
+              </template>
+              <template #itemDestination="{ row }: { row: OperationLogItem }">
+                <span class="item-path">{{
+                  row.destination ? itemPath(row.destination) : t('common.none')
+                }}</span>
+              </template>
+              <template #itemStatus="{ row }: { row: OperationLogItem }">
+                <SecLabTag :type="itemStatusTag(row.status)" size="small">
+                  {{ t(`app.operationLog.items.statuses.${row.status}`) }}
+                </SecLabTag>
+              </template>
+              <template #itemError="{ row }: { row: OperationLogItem }">
+                <span>{{ row.errorSummary ?? t('common.none') }}</span>
+              </template>
+            </SecLabTable>
+          </div>
         </template>
         <SecLabLoading :loading="detailLoading" cover />
       </div>
-    </SecLabDrawer>
+    </SecLabDialog>
   </div>
 </template>
 
@@ -517,6 +587,23 @@ onBeforeUnmount(() => {
   min-height: 180px;
   display: grid;
   gap: var(--sdl-space-3);
+}
+.parameter-descriptions :deep(.sl-descriptions-label) {
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.operation-items h3 {
+  margin: 0 0 var(--sdl-space-2);
+  color: var(--sdl-text-primary);
+  font-size: var(--sdl-font-body);
+}
+.operation-items-table {
+  height: auto;
+}
+.item-path {
+  font-family: var(--sdl-font-mono);
+  overflow-wrap: anywhere;
 }
 small {
   display: block;

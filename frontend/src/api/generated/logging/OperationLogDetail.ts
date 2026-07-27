@@ -2,6 +2,7 @@
 import type { OperationActor } from "./OperationActor";
 import type { OperationImpact } from "./OperationImpact";
 import type { OperationLogCapabilities } from "./OperationLogCapabilities";
+import type { OperationLogItem } from "./OperationLogItem";
 import type { OperationModule } from "./OperationModule";
 import type { OperationOrigin } from "./OperationOrigin";
 import type { OperationOutcome } from "./OperationOutcome";
@@ -10,4 +11,4 @@ import type { OperationTarget } from "./OperationTarget";
 /**
  * 操作日志详情。
  */
-export type OperationLogDetail = { requestMethod?: string, routeTemplate?: string, parameters: Record<string, string | number | boolean>, errorCode?: string, errorSummary?: string, eventId: string, occurredAt: string, module: OperationModule, eventCode: string, actor: OperationActor, clientIp?: string, origin: OperationOrigin, target?: OperationTarget, outcome: OperationOutcome, impact: OperationImpact, traceId: string, taskId?: string, capabilities: OperationLogCapabilities, };
+export type OperationLogDetail = { requestMethod?: string, routeTemplate?: string, parameters: Record<string, string | number | boolean>, items: Array<OperationLogItem>, errorCode?: string, errorSummary?: string, eventId: string, occurredAt: string, module: OperationModule, eventCode: string, actor: OperationActor, clientIp?: string, origin: OperationOrigin, target?: OperationTarget, outcome: OperationOutcome, impact: OperationImpact, traceId: string, taskId?: string, capabilities: OperationLogCapabilities, };

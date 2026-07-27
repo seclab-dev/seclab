@@ -143,6 +143,44 @@ pub struct OperationTarget {
     pub ownership: Option<String>,
 }
 
+/// 单个操作对象的执行状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "logging/")]
+pub enum OperationItemStatus {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    Canceled,
+}
+
+impl OperationItemStatus {
+    /// 返回稳定的数据库值。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Canceled => "canceled",
+        }
+    }
+}
+
+/// 操作日志详情中的逐项执行事实。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "logging/", optional_fields)]
+pub struct OperationLogItem {
+    pub sequence: u32,
+    pub source: OperationTarget,
+    pub destination: Option<OperationTarget>,
+    pub status: OperationItemStatus,
+    pub error_code: Option<String>,
+    pub error_summary: Option<String>,
+}
+
 /// 事件详情中允许保存的参数值。
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(untagged)]
@@ -192,6 +230,7 @@ pub struct OperationLogDetail {
     pub route_template: Option<String>,
     #[ts(type = "Record<string, string | number | boolean>")]
     pub parameters: BTreeMap<String, OperationParameterValue>,
+    pub items: Vec<OperationLogItem>,
     pub error_code: Option<String>,
     pub error_summary: Option<String>,
 }

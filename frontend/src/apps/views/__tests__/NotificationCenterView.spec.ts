@@ -185,4 +185,28 @@ describe('NotificationCenterView', () => {
     })
     wrapper.unmount()
   })
+
+  it('文件任务通知只按总条目数展示范围', async () => {
+    const result = response('file-task')
+    result.data.items[0] = {
+      ...result.data.items[0],
+      code: 'fileTaskFinished',
+      source: { module: 'files', nodeName: 'Local Node' },
+      subject: undefined,
+      parameters: {
+        operation: 'remove',
+        totalItemCount: 2,
+        completedItemCount: 2,
+        failedItemCount: 0,
+      },
+    }
+    vi.mocked(notificationsApi.query).mockReset().mockResolvedValue(result)
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(wrapper.get('[data-ui="notification-table"]').text()).toContain('2 个条目')
+    expect(wrapper.get('[data-ui="notification-table"]').text()).not.toContain('/root/cc')
+    expect(wrapper.get('[data-ui="notification-table"]').text()).not.toContain('/root/bb')
+    wrapper.unmount()
+  })
 })

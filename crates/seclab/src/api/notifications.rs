@@ -458,9 +458,8 @@ fn notification_action(
         NotificationCode::ScriptRunFinished => "script-manager",
         NotificationCode::ScheduledTaskOperationFinished
         | NotificationCode::ScheduledTaskRunFinished => "task-scheduler",
-        NotificationCode::FileTaskFinished | NotificationCode::FileTransferFinished => {
-            "file-manager"
-        }
+        NotificationCode::FileTaskFinished => "operation-log",
+        NotificationCode::FileTransferFinished => "file-manager",
         NotificationCode::DiskOperationFinished => "disk-manager",
         NotificationCode::DockerImageTaskFinished | NotificationCode::DockerProjectTaskFinished => {
             "docker-manager"
@@ -469,6 +468,17 @@ fn notification_action(
         NotificationCode::UpgradePlanFinished => return None,
     };
     let mut payload = BTreeMap::new();
+    if code == NotificationCode::FileTaskFinished {
+        payload.insert(
+            "eventId".to_string(),
+            OperationParameterValue::String(row.operation_event_id.clone()),
+        );
+        return Some(NotificationAction {
+            app_id: app_id.to_string(),
+            label_key: "app.notificationCenter.viewOperationLog".to_string(),
+            payload,
+        });
+    }
     let node_id = row
         .source_node_id
         .as_ref()
@@ -951,5 +961,52 @@ mod tests {
                 }),
             Some("node-1")
         );
+    }
+
+    #[tokio::test]
+    async fn file_task_action_opens_the_matching_operation_log_event() {
+        let pool = crate::test_support::setup_test_db().await;
+        seed_user(&pool, 1).await;
+        seed_notification(
+            &pool,
+            1,
+            "file-task-notification",
+            "2026-07-18T00:00:00Z",
+            "unused",
+            None,
+            None,
+        )
+        .await;
+        sqlx::query(
+            "UPDATE user_notifications
+             SET code = 'fileTaskFinished', source_module = 'files',
+                 subject_kind = NULL, subject_id = NULL, subject_display_name = NULL,
+                 task_id = 'file-task-1',
+                 parameters_json = '{\"totalItemCount\":2,\"completedItemCount\":2,\"failedItemCount\":0}'
+             WHERE notification_id = 'file-task-notification'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let summary = sqlx::query_as::<_, NotificationRow>(
+            "SELECT * FROM user_notifications WHERE notification_id = 'file-task-notification'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .into_summary()
+        .unwrap();
+        let action = summary.action.unwrap();
+
+        assert_eq!(action.app_id, "operation-log");
+        assert_eq!(
+            action.payload.get("eventId").and_then(|value| match value {
+                OperationParameterValue::String(value) => Some(value.as_str()),
+                _ => None,
+            }),
+            Some("event-file-task-notification")
+        );
+        assert_eq!(action.label_key, "app.notificationCenter.viewOperationLog");
     }
 }
