@@ -116,6 +116,41 @@ describe('OperationLogView', () => {
     wrapper.unmount()
   })
 
+  it('用户列仅显示用户与可信客户端 IP，不再追加 Agent 来源', async () => {
+    const result = response('agent-event')
+    result.data.items[0] = {
+      ...result.data.items[0],
+      actor: { kind: 'user', displayName: 'admin' },
+      clientIp: '::ffff:10.0.0.41',
+      origin: { kind: 'agent', nodeId: 'node-a', nodeName: '节点 A' },
+    }
+    vi.mocked(operationLogApi.query).mockReset().mockResolvedValue(result)
+    const wrapper = mount(OperationLogView, {
+      global: { plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh, en } })] },
+    })
+    await flushPromises()
+
+    const table = wrapper.find('[data-ui="table"]')
+    expect(table.text()).toContain('用户')
+    expect(table.text()).toContain('admin (::ffff:10.0.0.41)')
+    expect(table.text()).not.toContain('Agent')
+    expect(table.text()).not.toContain('节点 A')
+    expect(table.text()).not.toContain('用户 / 来源')
+    wrapper.unmount()
+  })
+
+  it('英文用户列使用 User 标题', async () => {
+    vi.mocked(operationLogApi.query).mockReset().mockResolvedValue(response('english-user'))
+    const wrapper = mount(OperationLogView, {
+      global: { plugins: [createI18n({ legacy: false, locale: 'en', messages: { zh, en } })] },
+    })
+    await flushPromises()
+
+    expect(wrapper.find('[data-ui="table"]').text()).toContain('User')
+    expect(wrapper.find('[data-ui="table"]').text()).not.toContain('Actor / origin')
+    wrapper.unmount()
+  })
+
   it('表格隐藏目标，详情宽模态框展示领域名称与目标 ID', async () => {
     const result = response('named-target')
     result.data.items[0].target = {
@@ -212,6 +247,72 @@ describe('OperationLogView', () => {
         .querySelector('[data-ui="parameters"]')
         ?.classList.contains('parameter-descriptions'),
     ).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('详情将节点参数归一为名称，并在名称缺失时回退节点 ID', async () => {
+    const base = response('node-detail').data.items[0]
+    vi.mocked(operationLogApi.query).mockReset().mockResolvedValue(response('listed-event'))
+    vi.mocked(operationLogApi.detail)
+      .mockReset()
+      .mockResolvedValueOnce({
+        success: true,
+        code: 200,
+        message: '',
+        data: {
+          ...base,
+          origin: { kind: 'agent', nodeId: 'local' },
+          parameters: { nodeId: 'local', nodeName: 'local' },
+          items: [],
+        },
+      })
+      .mockResolvedValueOnce({
+        success: true,
+        code: 200,
+        message: '',
+        data: {
+          ...base,
+          origin: { kind: 'agent', nodeId: 'node-a', nodeName: '来源节点名称' },
+          parameters: { nodeId: 'node-a', nodeName: '参数节点名称' },
+          items: [],
+        },
+      })
+      .mockResolvedValueOnce({
+        success: true,
+        code: 200,
+        message: '',
+        data: {
+          ...base,
+          origin: { kind: 'master' },
+          target: undefined,
+          parameters: { nodeId: 'deleted-node-id' },
+          items: [],
+        },
+      })
+    const wrapper = mount(OperationLogView, {
+      props: { payload: { eventId: 'local-event' } },
+      global: { plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh, en } })] },
+    })
+    await flushPromises()
+
+    const parameterText = () =>
+      document.body.querySelector('[data-ui="parameters"]')?.textContent ?? ''
+    expect(parameterText()).toContain('节点')
+    expect(parameterText()).toContain('本地节点')
+    expect(parameterText()).not.toContain('nodeId')
+
+    await wrapper.setProps({ payload: { eventId: 'child-event' } })
+    await flushPromises()
+    expect(parameterText()).toContain('参数节点名称')
+    expect(parameterText()).not.toContain('来源节点名称')
+    expect(parameterText()).not.toContain('node-a')
+    expect(parameterText().match(/参数节点名称/g)).toHaveLength(1)
+    expect(parameterText()).not.toContain('nodeName')
+
+    await wrapper.setProps({ payload: { eventId: 'deleted-event' } })
+    await flushPromises()
+    expect(parameterText()).toContain('deleted-node-id')
+    expect(parameterText()).not.toContain('nodeId')
     wrapper.unmount()
   })
 

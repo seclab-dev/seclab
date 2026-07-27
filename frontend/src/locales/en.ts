@@ -1473,7 +1473,7 @@ const en = {
         index: 'No.',
         time: 'Time',
         impact: 'Impact',
-        actor: 'Actor / origin',
+        actor: 'User',
         operation: 'Operation',
         target: 'Target',
         outcome: 'Outcome',
@@ -1529,6 +1529,8 @@ const en = {
       },
       detail: {
         clientIp: 'Client IP',
+        node: 'Node',
+        localNode: 'Local Node',
         targetKind: 'Target type',
         targetId: 'Target ID',
         title: 'Operation details',

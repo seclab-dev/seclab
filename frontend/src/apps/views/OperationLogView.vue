@@ -162,12 +162,32 @@ const detailItems = computed(() => {
       : []),
   ]
 })
-const parameterItems = computed(() =>
-  Object.entries(detail.value?.parameters ?? {}).map(([key, value]) => ({
-    label: key,
-    value: String(value),
-  })),
-)
+const parameterItems = computed(() => {
+  if (!detail.value) return []
+  const value = detail.value
+  const parameters = value.parameters
+  const hasNodeId = Object.prototype.hasOwnProperty.call(parameters, 'nodeId')
+  return Object.entries(parameters).flatMap(([key, parameterValue]) => {
+    if (key === 'nodeName') {
+      if (hasNodeId) return []
+      return [
+        {
+          label: t('app.operationLog.detail.node'),
+          value: nodeDisplayName(value, undefined, parameterValue),
+        },
+      ]
+    }
+    if (key === 'nodeId') {
+      return [
+        {
+          label: t('app.operationLog.detail.node'),
+          value: nodeDisplayName(value, parameterValue, parameters.nodeName),
+        },
+      ]
+    }
+    return [{ label: key, value: String(parameterValue) }]
+  })
+})
 
 function label(group: string, value: string) {
   const key = `app.operationLog.${group}.${value}`
@@ -183,6 +203,30 @@ function actorLabel(actor: OperationLogSummary['actor']) {
 function actorText(value: OperationLogSummary) {
   const actor = actorLabel(value.actor)
   return value.clientIp ? `${actor} (${value.clientIp})` : actor
+}
+function nodeDisplayName(
+  value: OperationLogDetail,
+  rawNodeId: string | number | boolean | undefined,
+  rawNodeName: string | number | boolean | undefined,
+) {
+  const nodeId = rawNodeId === undefined ? undefined : String(rawNodeId)
+  const parameterNodeName = rawNodeName === undefined ? '' : String(rawNodeName).trim()
+  if (nodeId === 'local' || (!nodeId && parameterNodeName === 'local')) {
+    return t('app.operationLog.detail.localNode')
+  }
+  if (parameterNodeName) return parameterNodeName
+  if (nodeId && value.origin.nodeId === nodeId && value.origin.nodeName?.trim()) {
+    return value.origin.nodeName
+  }
+  if (
+    nodeId &&
+    value.target?.kind === 'node' &&
+    value.target.id === nodeId &&
+    value.target.displayName?.trim()
+  ) {
+    return value.target.displayName
+  }
+  return nodeId ?? ''
 }
 function formatTime(value: string) {
   const date = new Date(value)
@@ -434,12 +478,9 @@ onBeforeUnmount(() => {
             label('impacts', row.impact)
           }}</SecLabTag></template
         >
-        <template #actor="{ row }: { row: OperationLogSummary }"
-          ><strong>{{ actorText(row) }}</strong
-          ><small v-if="row.origin.kind === 'agent'" data-slot="origin">{{
-            row.origin.nodeName || label('origins', row.origin.kind)
-          }}</small></template
-        >
+        <template #actor="{ row }: { row: OperationLogSummary }">
+          <strong>{{ actorText(row) }}</strong>
+        </template>
         <template #operation="{ row }: { row: OperationLogSummary }">{{
           eventLabel(row.eventCode)
         }}</template>

@@ -1448,7 +1448,7 @@ const zh: typeof en = {
         index: '序号',
         time: '时间',
         impact: '级别',
-        actor: '用户 / 来源',
+        actor: '用户',
         operation: '操作',
         target: '目标',
         outcome: '结果',
@@ -1504,6 +1504,8 @@ const zh: typeof en = {
       },
       detail: {
         clientIp: '客户端 IP',
+        node: '节点',
+        localNode: '本地节点',
         targetKind: '目标类型',
         targetId: '目标 ID',
         title: '操作详情',
