@@ -106,8 +106,12 @@ pub fn spawn_reconciler(state: Arc<AppState>) {
 
 async fn reconcile_transfers_once(state: &AppState) -> ApiResult<()> {
     let rows = sqlx::query(
-        "SELECT transfer_id, node_id, user_id, actor_name, client_ip, trace_id, direction, target_path \
-         FROM file_transfer_audits WHERE terminal_logged = 0 ORDER BY created_at ASC LIMIT 100",
+        "SELECT audit.transfer_id, audit.node_id, audit.user_id, audit.actor_name, \
+                audit.client_ip, audit.trace_id, audit.direction, audit.target_path, \
+                node.name AS node_name \
+         FROM file_transfer_audits audit \
+         LEFT JOIN nodes node ON node.node_id = audit.node_id \
+         WHERE audit.terminal_logged = 0 ORDER BY audit.created_at ASC LIMIT 100",
     )
     .fetch_all(&state.metadata_db)
     .await?;
@@ -153,8 +157,12 @@ async fn reconcile_transfers_once(state: &AppState) -> ApiResult<()> {
 
 async fn reconcile_once(state: &AppState) -> ApiResult<()> {
     let rows = sqlx::query(
-        "SELECT task_id, node_id, user_id, actor_name, client_ip, trace_id, operation, high_impact \
-         FROM file_task_audits WHERE terminal_logged = 0 ORDER BY created_at ASC LIMIT 100",
+        "SELECT audit.task_id, audit.node_id, audit.user_id, audit.actor_name, \
+                audit.client_ip, audit.trace_id, audit.operation, audit.high_impact, \
+                node.name AS node_name \
+         FROM file_task_audits audit \
+         LEFT JOIN nodes node ON node.node_id = audit.node_id \
+         WHERE audit.terminal_logged = 0 ORDER BY audit.created_at ASC LIMIT 100",
     )
     .fetch_all(&state.metadata_db)
     .await?;
@@ -225,6 +233,7 @@ fn record_terminal(
         return;
     };
     let high_impact: bool = row.try_get("high_impact").unwrap_or(false);
+    let node_name = row.try_get::<String, _>("node_name").ok();
     let level = if task.status == FileTaskStatus::Failed {
         PlatformLogLevel::Error
     } else if high_impact || task.status == FileTaskStatus::Cancelled {
@@ -240,6 +249,7 @@ fn record_terminal(
     )
     .user_id(row.try_get("user_id").unwrap_or_default())
     .module(LogModule::File)
+    .origin_node(node_id, node_name.as_deref())
     .target_type("fileTask")
     .target_id(&task.task_id)
     .trace_id(&row.try_get::<String, _>("trace_id").unwrap_or_default())
@@ -286,6 +296,7 @@ fn record_transfer_terminal(
         FileTransferStatus::Cancelled | FileTransferStatus::Expired => PlatformLogLevel::Warning,
         _ => PlatformLogLevel::Info,
     };
+    let node_name = row.try_get::<String, _>("node_name").ok();
     OperationEventBuilder::new(
         &row.try_get::<String, _>("actor_name")
             .unwrap_or_else(|_| "unknown".to_string()),
@@ -294,6 +305,7 @@ fn record_transfer_terminal(
     )
     .user_id(row.try_get("user_id").unwrap_or_default())
     .module(LogModule::File)
+    .origin_node(node_id, node_name.as_deref())
     .target_type("fileTransfer")
     .target_id(&transfer.transfer_id)
     .trace_id(&row.try_get::<String, _>("trace_id").unwrap_or_default())

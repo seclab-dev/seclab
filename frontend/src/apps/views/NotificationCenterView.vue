@@ -144,7 +144,7 @@ const tableColumns = computed<SecLabTableColumn[]>(() => [
     slot: 'content',
     align: 'center',
   },
-  { label: t('app.notificationCenter.columns.source'), minWidth: 190, slot: 'source' },
+  { label: t('app.notificationCenter.columns.target'), minWidth: 190, slot: 'target' },
   {
     label: t('app.notificationCenter.columns.actions'),
     width: 104,
@@ -447,13 +447,8 @@ function notificationTitle(code: NotificationCode) {
   return t(`app.notificationCenter.events.${code}`)
 }
 
-function sourceText(item: NotificationSummary) {
-  const source =
-    item.source.nodeName ??
-    item.source.nodeId ??
-    t(`app.operationLog.modules.${item.source.module}`)
-  const subject = item.subject?.displayName ?? item.subject?.id
-  return subject ? `${source} · ${subject}` : source
+function targetText(item: NotificationSummary) {
+  return item.subject?.displayName ?? item.subject?.id ?? t('common.none')
 }
 
 function attentionLevelTagType(value: NotificationAttentionLevel): 'info' | 'warning' | 'danger' {
@@ -700,8 +695,8 @@ onBeforeUnmount(() => {
             <strong>{{ notificationTitle(row.code) }}</strong>
           </button>
         </template>
-        <template #source="{ row }: { row: NotificationSummary }">
-          <span class="source-cell">{{ sourceText(row) }}</span>
+        <template #target="{ row }: { row: NotificationSummary }">
+          <span class="target-cell">{{ targetText(row) }}</span>
         </template>
         <template #actions="{ row }: { row: NotificationSummary }">
           <SecLabActionMenu
@@ -895,12 +890,12 @@ onBeforeUnmount(() => {
 }
 
 .content-button span,
-.source-cell {
+.target-cell {
   color: var(--sdl-text-secondary);
   font-size: var(--sdl-font-body-sm);
 }
 
-.source-cell {
+.target-cell {
   word-break: break-word;
 }
 

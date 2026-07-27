@@ -1618,7 +1618,7 @@ const en = {
         attentionLevel: 'Attention Level',
         outcome: 'Outcome',
         content: 'Notification',
-        source: 'Source / Target',
+        target: 'Target',
         actions: 'Actions',
       },
       attentionLevel: { info: 'Info', warning: 'Warning', critical: 'Critical' },

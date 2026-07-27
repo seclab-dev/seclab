@@ -115,6 +115,9 @@ describe('NotificationCenterView', () => {
     expect(wrapper.text()).toContain('提示')
     expect(wrapper.text()).toContain('结果')
     expect(wrapper.text()).toContain('成功')
+    expect(wrapper.text()).toContain('目标')
+    expect(wrapper.get('[data-ui="notification-table"]').text()).toContain('selectable')
+    expect(wrapper.get('[data-ui="notification-table"]').text()).not.toContain('Node A')
 
     await wrapper.get('[data-ui="table-select-all"] input').setValue(true)
     await flushPromises()

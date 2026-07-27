@@ -1593,7 +1593,7 @@ const zh: typeof en = {
         attentionLevel: '关注级别',
         outcome: '结果',
         content: '通知内容',
-        source: '来源 / 目标',
+        target: '目标',
         actions: '操作',
       },
       attentionLevel: { info: '提示', warning: '警告', critical: '严重' },

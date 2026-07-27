@@ -162,6 +162,13 @@ impl OperationEventBuilder {
         }
         self
     }
+    /// 标记操作实际发生的节点，同时保留原始操作者身份。
+    pub fn origin_node(mut self, node_id: &str, node_name: Option<&str>) -> Self {
+        self.event.origin_kind = "agent".to_string();
+        self.event.origin_node_id = non_empty(node_id, 128);
+        self.event.origin_node_name = node_name.and_then(|value| non_empty(value, 128));
+        self
+    }
     pub fn request(mut self, method: &str, route_template: &str) -> Self {
         self.event.request_method = safe_method(method);
         self.event.route_template = safe_route_template(route_template);
@@ -1576,6 +1583,21 @@ mod tests {
         assert!(event.event.actor_user_id.is_none());
         assert!(event.event.target_kind.is_none());
         assert!(event.event.target_id.is_none());
+    }
+
+    #[test]
+    fn origin_node_keeps_the_user_actor() {
+        let event = OperationEventBuilder::new(
+            "admin",
+            "file_task_succeeded",
+            "127.0.0.1".parse().unwrap(),
+        )
+        .origin_node("local", Some("Local Node"));
+
+        assert_eq!(event.event.actor_kind, "user");
+        assert_eq!(event.event.origin_kind, "agent");
+        assert_eq!(event.event.origin_node_id.as_deref(), Some("local"));
+        assert_eq!(event.event.origin_node_name.as_deref(), Some("Local Node"));
     }
 
     #[test]
