@@ -1,5 +1,5 @@
 //! `seclab-slctl` 命令行工具，用于管理和操作 SecLab 服务。
-//! 支持服务的重启、状态查询、系统信息展示及服务的卸载等操作。
+//! 支持服务的停止、重启、状态查询、系统信息展示及服务的卸载等操作。
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -22,6 +22,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// 停止当前节点的全部服务，或仅停止指定服务
+    Stop {
+        /// 可选目标服务名称 (seclab 或 agent)
+        target: Option<String>,
+    },
     /// 重启指定的服务 (seclab 或 agent)
     Restart {
         /// 目标服务名称 (seclab 或 agent)
@@ -192,8 +197,38 @@ fn normalize_listen_host(host: &str) -> String {
 /// 打印命令行工具用法。
 fn print_usage() {
     eprintln!(
-        "Usage:\n  slctl restart <seclab|agent>\n  slctl status\n  slctl info\n  slctl passwd [--username <username>] [password]\n  slctl user --username <username>\n  slctl entry [--regenerate|--set <entry>|--disable]\n  slctl uninstall [--purge]\n  slctl self uninstall"
+        "Usage:\n  slctl stop [seclab|agent]\n  slctl restart <seclab|agent>\n  slctl status\n  slctl info\n  slctl passwd [--username <username>] [password]\n  slctl user --username <username>\n  slctl entry [--regenerate|--set <entry>|--disable]\n  slctl uninstall [--purge]\n  slctl self uninstall"
     );
+}
+
+/// 根据可选目标和本机安装状态选择需要停止的服务。
+fn select_stop_targets(
+    target: Option<&str>,
+    has_seclab: bool,
+    has_agent: bool,
+) -> Result<Vec<&'static str>> {
+    match target {
+        Some("seclab") if has_seclab => Ok(vec!["seclab"]),
+        Some("agent") if has_agent => Ok(vec!["agent"]),
+        Some("seclab") => Err(anyhow::anyhow!("seclab service is not installed")),
+        Some("agent") => Err(anyhow::anyhow!("seclab-agent service is not installed")),
+        Some(_) => Err(anyhow::anyhow!(
+            "invalid service target; expected seclab or agent"
+        )),
+        None => {
+            let mut targets = Vec::new();
+            if has_agent {
+                targets.push("agent");
+            }
+            if has_seclab {
+                targets.push("seclab");
+            }
+            if targets.is_empty() {
+                return Err(anyhow::anyhow!("no SecLab services are installed"));
+            }
+            Ok(targets)
+        }
+    }
 }
 
 /// 读取一行交互输入。
@@ -432,6 +467,25 @@ impl Context {
         let status_output =
             self.run_command_output("systemctl", &["status", &service, "--no-pager"])?;
         print!("{}", status_output);
+        Ok(())
+    }
+
+    /// 停止当前节点的全部 SecLab 服务，或仅停止指定服务。
+    fn stop_services(&self, target: Option<&str>) -> Result<()> {
+        if !command_exists("systemctl") {
+            return Err(anyhow::anyhow!("systemctl not found"));
+        }
+
+        let targets = select_stop_targets(
+            target,
+            self.service_installed("seclab"),
+            self.service_installed("agent"),
+        )?;
+        for target in targets {
+            let service = build_service_name(target);
+            self.stop_service_and_verify(&service)?;
+            println!("slctl: {service} stopped");
+        }
         Ok(())
     }
 
@@ -849,6 +903,9 @@ fn service_has_stopped(is_active: bool, main_pid: &str) -> bool {
 /// 分发并执行命令行指令。
 fn run_app(cli: Cli, context: Context) -> Result<()> {
     match cli.command {
+        Commands::Stop { target } => {
+            context.stop_services(target.as_deref())?;
+        }
         Commands::Restart { target } => {
             context.restart_service(&target)?;
         }
@@ -946,7 +1003,41 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{service_has_stopped, validate_password, validate_safe_entry_value};
+    use clap::Parser;
+
+    use super::{
+        Cli, Commands, select_stop_targets, service_has_stopped, validate_password,
+        validate_safe_entry_value,
+    };
+
+    #[test]
+    fn stop_command_accepts_optional_target() {
+        let all = Cli::try_parse_from(["slctl", "stop"]).unwrap();
+        assert!(matches!(all.command, Commands::Stop { target: None }));
+
+        let agent = Cli::try_parse_from(["slctl", "stop", "agent"]).unwrap();
+        assert!(matches!(
+            agent.command,
+            Commands::Stop {
+                target: Some(ref target)
+            } if target == "agent"
+        ));
+    }
+
+    #[test]
+    fn stop_target_selection_prefers_agent_before_seclab() {
+        assert_eq!(
+            select_stop_targets(None, true, true).unwrap(),
+            vec!["agent", "seclab"]
+        );
+        assert_eq!(
+            select_stop_targets(Some("seclab"), true, true).unwrap(),
+            vec!["seclab"]
+        );
+        assert!(select_stop_targets(Some("unknown"), true, true).is_err());
+        assert!(select_stop_targets(Some("agent"), true, false).is_err());
+        assert!(select_stop_targets(None, false, false).is_err());
+    }
 
     #[test]
     fn service_stop_verification_requires_inactive_state_and_zero_pid() {
