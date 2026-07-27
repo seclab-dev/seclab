@@ -806,6 +806,8 @@ onUnmounted(() => document.removeEventListener('click', hideContextMenu))
 }
 
 .path-btn {
+  height: auto;
+  align-self: stretch;
   border-top-left-radius: 0;
   border-bottom-left-radius: 0;
 }
