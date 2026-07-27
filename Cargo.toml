@@ -79,6 +79,15 @@ panic = "unwind"
 
 [profile.fast-release]
 inherits = "release"
-strip = false
+# 关闭 LLVM 优化，显著减少代码生成时间
+opt-level = 0
+# 不执行 LTO
 lto = false
+# 提高 crate 内代码生成并行度
 codegen-units = 256
+# 启用增量编译，明显加速修改后的重复构建
+incremental = true
+# 不执行符号剥离
+strip = false
+# 不生成调试信息
+debug = 0
