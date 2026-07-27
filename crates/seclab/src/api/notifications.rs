@@ -1,14 +1,18 @@
 //! 个人通知中心 API：按可信用户隔离查询，并只允许修改读取与归档状态。
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, convert::Infallible, sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
     extract::{Path, State},
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{get, patch, post},
 };
 use chrono::{DateTime, Utc};
+use futures_util::{Stream, stream};
 use seclab_contracts::{
     api::ErrorCode,
     logging::{OperationModule, OperationOutcome, OperationParameterValue},
@@ -24,6 +28,7 @@ use sqlx::{FromRow, QueryBuilder, Sqlite};
 
 use crate::{
     api::auth::AuthenticatedAdmin,
+    services::logging,
     state::{AppState, DbPool},
     types::{ApiError, ApiResponse, ApiResult},
 };
@@ -36,6 +41,7 @@ pub fn notifications_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/query", post(query_notifications))
         .route("/unread-summary", get(unread_summary))
+        .route("/events", get(notification_events))
         .route("/read-all", post(read_all))
         .route("/archive-state", post(batch_archive_state))
         .route("/{notification_id}", get(notification_detail))
@@ -44,6 +50,51 @@ pub fn notifications_router() -> Router<Arc<AppState>> {
             "/{notification_id}/archive-state",
             patch(update_archive_state),
         )
+}
+
+/// 建立当前认证用户的通知变化事件流；事件不包含任何通知业务数据。
+async fn notification_events(
+    admin: AuthenticatedAdmin,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    Sse::new(notification_change_stream(
+        logging::subscribe_notification_changes(),
+        admin.id,
+    ))
+    .keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    )
+}
+
+/// 将进程内广播过滤为单一用户的通用变化信号；积压时也要求客户端重新校准。
+fn notification_change_stream(
+    receiver: tokio::sync::broadcast::Receiver<i64>,
+    recipient_user_id: i64,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    stream::unfold(
+        (receiver, recipient_user_id),
+        |(mut receiver, recipient_user_id)| async move {
+            loop {
+                match receiver.recv().await {
+                    Ok(changed_user_id) if changed_user_id == recipient_user_id => {
+                        return Some((
+                            Ok(Event::default().data("changed")),
+                            (receiver, recipient_user_id),
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        return Some((
+                            Ok(Event::default().data("changed")),
+                            (receiver, recipient_user_id),
+                        ));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        },
+    )
 }
 
 /// 查询当前用户的通知摘要。
@@ -150,6 +201,7 @@ async fn update_read_state(
 ) -> ApiResult<Response> {
     set_notification_read_state(&state.metadata_db, admin.id, &notification_id, payload.read)
         .await?;
+    logging::publish_notification_change(admin.id);
     Ok(ApiResponse::ok("Notification read state updated").into_response())
 }
 
@@ -159,8 +211,11 @@ async fn read_all(
     State(state): State<Arc<AppState>>,
 ) -> ApiResult<Response> {
     let now = Utc::now().to_rfc3339();
-    sqlx::query("UPDATE user_notifications SET read_at = ?, state_changed_at = ? WHERE recipient_user_id = ? AND archived_at IS NULL AND read_at IS NULL")
+    let result = sqlx::query("UPDATE user_notifications SET read_at = ?, state_changed_at = ? WHERE recipient_user_id = ? AND archived_at IS NULL AND read_at IS NULL")
         .bind(&now).bind(&now).bind(admin.id).execute(&state.metadata_db).await?;
+    if result.rows_affected() > 0 {
+        logging::publish_notification_change(admin.id);
+    }
     Ok(ApiResponse::ok("Notifications marked as read").into_response())
 }
 
@@ -178,6 +233,7 @@ async fn update_archive_state(
         payload.archived,
     )
     .await?;
+    logging::publish_notification_change(admin.id);
     Ok(ApiResponse::ok("Notification archive state updated").into_response())
 }
 
@@ -250,7 +306,10 @@ async fn batch_archive_state(
         separated.push_bind(id);
     }
     separated.push_unseparated(")");
-    update.build().execute(&state.metadata_db).await?;
+    let result = update.build().execute(&state.metadata_db).await?;
+    if result.rows_affected() > 0 {
+        logging::publish_notification_change(admin.id);
+    }
     Ok(ApiResponse::ok("Notification archive states updated").into_response())
 }
 
@@ -655,6 +714,7 @@ fn parse_module(value: &str) -> Result<OperationModule, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
 
     fn query() -> NotificationQuery {
         NotificationQuery {
@@ -726,6 +786,21 @@ mod tests {
         value.created_from = Some("2026-07-18T10:00:00Z".to_string());
         value.created_to = Some("2026-07-18T09:00:00Z".to_string());
         assert!(validate_query(&value).is_err());
+    }
+
+    #[tokio::test]
+    async fn notification_change_stream_only_emits_for_the_target_user() {
+        let (sender, receiver) = tokio::sync::broadcast::channel(8);
+        let changes = notification_change_stream(receiver, 42);
+        tokio::pin!(changes);
+
+        sender.send(7).unwrap();
+        sender.send(42).unwrap();
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), changes.next())
+            .await
+            .unwrap();
+        assert!(event.is_some());
     }
 
     #[tokio::test]

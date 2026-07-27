@@ -211,7 +211,11 @@ const detailItems = computed(() => {
         }
       : null,
     current.taskId
-      ? { label: t('app.notificationCenter.detail.taskId'), value: current.taskId }
+      ? {
+          label: t('app.notificationCenter.detail.taskId'),
+          value: current.taskId,
+          span: 2,
+        }
       : null,
     {
       label: t('app.notificationCenter.detail.operationEventId'),

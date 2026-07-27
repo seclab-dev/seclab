@@ -130,4 +130,59 @@ describe('NotificationCenterView', () => {
     expect(wrapper.get('[data-ui="table-row-selection"] input').element.checked).toBe(false)
     wrapper.unmount()
   })
+
+  it('通知详情中的任务 ID 占用抽屉整行', async () => {
+    vi.mocked(notificationsApi.query).mockReset().mockResolvedValue(response('with-task'))
+    vi.mocked(notificationsApi.detail).mockResolvedValue({
+      success: true,
+      code: 200,
+      message: '',
+      data: {
+        notificationId: 'with-task',
+        createdAt: '2026-07-18T00:00:00Z',
+        code: 'scriptRunFinished',
+        category: 'task',
+        attentionLevel: 'info',
+        outcome: 'success',
+        source: { module: 'scripts', nodeName: 'Node A' },
+        subject: { kind: 'script', id: 'script-1', displayName: 'Script 1' },
+        taskId: '019fa1b7-cab3-7083-9aea-581e8c05d6c4',
+        operationEventId: '019fa1b7-d3ae-71a0-88f0-32e79c2e6044',
+        parameters: {},
+        readAt: '2026-07-18T00:01:00Z',
+        action: null,
+        capabilities: {
+          canViewDetails: true,
+          canMarkRead: false,
+          canMarkUnread: true,
+          canArchive: true,
+          canRestore: false,
+          canOpenTarget: false,
+        },
+        errorCode: null,
+        errorSummary: null,
+        traceId: '019fa1b7-cab4-7910-8f64-7150af7c5dc6',
+      },
+    })
+    const wrapper = mountView()
+    await flushPromises()
+    const item = response('with-task').data.items[0]
+
+    await (
+      wrapper.vm as unknown as {
+        openDetail: (notification: typeof item) => Promise<void>
+      }
+    ).openDetail(item)
+
+    const detailItems = (
+      wrapper.vm as unknown as {
+        detailItems: Array<{ label: string; value: string; span?: number }>
+      }
+    ).detailItems
+    expect(detailItems.find((detailItem) => detailItem.label === '任务 ID')).toMatchObject({
+      value: '019fa1b7-cab3-7083-9aea-581e8c05d6c4',
+      span: 2,
+    })
+    wrapper.unmount()
+  })
 })

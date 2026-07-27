@@ -15,6 +15,7 @@ export const useNotificationCenterStore = defineStore('notification-center', () 
 
   let timer: number | undefined
   let controller: AbortController | undefined
+  let changeStream: EventSource | undefined
   let requestSequence = 0
   let started = false
 
@@ -48,11 +49,21 @@ export const useNotificationCenterStore = defineStore('notification-center', () 
     }
   }
 
-  /** 登录桌面后启动可见性轮询。 */
+  /** 建立仅承载变化提示的通知事件流；断线重连由 EventSource 原生机制负责。 */
+  function startChangeStream() {
+    if (typeof EventSource === 'undefined' || changeStream) return
+    changeStream = new EventSource('/api/v1/notifications/events', { withCredentials: true })
+    changeStream.onmessage = () => {
+      void refreshUnreadSummary()
+    }
+  }
+
+  /** 登录桌面后启动实时变化监听与可见性轮询兜底。 */
   function startPolling() {
     if (started) return
     started = true
     void refreshUnreadSummary()
+    startChangeStream()
     timer = window.setInterval(() => {
       if (document.visibilityState === 'visible') void refreshUnreadSummary()
     }, POLL_INTERVAL_MS)
@@ -63,7 +74,7 @@ export const useNotificationCenterStore = defineStore('notification-center', () 
     if (document.visibilityState === 'visible') void refreshUnreadSummary()
   }
 
-  /** 登出或 Shell 卸载时停止轮询并清除当前用户状态。 */
+  /** 登出或 Shell 卸载时停止实时监听与轮询，并按需清除当前用户状态。 */
   function stopPolling(resetState = false) {
     started = false
     if (timer !== undefined) window.clearInterval(timer)
@@ -72,6 +83,11 @@ export const useNotificationCenterStore = defineStore('notification-center', () 
     requestSequence += 1
     controller?.abort()
     controller = undefined
+    if (changeStream) {
+      changeStream.onmessage = null
+      changeStream.close()
+      changeStream = undefined
+    }
     polling.value = false
     if (resetState) {
       unreadCount.value = 0

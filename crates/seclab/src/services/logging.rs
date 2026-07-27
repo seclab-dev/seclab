@@ -19,7 +19,7 @@ use seclab_contracts::notification::{
 };
 use serde_json::Value;
 use sqlx::{FromRow, QueryBuilder, Sqlite, Transaction};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{error, warn};
 
 use crate::{
@@ -38,6 +38,24 @@ const RUNTIME_REGISTER_MAX_IDENTITIES: usize = 4_096;
 const INCREMENTAL_VACUUM_MAX_PAGES: i64 = 1_024;
 static WRITER: OnceLock<mpsc::Sender<StoredOperationEvent>> = OnceLock::new();
 static RUNTIME_REGISTER_AGGREGATOR: OnceLock<Mutex<RuntimeRegisterAggregator>> = OnceLock::new();
+static NOTIFICATION_CHANGES: OnceLock<broadcast::Sender<i64>> = OnceLock::new();
+
+fn notification_changes() -> &'static broadcast::Sender<i64> {
+    NOTIFICATION_CHANGES.get_or_init(|| {
+        let (sender, _) = broadcast::channel(1_024);
+        sender
+    })
+}
+
+/// 订阅个人通知变化信号；信号仅包含收件人用户 ID，不包含通知内容。
+pub fn subscribe_notification_changes() -> broadcast::Receiver<i64> {
+    notification_changes().subscribe()
+}
+
+/// 在通知状态已经持久化后广播变化，供当前用户的实时连接刷新权威摘要。
+pub fn publish_notification_change(recipient_user_id: i64) {
+    let _ = notification_changes().send(recipient_user_id);
+}
 
 /// 初始化进程内唯一的操作日志写入队列。
 pub fn init_operation_log_writer(pool: DbPool) {
@@ -770,10 +788,15 @@ async fn insert_event(pool: &DbPool, event: &StoredOperationEvent) -> Result<(),
         .bind(&event.target_display_name).bind(&event.target_ownership).bind(event.outcome.as_str()).bind(event.impact.as_str())
         .bind(&event.trace_id).bind(&event.task_id).bind(&event.client_ip).bind(&event.request_method).bind(&event.route_template)
         .bind(&event.parameters_json).bind(&event.error_code).bind(&event.error_summary).execute(&mut *transaction).await?;
-    if result.rows_affected() > 0 {
-        project_notification(&mut transaction, event).await?;
-    }
+    let recipients = if result.rows_affected() > 0 {
+        project_notification(&mut transaction, event).await?
+    } else {
+        Vec::new()
+    };
     transaction.commit().await?;
+    for recipient_user_id in recipients {
+        publish_notification_change(recipient_user_id);
+    }
     Ok(())
 }
 
@@ -804,14 +827,14 @@ enum NotificationAttentionPolicy {
 async fn project_notification(
     transaction: &mut Transaction<'_, Sqlite>,
     event: &StoredOperationEvent,
-) -> Result<(), ApiError> {
+) -> Result<Vec<i64>, ApiError> {
     let Some(registration) = notification_registration(event) else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let recipients = notification_recipients(transaction, event, registration.recipients).await?;
     if recipients.is_empty() {
         warn!(event_id = %event.event_id, event_code = %event.event_code, "Notification event has no trusted recipient");
-        return Ok(());
+        return Ok(Vec::new());
     }
     let parameters =
         serde_json::from_str::<BTreeMap<String, OperationParameterValue>>(&event.parameters_json)
@@ -822,9 +845,10 @@ async fn project_notification(
     let parameters_json = serde_json::to_string(&parameters).unwrap_or_else(|_| "{}".to_string());
     let attention_level = notification_attention_level(registration.attention, event.outcome);
     let outcome = registration.include_outcome.then(|| event.outcome.as_str());
+    let mut inserted_recipients = Vec::with_capacity(recipients.len());
     for recipient_user_id in recipients {
         let notification_id = new_uuid_v7();
-        sqlx::query(
+        let result = sqlx::query(
             r#"
             INSERT OR IGNORE INTO user_notifications (
                 notification_id, recipient_user_id, operation_event_id, created_at,
@@ -857,8 +881,11 @@ async fn project_notification(
         .bind(&event.occurred_at)
         .execute(&mut **transaction)
         .await?;
+        if result.rows_affected() > 0 {
+            inserted_recipients.push(recipient_user_id);
+        }
     }
-    Ok(())
+    Ok(inserted_recipients)
 }
 
 fn notification_registration(event: &StoredOperationEvent) -> Option<NotificationRegistration> {
@@ -1949,16 +1976,19 @@ mod tests {
     #[tokio::test]
     async fn registered_terminal_event_projects_once_with_safe_parameters() {
         let pool = setup_test_db().await;
-        sqlx::query("INSERT INTO users (id, username, password_hash) VALUES (1, 'admin', 'hash')")
+        let recipient_user_id = 700_001;
+        sqlx::query("INSERT INTO users (id, username, password_hash) VALUES (?, 'admin', 'hash')")
+            .bind(recipient_user_id)
             .execute(&pool)
             .await
             .unwrap();
+        let mut changes = subscribe_notification_changes();
         let mut event = OperationEventBuilder::new(
             "admin",
             "script_run_completed",
             "127.0.0.1".parse().unwrap(),
         )
-        .user_id(1)
+        .user_id(recipient_user_id)
         .target_type("script")
         .target_id("script-1")
         .task_id("run-1")
@@ -1972,7 +2002,28 @@ mod tests {
         .to_string();
 
         insert_event(&pool, &event).await.unwrap();
+        let changed_user_id = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let changed_user_id = changes.recv().await.unwrap();
+                if changed_user_id == recipient_user_id {
+                    break changed_user_id;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(changed_user_id, recipient_user_id);
         insert_event(&pool, &event).await.unwrap();
+        let duplicate_signal = tokio::time::timeout(std::time::Duration::from_millis(50), async {
+            loop {
+                let changed_user_id = changes.recv().await.unwrap();
+                if changed_user_id == recipient_user_id {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(duplicate_signal.is_err());
 
         let operation_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM operation_logs")
             .fetch_one(&pool)
@@ -1996,13 +2047,57 @@ mod tests {
         .unwrap();
         assert_eq!(operation_count, 1);
         assert_eq!(notification_count, 1);
-        assert_eq!(recipient, 1);
+        assert_eq!(recipient, recipient_user_id);
         assert_eq!(code, "scriptRunFinished");
         assert_eq!(attention_level, "info");
         assert_eq!(outcome.as_deref(), Some("success"));
         assert!(parameters.contains("Safe Script"));
         assert!(!parameters.contains("token"));
         assert!(!parameters.contains("unregistered"));
+    }
+
+    #[tokio::test]
+    async fn failed_notification_transaction_does_not_publish_change() {
+        let pool = setup_test_db().await;
+        let recipient_user_id = 700_002;
+        sqlx::query("INSERT INTO users (id, username, password_hash) VALUES (?, 'admin', 'hash')")
+            .bind(recipient_user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE user_notifications")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut changes = subscribe_notification_changes();
+        let event = OperationEventBuilder::new(
+            "admin",
+            "script_run_completed",
+            "127.0.0.1".parse().unwrap(),
+        )
+        .user_id(recipient_user_id)
+        .target_type("script")
+        .target_id("script-1")
+        .task_id("run-1")
+        .set_success()
+        .event;
+
+        assert!(insert_event(&pool, &event).await.is_err());
+        let matching_signal = tokio::time::timeout(std::time::Duration::from_millis(50), async {
+            loop {
+                let changed_user_id = changes.recv().await.unwrap();
+                if changed_user_id == recipient_user_id {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(matching_signal.is_err());
+        let operation_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM operation_logs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(operation_count, 0);
     }
 
     #[test]
