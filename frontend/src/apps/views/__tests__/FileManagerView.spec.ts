@@ -11,6 +11,13 @@ const api = vi.hoisted(() => ({
   forNode: vi.fn(),
   openWindowWithPayload: vi.fn(),
 }))
+const operations = vi.hoisted(() => ({
+  removePath: vi.fn(),
+  runPathTask: vi.fn(),
+}))
+const confirmation = vi.hoisted(() => ({
+  showConfirmation: vi.fn(),
+}))
 
 vi.mock('@/api/modules/fs', () => ({ fsApi: { forNode: api.forNode } }))
 vi.mock('@/stores/node', () => ({
@@ -25,13 +32,16 @@ vi.mock('@/stores/window-manager', () => ({
 vi.mock('@/stores/toast', () => ({
   useToastStore: () => ({ error: vi.fn(), success: vi.fn() }),
 }))
+vi.mock('@/stores/confirmation-modal', () => ({
+  useConfirmationModalStore: () => confirmation,
+}))
 vi.mock('@/composables/useFileOperations', () => ({
   useFileOperations: () => ({
     createFile: vi.fn(),
     mkdir: vi.fn(),
-    removePath: vi.fn(),
+    removePath: operations.removePath,
     renamePath: vi.fn(),
-    runPathTask: vi.fn(),
+    runPathTask: operations.runPathTask,
     downloadFile: vi.fn(),
     uploadFile: vi.fn(),
     resumeActiveTasks: vi.fn().mockResolvedValue(undefined),
@@ -41,10 +51,10 @@ vi.mock('@/composables/useFileOperations', () => ({
 
 const response = <T>(data: T) => ({ success: true, code: 200, message: '', data })
 
-const entry = (name: string, path: string): FsEntry => ({
+const entry = (name: string, path: string, kind: FsEntry['kind'] = 'file'): FsEntry => ({
   name,
   path,
-  kind: 'file',
+  kind,
   sizeBytes: 1,
   revision: `revision-${name}`,
   management: { kind: 'custom' },
@@ -90,6 +100,9 @@ describe('FileManagerView', () => {
     api.forNode.mockReturnValue({ home: api.home, listEntries: api.listEntries })
     api.home.mockResolvedValue(response({ path: '/home' }))
     api.listEntries.mockResolvedValue(response(page('/home', [])))
+    confirmation.showConfirmation.mockResolvedValue(false)
+    operations.removePath.mockResolvedValue(true)
+    operations.runPathTask.mockResolvedValue(true)
   })
 
   it('固定使用窗口节点并让最新路径请求获胜', async () => {
@@ -172,6 +185,95 @@ describe('FileManagerView', () => {
 
     expect(wrapper.text()).toContain('retained.txt')
     expect(wrapper.text()).toContain('node unavailable')
+    wrapper.unmount()
+  })
+
+  it('取消目录删除确认时不调用删除接口', async () => {
+    const directory = entry('archive', '/home/archive', 'directory')
+    api.listEntries.mockResolvedValue(response(page('/home', [directory])))
+    const wrapper = mount(FileManagerView, {
+      props: { payload: { nodeId: 'node-a' } },
+      global: {
+        plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })],
+      },
+    })
+    await flushPromises()
+
+    await (
+      wrapper.vm as unknown as { handleDelete: (item: FsEntry) => Promise<void> }
+    ).handleDelete(directory)
+
+    expect(confirmation.showConfirmation).toHaveBeenCalledWith(
+      expect.stringContaining('/home/archive'),
+      '确认删除',
+      '确认删除',
+      '取消',
+      'danger',
+    )
+    expect(operations.removePath).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('确认单项删除时保留路径、递归参数和 revision', async () => {
+    confirmation.showConfirmation.mockResolvedValue(true)
+    const file = entry('report.txt', '/home/report.txt')
+    api.listEntries.mockResolvedValue(response(page('/home', [file])))
+    const wrapper = mount(FileManagerView, {
+      props: { payload: { nodeId: 'node-a' } },
+      global: {
+        plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })],
+      },
+    })
+    await flushPromises()
+
+    await (
+      wrapper.vm as unknown as { handleDelete: (item: FsEntry) => Promise<void> }
+    ).handleDelete(file)
+    await flushPromises()
+
+    expect(operations.removePath).toHaveBeenCalledWith(
+      '/home/report.txt',
+      true,
+      'revision-report.txt',
+    )
+    wrapper.unmount()
+  })
+
+  it('批量删除只使用确认弹窗打开时的路径快照', async () => {
+    const confirmationResult = deferred<boolean>()
+    confirmation.showConfirmation.mockReturnValue(confirmationResult.promise)
+    const wrapper = mount(FileManagerView, {
+      props: { payload: { nodeId: 'node-a' } },
+      global: {
+        plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })],
+      },
+    })
+    await flushPromises()
+    const view = wrapper.vm as unknown as {
+      toggleSelection: (path: string, checked: boolean) => void
+      handleBatchDelete: () => Promise<void>
+    }
+    view.toggleSelection('/home/a', true)
+    view.toggleSelection('/home/b', true)
+
+    const deletion = view.handleBatchDelete()
+    view.toggleSelection('/home/c', true)
+    confirmationResult.resolve(true)
+    await deletion
+    await flushPromises()
+
+    expect(confirmation.showConfirmation).toHaveBeenCalledWith(
+      expect.stringContaining('2'),
+      '确认批量删除',
+      '确认删除',
+      '取消',
+      'danger',
+    )
+    expect(operations.runPathTask).toHaveBeenCalledWith(
+      'remove',
+      [{ path: '/home/a' }, { path: '/home/b' }],
+      true,
+    )
     wrapper.unmount()
   })
 })

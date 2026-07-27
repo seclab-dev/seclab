@@ -1692,6 +1692,15 @@ const en = {
       rename: 'Rename',
       delete: 'Delete',
       batchDelete: 'Batch Delete',
+      deleteTitle: 'Confirm deletion',
+      batchDeleteTitle: 'Confirm batch deletion',
+      confirmDelete: 'Confirm deletion',
+      deleteItemWarning:
+        'The {type} "{path}" will be deleted. This action cannot be undone. Continue?',
+      deleteDirectoryWarning:
+        'The directory "{path}" and all of its contents will be deleted recursively. This action cannot be undone. Continue?',
+      batchDeleteWarning:
+        '{count} selected items will be deleted. Directories and all of their contents will be deleted recursively. This action cannot be undone. Continue?',
       batchMove: 'Batch Move',
       batchCopy: 'Batch Copy',
       targetPath: 'Target Path',

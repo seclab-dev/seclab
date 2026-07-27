@@ -6,6 +6,7 @@ export interface ConfirmationModalData {
   message: string
   confirmText: string
   cancelText: string
+  type: 'primary' | 'danger'
   isVisible: boolean
   resolve: ((confirmed: boolean) => void) | null // 用于解决 Promise 的函数
 }
@@ -16,6 +17,7 @@ export const useConfirmationModalStore = defineStore('confirmationModal', () => 
     message: '',
     confirmText: '确认',
     cancelText: '取消',
+    type: 'primary',
     isVisible: false,
     resolve: null,
   })
@@ -26,6 +28,7 @@ export const useConfirmationModalStore = defineStore('confirmationModal', () => 
    * @param title 弹窗标题 (可选, 默认 '确认操作')。
    * @param confirmText 确认按钮文本 (可选, 默认 '确认')。
    * @param cancelText 取消按钮文本 (可选, 默认 '取消')。
+   * @param type 确认操作类型 (可选, 默认 'primary')。
    * @returns Promise<boolean> 如果用户点击确认，返回 true；否则返回 false。
    */
   function showConfirmation(
@@ -33,6 +36,7 @@ export const useConfirmationModalStore = defineStore('confirmationModal', () => 
     title: string = '确认操作',
     confirmText: string = '确认',
     cancelText: string = '取消',
+    type: 'primary' | 'danger' = 'primary',
   ): Promise<boolean> {
     return new Promise((resolve) => {
       modalData.value = {
@@ -40,6 +44,7 @@ export const useConfirmationModalStore = defineStore('confirmationModal', () => 
         message,
         confirmText,
         cancelText,
+        type,
         isVisible: true,
         resolve: resolve as (confirmed: boolean) => void,
       }

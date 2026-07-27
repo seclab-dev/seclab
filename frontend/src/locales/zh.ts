@@ -1667,6 +1667,13 @@ const zh: typeof en = {
       rename: '重命名',
       delete: '删除',
       batchDelete: '批量删除',
+      deleteTitle: '确认删除',
+      batchDeleteTitle: '确认批量删除',
+      confirmDelete: '确认删除',
+      deleteItemWarning: '即将删除{type}“{path}”。删除后无法恢复，是否继续？',
+      deleteDirectoryWarning: '即将删除目录“{path}”及其中的全部内容。删除后无法恢复，是否继续？',
+      batchDeleteWarning:
+        '即将删除选中的 {count} 项；其中的目录会连同全部内容递归删除。删除后无法恢复，是否继续？',
       batchMove: '批量移动',
       batchCopy: '批量复制',
       targetPath: '目标路径',

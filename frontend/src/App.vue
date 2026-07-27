@@ -39,6 +39,7 @@ const modalStore = useConfirmationModalStore()
     :message="modalStore.modalData.message"
     :confirm-text="modalStore.modalData.confirmText"
     :cancel-text="modalStore.modalData.cancelText"
+    :type="modalStore.modalData.type"
     data-ui="global-confirmation-modal"
     style="z-index: calc(var(--sdl-z-index-modal) + 10)"
     @confirm="modalStore.handleModalResponse(true)"

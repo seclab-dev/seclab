@@ -5,6 +5,7 @@ import type { FsEntry } from '@/api/interface/fs'
 import { useToastStore } from '@/stores/toast'
 import { useNodeStore } from '@/stores/node'
 import { useWindowManagerStore } from '@/stores/window-manager'
+import { useConfirmationModalStore } from '@/stores/confirmation-modal'
 import { useI18n } from 'vue-i18n'
 import SecLabTable, { type SecLabTableColumn } from '@/components/ui/SecLabTable.vue'
 import {
@@ -37,6 +38,7 @@ const { t } = useI18n()
 const toastStore = useToastStore()
 const nodeStore = useNodeStore()
 const windowStore = useWindowManagerStore()
+const confirmationStore = useConfirmationModalStore()
 const targetNodeId = ref(
   typeof props.payload?.nodeId === 'string' ? props.payload.nodeId : nodeStore.currentNodeId,
 )
@@ -339,14 +341,24 @@ const isAllSelected = computed(() => {
 
 const handleBatchDelete = async () => {
   if (selectedPaths.value.size === 0) return
+  const pathSnapshot = Array.from(selectedPaths.value)
+  const confirmed = await confirmationStore.showConfirmation(
+    t('app.fileManager.batchDeleteWarning', { count: pathSnapshot.length }),
+    t('app.fileManager.batchDeleteTitle'),
+    t('app.fileManager.confirmDelete'),
+    t('app.fileManager.cancel'),
+    'danger',
+  )
+  if (!confirmed) return
+
   await runFileOperation(async () => {
     const success = await runPathTask(
       'remove',
-      Array.from(selectedPaths.value).map((path) => ({ path })),
+      pathSnapshot.map((path) => ({ path })),
       true,
     )
     if (success) {
-      selectedPaths.value.clear()
+      pathSnapshot.forEach((path) => selectedPaths.value.delete(path))
       await refresh()
     }
   })
@@ -431,6 +443,20 @@ const handleDownload = async (entry: FsEntry) => {
 }
 const handleDelete = async (entry: FsEntry) => {
   if (!entry.capabilities.canRemove) return
+  const confirmed = await confirmationStore.showConfirmation(
+    entry.kind === 'directory'
+      ? t('app.fileManager.deleteDirectoryWarning', { path: entry.path })
+      : t('app.fileManager.deleteItemWarning', {
+          path: entry.path,
+          type: entryKindLabel(entry.kind),
+        }),
+    t('app.fileManager.deleteTitle'),
+    t('app.fileManager.confirmDelete'),
+    t('app.fileManager.cancel'),
+    'danger',
+  )
+  if (!confirmed) return
+
   await runFileOperation(async () => {
     const success = await removePath(entry.path, true, entry.revision)
     if (success) {
