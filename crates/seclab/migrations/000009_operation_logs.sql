@@ -31,10 +31,11 @@ CREATE INDEX idx_operation_logs_occurred_event
 CREATE INDEX idx_operation_logs_module_occurred
     ON operation_logs (module, occurred_at DESC, event_id DESC);
 CREATE INDEX idx_operation_logs_actor_occurred
-    ON operation_logs (actor_user_id, occurred_at DESC, event_id DESC);
+    ON operation_logs (actor_user_id, occurred_at DESC, event_id DESC)
+    WHERE actor_user_id IS NOT NULL;
 CREATE INDEX idx_operation_logs_origin_occurred
-    ON operation_logs (origin_node_id, occurred_at DESC, event_id DESC);
-CREATE INDEX idx_operation_logs_trace_id ON operation_logs (trace_id);
+    ON operation_logs (origin_node_id, occurred_at DESC, event_id DESC)
+    WHERE origin_node_id IS NOT NULL;
 
 CREATE TABLE user_notifications (
     notification_id TEXT PRIMARY KEY,

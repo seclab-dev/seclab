@@ -1,6 +1,10 @@
 //! 操作审计服务：事件归一化、best-effort 队列、查询与保留清理。
 
-use std::{collections::BTreeMap, net::IpAddr, sync::OnceLock};
+use std::{
+    collections::{BTreeMap, HashMap},
+    net::IpAddr,
+    sync::{Mutex, OnceLock},
+};
 
 use axum::http::HeaderMap;
 use chrono::{DateTime, Duration, Utc};
@@ -27,7 +31,13 @@ use crate::{
 const QUEUE_CAPACITY: usize = 2_048;
 const MAX_ERROR_SUMMARY_BYTES: usize = 512;
 const RETENTION_DAYS: i64 = 180;
+const RUNTIME_RETENTION_DAYS: i64 = 30;
+const RUNTIME_REGISTER_SUMMARY_MINUTES: i64 = 10;
+const RUNTIME_REGISTER_IDLE_MINUTES: i64 = 60;
+const RUNTIME_REGISTER_MAX_IDENTITIES: usize = 4_096;
+const INCREMENTAL_VACUUM_MAX_PAGES: i64 = 1_024;
 static WRITER: OnceLock<mpsc::Sender<StoredOperationEvent>> = OnceLock::new();
+static RUNTIME_REGISTER_AGGREGATOR: OnceLock<Mutex<RuntimeRegisterAggregator>> = OnceLock::new();
 
 /// 初始化进程内唯一的操作日志写入队列。
 pub fn init_operation_log_writer(pool: DbPool) {
@@ -40,6 +50,19 @@ pub fn init_operation_log_writer(pool: DbPool) {
             enrich_target_display_name(&pool, &mut event).await;
             if let Err(err) = insert_event(&pool, &event).await {
                 error!(event_id = %event.event_id, error = %err, "Operation audit event write failed");
+            }
+        }
+    });
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            for event in runtime_register_aggregator()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .flush_due(Utc::now())
+            {
+                enqueue_event(event);
             }
         }
     });
@@ -200,6 +223,35 @@ impl OperationEventBuilder {
 
     /// 非阻塞提交到统一队列；队列不可用时只记录运行警告，不改变业务结果。
     pub fn finish(mut self, _pool: &DbPool) {
+        self.prepare_for_storage();
+        enqueue_event(self.event);
+    }
+
+    /// 聚合相同身份与原因的连续运行时注册失败。
+    pub fn finish_runtime_register_failure(mut self, _pool: &DbPool) {
+        self.prepare_for_storage();
+        let events = runtime_register_aggregator()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_failure(self.event, Utc::now());
+        for event in events {
+            enqueue_event(event);
+        }
+    }
+
+    /// 刷新当前身份的注册失败汇总后记录恢复成功。
+    pub fn finish_runtime_register_success(mut self, _pool: &DbPool) {
+        self.prepare_for_storage();
+        let events = runtime_register_aggregator()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_success(self.event, Utc::now());
+        for event in events {
+            enqueue_event(event);
+        }
+    }
+
+    fn prepare_for_storage(&mut self) {
         let (parameters, error_code, error_summary) =
             sanitize_parameters(self.raw_parameters.take());
         self.event.parameters_json =
@@ -207,12 +259,192 @@ impl OperationEventBuilder {
         normalize_operation_target(&mut self.event, &parameters);
         self.event.error_code = error_code;
         self.event.error_summary = error_summary;
-        match WRITER.get() {
-            Some(sender) if sender.try_send(self.event).is_ok() => {}
-            Some(_) => warn!("Operation audit queue is full; event was dropped"),
-            None => warn!("Operation audit queue is not initialized; event was dropped"),
+    }
+}
+
+/// 将审计事件以 best-effort 方式提交到单一写入队列。
+fn enqueue_event(event: StoredOperationEvent) {
+    match WRITER.get() {
+        Some(sender) if sender.try_send(event).is_ok() => {}
+        Some(_) => warn!("Operation audit queue is full; event was dropped"),
+        None => warn!("Operation audit queue is not initialized; event was dropped"),
+    }
+}
+
+/// 返回进程内唯一的运行时注册失败聚合器。
+fn runtime_register_aggregator() -> &'static Mutex<RuntimeRegisterAggregator> {
+    RUNTIME_REGISTER_AGGREGATOR.get_or_init(|| Mutex::new(RuntimeRegisterAggregator::default()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// 标识一个独立的 Agent 注册来源。
+struct RuntimeRegisterIdentity {
+    agent_id: String,
+    client_ip: String,
+}
+
+#[derive(Debug)]
+/// 保存一个注册来源当前失败原因及尚未写出的重复次数。
+struct PendingRuntimeRegisterFailure {
+    template: StoredOperationEvent,
+    reason_fingerprint: String,
+    last_emitted_at: DateTime<Utc>,
+    last_activity_at: DateTime<Utc>,
+    suppressed_started_at: Option<DateTime<Utc>>,
+    suppressed_count: u64,
+}
+
+#[derive(Debug, Default)]
+/// 对高频、同原因的注册失败执行有界内存聚合。
+struct RuntimeRegisterAggregator {
+    entries: HashMap<RuntimeRegisterIdentity, PendingRuntimeRegisterFailure>,
+}
+
+impl RuntimeRegisterAggregator {
+    /// 记录失败，返回当前需要立即写入的首条或汇总事件。
+    fn record_failure(
+        &mut self,
+        event: StoredOperationEvent,
+        now: DateTime<Utc>,
+    ) -> Vec<StoredOperationEvent> {
+        let identity = runtime_register_identity(&event);
+        let fingerprint = runtime_register_reason_fingerprint(&event);
+        let Some(pending) = self.entries.get_mut(&identity) else {
+            let mut events = self.evict_if_full(now);
+            self.entries.insert(
+                identity,
+                PendingRuntimeRegisterFailure {
+                    template: event.clone(),
+                    reason_fingerprint: fingerprint,
+                    last_emitted_at: now,
+                    last_activity_at: now,
+                    suppressed_started_at: None,
+                    suppressed_count: 0,
+                },
+            );
+            events.push(event);
+            return events;
+        };
+
+        if pending.reason_fingerprint != fingerprint {
+            let mut events = pending.take_summary(now).into_iter().collect::<Vec<_>>();
+            *pending = PendingRuntimeRegisterFailure {
+                template: event.clone(),
+                reason_fingerprint: fingerprint,
+                last_emitted_at: now,
+                last_activity_at: now,
+                suppressed_started_at: None,
+                suppressed_count: 0,
+            };
+            events.push(event);
+            return events;
+        }
+
+        pending.last_activity_at = now;
+        pending.suppressed_started_at.get_or_insert(now);
+        pending.suppressed_count = pending.suppressed_count.saturating_add(1);
+        if now - pending.last_emitted_at >= Duration::minutes(RUNTIME_REGISTER_SUMMARY_MINUTES) {
+            pending.take_summary(now).into_iter().collect()
+        } else {
+            Vec::new()
         }
     }
+
+    /// 记录恢复成功，并在成功事件前返回尚未写出的失败汇总。
+    fn record_success(
+        &mut self,
+        event: StoredOperationEvent,
+        now: DateTime<Utc>,
+    ) -> Vec<StoredOperationEvent> {
+        let identity = runtime_register_identity(&event);
+        let mut events = self
+            .entries
+            .remove(&identity)
+            .and_then(|mut pending| pending.take_summary(now))
+            .into_iter()
+            .collect::<Vec<_>>();
+        events.push(event);
+        events
+    }
+
+    /// 写出到期汇总并移除长时间闲置的来源。
+    fn flush_due(&mut self, now: DateTime<Utc>) -> Vec<StoredOperationEvent> {
+        let mut events = Vec::new();
+        self.entries.retain(|_, pending| {
+            let idle =
+                now - pending.last_activity_at >= Duration::minutes(RUNTIME_REGISTER_IDLE_MINUTES);
+            let summary_due = now - pending.last_emitted_at
+                >= Duration::minutes(RUNTIME_REGISTER_SUMMARY_MINUTES);
+            if (idle || summary_due)
+                && let Some(summary) = pending.take_summary(now)
+            {
+                events.push(summary);
+            }
+            !idle
+        });
+        events
+    }
+
+    /// 达到容量上限时淘汰最久未活动的来源，并先写出其累计。
+    fn evict_if_full(&mut self, now: DateTime<Utc>) -> Vec<StoredOperationEvent> {
+        if self.entries.len() < RUNTIME_REGISTER_MAX_IDENTITIES {
+            return Vec::new();
+        }
+        let Some(identity) = self
+            .entries
+            .iter()
+            .min_by_key(|(_, pending)| pending.last_activity_at)
+            .map(|(identity, _)| identity.clone())
+        else {
+            return Vec::new();
+        };
+        self.entries
+            .remove(&identity)
+            .and_then(|mut pending| pending.take_summary(now))
+            .into_iter()
+            .collect()
+    }
+}
+
+impl PendingRuntimeRegisterFailure {
+    /// 将尚未写出的重复失败转换为一条汇总审计事件。
+    fn take_summary(&mut self, now: DateTime<Utc>) -> Option<StoredOperationEvent> {
+        if self.suppressed_count == 0 {
+            self.last_emitted_at = now;
+            return None;
+        }
+        let mut summary = self.template.clone();
+        summary.event_id = new_uuid_v7();
+        summary.trace_id = new_uuid_v7();
+        summary.occurred_at = now.to_rfc3339();
+        summary.parameters_json = serde_json::json!({
+            "attemptCount": self.suppressed_count,
+            "windowStartedAt": self.suppressed_started_at.unwrap_or(self.last_emitted_at).to_rfc3339(),
+            "windowEndedAt": self.last_activity_at.to_rfc3339(),
+        })
+        .to_string();
+        self.suppressed_count = 0;
+        self.suppressed_started_at = None;
+        self.last_emitted_at = now;
+        Some(summary)
+    }
+}
+
+/// 从已净化的注册审计事件提取聚合身份。
+fn runtime_register_identity(event: &StoredOperationEvent) -> RuntimeRegisterIdentity {
+    RuntimeRegisterIdentity {
+        agent_id: event.target_id.clone().unwrap_or_default(),
+        client_ip: event.client_ip.clone(),
+    }
+}
+
+/// 使用脱敏后的错误编码和摘要生成稳定原因指纹。
+fn runtime_register_reason_fingerprint(event: &StoredOperationEvent) -> String {
+    format!(
+        "{}\u{1f}{}",
+        event.error_code.as_deref().unwrap_or_default(),
+        event.error_summary.as_deref().unwrap_or_default()
+    )
 }
 
 pub fn operation_log_success(
@@ -328,15 +560,66 @@ pub async fn store_agent_event(
     insert_event(pool, &stored).await
 }
 
-/// 分批删除超过 180 天的事件，避免长事务。
+/// 分批删除超过分级保留期的事件，避免长事务。
 pub async fn prune_expired_operation_logs(pool: &DbPool) -> Result<u64, ApiError> {
-    let cutoff = (Utc::now() - Duration::days(RETENTION_DAYS)).to_rfc3339();
-    let result = sqlx::query("DELETE FROM operation_logs WHERE event_id IN (SELECT event_id FROM operation_logs WHERE occurred_at < ? ORDER BY occurred_at LIMIT 1000)")
-        .bind(cutoff).execute(pool).await?;
+    prune_expired_operation_logs_at(pool, Utc::now()).await
+}
+
+/// 使用指定时间执行一次可测试的分级保留清理。
+async fn prune_expired_operation_logs_at(
+    pool: &DbPool,
+    now: DateTime<Utc>,
+) -> Result<u64, ApiError> {
+    let runtime_cutoff = (now - Duration::days(RUNTIME_RETENTION_DAYS)).to_rfc3339();
+    let default_cutoff = (now - Duration::days(RETENTION_DAYS)).to_rfc3339();
+    let result = sqlx::query(
+        "DELETE FROM operation_logs WHERE event_id IN (
+            SELECT event_id FROM operation_logs
+            WHERE (
+                event_code IN (
+                    'runtime_enroll',
+                    'runtime_register',
+                    'runtime_deregister',
+                    'runtime_rotate_certificate',
+                    'runtime_heartbeat'
+                )
+                AND occurred_at < ?
+            ) OR (
+                event_code NOT IN (
+                    'runtime_enroll',
+                    'runtime_register',
+                    'runtime_deregister',
+                    'runtime_rotate_certificate',
+                    'runtime_heartbeat'
+                )
+                AND occurred_at < ?
+            )
+            ORDER BY occurred_at
+            LIMIT 1000
+        )",
+    )
+    .bind(runtime_cutoff)
+    .bind(default_cutoff)
+    .execute(pool)
+    .await?;
     Ok(result.rows_affected())
 }
 
-/// 每日分批执行 180 天保留清理。
+/// 有界回收删除日志后产生的 SQLite 空闲页。
+async fn reclaim_unused_pages(pool: &DbPool) -> Result<u64, ApiError> {
+    let free_pages = sqlx::query_scalar::<_, i64>("PRAGMA freelist_count")
+        .fetch_one(pool)
+        .await?;
+    let pages_to_reclaim = free_pages.min(INCREMENTAL_VACUUM_MAX_PAGES);
+    if pages_to_reclaim > 0 {
+        sqlx::query(&format!("PRAGMA incremental_vacuum({pages_to_reclaim})"))
+            .execute(pool)
+            .await?;
+    }
+    Ok(pages_to_reclaim as u64)
+}
+
+/// 启动时及每日分批执行分级保留清理。
 pub fn spawn_retention_worker(pool: DbPool) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(24 * 60 * 60));
@@ -345,7 +628,12 @@ pub fn spawn_retention_worker(pool: DbPool) {
             loop {
                 match prune_expired_operation_logs(&pool).await {
                     Ok(1_000) => continue,
-                    Ok(_) => break,
+                    Ok(_) => {
+                        if let Err(error) = reclaim_unused_pages(&pool).await {
+                            error!(%error, "Operation log incremental vacuum failed");
+                        }
+                        break;
+                    }
                     Err(error) => {
                         error!(%error, "Operation log retention cleanup failed");
                         break;
@@ -356,7 +644,7 @@ pub fn spawn_retention_worker(pool: DbPool) {
     });
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct StoredOperationEvent {
     event_id: String,
     occurred_at: String,
@@ -1218,6 +1506,30 @@ fn parse_origin_kind(value: &str) -> Result<OperationOriginKind, ApiError> {
 mod tests {
     use super::*;
     use crate::test_support::setup_test_db;
+
+    fn runtime_register_event(
+        agent_id: &str,
+        client_ip: &str,
+        error_summary: Option<&str>,
+    ) -> StoredOperationEvent {
+        let mut event = OperationEventBuilder::new(
+            "runtime-agent",
+            "runtime_register",
+            client_ip.parse().unwrap(),
+        )
+        .target_type("agent")
+        .target_id(agent_id)
+        .event;
+        event.error_summary = error_summary.map(str::to_string);
+        event
+    }
+
+    fn timestamp(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
     #[test]
     fn sanitizer_drops_sensitive_and_complex_values() {
         let (parameters, code, summary) = sanitize_parameters(Some(
@@ -1254,6 +1566,153 @@ mod tests {
         );
         assert_eq!(sanitize_reported_client_ip(Some("forwarded-client")), None);
         assert_eq!(sanitize_reported_client_ip(None), None);
+    }
+
+    #[test]
+    fn runtime_register_failures_emit_first_and_periodic_summary() {
+        let mut aggregator = RuntimeRegisterAggregator::default();
+        let started_at = timestamp("2026-01-01T00:00:00Z");
+
+        let first = aggregator.record_failure(
+            runtime_register_event("agent-1", "127.0.0.1", Some("unknown agent")),
+            started_at,
+        );
+        assert_eq!(first.len(), 1);
+
+        let suppressed = aggregator.record_failure(
+            runtime_register_event("agent-1", "127.0.0.1", Some("unknown agent")),
+            started_at + Duration::seconds(20),
+        );
+        assert!(suppressed.is_empty());
+
+        let summary = aggregator.record_failure(
+            runtime_register_event("agent-1", "127.0.0.1", Some("unknown agent")),
+            started_at + Duration::minutes(10),
+        );
+        assert_eq!(summary.len(), 1);
+        let parameters: Value = serde_json::from_str(&summary[0].parameters_json).unwrap();
+        assert_eq!(parameters["attemptCount"], 2);
+        assert_eq!(parameters["windowStartedAt"], "2026-01-01T00:00:20+00:00");
+        assert_eq!(parameters["windowEndedAt"], "2026-01-01T00:10:00+00:00");
+    }
+
+    #[test]
+    fn runtime_register_reason_change_and_success_flush_pending_failures() {
+        let mut aggregator = RuntimeRegisterAggregator::default();
+        let started_at = timestamp("2026-01-01T00:00:00Z");
+        aggregator.record_failure(
+            runtime_register_event("agent-1", "127.0.0.1", Some("unknown agent")),
+            started_at,
+        );
+        aggregator.record_failure(
+            runtime_register_event("agent-1", "127.0.0.1", Some("unknown agent")),
+            started_at + Duration::seconds(20),
+        );
+
+        let changed = aggregator.record_failure(
+            runtime_register_event("agent-1", "127.0.0.1", Some("certificate rejected")),
+            started_at + Duration::minutes(1),
+        );
+        assert_eq!(changed.len(), 2);
+        assert_eq!(changed[0].error_summary.as_deref(), Some("unknown agent"));
+        assert_eq!(
+            changed[1].error_summary.as_deref(),
+            Some("certificate rejected")
+        );
+
+        aggregator.record_failure(
+            runtime_register_event("agent-1", "127.0.0.1", Some("certificate rejected")),
+            started_at + Duration::minutes(2),
+        );
+        let mut success_event = runtime_register_event("agent-1", "127.0.0.1", None);
+        success_event.outcome = OperationOutcome::Success;
+        success_event.impact = OperationImpact::Info;
+        let recovered = aggregator.record_success(success_event, started_at + Duration::minutes(3));
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0].outcome, OperationOutcome::Failure);
+        assert_eq!(recovered[1].outcome, OperationOutcome::Success);
+        assert!(aggregator.entries.is_empty());
+    }
+
+    #[test]
+    fn runtime_register_aggregator_separates_identities_and_flushes_idle_entries() {
+        let mut aggregator = RuntimeRegisterAggregator::default();
+        let started_at = timestamp("2026-01-01T00:00:00Z");
+        assert_eq!(
+            aggregator
+                .record_failure(
+                    runtime_register_event("agent-1", "127.0.0.1", Some("failed")),
+                    started_at,
+                )
+                .len(),
+            1
+        );
+        assert_eq!(
+            aggregator
+                .record_failure(
+                    runtime_register_event("agent-1", "127.0.0.2", Some("failed")),
+                    started_at,
+                )
+                .len(),
+            1
+        );
+        aggregator.record_failure(
+            runtime_register_event("agent-1", "127.0.0.1", Some("failed")),
+            started_at + Duration::seconds(20),
+        );
+
+        let flushed = aggregator.flush_due(started_at + Duration::minutes(61));
+        assert_eq!(flushed.len(), 1);
+        assert!(aggregator.entries.is_empty());
+    }
+
+    #[test]
+    fn runtime_register_aggregator_flushes_counts_before_capacity_eviction() {
+        let mut aggregator = RuntimeRegisterAggregator::default();
+        let started_at = timestamp("2026-01-01T00:00:00Z");
+        aggregator.record_failure(
+            runtime_register_event("agent-0", "127.0.0.1", Some("failed")),
+            started_at,
+        );
+        aggregator.record_failure(
+            runtime_register_event("agent-0", "127.0.0.1", Some("failed")),
+            started_at,
+        );
+        for index in 1..RUNTIME_REGISTER_MAX_IDENTITIES {
+            aggregator.record_failure(
+                runtime_register_event(&format!("agent-{index}"), "127.0.0.1", Some("failed")),
+                started_at + Duration::seconds(1),
+            );
+        }
+
+        let events = aggregator.record_failure(
+            runtime_register_event("agent-new", "127.0.0.1", Some("failed")),
+            started_at + Duration::seconds(2),
+        );
+        assert_eq!(events.len(), 2);
+        let parameters: Value = serde_json::from_str(&events[0].parameters_json).unwrap();
+        assert_eq!(parameters["attemptCount"], 1);
+        assert_eq!(events[1].target_id.as_deref(), Some("agent-new"));
+        assert_eq!(aggregator.entries.len(), RUNTIME_REGISTER_MAX_IDENTITIES);
+    }
+
+    #[test]
+    fn four_days_of_twenty_second_retries_stay_below_expected_log_budget() {
+        let mut aggregator = RuntimeRegisterAggregator::default();
+        let started_at = timestamp("2026-01-01T00:00:00Z");
+        let attempts = 4 * 24 * 60 * 60 / 20;
+        let mut emitted = 0;
+        for attempt in 0..attempts {
+            emitted += aggregator
+                .record_failure(
+                    runtime_register_event("agent-1", "127.0.0.1", Some("failed")),
+                    started_at + Duration::seconds(i64::from(attempt * 20)),
+                )
+                .len();
+        }
+
+        assert!(emitted <= 577);
+        assert!(emitted * 10 < attempts as usize);
     }
 
     #[tokio::test]
@@ -1375,6 +1834,74 @@ mod tests {
         )
         .await;
         assert!(invalid.is_err());
+    }
+
+    #[tokio::test]
+    async fn retention_uses_runtime_and_default_cutoffs() {
+        let pool = setup_test_db().await;
+        let now = timestamp("2026-07-01T00:00:00Z");
+        for (event_code, occurred_at) in [
+            ("runtime_register", now - Duration::days(31)),
+            ("runtime_register", now - Duration::days(29)),
+            ("node_update", now - Duration::days(181)),
+            ("node_update", now - Duration::days(179)),
+        ] {
+            let mut event = runtime_register_event("agent-1", "127.0.0.1", Some("failed"));
+            event.event_code = event_code.to_string();
+            event.occurred_at = occurred_at.to_rfc3339();
+            insert_event(&pool, &event).await.unwrap();
+        }
+
+        assert_eq!(
+            prune_expired_operation_logs_at(&pool, now).await.unwrap(),
+            2
+        );
+        let remaining = sqlx::query_as::<_, (String, String)>(
+            "SELECT event_code, occurred_at FROM operation_logs ORDER BY occurred_at",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].0, "node_update");
+        assert_eq!(remaining[1].0, "runtime_register");
+    }
+
+    #[tokio::test]
+    async fn operation_log_indexes_are_compact_and_partial_where_expected() {
+        let pool = setup_test_db().await;
+        let indexes = sqlx::query_as::<_, (i64, String, i64, String, i64)>(
+            "PRAGMA index_list('operation_logs')",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            indexes
+                .iter()
+                .all(|(_, name, _, _, _)| name != "idx_operation_logs_trace_id")
+        );
+        for expected in [
+            "idx_operation_logs_occurred_event",
+            "idx_operation_logs_module_occurred",
+        ] {
+            assert!(
+                indexes
+                    .iter()
+                    .any(|(_, name, _, _, partial)| name == expected && *partial == 0)
+            );
+        }
+        for expected in [
+            "idx_operation_logs_actor_occurred",
+            "idx_operation_logs_origin_occurred",
+        ] {
+            assert!(
+                indexes
+                    .iter()
+                    .any(|(_, name, _, _, partial)| name == expected && *partial == 1)
+            );
+        }
     }
 
     #[tokio::test]

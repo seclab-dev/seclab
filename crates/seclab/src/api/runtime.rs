@@ -460,10 +460,11 @@ pub async fn register(
         payload.node.listen_port,
     )
     .await;
-    let response = match result {
+    match result {
         Ok(result) => {
             runtime_metrics::record_register(true);
             platform_log = platform_log.set_success();
+            platform_log.finish_runtime_register_success(&state.metadata_db);
 
             let state_clone = Arc::clone(&state);
             let agent_id = result.agent_id.clone();
@@ -496,11 +497,10 @@ pub async fn register(
         Err(err) => {
             runtime_metrics::record_register(false);
             platform_log = platform_log.metadata(json!({ "error": err }));
+            platform_log.finish_runtime_register_failure(&state.metadata_db);
             Err(err)
         }
-    };
-    platform_log.finish(&state.metadata_db);
-    response
+    }
 }
 
 pub async fn heartbeat(
