@@ -1,6 +1,6 @@
-//! Agent 操作审计 outbox：持久排队、批量读取、重试确认与保留清理。
+//! Agent 操作审计 outbox：持久排队、批量读取、重试与确认。
 
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use seclab_contracts::logging::AgentOperationEvent;
 use sqlx::FromRow;
 
@@ -48,18 +48,6 @@ pub async fn mark_failed(pool: &DbPool, event_ids: &[String]) -> Result<(), sqlx
             .bind(event_id).execute(pool).await?;
     }
     Ok(())
-}
-
-/// 删除确认超过七天的 outbox 项。
-pub async fn prune_delivered(pool: &DbPool) -> Result<u64, sqlx::Error> {
-    let cutoff = (Utc::now() - Duration::days(7)).to_rfc3339();
-    Ok(sqlx::query(
-        "DELETE FROM operation_event_outbox WHERE delivered_at IS NOT NULL AND delivered_at < ?",
-    )
-    .bind(cutoff)
-    .execute(pool)
-    .await?
-    .rows_affected())
 }
 
 #[cfg(test)]

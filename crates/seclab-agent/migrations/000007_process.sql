@@ -15,6 +15,3 @@ CREATE TABLE process_signal_operations (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
-
-CREATE INDEX idx_process_signal_operations_process
-    ON process_signal_operations(process_id, status);

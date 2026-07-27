@@ -49,4 +49,5 @@ CREATE UNIQUE INDEX idx_disk_operations_active_mount
 
 -- Agent 重启时按状态恢复未完成操作。
 CREATE INDEX idx_disk_operations_active
-    ON disk_operations(status, updated_at, operation_id);
+    ON disk_operations(status, updated_at, operation_id)
+    WHERE status IN ('queued', 'validating', 'preparing', 'applying', 'verifying', 'canceling');

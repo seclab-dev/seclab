@@ -19,8 +19,6 @@ use std::str::FromStr;
 use crate::types::{ApiError, ApiResult};
 
 pub const MAX_OUTPUT_BYTES: usize = 256 * 1024;
-pub const RUN_RETENTION_COUNT: i64 = 100;
-pub const RUN_RETENTION_DAYS: i64 = 30;
 
 /// Agent 本地任务定义。
 #[derive(Debug, Clone, FromRow)]
@@ -451,7 +449,6 @@ pub async fn finish_run(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    cleanup_runs(pool, &run.task_id).await?;
     Ok(run)
 }
 
@@ -697,18 +694,6 @@ async fn has_active_run(pool: &DbPool, task_id: &str) -> ApiResult<bool> {
     .fetch_one(pool)
     .await?;
     Ok(count > 0)
-}
-
-async fn cleanup_runs(pool: &DbPool, task_id: &str) -> ApiResult<()> {
-    sqlx::query(
-        "DELETE FROM task_runs WHERE task_id = ?1 AND (created_at < datetime('now', ?2) OR run_id NOT IN (SELECT run_id FROM task_runs WHERE task_id = ?1 ORDER BY queued_at DESC, run_id DESC LIMIT ?3)) AND status NOT IN ('queued', 'starting', 'running', 'cancelling') AND run_id NOT IN (SELECT run_id FROM task_run_outbox)",
-    )
-    .bind(task_id)
-    .bind(format!("-{RUN_RETENTION_DAYS} days"))
-    .bind(RUN_RETENTION_COUNT)
-    .execute(pool)
-    .await?;
-    Ok(())
 }
 
 async fn record_operation_receipt(

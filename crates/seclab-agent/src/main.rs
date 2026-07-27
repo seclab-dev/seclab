@@ -783,7 +783,6 @@ async fn maintain_runtime_session(
                             let payload = response.json::<ApiResponse<seclab_contracts::logging::AgentOperationEventAck>>().await?;
                             let accepted = payload.data.map(|value| value.accepted_event_ids).unwrap_or_default();
                             services::operation_outbox::acknowledge(pool, &accepted).await?;
-                            let _ = services::operation_outbox::prune_delivered(pool).await?;
                         }
                         Ok(response) => {
                             services::operation_outbox::mark_failed(pool, &event_ids).await?;

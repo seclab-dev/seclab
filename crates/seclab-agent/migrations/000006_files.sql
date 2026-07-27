@@ -34,8 +34,9 @@ CREATE TABLE file_operation_tasks (
     finished_at INTEGER
 );
 
-CREATE INDEX idx_file_operation_tasks_status_created
-    ON file_operation_tasks (status, created_at DESC);
+CREATE INDEX idx_file_operation_tasks_active_created
+    ON file_operation_tasks (created_at)
+    WHERE status IN ('queued', 'running', 'cancelling');
 
 CREATE TABLE file_operation_task_items (
     task_id TEXT NOT NULL,
@@ -52,9 +53,6 @@ CREATE TABLE file_operation_task_items (
     PRIMARY KEY (task_id, ordinal),
     FOREIGN KEY (task_id) REFERENCES file_operation_tasks(id) ON DELETE CASCADE
 );
-
-CREATE INDEX idx_file_operation_task_items_source
-    ON file_operation_task_items (source_path);
 
 CREATE TABLE file_transfers (
     id TEXT PRIMARY KEY,
@@ -78,5 +76,6 @@ CREATE TABLE file_transfers (
     expires_at INTEGER NOT NULL
 );
 
-CREATE INDEX idx_file_transfers_status_expires
-    ON file_transfers (status, expires_at);
+CREATE INDEX idx_file_transfers_active_expires
+    ON file_transfers (expires_at)
+    WHERE status IN ('created', 'receiving', 'ready', 'streaming');

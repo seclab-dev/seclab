@@ -82,6 +82,7 @@ pub async fn create_router() -> Result<(Router, DbPool)> {
     });
 
     docker_stats::spawn_stats_collector(Arc::clone(&app_state));
+    crate::services::database_maintenance::spawn_worker(app_state.metadata_db.clone());
     docker_project_tasks::spawn_retention_worker(app_state.metadata_db.clone());
     crate::services::file_transfers::spawn_retention_worker(app_state.metadata_db.clone());
     monitoring_service::spawn_sampler(app_state.metadata_db.clone(), system_monitoring);

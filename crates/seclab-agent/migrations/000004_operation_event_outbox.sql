@@ -9,4 +9,5 @@ CREATE TABLE operation_event_outbox (
 );
 
 CREATE INDEX idx_operation_event_outbox_pending
-    ON operation_event_outbox (delivered_at, next_attempt_at, created_at);
+    ON operation_event_outbox (next_attempt_at, created_at, event_id)
+    WHERE delivered_at IS NULL;

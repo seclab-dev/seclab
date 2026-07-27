@@ -33,9 +33,6 @@ CREATE TABLE IF NOT EXISTS system_monitoring_samples (
     source_count INTEGER NOT NULL DEFAULT 5 CHECK (source_count = 5)
 );
 
-CREATE INDEX IF NOT EXISTS idx_system_monitoring_samples_sampled_at
-    ON system_monitoring_samples (sampled_at);
-
 -- 系统监控采集状态表：保存最近采集尝试、成功时间与错误摘要，固定使用单例记录。
 CREATE TABLE IF NOT EXISTS system_monitoring_collector_state (
     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
