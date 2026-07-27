@@ -1260,7 +1260,13 @@ fn sanitize_parameters(
                 continue;
             }
             if normalized == "error" || normalized == "errorsummary" {
-                error_summary = Some(redact_error(value.as_str().unwrap_or("Operation failed")));
+                if let Some(value) = value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    error_summary = Some(redact_error(value));
+                }
                 continue;
             }
             if let Some(value) = parameter_from_json(value) {
@@ -1539,6 +1545,20 @@ mod tests {
         assert_eq!(code.as_deref(), Some("FAILED"));
         assert_eq!(summary.as_deref(), Some("safe summary"));
     }
+
+    #[test]
+    fn sanitizer_ignores_missing_or_invalid_error_summaries() {
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!("  "),
+            serde_json::json!({"message": "failed"}),
+        ] {
+            let (_, _, summary) =
+                sanitize_parameters(Some(serde_json::json!({"errorSummary": value})));
+            assert_eq!(summary, None);
+        }
+    }
+
     #[test]
     fn registry_computes_module_and_high_impact() {
         assert_eq!(
