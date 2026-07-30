@@ -208,6 +208,7 @@ const detailItems = computed(() => {
       ? {
           label: t('app.notificationCenter.detail.subject'),
           value: current.subject.displayName ?? current.subject.id,
+          span: 2,
         }
       : null,
     current.taskId
