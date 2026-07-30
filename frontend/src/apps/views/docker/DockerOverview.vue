@@ -447,17 +447,6 @@ onUnmounted(() => {
         <span class="summary-value"
           >{{ store.projectStates.healthy }}/{{ store.projectStates.total }}</span
         >
-        <div class="summary-tags">
-          <SecLabTag v-if="store.projectStates.partial" type="warning" size="small">
-            {{ t('app.docker.overview.states.partial') }} {{ store.projectStates.partial }}
-          </SecLabTag>
-          <SecLabTag v-if="store.projectStates.stopped" type="info" size="small">
-            {{ t('app.docker.overview.states.stopped') }} {{ store.projectStates.stopped }}
-          </SecLabTag>
-          <SecLabTag v-if="store.projectStates.unknown" type="default" size="small">
-            {{ t('app.docker.overview.states.unknown') }} {{ store.projectStates.unknown }}
-          </SecLabTag>
-        </div>
       </div>
       <div class="summary-item" data-slot="container-states">
         <span class="summary-label">{{ t('app.docker.overview.containers') }}</span>
@@ -468,9 +457,6 @@ onUnmounted(() => {
       <div class="summary-item" data-slot="image-states">
         <span class="summary-label">{{ t('app.docker.overview.images') }}</span>
         <span class="summary-value">{{ store.imageCounts.total }}</span>
-        <SecLabTag v-if="store.imageCounts.dangling" type="warning" size="small">
-          {{ t('app.docker.overview.states.dangling') }} {{ store.imageCounts.dangling }}
-        </SecLabTag>
       </div>
     </div>
 
@@ -682,13 +668,6 @@ onUnmounted(() => {
   font-weight: 650;
   line-height: 1.1;
 }
-.summary-tags {
-  display: flex;
-  min-width: 0;
-  gap: var(--sdl-space-1);
-  overflow: hidden;
-}
-
 :deep(.sl-tabs-nav) {
   padding: 0 var(--sdl-space-4);
 }
