@@ -80,6 +80,33 @@ describe('OperationLogView', () => {
     wrapper.unmount()
   })
 
+  it('Docker 嵌入模式将时间与结果收进更多筛选并保持主工具栏紧凑', async () => {
+    vi.mocked(operationLogApi.query).mockReset().mockResolvedValue(response('docker-event'))
+    const wrapper = mount(OperationLogView, {
+      props: { embedded: true, module: 'docker' },
+      global: { plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh, en } })] },
+    })
+    await flushPromises()
+
+    const toolbar = wrapper.find('[data-ui="toolbar"]')
+    expect(toolbar.find('#operation-log-keyword').exists()).toBe(true)
+    expect(toolbar.find('#operation-log-range').exists()).toBe(false)
+    expect(toolbar.find('#operation-log-outcome').exists()).toBe(false)
+    const moreFilters = toolbar.find('[data-ui="toolbar-actions"] button')
+    expect(moreFilters.attributes('aria-expanded')).toBe('false')
+    expect(moreFilters.attributes('aria-controls')).toBe('operation-log-advanced-filters')
+
+    await moreFilters.trigger('click')
+
+    const advancedFilters = wrapper.find('#operation-log-advanced-filters')
+    expect(advancedFilters.find('#operation-log-range').exists()).toBe(true)
+    expect(advancedFilters.find('#operation-log-outcome').exists()).toBe(true)
+    expect(advancedFilters.find('#operation-log-impact').exists()).toBe(true)
+    expect(advancedFilters.find('#operation-log-module').exists()).toBe(false)
+    expect(moreFilters.attributes('aria-expanded')).toBe('true')
+    wrapper.unmount()
+  })
+
   it('刷新失败时保留已经加载的数据', async () => {
     vi.mocked(operationLogApi.query)
       .mockReset()

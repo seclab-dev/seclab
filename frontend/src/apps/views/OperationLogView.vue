@@ -373,6 +373,7 @@ onBeforeUnmount(() => {
   >
     <div class="toolbar" data-ui="toolbar" data-slot="controls">
       <SecLabFormItem
+        v-if="!props.embedded"
         class="filter-select"
         :label="t('app.operationLog.timeRange')"
         for="operation-log-range"
@@ -385,6 +386,7 @@ onBeforeUnmount(() => {
         />
       </SecLabFormItem>
       <SecLabFormItem
+        v-if="!props.embedded"
         class="filter-select"
         :label="t('app.operationLog.outcome')"
         for="operation-log-outcome"
@@ -410,9 +412,12 @@ onBeforeUnmount(() => {
         />
       </SecLabFormItem>
       <div class="toolbar-actions" data-ui="toolbar-actions" data-slot="actions">
-        <SecLabButton @click="filtersExpanded = !filtersExpanded">{{
-          t('app.operationLog.moreFilters')
-        }}</SecLabButton>
+        <SecLabButton
+          :aria-expanded="filtersExpanded"
+          aria-controls="operation-log-advanced-filters"
+          @click="filtersExpanded = !filtersExpanded"
+          >{{ t('app.operationLog.moreFilters') }}</SecLabButton
+        >
         <SecLabButton type="primary" @click="applyFilters">{{
           t('app.operationLog.query')
         }}</SecLabButton>
@@ -420,7 +425,39 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
-    <div v-if="filtersExpanded" class="advanced-filters" data-ui="filters" data-slot="controls">
+    <div
+      v-if="filtersExpanded"
+      id="operation-log-advanced-filters"
+      class="advanced-filters"
+      data-ui="filters"
+      data-slot="controls"
+    >
+      <SecLabFormItem
+        v-if="props.embedded"
+        class="filter-select"
+        :label="t('app.operationLog.timeRange')"
+        for="operation-log-range"
+      >
+        <SecLabSelect
+          id="operation-log-range"
+          v-model="filters.range"
+          name="operationLogRange"
+          :options="rangeOptions"
+        />
+      </SecLabFormItem>
+      <SecLabFormItem
+        v-if="props.embedded"
+        class="filter-select"
+        :label="t('app.operationLog.outcome')"
+        for="operation-log-outcome"
+      >
+        <SecLabSelect
+          id="operation-log-outcome"
+          v-model="filters.outcome"
+          name="operationLogOutcome"
+          :options="outcomeOptions"
+        />
+      </SecLabFormItem>
       <SecLabFormItem
         v-if="!props.module"
         class="filter-select"
@@ -588,6 +625,17 @@ onBeforeUnmount(() => {
 .operation-log.embedded {
   padding: var(--sdl-space-3) 0 0;
 }
+.operation-log.embedded .toolbar {
+  flex-wrap: nowrap;
+}
+.operation-log.embedded .search {
+  flex: 1 1 auto;
+  inline-size: auto;
+  min-inline-size: 180px;
+}
+.operation-log.embedded .toolbar-actions {
+  flex-shrink: 0;
+}
 .toolbar,
 .advanced-filters {
   display: flex;
@@ -655,6 +703,13 @@ small {
   .toolbar > *,
   .advanced-filters > * {
     flex: 1 1 180px;
+  }
+  .operation-log.embedded .toolbar {
+    flex-wrap: wrap;
+  }
+  .operation-log.embedded .toolbar-actions {
+    flex-basis: 100%;
+    margin-inline-start: 0;
   }
 }
 </style>
