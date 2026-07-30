@@ -568,6 +568,30 @@ export type DockerProjectTaskStage =
   | 'completed'
   | 'cancelled'
   | 'interrupted'
+export type DockerProjectProgressMode = 'structured' | 'text' | 'unavailable'
+export type DockerProjectProgressPhase = 'pulling' | 'applying'
+export type DockerProjectProgressStatus = 'working' | 'done' | 'warning' | 'error'
+
+/** Compose 命令输出中的单个资源进度快照。 */
+export interface DockerProjectTaskProgressItem {
+  id: string
+  parentId?: string
+  phase: DockerProjectProgressPhase
+  status: DockerProjectProgressStatus
+  label: string
+  action: string
+  details?: string
+  currentBytes?: number | null
+  totalBytes?: number | null
+  percent?: number | null
+}
+
+/** Compose 项目任务事件流中的单项进度更新。 */
+export interface DockerProjectTaskProgressUpdate {
+  progressMode: DockerProjectProgressMode
+  progressPercent: number
+  item: DockerProjectTaskProgressItem
+}
 
 /** Compose 项目后台任务。 */
 export interface DockerProjectTask {
@@ -577,6 +601,8 @@ export interface DockerProjectTask {
   status: DockerProjectTaskStatus
   stage: DockerProjectTaskStage
   progressPercent: number
+  progressMode: DockerProjectProgressMode
+  progressItems: DockerProjectTaskProgressItem[]
   serviceName?: string
   replicas?: number
   pullImages: boolean

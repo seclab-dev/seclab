@@ -39,6 +39,10 @@ CREATE TABLE IF NOT EXISTS docker_compose_project_tasks (
     progress_percent INTEGER NOT NULL DEFAULT 0 CHECK (
         progress_percent >= 0 AND progress_percent <= 100
     ),
+    progress_mode TEXT NOT NULL DEFAULT 'unavailable' CHECK (
+        progress_mode IN ('structured', 'text', 'unavailable')
+    ),
+    progress_items TEXT NOT NULL DEFAULT '[]',
     service_name TEXT,
     replicas INTEGER CHECK (replicas IS NULL OR replicas >= 0),
     pull_images INTEGER NOT NULL DEFAULT 0 CHECK (pull_images IN (0, 1)),

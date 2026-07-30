@@ -192,6 +192,12 @@ const createScopedDockerApi = (nodeId?: string) => ({
       ),
     )
   },
+  composeProjectOperationEventsUrl: (operationId: string) => {
+    return `/api/v1${buildDockerPath(
+      `/agent/docker/compose/project-operations/${encodeURIComponent(operationId)}/events`,
+      nodeId,
+    )}`
+  },
   listImages: () => {
     return http.get<docker.DockerImageSummary[]>(buildDockerPath('/agent/docker/images', nodeId))
   },

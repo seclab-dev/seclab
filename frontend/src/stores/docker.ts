@@ -215,6 +215,10 @@ export const useDockerStore = defineStore('docker', () => {
   let containerStatsPollingTimer: number | null = null
   let projectOperationPollingTimer: number | null = null
   let projectOperationPollingInFlight = false
+  let projectDeploymentEventSource: EventSource | null = null
+  let projectDeploymentEventSourceTaskId: string | null = null
+  let projectDeploymentEventSourceNodeId: string | null = null
+  let projectDeploymentEventSourceHealthy = false
   const trackedProjectOperations = new Map<string, dockerType.DockerProjectTask>()
 
   // ─── 容器统计批量队列 ───
@@ -1234,6 +1238,131 @@ export const useDockerStore = defineStore('docker', () => {
   const isProjectOperationActive = (operation: dockerType.DockerProjectTask) =>
     operation.status === 'queued' || operation.status === 'running'
 
+  /** 将实时单项进度合并到当前部署快照。 */
+  const applyProjectProgressUpdate = (
+    operationId: string,
+    update: dockerType.DockerProjectTaskProgressUpdate,
+  ) => {
+    const operation = projectDeploymentProgress.value
+    if (!operation || operation.id !== operationId) return
+    const progressItems = [...operation.progressItems]
+    const index = progressItems.findIndex((item) => item.id === update.item.id)
+    if (index >= 0) {
+      progressItems[index] = update.item
+    } else {
+      progressItems.push(update.item)
+    }
+    const nextOperation = {
+      ...operation,
+      progressMode: update.progressMode,
+      progressPercent: Math.max(operation.progressPercent, update.progressPercent),
+      progressItems,
+    }
+    projectDeploymentProgress.value = nextOperation
+    trackedProjectOperations.set(operationId, nextOperation)
+    projectDeploymentProgressError.value = null
+  }
+
+  /** 处理项目操作终态，确保通知和事实数据只刷新一次。 */
+  const finishTrackedProjectOperation = async (operation: dockerType.DockerProjectTask) => {
+    const tracked = trackedProjectOperations.delete(operation.id)
+    if (projectDeploymentProgress.value?.id === operation.id) {
+      projectDeploymentProgress.value = operation
+      projectDeploymentProgressError.value = null
+      stopProjectDeploymentEventStream(operation.id)
+    }
+    if (!tracked) return
+    notifyProjectOperationResult(operation)
+    await Promise.all([fetchComposeProjects(), fetchOverviewData()])
+  }
+
+  /** 关闭指定部署任务的 SSE 连接。 */
+  function stopProjectDeploymentEventStream(operationId?: string) {
+    if (operationId && projectDeploymentEventSourceTaskId !== operationId) return
+    projectDeploymentEventSource?.close()
+    projectDeploymentEventSource = null
+    projectDeploymentEventSourceTaskId = null
+    projectDeploymentEventSourceNodeId = null
+    projectDeploymentEventSourceHealthy = false
+  }
+
+  /** 为创建或重新部署任务建立实时进度事件流。 */
+  function startProjectDeploymentEventStream(operation: dockerType.DockerProjectTask) {
+    if (
+      typeof EventSource === 'undefined' ||
+      !isProjectOperationActive(operation) ||
+      (operation.operation !== 'create' && operation.operation !== 'redeploy')
+    ) {
+      return false
+    }
+    const nodeId = nodeStore.currentNodeId || 'local'
+    if (
+      projectDeploymentEventSource &&
+      projectDeploymentEventSourceTaskId === operation.id &&
+      projectDeploymentEventSourceNodeId === nodeId
+    ) {
+      return true
+    }
+    stopProjectDeploymentEventStream()
+    const source = new EventSource(
+      dockerClient.value.composeProjectOperationEventsUrl(operation.id),
+      { withCredentials: true },
+    )
+    projectDeploymentEventSource = source
+    projectDeploymentEventSourceTaskId = operation.id
+    projectDeploymentEventSourceNodeId = nodeId
+
+    const isCurrentStream = () =>
+      projectDeploymentEventSource === source &&
+      projectDeploymentEventSourceTaskId === operation.id &&
+      projectDeploymentEventSourceNodeId === (nodeStore.currentNodeId || 'local')
+    const parseEvent = <T>(event: Event): T | null => {
+      try {
+        return JSON.parse((event as MessageEvent<string>).data) as T
+      } catch {
+        return null
+      }
+    }
+    source.addEventListener('snapshot', (event) => {
+      if (!isCurrentStream()) return
+      const snapshot = parseEvent<dockerType.DockerProjectTask>(event)
+      if (!snapshot || snapshot.id !== operation.id) return
+      projectDeploymentEventSourceHealthy = true
+      projectDeploymentProgress.value = snapshot
+      trackedProjectOperations.set(snapshot.id, snapshot)
+      projectDeploymentProgressError.value = null
+    })
+    source.addEventListener('progress', (event) => {
+      if (!isCurrentStream()) return
+      const update = parseEvent<dockerType.DockerProjectTaskProgressUpdate>(event)
+      if (!update) return
+      projectDeploymentEventSourceHealthy = true
+      applyProjectProgressUpdate(operation.id, update)
+    })
+    source.addEventListener('terminal', (event) => {
+      if (!isCurrentStream()) return
+      const terminal = parseEvent<dockerType.DockerProjectTask>(event)
+      if (!terminal || terminal.id !== operation.id) return
+      void finishTrackedProjectOperation(terminal)
+    })
+    source.addEventListener('resync', () => {
+      if (!isCurrentStream()) return
+      projectDeploymentEventSourceHealthy = false
+      void pollProjectOperations()
+    })
+    source.onopen = () => {
+      if (!isCurrentStream()) return
+      projectDeploymentEventSourceHealthy = true
+      projectDeploymentProgressError.value = null
+    }
+    source.onerror = () => {
+      if (!isCurrentStream()) return
+      projectDeploymentEventSourceHealthy = false
+      startProjectOperationPolling()
+    }
+    return true
+  }
+
   /** 跟踪新提交的后台操作；创建和重新部署同时打开部署进度。 */
   const acceptProjectOperation = (operation: dockerType.DockerProjectTask) => {
     const nodeId = nodeStore.currentNodeId || 'local'
@@ -1245,6 +1374,7 @@ export const useDockerStore = defineStore('docker', () => {
     if (operation.operation === 'create' || operation.operation === 'redeploy') {
       projectDeploymentProgress.value = operation
       projectDeploymentProgressError.value = null
+      startProjectDeploymentEventStream(operation)
     }
     startProjectOperationPolling()
   }
@@ -1405,6 +1535,7 @@ export const useDockerStore = defineStore('docker', () => {
     if (!res.data) return true
     projectDeploymentProgress.value = res.data
     trackedProjectOperations.set(res.data.id, res.data)
+    startProjectDeploymentEventStream(res.data)
     startProjectOperationPolling()
     return true
   }
@@ -1432,9 +1563,15 @@ export const useDockerStore = defineStore('docker', () => {
     const nodeId = nodeStore.currentNodeId || 'local'
     if (projectOperationsNodeId !== nodeId) return
     projectOperationPollingInFlight = true
-    let reachedTerminalState = false
     try {
-      const operationIds = [...trackedProjectOperations.keys()]
+      const operationIds = [...trackedProjectOperations.keys()].filter(
+        (operationId) =>
+          !(
+            projectDeploymentEventSourceHealthy &&
+            projectDeploymentEventSourceTaskId === operationId
+          ),
+      )
+      if (!operationIds.length) return
       const responses = await Promise.all(
         operationIds.map(async (operationId) => ({
           operationId,
@@ -1456,16 +1593,11 @@ export const useDockerStore = defineStore('docker', () => {
           projectDeploymentProgressError.value = null
         }
         if (!isProjectOperationActive(operation)) {
-          trackedProjectOperations.delete(operationId)
-          notifyProjectOperationResult(operation)
-          reachedTerminalState = true
+          await finishTrackedProjectOperation(operation)
         }
       }
     } finally {
       projectOperationPollingInFlight = false
-    }
-    if (reachedTerminalState) {
-      await Promise.all([fetchComposeProjects(), fetchOverviewData()])
     }
   }
 
@@ -1477,7 +1609,7 @@ export const useDockerStore = defineStore('docker', () => {
       if (document.hidden) return
       await pollProjectOperations()
       if (trackedProjectOperations.size) {
-        projectOperationPollingTimer = window.setTimeout(poll, 2000)
+        projectOperationPollingTimer = window.setTimeout(poll, 1000)
       }
     }
     projectOperationPollingTimer = window.setTimeout(poll, 500)
@@ -1485,9 +1617,11 @@ export const useDockerStore = defineStore('docker', () => {
 
   /** 停止项目操作轮询。 */
   function stopProjectOperationPolling() {
-    if (projectOperationPollingTimer === null) return
-    window.clearTimeout(projectOperationPollingTimer)
-    projectOperationPollingTimer = null
+    if (projectOperationPollingTimer !== null) {
+      window.clearTimeout(projectOperationPollingTimer)
+      projectOperationPollingTimer = null
+    }
+    stopProjectDeploymentEventStream()
   }
 
   /** 仅允许关闭已经到达终态的部署进度。 */

@@ -2,30 +2,57 @@
 
 use crate::api::docker::context::DockerOperationContext;
 use crate::models::docker::{
-    DockerActivityActorKind, DockerProjectTask, DockerProjectTaskOperation, DockerProjectTaskStage,
+    DockerActivityActorKind, DockerProjectProgressMode, DockerProjectProgressPhase,
+    DockerProjectProgressStatus, DockerProjectTask, DockerProjectTaskOperation,
+    DockerProjectTaskProgressItem, DockerProjectTaskProgressUpdate, DockerProjectTaskStage,
     DockerProjectTaskStatus,
 };
 use crate::state::DbPool;
 use crate::types::{ApiError, ApiResult};
 use once_cell::sync::Lazy;
 use seclab_contracts::api::ErrorCode;
+use serde::Deserialize;
 use serde_json::json;
 use sqlx::Row;
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell, broadcast};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const TASK_RETENTION_SECONDS: i64 = 24 * 60 * 60;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const COMPOSE_CAPABILITY_TIMEOUT: Duration = Duration::from_secs(5);
+const PROGRESS_PERSIST_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_PROGRESS_ITEMS: usize = 200;
+const MAX_PROGRESS_LABEL_CHARS: usize = 240;
+const MAX_PROGRESS_DETAIL_CHARS: usize = 500;
 
 static CANCELLATIONS: Lazy<Mutex<HashMap<String, CancellationToken>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static CREATE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+static JSON_PROGRESS_SUPPORTED: OnceCell<bool> = OnceCell::const_new();
+static TASK_EVENT_HUBS: Lazy<Mutex<HashMap<String, DockerProjectTaskEventHub>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+const TASK_EVENT_BUFFER: usize = 512;
+
+/// Compose 项目任务事件流中的实时消息。
+#[derive(Debug, Clone)]
+pub enum DockerProjectTaskEvent {
+    Snapshot(DockerProjectTask),
+    Progress(DockerProjectTaskProgressUpdate),
+    Terminal(DockerProjectTask),
+}
+
+struct DockerProjectTaskEventHub {
+    sender: broadcast::Sender<DockerProjectTaskEvent>,
+    latest_progress: Vec<DockerProjectTaskProgressUpdate>,
+}
 
 /// 创建任务时允许保存的非敏感参数。
 pub struct NewDockerProjectTask<'a> {
@@ -128,12 +155,68 @@ pub async fn create(
         .await;
     let cancellation = CancellationToken::new();
     CANCELLATIONS.lock().await.insert(id.clone(), cancellation);
+    let (sender, _) = broadcast::channel(TASK_EVENT_BUFFER);
+    TASK_EVENT_HUBS.lock().await.insert(
+        id.clone(),
+        DockerProjectTaskEventHub {
+            sender,
+            latest_progress: Vec::new(),
+        },
+    );
     get(pool, &id).await
 }
 
 /// 返回任务的取消令牌。
 pub async fn cancellation(task_id: &str) -> Option<CancellationToken> {
     CANCELLATIONS.lock().await.get(task_id).cloned()
+}
+
+/// 订阅任务事件，并返回订阅建立前已经产生的最新单项进度。
+pub async fn subscribe(
+    task_id: &str,
+) -> Option<(
+    broadcast::Receiver<DockerProjectTaskEvent>,
+    Vec<DockerProjectTaskProgressUpdate>,
+)> {
+    let hubs = TASK_EVENT_HUBS.lock().await;
+    let hub = hubs.get(task_id)?;
+    Some((hub.sender.subscribe(), hub.latest_progress.clone()))
+}
+
+async fn publish_progress(task_id: &str, update: DockerProjectTaskProgressUpdate) {
+    let mut hubs = TASK_EVENT_HUBS.lock().await;
+    let Some(hub) = hubs.get_mut(task_id) else {
+        return;
+    };
+    if let Some(existing) = hub
+        .latest_progress
+        .iter_mut()
+        .find(|existing| existing.item.id == update.item.id)
+    {
+        *existing = update.clone();
+    } else {
+        hub.latest_progress.push(update.clone());
+    }
+    let _ = hub.sender.send(DockerProjectTaskEvent::Progress(update));
+}
+
+async fn publish_snapshot(pool: &DbPool, task_id: &str, terminal: bool) {
+    let Ok(task) = get(pool, task_id).await else {
+        return;
+    };
+    let mut hubs = TASK_EVENT_HUBS.lock().await;
+    let Some(hub) = hubs.get(task_id) else {
+        return;
+    };
+    let event = if terminal {
+        DockerProjectTaskEvent::Terminal(task)
+    } else {
+        DockerProjectTaskEvent::Snapshot(task)
+    };
+    let _ = hub.sender.send(event);
+    if terminal {
+        hubs.remove(task_id);
+    }
 }
 
 /// 将任务推进到运行阶段。
@@ -152,6 +235,7 @@ pub async fn update(
     .bind(i64::from(progress_percent))
     .execute(pool)
     .await?;
+    publish_snapshot(pool, task_id, false).await;
     Ok(())
 }
 
@@ -232,6 +316,7 @@ async fn finish(
     .bind(cleanup_warning.map(sanitize_error))
     .execute(pool)
     .await?;
+    publish_snapshot(pool, task_id, true).await;
     CANCELLATIONS.lock().await.remove(task_id);
     record_terminal_activity(pool, task_id).await;
     Ok(())
@@ -320,7 +405,8 @@ async fn record_terminal_activity(pool: &DbPool, task_id: &str) {
 /// 查询一个任务。
 pub async fn get(pool: &DbPool, task_id: &str) -> ApiResult<DockerProjectTask> {
     let row = sqlx::query(
-        "SELECT id, project_name, operation, status, stage, progress_percent, service_name, \
+        "SELECT id, project_name, operation, status, stage, progress_percent, \
+         progress_mode, progress_items, service_name, \
          replicas, pull_images, error_summary, cleanup_warning, created_at, started_at, finished_at \
          FROM docker_compose_project_tasks WHERE id = ?1",
     )
@@ -334,7 +420,8 @@ pub async fn get(pool: &DbPool, task_id: &str) -> ApiResult<DockerProjectTask> {
 /// 返回最近提交且仍在执行的创建或重新部署操作。
 pub async fn latest_active_deployment(pool: &DbPool) -> ApiResult<Option<DockerProjectTask>> {
     let row = sqlx::query(
-        "SELECT id, project_name, operation, status, stage, progress_percent, service_name, \
+        "SELECT id, project_name, operation, status, stage, progress_percent, \
+         progress_mode, progress_items, service_name, \
          replicas, pull_images, error_summary, cleanup_warning, created_at, started_at, finished_at \
          FROM docker_compose_project_tasks \
          WHERE status IN ('queued', 'running') AND operation IN ('create', 'redeploy') \
@@ -378,6 +465,378 @@ pub async fn run_compose_command(
     Ok(ComposeCommandResult::Succeeded)
 }
 
+/// 执行 Compose 命令并把结构化资源事件持久化到任务快照。
+pub async fn run_tracked_compose_command(
+    pool: &DbPool,
+    task_id: &str,
+    phase: DockerProjectProgressPhase,
+    project: &str,
+    compose_file: &Path,
+    args: &[String],
+    cancellation: &CancellationToken,
+) -> ApiResult<ComposeCommandResult> {
+    let structured = compose_supports_json_progress().await;
+    let mode = if structured {
+        DockerProjectProgressMode::Structured
+    } else {
+        DockerProjectProgressMode::Text
+    };
+    let mut command = Command::new("docker");
+    command.arg("compose").args(["--ansi", "never"]);
+    if structured {
+        command.args(["--progress", "json"]);
+    }
+    command
+        .args(["-f"])
+        .arg(compose_file)
+        .args(["-p", project])
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .map_err(|error| ApiError::internal(format!("failed to start Docker Compose: {error}")))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| ApiError::internal("failed to capture Docker Compose progress"))?;
+    let mut lines = BufReader::new(stderr).lines();
+    let timeout = tokio::time::sleep(COMMAND_TIMEOUT);
+    tokio::pin!(timeout);
+    let mut items = load_progress_items(pool, task_id).await?;
+    let mut text_sequence = 0usize;
+    let mut progress_dirty = false;
+    let mut persist_interval = tokio::time::interval(PROGRESS_PERSIST_INTERVAL);
+    persist_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    persist_interval.tick().await;
+    let mut error_lines = Vec::new();
+
+    loop {
+        let line = tokio::select! {
+            _ = cancellation.cancelled() => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Ok(ComposeCommandResult::Cancelled);
+            }
+            _ = &mut timeout => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(ApiError::validation("Docker Compose command timed out"));
+            }
+            _ = persist_interval.tick() => {
+                if progress_dirty {
+                    persist_progress(pool, task_id, mode, &items, phase).await?;
+                    progress_dirty = false;
+                }
+                continue;
+            }
+            result = lines.next_line() => result?,
+        };
+        let Some(line) = line else {
+            break;
+        };
+        let sanitized_line = truncate_chars(&sanitize_error(&line), MAX_PROGRESS_DETAIL_CHARS);
+        if !sanitized_line.is_empty() {
+            error_lines.push(sanitized_line);
+            if error_lines.len() > 20 {
+                error_lines.remove(0);
+            }
+        }
+        let changed_item = if structured {
+            parse_progress_event(&line, phase).and_then(|item| {
+                if upsert_progress_item(&mut items, item.clone()) {
+                    Some(item)
+                } else {
+                    None
+                }
+            })
+        } else {
+            text_sequence += 1;
+            if upsert_text_progress_item(&mut items, phase, text_sequence, &line) {
+                items.last().cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(item) = changed_item {
+            let progress_percent = aggregate_progress_percent(&items, phase);
+            publish_progress(
+                task_id,
+                DockerProjectTaskProgressUpdate {
+                    progress_mode: mode,
+                    progress_percent,
+                    item,
+                },
+            )
+            .await;
+            progress_dirty = true;
+        }
+    }
+    let status = child.wait().await?;
+    if status.success() {
+        for item in items.iter_mut().filter(|item| {
+            item.phase == phase && item.status == DockerProjectProgressStatus::Working
+        }) {
+            item.status = DockerProjectProgressStatus::Done;
+        }
+    }
+    persist_progress(pool, task_id, mode, &items, phase).await?;
+    if !status.success() {
+        let message = if error_lines.is_empty() {
+            "Docker Compose command failed".to_string()
+        } else {
+            error_lines.join(" ")
+        };
+        return Err(ApiError::validation(sanitize_error(&message)));
+    }
+    Ok(ComposeCommandResult::Succeeded)
+}
+
+#[derive(Debug, Deserialize)]
+struct ComposeProgressEvent {
+    id: Option<String>,
+    parent_id: Option<String>,
+    status: Option<String>,
+    text: Option<String>,
+    details: Option<String>,
+    current: Option<i64>,
+    total: Option<i64>,
+    percent: Option<i64>,
+}
+
+async fn compose_supports_json_progress() -> bool {
+    *JSON_PROGRESS_SUPPORTED
+        .get_or_init(|| async {
+            let output = tokio::time::timeout(
+                COMPOSE_CAPABILITY_TIMEOUT,
+                Command::new("docker")
+                    .args(["compose", "--help"])
+                    .stdin(Stdio::null())
+                    .stderr(Stdio::null())
+                    .output(),
+            )
+            .await;
+            matches!(
+                output,
+                Ok(Ok(output))
+                    if output.status.success()
+                        && String::from_utf8_lossy(&output.stdout).contains("--progress")
+                        && String::from_utf8_lossy(&output.stdout).contains("json")
+            )
+        })
+        .await
+}
+
+fn parse_progress_event(
+    line: &str,
+    phase: DockerProjectProgressPhase,
+) -> Option<DockerProjectTaskProgressItem> {
+    let event: ComposeProgressEvent = serde_json::from_str(line).ok()?;
+    let raw_id = event.id?.trim().to_string();
+    if raw_id.is_empty() {
+        return None;
+    }
+    let namespace = phase_as_str(phase);
+    let id = format!("{namespace}:{raw_id}");
+    let parent_id = event
+        .parent_id
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("{namespace}:{}", value.trim()));
+    let label = truncate_chars(&sanitize_error(&raw_id), MAX_PROGRESS_LABEL_CHARS);
+    let action = truncate_chars(
+        &sanitize_error(event.text.as_deref().unwrap_or_default()),
+        MAX_PROGRESS_LABEL_CHARS,
+    );
+    let details = event
+        .details
+        .map(|value| truncate_chars(&sanitize_error(&value), MAX_PROGRESS_DETAIL_CHARS))
+        .filter(|value| !value.is_empty());
+    let total_bytes = event.total.filter(|value| *value > 0);
+    let current_bytes = event
+        .current
+        .filter(|value| *value >= 0 && total_bytes.is_some());
+    let percent = event
+        .percent
+        .filter(|value| *value >= 0)
+        .map(|value| value.clamp(0, 100) as u8)
+        .or_else(|| {
+            current_bytes
+                .zip(total_bytes)
+                .map(|(current, total)| ((current.saturating_mul(100) / total).clamp(0, 100)) as u8)
+        });
+    Some(DockerProjectTaskProgressItem {
+        id,
+        parent_id,
+        phase,
+        status: parse_progress_status(event.status.as_deref()),
+        label,
+        action,
+        details,
+        current_bytes,
+        total_bytes,
+        percent,
+    })
+}
+
+fn parse_progress_status(value: Option<&str>) -> DockerProjectProgressStatus {
+    match value.unwrap_or_default().to_ascii_lowercase().as_str() {
+        "done" => DockerProjectProgressStatus::Done,
+        "warning" => DockerProjectProgressStatus::Warning,
+        "error" => DockerProjectProgressStatus::Error,
+        _ => DockerProjectProgressStatus::Working,
+    }
+}
+
+fn upsert_progress_item(
+    items: &mut Vec<DockerProjectTaskProgressItem>,
+    item: DockerProjectTaskProgressItem,
+) -> bool {
+    if let Some(existing) = items.iter_mut().find(|existing| existing.id == item.id) {
+        if existing == &item {
+            return false;
+        }
+        *existing = item;
+        return true;
+    }
+    items.push(item);
+    if items.len() > MAX_PROGRESS_ITEMS {
+        items.remove(0);
+    }
+    true
+}
+
+fn upsert_text_progress_item(
+    items: &mut Vec<DockerProjectTaskProgressItem>,
+    phase: DockerProjectProgressPhase,
+    sequence: usize,
+    line: &str,
+) -> bool {
+    let label = truncate_chars(&sanitize_error(line), MAX_PROGRESS_DETAIL_CHARS);
+    if label.is_empty() {
+        return false;
+    }
+    upsert_progress_item(
+        items,
+        DockerProjectTaskProgressItem {
+            id: format!("{}:text:{sequence}", phase_as_str(phase)),
+            parent_id: None,
+            phase,
+            status: if label.to_ascii_lowercase().contains("error") {
+                DockerProjectProgressStatus::Error
+            } else {
+                DockerProjectProgressStatus::Working
+            },
+            label,
+            action: String::new(),
+            details: None,
+            current_bytes: None,
+            total_bytes: None,
+            percent: None,
+        },
+    )
+}
+
+async fn load_progress_items(
+    pool: &DbPool,
+    task_id: &str,
+) -> ApiResult<Vec<DockerProjectTaskProgressItem>> {
+    let value: String =
+        sqlx::query_scalar("SELECT progress_items FROM docker_compose_project_tasks WHERE id = ?1")
+            .bind(task_id)
+            .fetch_one(pool)
+            .await?;
+    Ok(serde_json::from_str(&value).unwrap_or_default())
+}
+
+async fn persist_progress(
+    pool: &DbPool,
+    task_id: &str,
+    mode: DockerProjectProgressMode,
+    items: &[DockerProjectTaskProgressItem],
+    phase: DockerProjectProgressPhase,
+) -> ApiResult<()> {
+    let progress_percent = aggregate_progress_percent(items, phase);
+    let progress_items = serde_json::to_string(items).map_err(|error| {
+        ApiError::internal(format!("failed to serialize Compose progress: {error}"))
+    })?;
+    sqlx::query(
+        "UPDATE docker_compose_project_tasks \
+         SET progress_mode = ?2, progress_items = ?3, \
+             progress_percent = MAX(progress_percent, ?4) WHERE id = ?1",
+    )
+    .bind(task_id)
+    .bind(progress_mode_as_str(mode))
+    .bind(progress_items)
+    .bind(i64::from(progress_percent))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+fn aggregate_progress_percent(
+    items: &[DockerProjectTaskProgressItem],
+    phase: DockerProjectProgressPhase,
+) -> u8 {
+    let parent_ids = items
+        .iter()
+        .filter_map(|item| item.parent_id.as_deref())
+        .collect::<std::collections::HashSet<_>>();
+    let leaves = items
+        .iter()
+        .filter(|item| item.phase == phase && !parent_ids.contains(item.id.as_str()))
+        .collect::<Vec<_>>();
+    let (weighted_current, weighted_total) = leaves
+        .iter()
+        .filter_map(|item| item.current_bytes.zip(item.total_bytes))
+        .fold(
+            (0_i64, 0_i64),
+            |(current, total), (item_current, item_total)| {
+                (
+                    current.saturating_add(item_current.min(item_total)),
+                    total.saturating_add(item_total),
+                )
+            },
+        );
+    let detail_percent = if weighted_total > 0 {
+        (weighted_current.saturating_mul(100) / weighted_total).clamp(0, 100) as u8
+    } else {
+        let values = leaves
+            .iter()
+            .filter_map(|item| item.percent)
+            .collect::<Vec<_>>();
+        if values.is_empty() {
+            0
+        } else {
+            values.iter().map(|value| u32::from(*value)).sum::<u32>() as u8 / values.len() as u8
+        }
+    };
+    match phase {
+        DockerProjectProgressPhase::Pulling => 25 + ((u16::from(detail_percent) * 29) / 100) as u8,
+        DockerProjectProgressPhase::Applying => 55 + ((u16::from(detail_percent) * 34) / 100) as u8,
+    }
+}
+
+const fn phase_as_str(phase: DockerProjectProgressPhase) -> &'static str {
+    match phase {
+        DockerProjectProgressPhase::Pulling => "pulling",
+        DockerProjectProgressPhase::Applying => "applying",
+    }
+}
+
+const fn progress_mode_as_str(mode: DockerProjectProgressMode) -> &'static str {
+    match mode {
+        DockerProjectProgressMode::Structured => "structured",
+        DockerProjectProgressMode::Text => "text",
+        DockerProjectProgressMode::Unavailable => "unavailable",
+    }
+}
+
+fn truncate_chars(value: &str, limit: usize) -> String {
+    value.chars().take(limit).collect()
+}
+
 /// 清理超过保留期的终态任务。
 pub async fn cleanup_expired(pool: &DbPool) -> ApiResult<()> {
     sqlx::query(
@@ -401,6 +860,15 @@ fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> ApiResult<DockerProjectTask> {
         status: parse_status(&status)?,
         stage: parse_stage(&stage)?,
         progress_percent: row.try_get::<i64, _>("progress_percent")? as u8,
+        progress_mode: parse_progress_mode(
+            &row.try_get::<String, _>("progress_mode")
+                .unwrap_or_else(|_| "unavailable".to_string()),
+        ),
+        progress_items: row
+            .try_get::<String, _>("progress_items")
+            .ok()
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default(),
         service_name: row.try_get("service_name")?,
         replicas: row
             .try_get::<Option<i64>, _>("replicas")?
@@ -412,6 +880,14 @@ fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> ApiResult<DockerProjectTask> {
         started_at: row.try_get("started_at")?,
         finished_at: row.try_get("finished_at")?,
     })
+}
+
+fn parse_progress_mode(value: &str) -> DockerProjectProgressMode {
+    match value {
+        "structured" => DockerProjectProgressMode::Structured,
+        "text" => DockerProjectProgressMode::Text,
+        _ => DockerProjectProgressMode::Unavailable,
+    }
 }
 
 fn parse_operation(value: &str) -> ApiResult<DockerProjectTaskOperation> {
@@ -512,6 +988,228 @@ fn redact_assignment(value: &str, key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_namespaced_structured_progress() {
+        let item = parse_progress_event(
+            r#"{"id":"sha256:abc","parent_id":"Image nginx","status":"Working","text":"Downloading","details":"layer","current":512,"total":1024,"percent":50}"#,
+            DockerProjectProgressPhase::Pulling,
+        )
+        .expect("progress event");
+        assert_eq!(item.id, "pulling:sha256:abc");
+        assert_eq!(item.parent_id.as_deref(), Some("pulling:Image nginx"));
+        assert_eq!(item.status, DockerProjectProgressStatus::Working);
+        assert_eq!(item.current_bytes, Some(512));
+        assert_eq!(item.total_bytes, Some(1024));
+        assert_eq!(item.percent, Some(50));
+    }
+
+    #[test]
+    fn ignores_malformed_or_identity_less_progress() {
+        assert!(parse_progress_event("not-json", DockerProjectProgressPhase::Applying).is_none());
+        assert!(
+            parse_progress_event(
+                r#"{"status":"Working","text":"Pulling"}"#,
+                DockerProjectProgressPhase::Pulling,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn updates_existing_item_without_cross_phase_collision() {
+        let mut items = Vec::new();
+        let pulling = parse_progress_event(
+            r#"{"id":"Image nginx","status":"Working","text":"Pulling","percent":10}"#,
+            DockerProjectProgressPhase::Pulling,
+        )
+        .expect("pull event");
+        let applying = parse_progress_event(
+            r#"{"id":"Image nginx","status":"Done","text":"Pulled","percent":100}"#,
+            DockerProjectProgressPhase::Applying,
+        )
+        .expect("apply event");
+        assert!(upsert_progress_item(&mut items, pulling.clone()));
+        let mut updated = pulling;
+        updated.percent = Some(80);
+        assert!(upsert_progress_item(&mut items, updated));
+        assert!(upsert_progress_item(&mut items, applying));
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].percent, Some(80));
+    }
+
+    #[test]
+    fn aggregates_leaf_byte_progress_into_stage_range() {
+        let items = vec![
+            DockerProjectTaskProgressItem {
+                id: "pulling:image".into(),
+                parent_id: None,
+                phase: DockerProjectProgressPhase::Pulling,
+                status: DockerProjectProgressStatus::Working,
+                label: "Image nginx".into(),
+                action: "Pulling".into(),
+                details: None,
+                current_bytes: None,
+                total_bytes: None,
+                percent: None,
+            },
+            DockerProjectTaskProgressItem {
+                id: "pulling:layer".into(),
+                parent_id: Some("pulling:image".into()),
+                phase: DockerProjectProgressPhase::Pulling,
+                status: DockerProjectProgressStatus::Working,
+                label: "layer".into(),
+                action: "Downloading".into(),
+                details: None,
+                current_bytes: Some(50),
+                total_bytes: Some(100),
+                percent: Some(50),
+            },
+        ];
+        assert_eq!(
+            aggregate_progress_percent(&items, DockerProjectProgressPhase::Pulling),
+            39
+        );
+    }
+
+    #[test]
+    fn text_fallback_is_bounded_and_sanitized() {
+        let mut items = Vec::new();
+        assert!(upsert_text_progress_item(
+            &mut items,
+            DockerProjectProgressPhase::Applying,
+            1,
+            "token=secret Creating container"
+        ));
+        assert_eq!(items.len(), 1);
+        assert!(!items[0].label.contains("secret"));
+        assert_eq!(items[0].percent, None);
+    }
+
+    #[tokio::test]
+    async fn persists_and_restores_progress_snapshot() {
+        let pool = crate::test_support::setup_test_db().await;
+        sqlx::query(
+            "INSERT INTO docker_compose_project_tasks (\
+                id, project_name, operation, status, stage, progress_percent, pull_images, \
+                actor_kind, actor_name\
+             ) VALUES ('task-progress', 'demo', 'redeploy', 'running', 'pulling', 25, 1, \
+                'system', 'test')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert task");
+        let item = parse_progress_event(
+            r#"{"id":"Image nginx","status":"Working","text":"Pulling","percent":50}"#,
+            DockerProjectProgressPhase::Pulling,
+        )
+        .expect("progress event");
+
+        persist_progress(
+            &pool,
+            "task-progress",
+            DockerProjectProgressMode::Structured,
+            &[item],
+            DockerProjectProgressPhase::Pulling,
+        )
+        .await
+        .expect("persist progress");
+
+        let task = get(&pool, "task-progress").await.expect("load task");
+        assert_eq!(task.progress_mode, DockerProjectProgressMode::Structured);
+        assert_eq!(task.progress_items.len(), 1);
+        assert_eq!(task.progress_items[0].label, "Image nginx");
+        assert_eq!(task.progress_percent, 39);
+    }
+
+    #[tokio::test]
+    async fn exposes_working_layer_snapshot_before_pull_finishes() {
+        let pool = crate::test_support::setup_test_db().await;
+        sqlx::query(
+            "INSERT INTO docker_compose_project_tasks (\
+                id, project_name, operation, status, stage, progress_percent, pull_images, \
+                actor_kind, actor_name\
+             ) VALUES ('task-working-layer', 'demo', 'redeploy', 'running', 'pulling', 25, 1, \
+                'system', 'test')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert task");
+        let parent = parse_progress_event(
+            r#"{"id":"Image nginx","status":"Working","text":"Pulling"}"#,
+            DockerProjectProgressPhase::Pulling,
+        )
+        .expect("parent event");
+        let layer = parse_progress_event(
+            r#"{"id":"sha256:abc","parent_id":"Image nginx","status":"Working","text":"Downloading","current":25,"total":100,"percent":25}"#,
+            DockerProjectProgressPhase::Pulling,
+        )
+        .expect("layer event");
+
+        persist_progress(
+            &pool,
+            "task-working-layer",
+            DockerProjectProgressMode::Structured,
+            &[parent, layer],
+            DockerProjectProgressPhase::Pulling,
+        )
+        .await
+        .expect("persist progress");
+
+        let task = get(&pool, "task-working-layer").await.expect("load task");
+        assert_eq!(task.status, DockerProjectTaskStatus::Running);
+        assert_eq!(task.progress_items.len(), 2);
+        assert_eq!(
+            task.progress_items[1].parent_id.as_deref(),
+            Some("pulling:Image nginx")
+        );
+        assert_eq!(
+            task.progress_items[1].status,
+            DockerProjectProgressStatus::Working
+        );
+        assert_eq!(task.progress_items[1].percent, Some(25));
+    }
+
+    #[tokio::test]
+    async fn broadcasts_working_layer_before_database_flush() {
+        let task_id = "task-live-layer";
+        let (sender, _) = broadcast::channel(TASK_EVENT_BUFFER);
+        TASK_EVENT_HUBS.lock().await.insert(
+            task_id.to_string(),
+            DockerProjectTaskEventHub {
+                sender,
+                latest_progress: Vec::new(),
+            },
+        );
+        let (mut receiver, replay) = subscribe(task_id).await.expect("subscribe task");
+        assert!(replay.is_empty());
+        let item = parse_progress_event(
+            r#"{"id":"sha256:abc","parent_id":"Image nginx","status":"Working","text":"Downloading","current":25,"total":100,"percent":25}"#,
+            DockerProjectProgressPhase::Pulling,
+        )
+        .expect("layer event");
+
+        publish_progress(
+            task_id,
+            DockerProjectTaskProgressUpdate {
+                progress_mode: DockerProjectProgressMode::Structured,
+                progress_percent: 32,
+                item: item.clone(),
+            },
+        )
+        .await;
+
+        let event = receiver.recv().await.expect("live progress");
+        let DockerProjectTaskEvent::Progress(update) = event else {
+            panic!("expected progress event");
+        };
+        assert_eq!(update.item, item);
+        assert_eq!(update.progress_percent, 32);
+        let (_, replay) = subscribe(task_id).await.expect("resubscribe task");
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].item.status, DockerProjectProgressStatus::Working);
+        TASK_EVENT_HUBS.lock().await.remove(task_id);
+    }
 
     #[test]
     fn sanitizes_and_limits_command_errors() {

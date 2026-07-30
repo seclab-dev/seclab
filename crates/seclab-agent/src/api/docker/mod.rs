@@ -227,6 +227,10 @@ pub fn docker_router() -> Router<Arc<AppState>> {
             get(compose::project_operation),
         )
         .route(
+            "/compose/project-operations/{operation_id}/events",
+            get(compose::project_operation_events),
+        )
+        .route(
             "/compose/deployments/active",
             get(compose::active_deployment),
         )

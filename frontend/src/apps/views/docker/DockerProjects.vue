@@ -91,6 +91,22 @@ const deploymentProgressActive = computed(() => {
   const progress = store.projectDeploymentProgress
   return progress?.status === 'queued' || progress?.status === 'running'
 })
+const deploymentProgressItems = computed(() => store.projectDeploymentProgress?.progressItems ?? [])
+const deploymentProgressPhases = computed(() => {
+  const phases: dockerType.DockerProjectProgressPhase[] = ['pulling', 'applying']
+  return phases
+    .map((phase) => ({
+      phase,
+      items: deploymentProgressItems.value.filter((item) => item.phase === phase),
+    }))
+    .filter((group) => group.items.length)
+})
+const deploymentStageSteps = computed(() => [
+  { key: 'preparing', label: t('app.docker.projects.deploymentProgress.stageSteps.preparing') },
+  { key: 'pulling', label: t('app.docker.projects.deploymentProgress.stageSteps.pulling') },
+  { key: 'applying', label: t('app.docker.projects.deploymentProgress.stageSteps.applying') },
+  { key: 'completed', label: t('app.docker.projects.deploymentProgress.stageSteps.completed') },
+])
 
 const loadProjects = (page = store.projectPage) =>
   store.fetchComposeProjects({
@@ -275,15 +291,120 @@ const operationStatusType = (status: dockerType.DockerProjectTaskStatus) => {
   if (status === 'cancelled') return 'warning'
   return 'info'
 }
-const operationStageLabel = (operation: dockerType.DockerProjectTask) => {
-  if (
-    operation.status === 'succeeded' ||
-    operation.status === 'failed' ||
-    operation.status === 'cancelled'
-  ) {
-    return t(`app.docker.projects.deploymentProgress.statuses.${operation.status}`)
+const progressStatusType = (status: dockerType.DockerProjectProgressStatus) => {
+  if (status === 'done') return 'success'
+  if (status === 'warning') return 'warning'
+  if (status === 'error') return 'danger'
+  return 'info'
+}
+const progressActionLabel = (action: string) => {
+  const key = action.trim().toLowerCase().replaceAll(' ', '_')
+  const knownActions = new Set([
+    'creating',
+    'starting',
+    'started',
+    'waiting',
+    'healthy',
+    'running',
+    'created',
+    'stopping',
+    'stopped',
+    'removing',
+    'removed',
+    'building',
+    'built',
+    'pulling',
+    'pulled',
+    'downloading',
+    'download_complete',
+  ])
+  return knownActions.has(key) ? t(`app.docker.projects.deploymentProgress.actions.${key}`) : action
+}
+const progressItemChildren = (parentId: string) =>
+  deploymentProgressItems.value.filter((item) => item.parentId === parentId)
+const progressRootItems = (items: dockerType.DockerProjectTaskProgressItem[]) => {
+  const ids = new Set(items.map((item) => item.id))
+  return items.filter((item) => !item.parentId || !ids.has(item.parentId))
+}
+const formatProgressBytes = (value: number) => {
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
+  let amount = Math.max(0, value)
+  let unit = 0
+  while (amount >= 1024 && unit < units.length - 1) {
+    amount /= 1024
+    unit += 1
   }
-  return t(`app.docker.projects.deploymentProgress.stages.${operation.stage}`)
+  const digits = unit === 0 || amount >= 100 ? 0 : 1
+  return `${amount.toFixed(digits)} ${units[unit]}`
+}
+const progressBytesLabel = (item: dockerType.DockerProjectTaskProgressItem) => {
+  if (
+    typeof item.currentBytes === 'number' &&
+    Number.isFinite(item.currentBytes) &&
+    typeof item.totalBytes === 'number' &&
+    Number.isFinite(item.totalBytes) &&
+    item.totalBytes > 0
+  ) {
+    return `${formatProgressBytes(item.currentBytes)} / ${formatProgressBytes(item.totalBytes)}`
+  }
+  return ''
+}
+const progressItemPercent = (item: dockerType.DockerProjectTaskProgressItem) => {
+  if (typeof item.percent === 'number' && Number.isFinite(item.percent)) return item.percent
+  const children = progressItemChildren(item.id)
+  const byteMetrics = children
+    .filter(
+      (child) =>
+        typeof child.currentBytes === 'number' &&
+        Number.isFinite(child.currentBytes) &&
+        typeof child.totalBytes === 'number' &&
+        Number.isFinite(child.totalBytes),
+    )
+    .reduce(
+      (metrics, child) => ({
+        current: metrics.current + Math.min(child.currentBytes ?? 0, child.totalBytes ?? 0),
+        total: metrics.total + (child.totalBytes ?? 0),
+      }),
+      { current: 0, total: 0 },
+    )
+  if (byteMetrics.total) return Math.round((byteMetrics.current / byteMetrics.total) * 100)
+  const percentages = children
+    .map((child) => child.percent)
+    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
+  if (!percentages.length) return undefined
+  return Math.round(percentages.reduce((sum, value) => sum + value, 0) / percentages.length)
+}
+const progressItemPercentLabel = (item: dockerType.DockerProjectTaskProgressItem) => {
+  const percent = progressItemPercent(item)
+  return percent === undefined ? '' : `${percent}%`
+}
+const progressPhaseCompleted = (phase: dockerType.DockerProjectProgressPhase) => {
+  const items = deploymentProgressItems.value.filter((item) => item.phase === phase)
+  return (
+    items.length > 0 && items.every((item) => item.status === 'done' || item.status === 'warning')
+  )
+}
+const deploymentStageState = (key: string) => {
+  const operation = store.projectDeploymentProgress
+  if (!operation) return 'pending'
+  if (key === 'completed') {
+    if (operation.status === 'failed' || operation.status === 'cancelled') return 'error'
+    return operation.status === 'succeeded' ? 'done' : 'pending'
+  }
+  if (operation.status === 'failed' || operation.status === 'cancelled') {
+    return operation.stage === key ? 'error' : 'done'
+  }
+  if (key === 'pulling' && progressPhaseCompleted('pulling')) return 'done'
+  if (key === 'applying' && progressPhaseCompleted('applying')) return 'done'
+  if (key === 'preparing' && deploymentProgressItems.value.length) return 'done'
+  const order = ['preparing', 'pulling', 'applying']
+  const currentStage = operation.stage === 'validating' ? 'preparing' : operation.stage
+  const stepIndex = order.indexOf(key)
+  const currentIndex = order.indexOf(currentStage)
+  if (key === 'pulling' && currentIndex > stepIndex && !operation.pullImages) return 'skipped'
+  if (stepIndex < currentIndex || operation.status === 'succeeded') return 'done'
+  if (stepIndex === currentIndex) return 'active'
+  return 'pending'
 }
 const handleVisibility = () => {
   if (document.hidden) {
@@ -547,8 +668,9 @@ onUnmounted(() => {
           id="docker-project-pull-images"
           v-model="pullImages"
           name="pullImages"
-          :label="t('app.docker.projects.deployment.pullImages')"
-        />
+          :aria-label="t('app.docker.projects.deployment.pullImages')"
+          >{{ t('app.docker.projects.deployment.pullImages') }}</SecLabCheckbox
+        >
       </div>
       <template #footer>
         <SecLabButton @click="deploymentVisible = false">{{ t('common.cancel') }}</SecLabButton>
@@ -564,7 +686,7 @@ onUnmounted(() => {
     <SecLabDialog
       :visible="Boolean(store.projectDeploymentProgress)"
       :title="t('app.docker.projects.deploymentProgress.title')"
-      width="560px"
+      width="760px"
       :close-on-click-overlay="false"
       data-ui="project-deployment-progress-dialog"
       @close="store.closeProjectDeploymentProgress"
@@ -577,33 +699,26 @@ onUnmounted(() => {
           :description="store.projectDeploymentProgressError"
           show-icon
         />
-        <div class="deployment-summary">
-          <div>
-            <span>{{ t('app.docker.projects.deploymentProgress.project') }}</span>
-            <strong>{{ store.projectDeploymentProgress.projectName }}</strong>
-          </div>
-          <div>
-            <span>{{ t('app.docker.projects.deploymentProgress.operation') }}</span>
-            <strong>{{
-              t(
-                `app.docker.projects.deploymentProgress.operations.${store.projectDeploymentProgress.operation}`,
-              )
+        <div class="deployment-summary" data-ui="deployment-summary">
+          <div class="deployment-identity" data-ui="deployment-identity">
+            <strong data-ui="deployment-project-name">{{
+              store.projectDeploymentProgress.projectName
             }}</strong>
-          </div>
-          <div>
-            <span>{{ t('app.docker.projects.deploymentProgress.status') }}</span>
-            <SecLabTag :type="operationStatusType(store.projectDeploymentProgress.status)">{{
-              t(
-                `app.docker.projects.deploymentProgress.statuses.${store.projectDeploymentProgress.status}`,
-              )
-            }}</SecLabTag>
-          </div>
-          <div>
-            <span>{{ t('app.docker.projects.deploymentProgress.stage') }}</span>
-            <strong>{{ operationStageLabel(store.projectDeploymentProgress) }}</strong>
+            <div class="deployment-meta">
+              <span>{{
+                t(
+                  `app.docker.projects.deploymentProgress.operations.${store.projectDeploymentProgress.operation}`,
+                )
+              }}</span>
+              <SecLabTag :type="operationStatusType(store.projectDeploymentProgress.status)">{{
+                t(
+                  `app.docker.projects.deploymentProgress.statuses.${store.projectDeploymentProgress.status}`,
+                )
+              }}</SecLabTag>
+            </div>
           </div>
         </div>
-        <div class="progress-row">
+        <div class="progress-row" data-ui="deployment-overall-progress">
           <div class="progress-track" aria-hidden="true">
             <div
               class="progress-value"
@@ -611,6 +726,118 @@ onUnmounted(() => {
             />
           </div>
           <span>{{ store.projectDeploymentProgress.progressPercent }}%</span>
+        </div>
+        <div class="deployment-stage-track" data-ui="deployment-stage-track">
+          <div
+            v-for="step in deploymentStageSteps"
+            :key="step.key"
+            class="deployment-stage-step"
+            :class="`is-${deploymentStageState(step.key)}`"
+          >
+            <span class="deployment-stage-dot" aria-hidden="true" />
+            <span>{{ step.label }}</span>
+          </div>
+        </div>
+        <div
+          v-if="store.projectDeploymentProgress.progressMode === 'text'"
+          class="deployment-compatibility"
+          data-ui="deployment-progress-compatibility"
+        >
+          {{ t('app.docker.projects.deploymentProgress.compatibilityText') }}
+        </div>
+        <div
+          v-else-if="store.projectDeploymentProgress.progressMode === 'unavailable'"
+          class="deployment-compatibility"
+          data-ui="deployment-progress-compatibility"
+        >
+          {{ t('app.docker.projects.deploymentProgress.compatibilityUnavailable') }}
+        </div>
+        <div class="deployment-details" data-ui="deployment-progress-list">
+          <div v-if="deploymentProgressPhases.length" class="deployment-phase-list">
+            <div
+              v-for="group in deploymentProgressPhases"
+              :key="group.phase"
+              class="deployment-phase"
+              :data-slot="`deployment-phase-${group.phase}`"
+            >
+              <div class="deployment-phase-title" data-ui="deployment-phase-title">
+                {{ t(`app.docker.projects.deploymentProgress.phases.${group.phase}`) }}
+              </div>
+              <div class="deployment-item-list">
+                <div
+                  v-for="item in progressRootItems(group.items)"
+                  :key="item.id"
+                  class="deployment-item"
+                  :class="`is-${item.status}`"
+                  data-ui="deployment-progress-item"
+                >
+                  <div class="deployment-item-main">
+                    <div class="deployment-item-identity">
+                      <strong data-ui="deployment-progress-item-label">{{ item.label }}</strong>
+                    </div>
+                    <div class="deployment-item-state">
+                      <SecLabTag :type="progressStatusType(item.status)">{{
+                        t(`app.docker.projects.deploymentProgress.itemStatuses.${item.status}`)
+                      }}</SecLabTag>
+                    </div>
+                  </div>
+                  <div
+                    v-if="progressItemPercent(item) !== undefined || item.status === 'working'"
+                    class="deployment-item-progress"
+                  >
+                    <div class="progress-track" aria-hidden="true">
+                      <div
+                        class="progress-value"
+                        :class="{ 'is-indeterminate': progressItemPercent(item) === undefined }"
+                        :style="
+                          progressItemPercent(item) === undefined
+                            ? undefined
+                            : { width: `${progressItemPercent(item)}%` }
+                        "
+                      />
+                    </div>
+                    <span
+                      v-if="progressItemPercentLabel(item)"
+                      data-ui="deployment-progress-item-percent"
+                      >{{ progressItemPercentLabel(item) }}</span
+                    >
+                  </div>
+                  <div v-if="item.details" class="deployment-item-details">
+                    {{ item.details }}
+                  </div>
+                  <div
+                    v-if="progressItemChildren(item.id).length"
+                    class="deployment-child-list"
+                    data-slot="deployment-progress-children"
+                  >
+                    <div
+                      v-for="child in progressItemChildren(item.id)"
+                      :key="child.id"
+                      class="deployment-child-item"
+                      :class="`is-${child.status}`"
+                      data-ui="deployment-progress-layer"
+                    >
+                      <div class="deployment-child-copy">
+                        <strong data-ui="deployment-progress-layer-label">{{ child.label }}</strong>
+                        <span>{{ progressActionLabel(child.action) }}</span>
+                      </div>
+                      <span v-if="progressBytesLabel(child)" class="deployment-bytes">{{
+                        progressBytesLabel(child)
+                      }}</span>
+                      <span
+                        v-if="progressItemPercentLabel(child)"
+                        data-ui="deployment-progress-layer-percent"
+                        >{{ progressItemPercentLabel(child) }}</span
+                      >
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div v-else class="deployment-empty-progress">
+            {{ t('app.docker.projects.deploymentProgress.waitingForDetails') }}
+          </div>
         </div>
         <SecLabAlert
           v-if="store.projectDeploymentProgress.errorSummary"
@@ -696,23 +923,36 @@ onUnmounted(() => {
   flex-direction: column;
   gap: var(--sdl-space-4);
 }
+.deployment-progress {
+  min-height: 0;
+}
 .deployment-summary {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: var(--sdl-space-4);
-}
-.deployment-summary > div {
   display: flex;
-  flex-direction: column;
-  gap: var(--sdl-space-1);
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--sdl-space-5);
+}
+.deployment-identity {
+  display: flex;
+  align-items: center;
   min-width: 0;
+  gap: var(--sdl-space-2);
 }
-.deployment-summary span {
-  color: var(--sdl-text-muted);
-  font-size: var(--sdl-font-size-sm);
+.deployment-identity > strong {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--sdl-font-subtitle);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.deployment-summary strong {
-  overflow-wrap: anywhere;
+.deployment-meta {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  gap: var(--sdl-space-2);
+  color: var(--sdl-text-secondary);
+  font-size: var(--sdl-font-body-sm);
 }
 .progress-row {
   display: flex;
@@ -723,14 +963,206 @@ onUnmounted(() => {
   flex: 1;
   height: 8px;
   overflow: hidden;
-  border-radius: var(--sdl-radius-full);
+  border-radius: var(--sdl-radius-pill);
   background: var(--sdl-bg-muted);
 }
 .progress-value {
   height: 100%;
   border-radius: inherit;
-  background: var(--sdl-color-primary);
+  background: var(--sdl-primary);
   transition: width 180ms ease;
+}
+.progress-value.is-indeterminate {
+  width: 38%;
+  animation: deployment-progress-indeterminate 1.2s ease-in-out infinite;
+}
+.deployment-stage-track {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  padding: var(--sdl-space-1) 0;
+}
+.deployment-stage-step {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sdl-space-1);
+  color: var(--sdl-text-muted);
+  font-size: var(--sdl-font-caption);
+  text-align: center;
+}
+.deployment-stage-step::before,
+.deployment-stage-step::after {
+  position: absolute;
+  top: 6px;
+  height: 1px;
+  background: var(--sdl-border-default);
+  content: '';
+}
+.deployment-stage-step::before {
+  left: 0;
+  right: 50%;
+}
+.deployment-stage-step::after {
+  left: 50%;
+  right: 0;
+}
+.deployment-stage-step:first-child::before,
+.deployment-stage-step:last-child::after {
+  display: none;
+}
+.deployment-stage-dot {
+  z-index: 1;
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--sdl-border-default);
+  border-radius: var(--sdl-radius-pill);
+  background: var(--sdl-bg-panel);
+}
+.deployment-stage-step.is-active {
+  color: var(--sdl-text-primary);
+  font-weight: var(--sdl-font-weight-medium);
+}
+.deployment-stage-step.is-active .deployment-stage-dot {
+  border-color: var(--sdl-primary);
+  background: var(--sdl-primary);
+}
+.deployment-stage-step.is-done .deployment-stage-dot {
+  border-color: var(--sdl-success);
+  background: var(--sdl-success);
+}
+.deployment-stage-step.is-error .deployment-stage-dot {
+  border-color: var(--sdl-danger);
+  background: var(--sdl-danger);
+}
+.deployment-stage-step.is-skipped {
+  opacity: 0.6;
+}
+.deployment-compatibility {
+  padding: var(--sdl-space-2) var(--sdl-space-3);
+  border-left: 2px solid var(--sdl-warning);
+  color: var(--sdl-text-secondary);
+  background: var(--sdl-bg-muted);
+  font-size: var(--sdl-font-body-sm);
+}
+.deployment-details,
+.deployment-phase-list,
+.deployment-phase,
+.deployment-item-list {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.deployment-phase-list {
+  gap: var(--sdl-space-4);
+}
+.deployment-phase {
+  gap: var(--sdl-space-2);
+}
+.deployment-phase-title {
+  color: var(--sdl-text-secondary);
+  font-size: var(--sdl-font-body-sm);
+  font-weight: var(--sdl-font-weight-medium);
+}
+.deployment-item-list {
+  border-top: 1px solid var(--sdl-border-subtle);
+}
+.deployment-item {
+  padding: var(--sdl-space-3) 0;
+  border-bottom: 1px solid var(--sdl-border-subtle);
+}
+.deployment-item-main,
+.deployment-item-state,
+.deployment-item-progress,
+.deployment-child-item {
+  display: flex;
+  align-items: center;
+}
+.deployment-item-main {
+  justify-content: space-between;
+  gap: var(--sdl-space-4);
+}
+.deployment-item-identity {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 2px;
+}
+.deployment-item-identity strong,
+.deployment-child-copy strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.deployment-item-identity span,
+.deployment-child-copy span,
+.deployment-item-details,
+.deployment-bytes {
+  color: var(--sdl-text-muted);
+  font-size: var(--sdl-font-caption);
+}
+.deployment-item-state {
+  flex-shrink: 0;
+  gap: var(--sdl-space-3);
+}
+.deployment-bytes {
+  font-family: var(--sdl-font-mono);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.deployment-item-progress {
+  gap: var(--sdl-space-2);
+  margin-top: var(--sdl-space-2);
+  font-size: var(--sdl-font-caption);
+  font-variant-numeric: tabular-nums;
+}
+.deployment-item-progress > span {
+  width: 36px;
+  color: var(--sdl-text-muted);
+  text-align: right;
+}
+.deployment-item-details {
+  margin-top: var(--sdl-space-2);
+  overflow-wrap: anywhere;
+}
+.deployment-child-list {
+  margin-top: var(--sdl-space-2);
+  padding-left: var(--sdl-space-3);
+  border-left: 1px solid var(--sdl-border-default);
+}
+.deployment-child-item {
+  min-height: 28px;
+  gap: var(--sdl-space-3);
+  color: var(--sdl-text-secondary);
+  font-size: var(--sdl-font-caption);
+}
+.deployment-child-copy {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  gap: var(--sdl-space-2);
+}
+.deployment-child-copy strong {
+  max-width: 45%;
+}
+.deployment-child-item > span:last-child {
+  min-width: 36px;
+  text-align: right;
+}
+.deployment-empty-progress {
+  padding: var(--sdl-space-5);
+  border: 1px dashed var(--sdl-border-default);
+  color: var(--sdl-text-muted);
+  font-size: var(--sdl-font-body-sm);
+  text-align: center;
+}
+@keyframes deployment-progress-indeterminate {
+  0% {
+    transform: translateX(-110%);
+  }
+  100% {
+    transform: translateX(300%);
+  }
 }
 .compose-editor {
   height: 360px;
@@ -753,11 +1185,11 @@ onUnmounted(() => {
 }
 .compose-field-label {
   color: var(--sdl-text-primary);
-  font-size: var(--sdl-font-size-sm);
+  font-size: var(--sdl-font-body-sm);
   font-weight: var(--sdl-font-weight-medium);
 }
 .required-mark {
-  color: var(--sdl-color-danger);
+  color: var(--sdl-danger);
 }
 @media (max-width: 860px) {
   .project-toolbar,
@@ -769,7 +1201,28 @@ onUnmounted(() => {
     justify-content: flex-end;
   }
   .deployment-summary {
-    grid-template-columns: 1fr;
+    gap: var(--sdl-space-3);
+  }
+  .deployment-item-main {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: var(--sdl-space-2);
+  }
+  .deployment-item-state {
+    width: 100%;
+    justify-content: space-between;
+  }
+  .deployment-child-copy {
+    flex-direction: column;
+    gap: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .progress-value {
+    transition: none;
+  }
+  .progress-value.is-indeterminate {
+    animation: none;
   }
 }
 </style>

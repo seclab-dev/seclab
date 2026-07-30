@@ -600,6 +600,58 @@ pub enum DockerProjectTaskStage {
     Interrupted,
 }
 
+/// Compose 任务进度输出模式。
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DockerProjectProgressMode {
+    Structured,
+    Text,
+    Unavailable,
+}
+
+/// Compose 任务进度所属阶段。
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DockerProjectProgressPhase {
+    Pulling,
+    Applying,
+}
+
+/// Compose 资源事件状态。
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DockerProjectProgressStatus {
+    Working,
+    Done,
+    Warning,
+    Error,
+}
+
+/// Compose 命令输出中的单个资源进度快照。
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerProjectTaskProgressItem {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub phase: DockerProjectProgressPhase,
+    pub status: DockerProjectProgressStatus,
+    pub label: String,
+    pub action: String,
+    pub details: Option<String>,
+    pub current_bytes: Option<i64>,
+    pub total_bytes: Option<i64>,
+    pub percent: Option<u8>,
+}
+
+/// Compose 项目任务通过事件流发送的单项进度更新。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerProjectTaskProgressUpdate {
+    pub progress_mode: DockerProjectProgressMode,
+    pub progress_percent: u8,
+    pub item: DockerProjectTaskProgressItem,
+}
+
 /// Compose 项目后台任务。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -610,6 +662,8 @@ pub struct DockerProjectTask {
     pub status: DockerProjectTaskStatus,
     pub stage: DockerProjectTaskStage,
     pub progress_percent: u8,
+    pub progress_mode: DockerProjectProgressMode,
+    pub progress_items: Vec<DockerProjectTaskProgressItem>,
     pub service_name: Option<String>,
     pub replicas: Option<usize>,
     pub pull_images: bool,

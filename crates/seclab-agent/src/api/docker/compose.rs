@@ -11,11 +11,15 @@ use crate::state::AppState;
 use crate::types::{ApiError, ApiResponse, ApiResult};
 use axum::extract::{Json, Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::response::{
+    IntoResponse, Response,
+    sse::{Event, KeepAlive, Sse},
+};
 use bollard::models::ContainerSummary;
 use bollard::query_parameters;
+use futures_util::{Stream, StreamExt, stream};
 use seclab_contracts::api::ErrorCode;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::Row;
 use std::collections::{HashMap, HashSet};
@@ -23,6 +27,7 @@ use std::path::{Path as FsPath, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
+use std::{convert::Infallible, pin::Pin};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use uuid::Uuid;
@@ -390,6 +395,75 @@ pub async fn project_operation(
     )
 }
 
+/// 建立 Compose 项目操作的实时事件流，并以持久化快照作为首帧。
+pub async fn project_operation_events(
+    State(state): State<Arc<AppState>>,
+    Path(operation_id): Path<String>,
+) -> ApiResult<Response> {
+    let subscription = docker_project_tasks::subscribe(&operation_id).await;
+    let operation = docker_project_tasks::get(&state.metadata_db, &operation_id).await?;
+    let terminal = !matches!(
+        operation.status,
+        docker::DockerProjectTaskStatus::Queued | docker::DockerProjectTaskStatus::Running
+    );
+    let initial_event = if terminal {
+        sse_json_event("terminal", &operation)
+    } else {
+        sse_json_event("snapshot", &operation)
+    };
+    let initial = stream::once(async move { Ok(initial_event) });
+
+    let events: Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> =
+        if let Some((receiver, replay)) = subscription.filter(|_| !terminal) {
+            let replay = stream::iter(
+                replay
+                    .into_iter()
+                    .map(|update| Ok::<_, Infallible>(sse_json_event("progress", &update))),
+            );
+            let live = stream::unfold(receiver, |mut receiver| async move {
+                match receiver.recv().await {
+                    Ok(event) => Some((Ok(task_event_to_sse(event)), receiver)),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Some((
+                        Ok(Event::default().event("resync").data("lagged")),
+                        receiver,
+                    )),
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
+                }
+            });
+            Box::pin(initial.chain(replay).chain(live))
+        } else {
+            Box::pin(initial)
+        };
+
+    Ok(Sse::new(events)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response())
+}
+
+fn task_event_to_sse(event: docker_project_tasks::DockerProjectTaskEvent) -> Event {
+    match event {
+        docker_project_tasks::DockerProjectTaskEvent::Snapshot(task) => {
+            sse_json_event("snapshot", &task)
+        }
+        docker_project_tasks::DockerProjectTaskEvent::Progress(update) => {
+            sse_json_event("progress", &update)
+        }
+        docker_project_tasks::DockerProjectTaskEvent::Terminal(task) => {
+            sse_json_event("terminal", &task)
+        }
+    }
+}
+
+fn sse_json_event<T: Serialize>(name: &'static str, value: &T) -> Event {
+    Event::default()
+        .event(name)
+        .data(serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string()))
+}
+
 /// 返回最近提交且仍在执行的创建或重新部署操作。
 pub async fn active_deployment(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
     let deployment = docker_project_tasks::latest_active_deployment(&state.metadata_db).await?;
@@ -469,7 +543,10 @@ async fn run_create_task(
             55,
         )
         .await?;
-        match docker_project_tasks::run_compose_command(
+        match docker_project_tasks::run_tracked_compose_command(
+            &state.metadata_db,
+            &task_id,
+            docker::DockerProjectProgressPhase::Applying,
             &name,
             &compose_file,
             &["up".into(), "-d".into(), "--remove-orphans".into()],
@@ -582,7 +659,21 @@ async fn run_redeploy_task(
                 25,
             )
             .await?;
-            run_task_command(&record, &["pull".into()], &cancellation).await?;
+            if matches!(
+                docker_project_tasks::run_tracked_compose_command(
+                    &state.metadata_db,
+                    &task_id,
+                    docker::DockerProjectProgressPhase::Pulling,
+                    &record.name,
+                    &PathBuf::from(&record.compose_dir).join(COMPOSE_FILE_NAME),
+                    &["pull".into()],
+                    &cancellation,
+                )
+                .await?,
+                ComposeCommandResult::Cancelled
+            ) {
+                return Err(TaskRunError::Cancelled.into());
+            }
         }
         docker_project_tasks::update(
             &state.metadata_db,
@@ -591,17 +682,26 @@ async fn run_redeploy_task(
             55,
         )
         .await?;
-        run_task_command(
-            &record,
-            &[
-                "up".into(),
-                "-d".into(),
-                "--force-recreate".into(),
-                "--remove-orphans".into(),
-            ],
-            &cancellation,
-        )
-        .await?;
+        if matches!(
+            docker_project_tasks::run_tracked_compose_command(
+                &state.metadata_db,
+                &task_id,
+                docker::DockerProjectProgressPhase::Applying,
+                &record.name,
+                &PathBuf::from(&record.compose_dir).join(COMPOSE_FILE_NAME),
+                &[
+                    "up".into(),
+                    "-d".into(),
+                    "--force-recreate".into(),
+                    "--remove-orphans".into(),
+                ],
+                &cancellation,
+            )
+            .await?,
+            ComposeCommandResult::Cancelled
+        ) {
+            return Err(TaskRunError::Cancelled.into());
+        }
         let compose_file = PathBuf::from(&record.compose_dir).join(COMPOSE_FILE_NAME);
         tokio::fs::copy(
             &compose_file,
