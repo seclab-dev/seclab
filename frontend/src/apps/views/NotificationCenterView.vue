@@ -202,6 +202,7 @@ const detailItems = computed(() => {
       ? {
           label: t('app.notificationCenter.detail.node'),
           value: current.source.nodeName ?? current.source.nodeId,
+          span: 2,
         }
       : null,
     current.subject
