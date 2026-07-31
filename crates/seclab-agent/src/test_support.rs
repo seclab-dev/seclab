@@ -37,6 +37,9 @@ pub async fn setup_test_state() -> AppState {
         docker_status: RwLock::new(DockerServiceStatus::NotInstalled),
         system_monitoring: std::sync::Arc::new(system_monitoring),
         process_manager: std::sync::Arc::new(ProcessManagerRuntime::new()),
+        controller_runtime: std::sync::Arc::new(
+            crate::services::controller_runtime::ControllerRuntime::new(),
+        ),
         metadata_db,
         websocket_sender: websocket::create_channel(),
         running_task_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),

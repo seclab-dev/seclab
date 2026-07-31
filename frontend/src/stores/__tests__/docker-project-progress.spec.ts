@@ -129,8 +129,149 @@ describe('DockerStore Compose deployment SSE', () => {
 
     expect(store.projectDeploymentProgress?.progressPercent).toBe(37)
     expect(store.projectDeploymentProgress?.progressItems).toEqual([update.item])
+    expect(store.projectDeploymentProgressVisible).toBe(true)
+    store.closeProjectDeploymentProgress()
+    expect(store.projectDeploymentProgressVisible).toBe(false)
+    expect(store.projectDeploymentProgress?.id).toBe(task.id)
+    expect(source.closed).toBe(false)
+    store.openProjectDeploymentProgress()
+    expect(store.projectDeploymentProgressVisible).toBe(true)
     store.stopProjectOperationPolling()
     expect(source.closed).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('原位更新任务与条目并忽略延迟事件造成的进度回退', async () => {
+    const task = activeTask()
+    api.createComposeProject.mockResolvedValue({
+      success: true,
+      code: 202,
+      message: '',
+      data: task,
+    })
+    let store!: ReturnType<typeof useDockerStore>
+    const wrapper = mount(
+      defineComponent({
+        setup() {
+          store = useDockerStore()
+          return () => h('div')
+        },
+      }),
+      {
+        global: {
+          plugins: [
+            createPinia(),
+            createI18n({ legacy: false, locale: 'zh', messages: { zh, en } }),
+          ],
+        },
+      },
+    )
+    await store.createComposeProject({ name: 'demo', composeYaml: 'services: {}' })
+    const source = EventSourceMock.instances[0]
+    source.emit('progress', {
+      progressMode: 'structured',
+      progressPercent: 45,
+      item: {
+        id: 'pulling:layer',
+        parentId: 'pulling:image',
+        phase: 'pulling',
+        status: 'working',
+        label: 'layer',
+        action: 'Downloading',
+        currentBytes: 75,
+        totalBytes: 100,
+        percent: 75,
+      },
+    } satisfies DockerProjectTaskProgressUpdate)
+    const operation = store.projectDeploymentProgress
+    const item = operation?.progressItems[0]
+
+    source.emit('snapshot', {
+      ...activeTask(),
+      progressPercent: 35,
+      progressMode: 'unavailable',
+      progressItems: [
+        {
+          ...item!,
+          action: 'Waiting',
+          currentBytes: 25,
+          percent: 25,
+        },
+      ],
+    } satisfies DockerProjectTask)
+
+    expect(store.projectDeploymentProgress).toBe(operation)
+    expect(store.projectDeploymentProgress?.progressItems[0]).toBe(item)
+    expect(store.projectDeploymentProgress?.progressPercent).toBe(45)
+    expect(store.projectDeploymentProgress?.progressItems[0].currentBytes).toBe(75)
+    expect(store.projectDeploymentProgress?.progressItems[0].percent).toBe(75)
+    expect(store.projectDeploymentProgress?.progressItems[0].action).toBe('Downloading')
+    expect(store.projectDeploymentProgress?.progressMode).toBe('structured')
+    wrapper.unmount()
+  })
+
+  it('限制实时条目数量并用终态快照移除后端已裁剪的旧条目', async () => {
+    api.createComposeProject.mockResolvedValue({
+      success: true,
+      code: 202,
+      message: '',
+      data: activeTask(),
+    })
+    let store!: ReturnType<typeof useDockerStore>
+    const wrapper = mount(
+      defineComponent({
+        setup() {
+          store = useDockerStore()
+          return () => h('div')
+        },
+      }),
+      {
+        global: {
+          plugins: [
+            createPinia(),
+            createI18n({ legacy: false, locale: 'zh', messages: { zh, en } }),
+          ],
+        },
+      },
+    )
+    await store.createComposeProject({ name: 'demo', composeYaml: 'services: {}' })
+    const source = EventSourceMock.instances[0]
+    for (let index = 0; index <= 200; index += 1) {
+      source.emit('progress', {
+        progressMode: 'structured',
+        progressPercent: 50,
+        item: {
+          id: `pulling:layer-${index}`,
+          parentId: 'pulling:image',
+          phase: 'pulling',
+          status: 'working',
+          label: `layer-${index}`,
+          action: 'Downloading',
+        },
+      } satisfies DockerProjectTaskProgressUpdate)
+    }
+    expect(store.projectDeploymentProgress?.progressItems).toHaveLength(200)
+    expect(store.projectDeploymentProgress?.progressItems[0].id).toBe('pulling:layer-1')
+    const retainedItem = store.projectDeploymentProgress?.progressItems.at(-1)
+
+    source.emit('snapshot', {
+      ...activeTask(),
+      status: 'succeeded',
+      stage: 'completed',
+      progressPercent: 100,
+      progressItems: [
+        {
+          ...retainedItem!,
+          status: 'done',
+          action: 'Pull complete',
+          percent: 100,
+        },
+      ],
+    } satisfies DockerProjectTask)
+
+    expect(store.projectDeploymentProgress?.progressItems).toHaveLength(1)
+    expect(store.projectDeploymentProgress?.progressItems[0]).toBe(retainedItem)
+    expect(store.projectDeploymentProgress?.progressItems[0].status).toBe('done')
     wrapper.unmount()
   })
 })

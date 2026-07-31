@@ -31,6 +31,8 @@ const CONTAINER_STATS_TTL = 60_000
 const OVERVIEW_CACHE_TTL = 30_000
 /** 概览最大可选容器数 */
 const MAX_OVERVIEW_CONTAINERS = 5
+/** 与后端任务快照一致的部署进度项上限 */
+const MAX_PROJECT_PROGRESS_ITEMS = 200
 
 const emptyContainerStates = (): dockerType.ContainerStateCounts => ({
   total: 0,
@@ -108,6 +110,7 @@ export const useDockerStore = defineStore('docker', () => {
   const projectConfigurationError = ref<string | null>(null)
   const projectConfigurationLoadedAt = ref<number | null>(null)
   const projectDeploymentProgress = ref<dockerType.DockerProjectTask | null>(null)
+  const projectDeploymentProgressVisible = ref(false)
   const projectDeploymentProgressError = ref<string | null>(null)
   const projectMutationLoading = ref(false)
 
@@ -277,6 +280,7 @@ export const useDockerStore = defineStore('docker', () => {
     projectConfigurationError.value = null
     projectConfigurationLoadedAt.value = null
     projectDeploymentProgress.value = null
+    projectDeploymentProgressVisible.value = false
     projectDeploymentProgressError.value = null
     projectMutationLoading.value = false
     projectNodeId = null
@@ -572,6 +576,7 @@ export const useDockerStore = defineStore('docker', () => {
       projectOperationsNodeId = nodeId
       trackedProjectOperations.clear()
       projectDeploymentProgress.value = null
+      projectDeploymentProgressVisible.value = false
       projectDeploymentProgressError.value = null
       stopProjectOperationPolling()
     }
@@ -1238,6 +1243,112 @@ export const useDockerStore = defineStore('docker', () => {
   const isProjectOperationActive = (operation: dockerType.DockerProjectTask) =>
     operation.status === 'queued' || operation.status === 'running'
 
+  /** 合并同一进度项，避免延迟事件让百分比或终态发生回退。 */
+  const mergeProjectProgressItem = (
+    current: dockerType.DockerProjectTaskProgressItem,
+    incoming: dockerType.DockerProjectTaskProgressItem,
+  ) => {
+    const terminalStatuses = new Set<dockerType.DockerProjectProgressStatus>([
+      'done',
+      'warning',
+      'error',
+    ])
+    const terminalRegression = terminalStatuses.has(current.status) && incoming.status === 'working'
+    const status = terminalRegression ? current.status : incoming.status
+    const numericRegression =
+      (typeof current.percent === 'number' &&
+        typeof incoming.percent === 'number' &&
+        incoming.percent < current.percent) ||
+      (typeof current.currentBytes === 'number' &&
+        typeof incoming.currentBytes === 'number' &&
+        current.totalBytes === incoming.totalBytes &&
+        incoming.currentBytes < current.currentBytes)
+    const percent =
+      typeof current.percent === 'number' && typeof incoming.percent === 'number'
+        ? Math.max(current.percent, incoming.percent)
+        : (incoming.percent ?? current.percent)
+    const currentBytes =
+      typeof current.currentBytes === 'number' &&
+      typeof incoming.currentBytes === 'number' &&
+      current.totalBytes === incoming.totalBytes
+        ? Math.max(current.currentBytes, incoming.currentBytes)
+        : (incoming.currentBytes ?? current.currentBytes)
+    Object.assign(current, incoming, {
+      status,
+      action: terminalRegression || numericRegression ? current.action : incoming.action,
+      details: terminalRegression || numericRegression ? current.details : incoming.details,
+      percent,
+      currentBytes,
+    })
+  }
+
+  /** 原位合并任务快照；权威快照同时移除后端已裁剪的旧条目。 */
+  const mergeProjectDeploymentSnapshot = (
+    incoming: dockerType.DockerProjectTask,
+    authoritative = !isProjectOperationActive(incoming),
+  ) => {
+    const current = projectDeploymentProgress.value
+    if (!current || current.id !== incoming.id) {
+      projectDeploymentProgress.value = incoming
+      return incoming
+    }
+    const currentItems = current.progressItems
+    const currentItemsById = new Map(currentItems.map((item) => [item.id, item]))
+    const reconciledItems = incoming.progressItems.map((item) => {
+      const existing = currentItemsById.get(item.id)
+      if (existing) mergeProjectProgressItem(existing, item)
+      return existing ?? item
+    })
+    if (authoritative) {
+      currentItems.splice(0, currentItems.length, ...reconciledItems)
+    } else {
+      for (const item of reconciledItems) {
+        if (!currentItemsById.has(item.id)) currentItems.push(item)
+      }
+      if (currentItems.length > MAX_PROJECT_PROGRESS_ITEMS) {
+        currentItems.splice(0, currentItems.length - MAX_PROJECT_PROGRESS_ITEMS)
+      }
+    }
+    const active = isProjectOperationActive(current) && isProjectOperationActive(incoming)
+    const progressModeOrder: dockerType.DockerProjectProgressMode[] = [
+      'unavailable',
+      'text',
+      'structured',
+    ]
+    const progressMode =
+      active &&
+      progressModeOrder.indexOf(incoming.progressMode) <
+        progressModeOrder.indexOf(current.progressMode)
+        ? current.progressMode
+        : incoming.progressMode
+    const activeStageOrder: dockerType.DockerProjectTaskStage[] = [
+      'validating',
+      'preparing',
+      'pulling',
+      'applying',
+      'verifying',
+    ]
+    const currentStageIndex = activeStageOrder.indexOf(current.stage)
+    const incomingStageIndex = activeStageOrder.indexOf(incoming.stage)
+    const stage =
+      active &&
+      currentStageIndex >= 0 &&
+      incomingStageIndex >= 0 &&
+      incomingStageIndex < currentStageIndex
+        ? current.stage
+        : incoming.stage
+    const progressPercent = active
+      ? Math.max(current.progressPercent, incoming.progressPercent)
+      : incoming.progressPercent
+    Object.assign(current, incoming, {
+      stage,
+      progressMode,
+      progressPercent,
+      progressItems: currentItems,
+    })
+    return current
+  }
+
   /** 将实时单项进度合并到当前部署快照。 */
   const applyProjectProgressUpdate = (
     operationId: string,
@@ -1245,21 +1356,15 @@ export const useDockerStore = defineStore('docker', () => {
   ) => {
     const operation = projectDeploymentProgress.value
     if (!operation || operation.id !== operationId) return
-    const progressItems = [...operation.progressItems]
-    const index = progressItems.findIndex((item) => item.id === update.item.id)
-    if (index >= 0) {
-      progressItems[index] = update.item
-    } else {
-      progressItems.push(update.item)
+    const existing = operation.progressItems.find((item) => item.id === update.item.id)
+    if (existing) mergeProjectProgressItem(existing, update.item)
+    else operation.progressItems.push(update.item)
+    if (operation.progressItems.length > MAX_PROJECT_PROGRESS_ITEMS) {
+      operation.progressItems.splice(0, operation.progressItems.length - MAX_PROJECT_PROGRESS_ITEMS)
     }
-    const nextOperation = {
-      ...operation,
-      progressMode: update.progressMode,
-      progressPercent: Math.max(operation.progressPercent, update.progressPercent),
-      progressItems,
-    }
-    projectDeploymentProgress.value = nextOperation
-    trackedProjectOperations.set(operationId, nextOperation)
+    operation.progressMode = update.progressMode
+    operation.progressPercent = Math.max(operation.progressPercent, update.progressPercent)
+    trackedProjectOperations.set(operationId, operation)
     projectDeploymentProgressError.value = null
   }
 
@@ -1267,7 +1372,7 @@ export const useDockerStore = defineStore('docker', () => {
   const finishTrackedProjectOperation = async (operation: dockerType.DockerProjectTask) => {
     const tracked = trackedProjectOperations.delete(operation.id)
     if (projectDeploymentProgress.value?.id === operation.id) {
-      projectDeploymentProgress.value = operation
+      mergeProjectDeploymentSnapshot(operation)
       projectDeploymentProgressError.value = null
       stopProjectDeploymentEventStream(operation.id)
     }
@@ -1328,8 +1433,8 @@ export const useDockerStore = defineStore('docker', () => {
       const snapshot = parseEvent<dockerType.DockerProjectTask>(event)
       if (!snapshot || snapshot.id !== operation.id) return
       projectDeploymentEventSourceHealthy = true
-      projectDeploymentProgress.value = snapshot
-      trackedProjectOperations.set(snapshot.id, snapshot)
+      const merged = mergeProjectDeploymentSnapshot(snapshot)
+      trackedProjectOperations.set(snapshot.id, merged)
       projectDeploymentProgressError.value = null
     })
     source.addEventListener('progress', (event) => {
@@ -1373,6 +1478,7 @@ export const useDockerStore = defineStore('docker', () => {
     trackedProjectOperations.set(operation.id, operation)
     if (operation.operation === 'create' || operation.operation === 'redeploy') {
       projectDeploymentProgress.value = operation
+      projectDeploymentProgressVisible.value = true
       projectDeploymentProgressError.value = null
       startProjectDeploymentEventStream(operation)
     }
@@ -1533,7 +1639,9 @@ export const useDockerStore = defineStore('docker', () => {
     }
     projectDeploymentProgressError.value = null
     if (!res.data) return true
+    const alreadyTracked = trackedProjectOperations.has(res.data.id)
     projectDeploymentProgress.value = res.data
+    if (!alreadyTracked) projectDeploymentProgressVisible.value = true
     trackedProjectOperations.set(res.data.id, res.data)
     startProjectDeploymentEventStream(res.data)
     startProjectOperationPolling()
@@ -1589,7 +1697,8 @@ export const useDockerStore = defineStore('docker', () => {
         const operation = response.data
         trackedProjectOperations.set(operationId, operation)
         if (projectDeploymentProgress.value?.id === operationId) {
-          projectDeploymentProgress.value = operation
+          const merged = mergeProjectDeploymentSnapshot(operation, true)
+          trackedProjectOperations.set(operationId, merged)
           projectDeploymentProgressError.value = null
         }
         if (!isProjectOperationActive(operation)) {
@@ -1624,16 +1733,21 @@ export const useDockerStore = defineStore('docker', () => {
     stopProjectDeploymentEventStream()
   }
 
-  /** 仅允许关闭已经到达终态的部署进度。 */
+  /** 关闭部署进度视图；活动任务继续在后台接收 SSE 或轮询更新。 */
   const closeProjectDeploymentProgress = () => {
+    projectDeploymentProgressVisible.value = false
     if (
       projectDeploymentProgress.value &&
-      isProjectOperationActive(projectDeploymentProgress.value)
+      !isProjectOperationActive(projectDeploymentProgress.value)
     ) {
-      return
+      projectDeploymentProgress.value = null
+      projectDeploymentProgressError.value = null
     }
-    projectDeploymentProgress.value = null
-    projectDeploymentProgressError.value = null
+  }
+
+  /** 重新打开当前节点正在跟踪的部署进度。 */
+  const openProjectDeploymentProgress = () => {
+    if (projectDeploymentProgress.value) projectDeploymentProgressVisible.value = true
   }
 
   /** 删除镜像 */
@@ -2035,6 +2149,7 @@ export const useDockerStore = defineStore('docker', () => {
     projectConfigurationError,
     projectConfigurationLoadedAt,
     projectDeploymentProgress,
+    projectDeploymentProgressVisible,
     projectDeploymentProgressError,
     projectMutationLoading,
 
@@ -2141,6 +2256,7 @@ export const useDockerStore = defineStore('docker', () => {
     removeComposeProject,
     saveComposeProjectConfiguration,
     validateComposeYaml,
+    openProjectDeploymentProgress,
     closeProjectDeploymentProgress,
     handleDeleteImage,
     fetchNetworkDetail,

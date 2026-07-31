@@ -164,6 +164,37 @@ pub async fn cancellation(task_id: &str) -> Option<CancellationToken> {
     CANCELLATIONS.lock().await.get(task_id).cloned()
 }
 
+/// 读取 Compose 后台任务保存的可信操作者，供任务内部子操作复用。
+pub async fn operation_context(pool: &DbPool, task_id: &str) -> ApiResult<DockerOperationContext> {
+    let row = sqlx::query(
+        "SELECT actor_kind, actor_user_id, actor_name, client_ip, trace_id \
+         FROM docker_compose_project_tasks WHERE id = ?1",
+    )
+    .bind(task_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| {
+        ApiError::not_found(
+            ErrorCode::TaskNotFound,
+            "Docker project task audit context not found",
+        )
+    })?;
+    let actor_kind = match row.try_get::<String, _>("actor_kind")?.as_str() {
+        "user" => DockerActivityActorKind::User,
+        "system" => DockerActivityActorKind::System,
+        _ => return Err(ApiError::internal("invalid Docker project task actor kind")),
+    };
+    Ok(DockerOperationContext {
+        actor_kind,
+        actor_user_id: row.try_get("actor_user_id").ok().flatten(),
+        actor_name: row
+            .try_get("actor_name")
+            .unwrap_or_else(|_| "unknown".to_string()),
+        client_ip: row.try_get("client_ip").ok().flatten(),
+        trace_id: row.try_get("trace_id").ok().flatten(),
+    })
+}
+
 /// 订阅任务事件，并返回订阅建立前已经产生的最新单项进度。
 pub async fn subscribe(
     task_id: &str,
@@ -191,6 +222,57 @@ async fn publish_progress(task_id: &str, update: DockerProjectTaskProgressUpdate
         hub.latest_progress.push(update.clone());
     }
     let _ = hub.sender.send(DockerProjectTaskEvent::Progress(update));
+}
+
+/// 合并并持久化由 Compose 外部镜像编排产生的单项进度。
+pub async fn record_progress_item(
+    pool: &DbPool,
+    task_id: &str,
+    item: DockerProjectTaskProgressItem,
+) -> ApiResult<()> {
+    record_progress_items(pool, task_id, vec![item]).await
+}
+
+/// 批量合并同一阶段的外部镜像进度，避免每个分层重复读写任务快照。
+pub async fn record_progress_items(
+    pool: &DbPool,
+    task_id: &str,
+    incoming: Vec<DockerProjectTaskProgressItem>,
+) -> ApiResult<()> {
+    let Some(phase) = incoming.first().map(|item| item.phase) else {
+        return Ok(());
+    };
+    let mut items = load_progress_items(pool, task_id).await?;
+    let mut changed = Vec::new();
+    for item in incoming {
+        if item.phase == phase && upsert_progress_item(&mut items, item.clone()) {
+            changed.push(item);
+        }
+    }
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let progress_percent = aggregate_progress_percent(&items, phase);
+    persist_progress(
+        pool,
+        task_id,
+        DockerProjectProgressMode::Structured,
+        &items,
+        phase,
+    )
+    .await?;
+    for item in changed {
+        publish_progress(
+            task_id,
+            DockerProjectTaskProgressUpdate {
+                progress_mode: DockerProjectProgressMode::Structured,
+                progress_percent,
+                item,
+            },
+        )
+        .await;
+    }
+    Ok(())
 }
 
 async fn publish_snapshot(pool: &DbPool, task_id: &str, terminal: bool) {
@@ -332,19 +414,12 @@ async fn record_terminal_activity(pool: &DbPool, task_id: &str) {
             return;
         }
     };
-    let actor_kind = match row.try_get::<String, _>("actor_kind").as_deref() {
-        Ok("user") => DockerActivityActorKind::User,
-        Ok("system") => DockerActivityActorKind::System,
-        _ => return,
-    };
-    let context = DockerOperationContext {
-        actor_kind,
-        actor_user_id: row.try_get("actor_user_id").ok().flatten(),
-        actor_name: row
-            .try_get("actor_name")
-            .unwrap_or_else(|_| "unknown".to_string()),
-        client_ip: row.try_get("client_ip").ok().flatten(),
-        trace_id: row.try_get("trace_id").ok().flatten(),
+    let context = match operation_context(pool, task_id).await {
+        Ok(context) => context,
+        Err(error) => {
+            tracing::error!(%error, task_id, "failed to load Compose task actor");
+            return;
+        }
     };
     let project_name: String = match row.try_get("project_name") {
         Ok(value) => value,
@@ -768,6 +843,14 @@ async fn load_progress_items(
     Ok(serde_json::from_str(&value).unwrap_or_default())
 }
 
+/// 读取任务当前持久化的进度项，供终态子操作审计使用。
+pub async fn progress_items(
+    pool: &DbPool,
+    task_id: &str,
+) -> ApiResult<Vec<DockerProjectTaskProgressItem>> {
+    load_progress_items(pool, task_id).await
+}
+
 async fn persist_progress(
     pool: &DbPool,
     task_id: &str,
@@ -1138,6 +1221,62 @@ mod tests {
         assert_eq!(task.progress_items.len(), 1);
         assert_eq!(task.progress_items[0].label, "Image nginx");
         assert_eq!(task.progress_percent, 39);
+    }
+
+    #[tokio::test]
+    async fn external_controller_progress_is_persisted_and_published() {
+        let pool = crate::test_support::setup_test_db().await;
+        sqlx::query(
+            "INSERT INTO docker_compose_project_tasks (\
+                id, project_name, operation, status, stage, progress_percent, pull_images, \
+                actor_kind, actor_name\
+             ) VALUES ('controller-progress', 'demo', 'create', 'running', 'pulling', 25, 0, \
+                'system', 'test')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (sender, _) = broadcast::channel(TASK_EVENT_BUFFER);
+        TASK_EVENT_HUBS.lock().await.insert(
+            "controller-progress".to_string(),
+            DockerProjectTaskEventHub {
+                sender,
+                latest_progress: Vec::new(),
+            },
+        );
+        let item = DockerProjectTaskProgressItem {
+            id: "pulling:image:nginx".to_string(),
+            parent_id: None,
+            phase: DockerProjectProgressPhase::Pulling,
+            status: DockerProjectProgressStatus::Working,
+            label: "Image nginx:latest".to_string(),
+            action: "Transferring controller image".to_string(),
+            details: None,
+            current_bytes: None,
+            total_bytes: None,
+            percent: Some(42),
+        };
+
+        record_progress_item(&pool, "controller-progress", item.clone())
+            .await
+            .unwrap();
+
+        let restored = get(&pool, "controller-progress").await.unwrap();
+        assert_eq!(
+            restored.progress_mode,
+            DockerProjectProgressMode::Structured
+        );
+        assert_eq!(restored.progress_items, vec![item.clone()]);
+        let hubs = TASK_EVENT_HUBS.lock().await;
+        assert_eq!(
+            hubs.get("controller-progress")
+                .unwrap()
+                .latest_progress
+                .last()
+                .unwrap()
+                .item,
+            item
+        );
     }
 
     #[tokio::test]

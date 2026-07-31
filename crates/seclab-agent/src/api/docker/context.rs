@@ -64,6 +64,19 @@ impl DockerOperationContext {
         }
     }
 
+    /// 判断请求是否由 Master 镜像获取编排发起。
+    pub fn is_image_acquisition(&self) -> bool {
+        self.actor_kind == DockerActivityActorKind::System && self.actor_name == "image-acquisition"
+    }
+
+    /// 隐藏内部服务名，使用稳定的系统操作者写入用户可见审计。
+    pub fn into_public_system_actor(mut self) -> Self {
+        if self.actor_kind == DockerActivityActorKind::System {
+            self.actor_name = "system".to_string();
+        }
+        self
+    }
+
     /// 写入成功操作；高影响操作使用警告级别。
     pub async fn record_success(
         &self,
@@ -244,5 +257,21 @@ mod tests {
         assert_eq!(context.actor_kind, DockerActivityActorKind::User);
         assert_eq!(context.actor_user_id, Some(1));
         assert_eq!(context.actor_name, "admin");
+    }
+
+    #[test]
+    fn image_acquisition_actor_is_hidden_from_public_audit() {
+        let context = DockerOperationContext {
+            actor_kind: DockerActivityActorKind::System,
+            actor_user_id: None,
+            actor_name: "image-acquisition".to_string(),
+            client_ip: None,
+            trace_id: None,
+        };
+
+        assert!(context.is_image_acquisition());
+        let context = context.into_public_system_actor();
+        assert_eq!(context.actor_name, "system");
+        assert!(!context.is_image_acquisition());
     }
 }

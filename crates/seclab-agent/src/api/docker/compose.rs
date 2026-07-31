@@ -1,6 +1,7 @@
 //! Docker Compose 项目查询、详情与配置 API。
 
 use crate::api::docker::context::DockerOperationContext;
+use crate::api::docker::images;
 use crate::config;
 use crate::models::docker;
 use crate::services::docker_project_tasks::{self, ComposeCommandResult, NewDockerProjectTask};
@@ -19,10 +20,14 @@ use bollard::models::ContainerSummary;
 use bollard::query_parameters;
 use futures_util::{Stream, StreamExt, stream};
 use seclab_contracts::api::ErrorCode;
+use seclab_contracts::runtime_docker::{
+    RuntimeImageStage, RuntimeImageTask, RuntimeImageTaskStatus,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::Row;
 use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path as FsPath, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -559,6 +564,13 @@ async fn run_create_task(
         tokio::fs::create_dir_all(&directory).await?;
         let compose_file = directory.join(COMPOSE_FILE_NAME);
         tokio::fs::write(&compose_file, compose_yaml.as_bytes()).await?;
+        if is_remote_agent() {
+            prepare_remote_compose_images(&state, &task_id, &name, &compose_file, &cancellation)
+                .await?;
+        } else {
+            prepare_local_compose_images(&state, &task_id, &name, &compose_file, &cancellation)
+                .await?;
+        }
         docker_project_tasks::update(
             &state.metadata_db,
             &task_id,
@@ -566,13 +578,14 @@ async fn run_create_task(
             55,
         )
         .await?;
+        let up_args = compose_up_args(false, true);
         match docker_project_tasks::run_tracked_compose_command(
             &state.metadata_db,
             &task_id,
             docker::DockerProjectProgressPhase::Applying,
             &name,
             &compose_file,
-            &["up".into(), "-d".into(), "--remove-orphans".into()],
+            &up_args,
             &cancellation,
         )
         .await?
@@ -682,20 +695,71 @@ async fn run_redeploy_task(
                 25,
             )
             .await?;
-            if matches!(
-                docker_project_tasks::run_tracked_compose_command(
-                    &state.metadata_db,
+            let compose_file = PathBuf::from(&record.compose_dir).join(COMPOSE_FILE_NAME);
+            let image_refs =
+                resolve_compose_images(&record.name, &compose_file, &cancellation).await?;
+            let pull_result = docker_project_tasks::run_tracked_compose_command(
+                &state.metadata_db,
+                &task_id,
+                docker::DockerProjectProgressPhase::Pulling,
+                &record.name,
+                &compose_file,
+                &["pull".into()],
+                &cancellation,
+            )
+            .await;
+            match pull_result {
+                Ok(ComposeCommandResult::Succeeded) => {
+                    record_tracked_registry_pull_activities(
+                        &state,
+                        &task_id,
+                        &image_refs,
+                        RegistryPullAuditOutcome::Success,
+                    )
+                    .await;
+                }
+                Ok(ComposeCommandResult::Cancelled) => {
+                    record_tracked_registry_pull_activities(
+                        &state,
+                        &task_id,
+                        &image_refs,
+                        RegistryPullAuditOutcome::Cancelled,
+                    )
+                    .await;
+                    return Err(TaskRunError::Cancelled.into());
+                }
+                Err(error) => {
+                    let error_message = error.to_string();
+                    record_tracked_registry_pull_activities(
+                        &state,
+                        &task_id,
+                        &image_refs,
+                        RegistryPullAuditOutcome::Failure(error_message),
+                    )
+                    .await;
+                    return Err(error);
+                }
+            }
+        } else {
+            let compose_file = PathBuf::from(&record.compose_dir).join(COMPOSE_FILE_NAME);
+            if is_remote_agent() {
+                prepare_remote_compose_images(
+                    &state,
                     &task_id,
-                    docker::DockerProjectProgressPhase::Pulling,
                     &record.name,
-                    &PathBuf::from(&record.compose_dir).join(COMPOSE_FILE_NAME),
-                    &["pull".into()],
+                    &compose_file,
                     &cancellation,
                 )
-                .await?,
-                ComposeCommandResult::Cancelled
-            ) {
-                return Err(TaskRunError::Cancelled.into());
+                .await?;
+            } else {
+                prepare_local_compose_images(
+                    &state,
+                    &task_id,
+                    &record.name,
+                    &compose_file,
+                    &cancellation,
+                )
+                .await?;
             }
         }
         docker_project_tasks::update(
@@ -705,6 +769,7 @@ async fn run_redeploy_task(
             55,
         )
         .await?;
+        let up_args = compose_up_args(true, true);
         if matches!(
             docker_project_tasks::run_tracked_compose_command(
                 &state.metadata_db,
@@ -712,12 +777,7 @@ async fn run_redeploy_task(
                 docker::DockerProjectProgressPhase::Applying,
                 &record.name,
                 &PathBuf::from(&record.compose_dir).join(COMPOSE_FILE_NAME),
-                &[
-                    "up".into(),
-                    "-d".into(),
-                    "--force-recreate".into(),
-                    "--remove-orphans".into(),
-                ],
+                &up_args,
                 &cancellation,
             )
             .await?,
@@ -758,6 +818,566 @@ async fn run_redeploy_task(
     } else {
         let _ = docker_project_tasks::succeed(&state.metadata_db, &task_id).await;
     }
+}
+
+/// 判断当前进程是否为通过 Master 管理的远程 Agent。
+fn is_remote_agent() -> bool {
+    crate::config::get().mode.as_deref() == Some("remote")
+}
+
+fn compose_up_args(force_recreate: bool, prohibit_pull: bool) -> Vec<String> {
+    let mut args = vec!["up".into()];
+    if prohibit_pull {
+        args.extend(["--pull".into(), "never".into()]);
+    }
+    args.push("-d".into());
+    if force_recreate {
+        args.push("--force-recreate".into());
+    }
+    args.push("--remove-orphans".into());
+    args
+}
+
+/// 解析 Compose 展开变量后的仓库镜像引用，排除由本地构建产生镜像的服务。
+async fn resolve_compose_images(
+    project: &str,
+    compose_file: &FsPath,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> ApiResult<Vec<String>> {
+    let mut command = Command::new("docker");
+    command
+        .args(["compose", "-f"])
+        .arg(compose_file)
+        .args(["-p", project, "config", "--format", "json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let future = command.output();
+    tokio::pin!(future);
+    let output = tokio::select! {
+        _ = cancellation.cancelled() => return Err(TaskRunError::Cancelled.into()),
+        result = tokio::time::timeout(COMPOSE_VALIDATION_TIMEOUT, &mut future) => {
+            result.map_err(|_| ApiError::validation("Compose image resolution timed out"))??
+        }
+    };
+    if !output.status.success() {
+        return Err(ApiError::validation(sanitize_error(
+            &String::from_utf8_lossy(&output.stderr),
+        )));
+    }
+    parse_compose_config_images(&output.stdout)
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolvedComposeConfig {
+    #[serde(default)]
+    services: HashMap<String, ResolvedComposeService>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolvedComposeService {
+    image: Option<String>,
+    build: Option<Value>,
+}
+
+fn parse_compose_config_images(output: &[u8]) -> ApiResult<Vec<String>> {
+    let config: ResolvedComposeConfig = serde_json::from_slice(output)
+        .map_err(|error| ApiError::validation(format!("invalid Compose image config: {error}")))?;
+    let mut images = config
+        .services
+        .into_values()
+        .filter(|service| service.build.is_none())
+        .filter_map(|service| service.image)
+        .map(|image| image.trim().to_string())
+        .filter(|image| !image.is_empty())
+        .collect::<Vec<_>>();
+    images.sort();
+    images.dedup();
+    Ok(images)
+}
+
+/// 为本地节点准备缺失镜像，并通过显式仓库拉取保留进度和审计。
+async fn prepare_local_compose_images(
+    state: &Arc<AppState>,
+    task_id: &str,
+    project: &str,
+    compose_file: &FsPath,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> ApiResult<()> {
+    let images = resolve_compose_images(project, compose_file, cancellation).await?;
+    if images.is_empty() {
+        return Ok(());
+    }
+    let docker = state.docker_client().await?;
+    let mut missing = Vec::new();
+    for image_ref in images {
+        if docker.inspect_image(&image_ref).await.is_err() {
+            missing.push(image_ref);
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    docker_project_tasks::update(
+        &state.metadata_db,
+        task_id,
+        docker::DockerProjectTaskStage::Pulling,
+        25,
+    )
+    .await?;
+    for image_ref in missing {
+        if cancellation.is_cancelled() {
+            return Err(TaskRunError::Cancelled.into());
+        }
+        let parent_id = image_progress_id(&image_ref);
+        docker_project_tasks::record_progress_item(
+            &state.metadata_db,
+            task_id,
+            docker::DockerProjectTaskProgressItem {
+                id: parent_id.clone(),
+                parent_id: None,
+                phase: docker::DockerProjectProgressPhase::Pulling,
+                status: docker::DockerProjectProgressStatus::Working,
+                label: format!("Image {image_ref}"),
+                action: "Pulling image from registry".to_string(),
+                details: None,
+                current_bytes: None,
+                total_bytes: None,
+                percent: None,
+            },
+        )
+        .await?;
+        pull_fallback_image(state, task_id, &image_ref, &parent_id, cancellation).await?;
+    }
+    Ok(())
+}
+
+/// 为远程 Agent 的 Compose 部署执行主控优先镜像准备。
+async fn prepare_remote_compose_images(
+    state: &Arc<AppState>,
+    task_id: &str,
+    project: &str,
+    compose_file: &FsPath,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> ApiResult<()> {
+    let images = resolve_compose_images(project, compose_file, cancellation).await?;
+    if images.is_empty() {
+        return Ok(());
+    }
+    docker_project_tasks::update(
+        &state.metadata_db,
+        task_id,
+        docker::DockerProjectTaskStage::Pulling,
+        25,
+    )
+    .await?;
+    for image_ref in images {
+        if cancellation.is_cancelled() {
+            return Err(TaskRunError::Cancelled.into());
+        }
+        prepare_remote_image(state, task_id, &image_ref, cancellation).await?;
+    }
+    Ok(())
+}
+
+/// 准备单个镜像；主控运行时不可用时回退到子节点仓库拉取。
+async fn prepare_remote_image(
+    state: &Arc<AppState>,
+    task_id: &str,
+    image_ref: &str,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> ApiResult<()> {
+    let parent_id = image_progress_id(image_ref);
+    record_runtime_image_progress(
+        state,
+        task_id,
+        image_ref,
+        &parent_id,
+        RuntimeImageTask {
+            task_id: String::new(),
+            image_ref: image_ref.to_string(),
+            status: RuntimeImageTaskStatus::Pending,
+            source: None,
+            stage: RuntimeImageStage::Checking,
+            progress_percent: 0,
+            status_text: "Checking controller image".to_string(),
+            layers: Vec::new(),
+        },
+    )
+    .await;
+    let controller_result = state
+        .controller_runtime
+        .acquire_image(image_ref, cancellation, |snapshot| {
+            record_runtime_image_progress(state, task_id, image_ref, &parent_id, snapshot)
+        })
+        .await;
+    match controller_result {
+        Ok(_) => return Ok(()),
+        Err(_) if cancellation.is_cancelled() => return Err(TaskRunError::Cancelled.into()),
+        Err(error) => {
+            docker_project_tasks::record_progress_item(
+                &state.metadata_db,
+                task_id,
+                docker::DockerProjectTaskProgressItem {
+                    id: parent_id.clone(),
+                    parent_id: None,
+                    phase: docker::DockerProjectProgressPhase::Pulling,
+                    status: docker::DockerProjectProgressStatus::Warning,
+                    label: format!("Image {image_ref}"),
+                    action: "Falling back to registry".to_string(),
+                    details: Some(sanitize_error(&error.to_string())),
+                    current_bytes: None,
+                    total_bytes: None,
+                    percent: None,
+                },
+            )
+            .await?;
+        }
+    }
+    pull_fallback_image(state, task_id, image_ref, &parent_id, cancellation).await
+}
+
+/// 将 Master 镜像任务快照映射为 Compose 镜像及分层进度。
+async fn record_runtime_image_progress(
+    state: &Arc<AppState>,
+    task_id: &str,
+    image_ref: &str,
+    parent_id: &str,
+    snapshot: RuntimeImageTask,
+) {
+    let status = match snapshot.status {
+        RuntimeImageTaskStatus::Success => docker::DockerProjectProgressStatus::Done,
+        RuntimeImageTaskStatus::Failed | RuntimeImageTaskStatus::Cancelled => {
+            docker::DockerProjectProgressStatus::Error
+        }
+        RuntimeImageTaskStatus::Pending | RuntimeImageTaskStatus::Running => {
+            docker::DockerProjectProgressStatus::Working
+        }
+    };
+    let mut items = vec![docker::DockerProjectTaskProgressItem {
+        id: parent_id.to_string(),
+        parent_id: None,
+        phase: docker::DockerProjectProgressPhase::Pulling,
+        status,
+        label: format!("Image {image_ref}"),
+        action: runtime_image_action(snapshot.stage).to_string(),
+        details: (status == docker::DockerProjectProgressStatus::Error)
+            .then(|| sanitize_error(&snapshot.status_text)),
+        current_bytes: None,
+        total_bytes: None,
+        percent: Some(snapshot.progress_percent),
+    }];
+    items.extend(snapshot.layers.into_iter().map(|layer| {
+        let normalized = layer.status_text.to_ascii_lowercase();
+        let status = if normalized.contains("error") {
+            docker::DockerProjectProgressStatus::Error
+        } else if normalized.contains("complete") || normalized.contains("already exists") {
+            docker::DockerProjectProgressStatus::Done
+        } else {
+            docker::DockerProjectProgressStatus::Working
+        };
+        docker::DockerProjectTaskProgressItem {
+            id: format!("{parent_id}:{}", short_progress_hash(&layer.id)),
+            parent_id: Some(parent_id.to_string()),
+            phase: docker::DockerProjectProgressPhase::Pulling,
+            status,
+            label: layer.id,
+            action: layer.status_text,
+            details: None,
+            current_bytes: None,
+            total_bytes: None,
+            percent: layer.percent,
+        }
+    }));
+    let _ = docker_project_tasks::record_progress_items(&state.metadata_db, task_id, items).await;
+}
+
+fn runtime_image_action(stage: RuntimeImageStage) -> &'static str {
+    match stage {
+        RuntimeImageStage::Checking => "Checking target image",
+        RuntimeImageStage::Exporting => "Exporting controller image",
+        RuntimeImageStage::Uploading => "Transferring controller image",
+        RuntimeImageStage::Loading => "Loading controller image",
+        RuntimeImageStage::Pulling => "Pulling image from registry",
+    }
+}
+
+/// Master 不可用时由子节点直接拉取，并保留 Docker 分层进度。
+async fn pull_fallback_image(
+    state: &Arc<AppState>,
+    task_id: &str,
+    image_ref: &str,
+    parent_id: &str,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> ApiResult<()> {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let pull = images::pull_registry_image(
+        state,
+        image_ref,
+        || cancellation.is_cancelled(),
+        |event| {
+            let _ = sender.send(event);
+        },
+    );
+    tokio::pin!(pull);
+    let mut pending = HashMap::new();
+    let mut persist_interval = tokio::time::interval(Duration::from_millis(250));
+    persist_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    persist_interval.tick().await;
+    let result = loop {
+        tokio::select! {
+            result = &mut pull => break result,
+            event = receiver.recv() => {
+                if let Some(event) = event {
+                    let key = event.id.clone().unwrap_or_else(|| image_ref.to_string());
+                    pending.insert(key, event);
+                }
+            }
+            _ = persist_interval.tick() => {
+                persist_registry_layer_progress(
+                    state, task_id, parent_id, image_ref, &mut pending,
+                ).await?;
+            }
+        }
+    };
+    while let Ok(event) = receiver.try_recv() {
+        let key = event.id.clone().unwrap_or_else(|| image_ref.to_string());
+        pending.insert(key, event);
+    }
+    persist_registry_layer_progress(state, task_id, parent_id, image_ref, &mut pending).await?;
+    let error_message = result.as_ref().err().map(ToString::to_string);
+    let audit_outcome = match (&result, error_message.as_deref()) {
+        (Ok(()), _) => RegistryPullAuditOutcome::Success,
+        (Err(_), _) if cancellation.is_cancelled() => RegistryPullAuditOutcome::Cancelled,
+        (Err(_), Some(error)) => RegistryPullAuditOutcome::Failure(error.to_string()),
+        (Err(_), None) => {
+            RegistryPullAuditOutcome::Failure("Registry image pull failed".to_string())
+        }
+    };
+    record_registry_pull_activities(state, task_id, vec![(image_ref.to_string(), audit_outcome)])
+        .await;
+    match result {
+        Ok(()) => {
+            docker_project_tasks::record_progress_item(
+                &state.metadata_db,
+                task_id,
+                docker::DockerProjectTaskProgressItem {
+                    id: parent_id.to_string(),
+                    parent_id: None,
+                    phase: docker::DockerProjectProgressPhase::Pulling,
+                    status: docker::DockerProjectProgressStatus::Done,
+                    label: format!("Image {image_ref}"),
+                    action: "Pull complete".to_string(),
+                    details: None,
+                    current_bytes: None,
+                    total_bytes: None,
+                    percent: Some(100),
+                },
+            )
+            .await
+        }
+        Err(_) if cancellation.is_cancelled() => Err(TaskRunError::Cancelled.into()),
+        Err(error) => {
+            let message = sanitize_error(&error.to_string());
+            docker_project_tasks::record_progress_item(
+                &state.metadata_db,
+                task_id,
+                docker::DockerProjectTaskProgressItem {
+                    id: parent_id.to_string(),
+                    parent_id: None,
+                    phase: docker::DockerProjectProgressPhase::Pulling,
+                    status: docker::DockerProjectProgressStatus::Error,
+                    label: format!("Image {image_ref}"),
+                    action: "Pull failed".to_string(),
+                    details: Some(message.clone()),
+                    current_bytes: None,
+                    total_bytes: None,
+                    percent: None,
+                },
+            )
+            .await?;
+            Err(ApiError::validation(message))
+        }
+    }
+}
+
+#[derive(Clone)]
+enum RegistryPullAuditOutcome {
+    Success,
+    Cancelled,
+    Failure(String),
+}
+
+/// 根据 Compose 结构化进度计算每个镜像的真实拉取结果。
+async fn record_tracked_registry_pull_activities(
+    state: &Arc<AppState>,
+    task_id: &str,
+    image_refs: &[String],
+    fallback: RegistryPullAuditOutcome,
+) {
+    let items = docker_project_tasks::progress_items(&state.metadata_db, task_id)
+        .await
+        .unwrap_or_default();
+    let outcomes = image_refs
+        .iter()
+        .map(|image_ref| {
+            let outcome = items
+                .iter()
+                .find(|item| {
+                    item.phase == docker::DockerProjectProgressPhase::Pulling
+                        && item.parent_id.is_none()
+                        && item.label.trim() == format!("Image {image_ref}")
+                })
+                .map(|item| match item.status {
+                    docker::DockerProjectProgressStatus::Done => RegistryPullAuditOutcome::Success,
+                    docker::DockerProjectProgressStatus::Error => {
+                        RegistryPullAuditOutcome::Failure(
+                            item.details
+                                .clone()
+                                .unwrap_or_else(|| "Registry image pull failed".to_string()),
+                        )
+                    }
+                    docker::DockerProjectProgressStatus::Warning
+                    | docker::DockerProjectProgressStatus::Working => fallback.clone(),
+                })
+                .unwrap_or_else(|| fallback.clone());
+            (image_ref.clone(), outcome)
+        })
+        .collect();
+    record_registry_pull_activities(state, task_id, outcomes).await;
+}
+
+/// 为 Compose 内部实际执行的仓库拉取记录逐镜像终态。
+async fn record_registry_pull_activities(
+    state: &Arc<AppState>,
+    task_id: &str,
+    outcomes: Vec<(String, RegistryPullAuditOutcome)>,
+) {
+    let context = match docker_project_tasks::operation_context(&state.metadata_db, task_id).await {
+        Ok(context) => context,
+        Err(error) => {
+            tracing::error!(%error, task_id, "failed to load registry pull audit context");
+            return;
+        }
+    };
+    for (image_ref, outcome) in outcomes {
+        let params = serde_json::json!({
+            "taskId": task_id,
+            "imageRef": &image_ref,
+        });
+        match outcome {
+            RegistryPullAuditOutcome::Success => {
+                context
+                    .record_success(
+                        &state.metadata_db,
+                        "docker_image_pulled_from_registry",
+                        Some(("image", &image_ref)),
+                        params,
+                        false,
+                    )
+                    .await;
+            }
+            RegistryPullAuditOutcome::Cancelled => {
+                context
+                    .record_canceled(
+                        &state.metadata_db,
+                        "docker_image_pulled_from_registry",
+                        Some(("image", &image_ref)),
+                        params,
+                    )
+                    .await;
+            }
+            RegistryPullAuditOutcome::Failure(error) => {
+                context
+                    .record_failure(
+                        &state.metadata_db,
+                        "docker_image_pulled_from_registry",
+                        Some(("image", &image_ref)),
+                        params,
+                        &error,
+                    )
+                    .await;
+            }
+        }
+    }
+}
+
+/// 批量写入每个分层在节流窗口内的最后一条事件。
+async fn persist_registry_layer_progress(
+    state: &Arc<AppState>,
+    task_id: &str,
+    parent_id: &str,
+    image_ref: &str,
+    pending: &mut HashMap<String, bollard::models::CreateImageInfo>,
+) -> ApiResult<()> {
+    for (_, event) in pending.drain() {
+        record_registry_layer_progress(state, task_id, parent_id, image_ref, event).await?;
+    }
+    Ok(())
+}
+
+/// 把 Docker Registry 事件映射为可恢复的 Compose 分层项。
+async fn record_registry_layer_progress(
+    state: &Arc<AppState>,
+    task_id: &str,
+    parent_id: &str,
+    image_ref: &str,
+    event: bollard::models::CreateImageInfo,
+) -> ApiResult<()> {
+    let action = event.status.unwrap_or_else(|| "Pulling".to_string());
+    let layer_id = event.id.unwrap_or_else(|| image_ref.to_string());
+    let (current_bytes, total_bytes, percent) = event
+        .progress_detail
+        .and_then(|progress| progress.current.zip(progress.total))
+        .filter(|(_, total)| *total > 0)
+        .map(|(current, total)| {
+            (
+                Some(current),
+                Some(total),
+                Some(
+                    ((current as f64 / total as f64) * 100.0)
+                        .round()
+                        .clamp(0.0, 100.0) as u8,
+                ),
+            )
+        })
+        .unwrap_or((None, None, None));
+    let normalized = action.to_ascii_lowercase();
+    let status = if normalized.contains("error") {
+        docker::DockerProjectProgressStatus::Error
+    } else if normalized.contains("complete") || normalized.contains("already exists") {
+        docker::DockerProjectProgressStatus::Done
+    } else {
+        docker::DockerProjectProgressStatus::Working
+    };
+    docker_project_tasks::record_progress_item(
+        &state.metadata_db,
+        task_id,
+        docker::DockerProjectTaskProgressItem {
+            id: format!("{parent_id}:{}", short_progress_hash(&layer_id)),
+            parent_id: Some(parent_id.to_string()),
+            phase: docker::DockerProjectProgressPhase::Pulling,
+            status,
+            label: layer_id,
+            action,
+            details: None,
+            current_bytes,
+            total_bytes,
+            percent,
+        },
+    )
+    .await
+}
+
+fn image_progress_id(image_ref: &str) -> String {
+    format!("pulling:image:{}", short_progress_hash(image_ref))
+}
+
+fn short_progress_hash(value: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 async fn run_scale_task(
@@ -1484,5 +2104,213 @@ mod tests {
             let parsed: Value = serde_json::from_str(json).unwrap();
             assert!(reject_reserved_labels(&parsed).is_err());
         }
+    }
+
+    #[test]
+    fn remote_compose_up_never_pulls_implicitly() {
+        assert_eq!(
+            compose_up_args(false, true),
+            vec!["up", "--pull", "never", "-d", "--remove-orphans"]
+        );
+        assert_eq!(
+            compose_up_args(true, true),
+            vec![
+                "up",
+                "--pull",
+                "never",
+                "-d",
+                "--force-recreate",
+                "--remove-orphans"
+            ]
+        );
+        assert!(!compose_up_args(false, false).contains(&"--pull".to_string()));
+    }
+
+    #[test]
+    fn compose_config_images_exclude_build_only_services_and_deduplicate() {
+        assert_eq!(
+            parse_compose_config_images(
+                br#"{
+                    "services": {
+                        "build-only": {"build": {"context": "/tmp/app"}},
+                        "tagged-build": {
+                            "image": "local/app:latest",
+                            "build": {"context": "/tmp/tagged"}
+                        },
+                        "web": {"image": " nginx:latest "},
+                        "worker": {"image": "redis:7"},
+                        "cache": {"image": "redis:7"}
+                    }
+                }"#
+            )
+            .expect("parse images"),
+            vec!["nginx:latest", "redis:7"]
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_registry_layers_are_persisted_as_compose_children() {
+        let state = Arc::new(crate::test_support::setup_test_state().await);
+        sqlx::query(
+            "INSERT INTO docker_compose_project_tasks (\
+                id, project_name, operation, status, stage, progress_percent, pull_images, \
+                actor_kind, actor_name, trace_id\
+             ) VALUES ('runtime-layers', 'demo', 'create', 'running', 'pulling', 25, 1, \
+                'system', 'system', 'runtime-layer-trace')",
+        )
+        .execute(&state.metadata_db)
+        .await
+        .expect("insert task");
+        let parent_id = image_progress_id("nginx:latest");
+
+        record_runtime_image_progress(
+            &state,
+            "runtime-layers",
+            "nginx:latest",
+            &parent_id,
+            RuntimeImageTask {
+                task_id: "image-task".to_string(),
+                image_ref: "nginx:latest".to_string(),
+                status: RuntimeImageTaskStatus::Running,
+                source: None,
+                stage: RuntimeImageStage::Pulling,
+                progress_percent: 48,
+                status_text: "Pulling image from registry".to_string(),
+                layers: vec![
+                    seclab_contracts::runtime_docker::RuntimeImageLayerProgress {
+                        id: "sha256:abc".to_string(),
+                        status_text: "Downloading".to_string(),
+                        percent: Some(42),
+                    },
+                ],
+            },
+        )
+        .await;
+
+        let items = docker_project_tasks::progress_items(&state.metadata_db, "runtime-layers")
+            .await
+            .expect("load progress");
+        assert_eq!(items.len(), 2);
+        let child = items
+            .iter()
+            .find(|item| item.parent_id.as_deref() == Some(parent_id.as_str()))
+            .expect("layer child");
+        assert_eq!(child.label, "sha256:abc");
+        assert_eq!(child.percent, Some(42));
+        assert_eq!(child.status, docker::DockerProjectProgressStatus::Working);
+    }
+
+    #[tokio::test]
+    async fn compose_registry_pull_uses_task_actor_and_image_target() {
+        let state = Arc::new(crate::test_support::setup_test_state().await);
+        sqlx::query(
+            "INSERT INTO docker_compose_project_tasks (\
+                id, project_name, operation, status, stage, progress_percent, pull_images, \
+                actor_kind, actor_user_id, actor_name, client_ip, trace_id\
+             ) VALUES ('registry-audit', 'demo', 'redeploy', 'running', 'pulling', 25, 1, \
+                'user', 7, 'admin', '10.0.0.7', 'compose-trace')",
+        )
+        .execute(&state.metadata_db)
+        .await
+        .expect("insert task");
+
+        record_registry_pull_activities(
+            &state,
+            "registry-audit",
+            vec![(
+                "nginx:latest".to_string(),
+                RegistryPullAuditOutcome::Success,
+            )],
+        )
+        .await;
+
+        let events = crate::services::operation_outbox::pending(&state.metadata_db, 10)
+            .await
+            .expect("load outbox");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_code, "docker_image_pulled_from_registry");
+        assert_eq!(events[0].actor.display_name, "admin");
+        assert_eq!(events[0].task_id.as_deref(), Some("registry-audit"));
+        assert_eq!(
+            events[0].target.as_ref().map(|target| target.id.as_str()),
+            Some("nginx:latest")
+        );
+    }
+
+    #[tokio::test]
+    async fn compose_registry_pull_records_each_image_result_from_progress() {
+        let state = Arc::new(crate::test_support::setup_test_state().await);
+        sqlx::query(
+            "INSERT INTO docker_compose_project_tasks (\
+                id, project_name, operation, status, stage, progress_percent, pull_images, \
+                actor_kind, actor_name, trace_id\
+             ) VALUES ('partial-registry-audit', 'demo', 'redeploy', 'running', 'pulling', 25, 1, \
+                'system', 'scheduler', 'partial-compose-trace')",
+        )
+        .execute(&state.metadata_db)
+        .await
+        .expect("insert task");
+        for (image_ref, status, details) in [
+            (
+                "nginx:latest",
+                docker::DockerProjectProgressStatus::Done,
+                None,
+            ),
+            (
+                "redis:7",
+                docker::DockerProjectProgressStatus::Error,
+                Some("registry denied".to_string()),
+            ),
+        ] {
+            docker_project_tasks::record_progress_item(
+                &state.metadata_db,
+                "partial-registry-audit",
+                docker::DockerProjectTaskProgressItem {
+                    id: format!("pulling:Image {image_ref}"),
+                    parent_id: None,
+                    phase: docker::DockerProjectProgressPhase::Pulling,
+                    status,
+                    label: format!("Image {image_ref}"),
+                    action: "Pull complete".to_string(),
+                    details,
+                    current_bytes: None,
+                    total_bytes: None,
+                    percent: Some(100),
+                },
+            )
+            .await
+            .expect("record image progress");
+        }
+
+        record_tracked_registry_pull_activities(
+            &state,
+            "partial-registry-audit",
+            &["nginx:latest".to_string(), "redis:7".to_string()],
+            RegistryPullAuditOutcome::Failure("compose pull failed".to_string()),
+        )
+        .await;
+
+        let events = crate::services::operation_outbox::pending(&state.metadata_db, 10)
+            .await
+            .expect("load outbox");
+        let outcome_for = |image_ref: &str| {
+            events
+                .iter()
+                .find(|event| {
+                    event
+                        .target
+                        .as_ref()
+                        .is_some_and(|target| target.id == image_ref)
+                })
+                .map(|event| event.outcome)
+        };
+        assert_eq!(
+            outcome_for("nginx:latest"),
+            Some(seclab_contracts::logging::OperationOutcome::Success)
+        );
+        assert_eq!(
+            outcome_for("redis:7"),
+            Some(seclab_contracts::logging::OperationOutcome::Failure)
+        );
     }
 }

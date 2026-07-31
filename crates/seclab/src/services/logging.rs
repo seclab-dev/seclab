@@ -1892,6 +1892,63 @@ mod tests {
         assert_eq!(row.3, "docker_compose_project_stop");
     }
 
+    #[tokio::test]
+    async fn remote_docker_event_is_queryable_by_origin_node() {
+        let pool = setup_test_db().await;
+        let event = AgentOperationEvent {
+            event_id: "remote-docker-event".to_string(),
+            occurred_at: "2026-07-31T03:55:28Z".to_string(),
+            module: OperationModule::Docker,
+            event_code: "docker_image_remove".to_string(),
+            actor: OperationActor {
+                kind: OperationActorKind::User,
+                user_id: None,
+                display_name: "admin".to_string(),
+            },
+            client_ip: Some("10.0.0.8".to_string()),
+            target: Some(OperationTarget {
+                kind: "image".to_string(),
+                id: "nginx:latest".to_string(),
+                display_name: Some("nginx:latest".to_string()),
+                ownership: None,
+            }),
+            outcome: OperationOutcome::Success,
+            impact: OperationImpact::Info,
+            trace_id: "remote-docker-trace".to_string(),
+            task_id: None,
+            parameters: BTreeMap::new(),
+            error_code: None,
+            error_summary: None,
+        };
+        store_agent_event(&pool, "node-81", Some("节点 81"), event)
+            .await
+            .unwrap();
+
+        let page = query_operation_logs(
+            &pool,
+            OperationLogQuery {
+                page: 1,
+                page_size: 20,
+                modules: Some(vec![OperationModule::Docker]),
+                event_codes: None,
+                outcomes: None,
+                impacts: None,
+                user_ids: None,
+                node_ids: Some(vec!["node-81".to_string()]),
+                occurred_from: None,
+                occurred_to: None,
+                keyword: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].origin.node_id.as_deref(), Some("node-81"));
+        assert_eq!(page.items[0].origin.node_name.as_deref(), Some("节点 81"));
+        assert_eq!(page.items[0].event_code, "docker_image_remove");
+    }
+
     #[test]
     fn sanitizer_drops_sensitive_and_complex_values() {
         let (parameters, code, summary) = sanitize_parameters(Some(

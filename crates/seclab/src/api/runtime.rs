@@ -16,6 +16,10 @@ use axum::{
 };
 use seclab_contracts::api::ErrorCode;
 use seclab_contracts::logging::{AgentOperationEvent, AgentOperationEventAck};
+use seclab_contracts::runtime_docker::{
+    RuntimeImageLayerProgress, RuntimeImageSource, RuntimeImageStage, RuntimeImageTask,
+    RuntimeImageTaskCreateRequest, RuntimeImageTaskQuery, RuntimeImageTaskStatus,
+};
 use seclab_contracts::terminal::{TerminalTicketConsumeRequest, TerminalTicketConsumeResponse};
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -107,6 +111,132 @@ struct OperationEventReportPayload {
     agent_id: String,
     session_id: String,
     events: Vec<AgentOperationEvent>,
+}
+
+/// 校验 Agent 运行时会话并返回会话绑定的节点 ID。
+async fn require_runtime_node(
+    pool: &crate::state::DbPool,
+    agent_id: &str,
+    session_id: &str,
+) -> ApiResult<String> {
+    let session = crate::models::node_sessions::get_session_by_id(pool, session_id)
+        .await?
+        .filter(|session| session.status == "active" && session.agent_id == agent_id)
+        .ok_or_else(|| {
+            ApiError::forbidden(ErrorCode::AuthForbidden, "runtime session is not active")
+        })?;
+    Ok(session.node_id)
+}
+
+/// 将 Master 内部镜像任务转换为稳定的运行时契约。
+fn runtime_image_task(task: crate::services::image_acquisition::ImageTask) -> RuntimeImageTask {
+    use crate::services::image_acquisition::{ImageSource, ImageStage, ImageTaskStatus};
+    RuntimeImageTask {
+        task_id: task.task_id,
+        image_ref: task.image_ref,
+        status: match task.status {
+            ImageTaskStatus::Pending => RuntimeImageTaskStatus::Pending,
+            ImageTaskStatus::Running => RuntimeImageTaskStatus::Running,
+            ImageTaskStatus::Success => RuntimeImageTaskStatus::Success,
+            ImageTaskStatus::Failed => RuntimeImageTaskStatus::Failed,
+            ImageTaskStatus::Cancelled => RuntimeImageTaskStatus::Cancelled,
+        },
+        source: task.source.map(|source| match source {
+            ImageSource::Target => RuntimeImageSource::Target,
+            ImageSource::Controller => RuntimeImageSource::Controller,
+            ImageSource::Registry => RuntimeImageSource::Registry,
+        }),
+        stage: match task.stage {
+            ImageStage::Checking => RuntimeImageStage::Checking,
+            ImageStage::Exporting => RuntimeImageStage::Exporting,
+            ImageStage::Uploading => RuntimeImageStage::Uploading,
+            ImageStage::Loading => RuntimeImageStage::Loading,
+            ImageStage::Pulling => RuntimeImageStage::Pulling,
+        },
+        progress_percent: task.progress_percent,
+        status_text: task.status_text,
+        layers: task
+            .layers
+            .into_iter()
+            .map(|layer| RuntimeImageLayerProgress {
+                id: layer.id,
+                status_text: layer.status.unwrap_or_else(|| "Pulling".to_string()),
+                percent: layer.progress_percent,
+            })
+            .collect(),
+    }
+}
+
+/// 为当前 Agent 所属节点创建主控优先的镜像获取任务。
+async fn create_runtime_image_task(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<RuntimeImageTaskCreateRequest>,
+) -> ApiResult<Response> {
+    let image_ref = payload.image_ref.trim();
+    if image_ref.is_empty() || image_ref.chars().count() > 512 {
+        return Err(ApiError::bad_request(
+            ErrorCode::BadRequest,
+            "imageRef must contain 1 to 512 characters",
+        ));
+    }
+    let node_id =
+        require_runtime_node(&state.metadata_db, &payload.agent_id, &payload.session_id).await?;
+    let task =
+        state
+            .image_acquisition
+            .start(Arc::clone(&state), node_id, image_ref.to_string(), None);
+    Ok(
+        ApiResponse::success_with_raw("Runtime image task started", Some(runtime_image_task(task)))
+            .into_response(),
+    )
+}
+
+/// 查询当前 Agent 自己创建的镜像获取任务。
+async fn runtime_image_task_progress(
+    State(state): State<Arc<AppState>>,
+    Path(task_id): Path<String>,
+    Query(query): Query<RuntimeImageTaskQuery>,
+) -> ApiResult<Response> {
+    let node_id =
+        require_runtime_node(&state.metadata_db, &query.agent_id, &query.session_id).await?;
+    let task = state
+        .image_acquisition
+        .get(&task_id)
+        .filter(|task| task.node_id == node_id)
+        .ok_or_else(|| ApiError::not_found(ErrorCode::TaskNotFound, "image task not found"))?;
+    Ok(
+        ApiResponse::success_with_raw("Runtime image task loaded", Some(runtime_image_task(task)))
+            .into_response(),
+    )
+}
+
+/// 取消当前 Agent 自己创建且仍在运行的镜像获取任务。
+async fn cancel_runtime_image_task(
+    State(state): State<Arc<AppState>>,
+    Path(task_id): Path<String>,
+    Query(query): Query<RuntimeImageTaskQuery>,
+) -> ApiResult<Response> {
+    let node_id =
+        require_runtime_node(&state.metadata_db, &query.agent_id, &query.session_id).await?;
+    let owned = state
+        .image_acquisition
+        .get(&task_id)
+        .is_some_and(|task| task.node_id == node_id);
+    if !owned {
+        return Err(ApiError::not_found(
+            ErrorCode::TaskNotFound,
+            "image task not found",
+        ));
+    }
+    let task = state
+        .image_acquisition
+        .cancel(&task_id)
+        .ok_or_else(|| ApiError::not_found(ErrorCode::TaskNotFound, "image task not found"))?;
+    Ok(ApiResponse::success_with_raw(
+        "Runtime image task cancellation requested",
+        Some(runtime_image_task(task)),
+    )
+    .into_response())
 }
 
 /// 接收 Agent 持久 outbox 上报，并以机器会话覆盖来源节点身份。
@@ -892,9 +1022,78 @@ pub fn runtime_router() -> Router<Arc<AppState>> {
         .route("/scheduled-tasks/runs/report", post(report_task_runs))
         .route("/script-runs/report", post(report_script_runs))
         .route("/operation-events/report", post(report_operation_events))
+        .route("/docker/image-tasks", post(create_runtime_image_task))
+        .route(
+            "/docker/image-tasks/{task_id}",
+            get(runtime_image_task_progress).delete(cancel_runtime_image_task),
+        )
         .route("/scheduled-tasks/snapshot", get(get_tasks_snapshot))
         .route(
             "/upgrades/artifacts/{version}/{component}/{target_triple}/download",
             get(download_upgrade_artifact),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::node_sessions::{NodeSessionRecord, insert_node_session};
+
+    #[tokio::test]
+    async fn runtime_image_identity_is_bound_to_active_session_node() {
+        let pool = crate::test_support::setup_test_db().await;
+        sqlx::query(
+            "INSERT INTO nodes (node_id, name, normalized_name, status) \
+             VALUES ('node-81', '节点 81', '节点 81', 'online')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO node_identities (\
+                identity_id, node_id, agent_id, certificate_fingerprint, \
+                certificate_status, public_key_algorithm\
+             ) VALUES ('identity-81', 'node-81', 'agent-81', 'fingerprint-81', 'active', 'ed25519')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        insert_node_session(
+            &pool,
+            &NodeSessionRecord {
+                session_id: "session-81".to_string(),
+                node_id: "node-81".to_string(),
+                agent_id: "agent-81".to_string(),
+                lease_id: "lease-81".to_string(),
+                advertise_addr: None,
+                listen_addr: None,
+                listen_port: None,
+                server_name: Some("节点 81".to_string()),
+                registered_at: "2026-07-31T00:00:00Z".to_string(),
+                lease_expires_at: "2026-07-31T01:00:00Z".to_string(),
+                last_heartbeat_at: None,
+                heartbeat_sequence: 0,
+                last_seen_at: None,
+                status: "active".to_string(),
+                close_reason: None,
+                closed_at: None,
+                created_at: "2026-07-31T00:00:00Z".to_string(),
+                updated_at: "2026-07-31T00:00:00Z".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            require_runtime_node(&pool, "agent-81", "session-81")
+                .await
+                .unwrap(),
+            "node-81"
+        );
+        assert!(
+            require_runtime_node(&pool, "other-agent", "session-81")
+                .await
+                .is_err()
+        );
+    }
 }

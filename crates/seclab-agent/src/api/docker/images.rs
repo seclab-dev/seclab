@@ -9,7 +9,7 @@ use axum::{
     Json,
     body::Body,
     extract::{Multipart, Path, Query, State},
-    http::header,
+    http::{HeaderMap, header},
     response::{IntoResponse, Response},
 };
 
@@ -697,15 +697,17 @@ pub async fn cancel_pull_image(
     let response =
         ApiResponse::success_with_raw("Image pull cancellation requested", Some(progress))
             .into_response();
-    context
-        .record_success(
-            &state.metadata_db,
-            "docker_image_pull_cancel_requested",
-            Some(("imagePullTask", &task_id)),
-            json!({ "taskId": task_id, "imageRef": image_ref }),
-            true,
-        )
-        .await;
+    if !context.is_image_acquisition() {
+        context
+            .record_success(
+                &state.metadata_db,
+                "docker_image_pull_cancel_requested",
+                Some(("imagePullTask", &task_id)),
+                json!({ "taskId": task_id, "imageRef": image_ref }),
+                true,
+            )
+            .await;
+    }
     Ok(response)
 }
 
@@ -717,6 +719,8 @@ async fn run_image_pull_task(
     tag: String,
     cancel: Arc<AtomicBool>,
 ) {
+    let image_acquisition = context.is_image_acquisition();
+    let context = context.into_public_system_actor();
     update_pull_task(&task_id, |task| {
         task.status = ImagePullStatus::Pulling;
         task.progress_percent = 5;
@@ -734,6 +738,47 @@ async fn run_image_pull_task(
     }
     .await;
 
+    let target = format!("{image_name}:{tag}");
+    let (event_code, target_kind) = image_pull_audit_descriptor(image_acquisition);
+    let target_id = if image_acquisition {
+        target.as_str()
+    } else {
+        task_id.as_str()
+    };
+    match result {
+        Ok(()) => {
+            context
+                .record_success(
+                    &state.metadata_db,
+                    event_code,
+                    Some((target_kind, target_id)),
+                    json!({ "imageRef": target, "name": image_name, "tag": tag }),
+                    false,
+                )
+                .await;
+        }
+        Err(_) if cancel.load(Ordering::Relaxed) => {
+            context
+                .record_canceled(
+                    &state.metadata_db,
+                    event_code,
+                    Some((target_kind, target_id)),
+                    json!({ "imageRef": target, "name": image_name, "tag": tag }),
+                )
+                .await;
+        }
+        Err(ref error) => {
+            context
+                .record_failure(
+                    &state.metadata_db,
+                    event_code,
+                    Some((target_kind, target_id)),
+                    json!({ "imageRef": target, "name": image_name, "tag": tag }),
+                    error.to_string(),
+                )
+                .await;
+        }
+    }
     update_pull_task(&task_id, |task| match &result {
         Ok(()) => {
             task.status = ImagePullStatus::Success;
@@ -753,42 +798,6 @@ async fn run_image_pull_task(
             task.error = Some(err.to_string());
         }
     });
-
-    let target = format!("{image_name}:{tag}");
-    match result {
-        Ok(()) => {
-            context
-                .record_success(
-                    &state.metadata_db,
-                    "docker_image_pull",
-                    Some(("imagePullTask", &task_id)),
-                    json!({ "imageRef": target, "name": image_name, "tag": tag }),
-                    false,
-                )
-                .await;
-        }
-        Err(_) if cancel.load(Ordering::Relaxed) => {
-            context
-                .record_canceled(
-                    &state.metadata_db,
-                    "docker_image_pull",
-                    Some(("imagePullTask", &task_id)),
-                    json!({ "imageRef": target, "name": image_name, "tag": tag }),
-                )
-                .await;
-        }
-        Err(error) => {
-            context
-                .record_failure(
-                    &state.metadata_db,
-                    "docker_image_pull",
-                    Some(("imagePullTask", &task_id)),
-                    json!({ "imageRef": target, "name": image_name, "tag": tag }),
-                    error.to_string(),
-                )
-                .await;
-        }
-    }
 }
 
 /// 通过 Docker Registry 拉取镜像，并把原始进度事件交给调用方。
@@ -824,6 +833,7 @@ pub async fn pull_registry_image(
             return Err(AgentError::DockerOperation(error));
         }
         on_progress(info);
+        tokio::task::yield_now().await;
     }
     Ok(())
 }
@@ -1048,19 +1058,49 @@ pub async fn export_image(
 pub async fn load_image(
     State(state): State<Arc<AppState>>,
     context: DockerOperationContext,
+    headers: HeaderMap,
     multipart: Multipart,
 ) -> ApiResult<Response> {
+    let image_acquisition = context.is_image_acquisition();
+    let image_ref = image_acquisition
+        .then(|| {
+            headers
+                .get("x-seclab-image-ref")
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.chars().take(512).collect::<String>())
+        })
+        .and_then(|value| value);
+    let context = context.into_public_system_actor();
     let result = load_image_inner(Arc::clone(&state), multipart).await;
+    let event_code = image_load_audit_event(image_acquisition);
     context
         .finish(
             &state.metadata_db,
-            "docker_image_load",
-            None,
-            json!({}),
+            event_code,
+            image_ref.as_deref().map(|value| ("image", value)),
+            json!({ "imageRef": image_ref }),
             false,
             result,
         )
         .await
+}
+
+fn image_pull_audit_descriptor(image_acquisition: bool) -> (&'static str, &'static str) {
+    if image_acquisition {
+        ("docker_image_pulled_from_registry", "image")
+    } else {
+        ("docker_image_pull", "imagePullTask")
+    }
+}
+
+fn image_load_audit_event(image_acquisition: bool) -> &'static str {
+    if image_acquisition {
+        "docker_image_transferred_from_controller"
+    } else {
+        "docker_image_load"
+    }
 }
 
 async fn load_image_inner(state: Arc<AppState>, mut multipart: Multipart) -> ApiResult<Response> {
@@ -1193,6 +1233,19 @@ mod tests {
             image_reference_names(&containers),
             vec!["aaaaaaaaaaaa".to_string(), "zeta".to_string()]
         );
+    }
+
+    #[test]
+    fn controller_image_operations_use_semantic_audit_events() {
+        assert_eq!(
+            image_load_audit_event(true),
+            "docker_image_transferred_from_controller"
+        );
+        assert_eq!(
+            image_pull_audit_descriptor(true),
+            ("docker_image_pulled_from_registry", "image")
+        );
+        assert_eq!(image_load_audit_event(false), "docker_image_load");
     }
 
     #[test]

@@ -9,6 +9,7 @@ pub mod logging;
 pub mod monitoring;
 pub mod notification;
 pub mod process;
+pub mod runtime_docker;
 pub mod runtime_logs;
 pub mod scheduled_tasks;
 pub mod scripts;

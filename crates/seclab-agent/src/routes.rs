@@ -56,7 +56,11 @@ pub fn state_api_router() -> Router<Arc<AppState>> {
 }
 
 /// 创建路由
-pub async fn create_router() -> Result<(Router, DbPool)> {
+pub async fn create_router() -> Result<(
+    Router,
+    DbPool,
+    Arc<crate::services::controller_runtime::ControllerRuntime>,
+)> {
     // 建立数据库连接池。
     let pool = db::establish_connection().await?;
     let pool_for_shutdown = pool.clone();
@@ -64,6 +68,8 @@ pub async fn create_router() -> Result<(Router, DbPool)> {
     let system_monitoring =
         Arc::new(monitoring_service::SystemMonitoringRuntime::load(&pool).await?);
     let process_manager = Arc::new(crate::services::process_manager::ProcessManagerRuntime::new());
+    let controller_runtime =
+        Arc::new(crate::services::controller_runtime::ControllerRuntime::new());
     docker_project_tasks::initialize(&pool).await?;
     crate::services::file_tasks::initialize(&pool).await?;
     crate::services::process_manager::initialize_signal_operations(&pool).await?;
@@ -80,6 +86,7 @@ pub async fn create_router() -> Result<(Router, DbPool)> {
         docker_status: tokio::sync::RwLock::new(docker_status),
         system_monitoring: Arc::clone(&system_monitoring),
         process_manager: Arc::clone(&process_manager),
+        controller_runtime: Arc::clone(&controller_runtime),
         metadata_db: pool,
         websocket_sender,
         running_task_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
@@ -145,5 +152,5 @@ pub async fn create_router() -> Result<(Router, DbPool)> {
             10 * 1024 * 1024 * 1024, /* 10GB */
         ));
 
-    Ok((router, pool_for_shutdown))
+    Ok((router, pool_for_shutdown, controller_runtime))
 }

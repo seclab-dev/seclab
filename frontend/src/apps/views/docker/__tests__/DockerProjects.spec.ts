@@ -66,10 +66,12 @@ const setupStore = (task: DockerProjectTask | null = null) => {
     projectConfigurationError: '',
     projectConfigurationLoading: false,
     projectDeploymentProgress: task,
+    projectDeploymentProgressVisible: Boolean(task),
     projectDeploymentProgressError: null,
     fetchComposeProjects: vi.fn().mockResolvedValue(true),
     recoverActiveComposeDeployment: vi.fn().mockResolvedValue(true),
     stopProjectOperationPolling: vi.fn(),
+    openProjectDeploymentProgress: vi.fn(),
     closeProjectDeploymentProgress: vi.fn(),
     clearComposeProjectDetail: vi.fn(),
     clearComposeProjectConfiguration: vi.fn(),
@@ -175,6 +177,29 @@ describe('DockerProjects deployment dialogs', () => {
       document.body.querySelector('[data-ui="deployment-overall-progress"]')?.textContent,
     ).toContain('100%')
     expect(document.body.textContent).not.toContain('null%')
+    wrapper.unmount()
+  })
+
+  it('活动部署允许转入后台并提供恢复进度入口', async () => {
+    setupStore(activeTask())
+    const wrapper = mountView()
+    await nextTick()
+
+    const footerButton = document.body.querySelector(
+      '[data-ui="project-deployment-progress-dialog"] .sl-dialog-footer button',
+    ) as HTMLButtonElement | null
+    expect(footerButton?.disabled).toBe(false)
+    expect(footerButton?.textContent).toContain('后台运行')
+    footerButton?.click()
+    expect(state.docker.closeProjectDeploymentProgress).toHaveBeenCalledOnce()
+
+    state.docker.projectDeploymentProgressVisible = false
+    await nextTick()
+    const restore = wrapper.find('[data-ui="restore-deployment-progress"]')
+    expect(restore.exists()).toBe(true)
+    expect(restore.text()).toContain('39%')
+    await restore.trigger('click')
+    expect(state.docker.openProjectDeploymentProgress).toHaveBeenCalledOnce()
     wrapper.unmount()
   })
 })

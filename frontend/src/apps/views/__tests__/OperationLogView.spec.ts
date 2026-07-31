@@ -10,6 +10,15 @@ import zh from '@/locales/zh'
 vi.mock('@/api/modules/operation-log', () => ({
   operationLogApi: { query: vi.fn(), detail: vi.fn() },
 }))
+vi.mock('@/stores/node', () => ({
+  useNodeStore: () => ({
+    nodes: [
+      { id: 'local', name: '本地节点' },
+      { id: 'node-81', name: '节点 81' },
+    ],
+    refreshNodes: vi.fn().mockResolvedValue(undefined),
+  }),
+}))
 
 const response = (eventId: string) => ({
   success: true,
@@ -52,6 +61,32 @@ afterEach(() => {
 })
 
 describe('OperationLogView', () => {
+  it('展示子节点来源并把节点筛选传给查询接口', async () => {
+    const result = response('remote-docker-event')
+    result.data.items[0] = {
+      ...result.data.items[0],
+      module: 'docker',
+      origin: { kind: 'agent', nodeId: 'node-81', nodeName: '节点 81' },
+    }
+    vi.mocked(operationLogApi.query).mockReset().mockResolvedValue(result)
+    const wrapper = mount(OperationLogView, {
+      global: { plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh, en } })] },
+    })
+    await flushPromises()
+
+    expect(wrapper.find('[data-ui="origin-node"]').text()).toBe('节点 81')
+    await wrapper.find('[data-ui="toolbar-actions"] button').trigger('click')
+    const vm = wrapper.vm as unknown as {
+      filters: { nodeId: string }
+      applyFilters: () => void
+    }
+    vm.filters.nodeId = 'node-81'
+    vm.applyFilters()
+    await flushPromises()
+
+    expect(vi.mocked(operationLogApi.query).mock.calls.at(-1)?.[0].nodeIds).toEqual(['node-81'])
+  })
+
   it('只允许最新请求更新数据并提供稳定控件标识', async () => {
     const first = deferred<ReturnType<typeof response>>()
     const second = deferred<ReturnType<typeof response>>()
@@ -159,7 +194,50 @@ describe('OperationLogView', () => {
     wrapper.unmount()
   })
 
-  it('用户列仅显示用户与可信客户端 IP，不再追加 Agent 来源', async () => {
+  it('主控镜像分发使用可读动作与系统操作者', async () => {
+    const result = response('controller-image-transfer')
+    result.data.items[0] = {
+      ...result.data.items[0],
+      module: 'docker',
+      eventCode: 'docker_image_transferred_from_controller',
+      actor: { kind: 'system', displayName: 'image-acquisition' },
+      origin: { kind: 'agent', nodeId: 'node-81', nodeName: '节点 81' },
+      target: {
+        kind: 'image',
+        id: 'guowenju/fluxterm-pulse-server:latest',
+        displayName: 'guowenju/fluxterm-pulse-server:latest',
+      },
+    }
+    vi.mocked(operationLogApi.query).mockReset().mockResolvedValue(result)
+    vi.mocked(operationLogApi.detail)
+      .mockReset()
+      .mockResolvedValue({
+        success: true,
+        code: 200,
+        message: '',
+        data: {
+          ...result.data.items[0],
+          parameters: { imageRef: 'guowenju/fluxterm-pulse-server:latest' },
+          items: [],
+        },
+      })
+    const wrapper = mount(OperationLogView, {
+      global: { plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh, en } })] },
+    })
+    await flushPromises()
+
+    const table = wrapper.find('[data-ui="table"]').text()
+    expect(table).toContain('从主控分发镜像')
+    expect(table).toContain('系统')
+    expect(table).not.toContain('image-acquisition')
+    await wrapper.find('[data-ui="table"] button').trigger('click')
+    await flushPromises()
+    expect(document.body.textContent).toContain('guowenju/fluxterm-pulse-server:latest')
+    expect(document.body.textContent).not.toContain('image-acquisition')
+    wrapper.unmount()
+  })
+
+  it('用户列不混入来源信息并由独立节点列展示 Agent 来源', async () => {
     const result = response('agent-event')
     result.data.items[0] = {
       ...result.data.items[0],
@@ -177,7 +255,7 @@ describe('OperationLogView', () => {
     expect(table.text()).toContain('用户')
     expect(table.text()).toContain('admin (::ffff:10.0.0.41)')
     expect(table.text()).not.toContain('Agent')
-    expect(table.text()).not.toContain('节点 A')
+    expect(table.text()).toContain('节点 A')
     expect(table.text()).not.toContain('用户 / 来源')
     wrapper.unmount()
   })

@@ -12,6 +12,7 @@ import type {
   OperationOutcome,
 } from '@/api/generated'
 import { operationLogApi } from '@/api/modules/operation-log'
+import { useNodeStore } from '@/stores/node'
 import {
   SecLabAlert,
   SecLabButton,
@@ -29,6 +30,7 @@ import {
 import type { SecLabTableColumn } from '@/components/ui/SecLabTable.vue'
 
 const { t, te } = useI18n()
+const nodeStore = useNodeStore()
 const props = defineProps<{
   module?: OperationModule
   nodeId?: string
@@ -62,6 +64,7 @@ const filters = reactive({
   keyword: '',
   module: '' as OperationModule | '',
   impact: '' as OperationImpact | '',
+  nodeId: '',
 })
 
 const columns = computed<SecLabTableColumn[]>(() => [
@@ -69,6 +72,7 @@ const columns = computed<SecLabTableColumn[]>(() => [
   { label: t('app.operationLog.columns.time'), width: 190, slot: 'time', align: 'center' },
   { label: t('app.operationLog.columns.impact'), width: 100, slot: 'impact', align: 'center' },
   { label: t('app.operationLog.columns.actor'), minWidth: 160, slot: 'actor' },
+  { label: t('app.operationLog.columns.originNode'), minWidth: 150, slot: 'originNode' },
   {
     label: t('app.operationLog.columns.operation'),
     minWidth: 210,
@@ -124,6 +128,10 @@ const impactOptions = computed(() => [
     value,
   })),
 ])
+const nodeOptions = computed(() => [
+  { label: t('app.operationLog.allNodes'), value: '' },
+  ...nodeStore.nodes.map((node) => ({ label: node.name || node.id, value: node.id })),
+])
 const detailItems = computed(() => {
   if (!detail.value) return []
   const value = detail.value
@@ -131,6 +139,7 @@ const detailItems = computed(() => {
     { label: t('app.operationLog.columns.time'), value: formatTime(value.occurredAt) },
     { label: t('app.operationLog.columns.operation'), value: eventLabel(value.eventCode) },
     { label: t('app.operationLog.columns.actor'), value: actorLabel(value.actor) },
+    { label: t('app.operationLog.columns.originNode'), value: originNodeLabel(value) },
     ...(value.clientIp
       ? [{ label: t('app.operationLog.detail.clientIp'), value: value.clientIp }]
       : []),
@@ -198,11 +207,18 @@ function eventLabel(value: string) {
   return te(key) ? t(key) : value.replaceAll('_', ' ')
 }
 function actorLabel(actor: OperationLogSummary['actor']) {
-  return actor.kind === 'anonymous' ? t('app.operationLog.actorKinds.anonymous') : actor.displayName
+  if (actor.kind === 'anonymous') return t('app.operationLog.actorKinds.anonymous')
+  if (actor.kind === 'system') return t('app.operationLog.actorKinds.system')
+  return actor.displayName
 }
 function actorText(value: OperationLogSummary) {
   const actor = actorLabel(value.actor)
   return value.clientIp ? `${actor} (${value.clientIp})` : actor
+}
+function originNodeLabel(value: OperationLogSummary) {
+  if (value.origin.kind === 'master') return t('app.operationLog.origins.master')
+  if (value.origin.nodeId === 'local') return t('app.operationLog.detail.localNode')
+  return value.origin.nodeName?.trim() || value.origin.nodeId || t('app.operationLog.origins.agent')
 }
 function nodeDisplayName(
   value: OperationLogDetail,
@@ -246,7 +262,7 @@ function buildQuery(): OperationLogQuery {
     occurredTo: new Date().toISOString(),
     outcomes: filters.outcome ? [filters.outcome] : undefined,
     modules: props.module ? [props.module] : filters.module ? [filters.module] : undefined,
-    nodeIds: props.nodeId && props.nodeId !== 'local' ? [props.nodeId] : undefined,
+    nodeIds: props.nodeId ? [props.nodeId] : filters.nodeId ? [filters.nodeId] : undefined,
     impacts: filters.impact ? [filters.impact] : undefined,
     keyword: filters.keyword.trim() || undefined,
   }
@@ -354,6 +370,7 @@ watch(
   { immediate: true },
 )
 onMounted(() => {
+  void nodeStore.refreshNodes().catch(() => undefined)
   void load()
   pollTimer = window.setInterval(poll, 30_000)
 })
@@ -472,6 +489,20 @@ onBeforeUnmount(() => {
         />
       </SecLabFormItem>
       <SecLabFormItem
+        v-if="!props.nodeId"
+        class="filter-select"
+        :label="t('app.operationLog.node')"
+        for="operation-log-node"
+      >
+        <SecLabSelect
+          id="operation-log-node"
+          v-model="filters.nodeId"
+          name="operationLogNode"
+          :options="nodeOptions"
+          data-ui="node-filter"
+        />
+      </SecLabFormItem>
+      <SecLabFormItem
         class="filter-select"
         :label="t('app.operationLog.impact')"
         for="operation-log-impact"
@@ -518,6 +549,9 @@ onBeforeUnmount(() => {
         <template #actor="{ row }: { row: OperationLogSummary }">
           <strong>{{ actorText(row) }}</strong>
         </template>
+        <template #originNode="{ row }: { row: OperationLogSummary }">
+          <span data-ui="origin-node">{{ originNodeLabel(row) }}</span>
+        </template>
         <template #operation="{ row }: { row: OperationLogSummary }">{{
           eventLabel(row.eventCode)
         }}</template>
@@ -537,7 +571,11 @@ onBeforeUnmount(() => {
         :description="
           initialError
             ? t('app.operationLog.unavailable')
-            : filters.keyword || filters.outcome || filters.module || filters.impact
+            : filters.keyword ||
+                filters.outcome ||
+                filters.module ||
+                filters.impact ||
+                filters.nodeId
               ? t('app.operationLog.noMatches')
               : t('app.operationLog.empty')
         "

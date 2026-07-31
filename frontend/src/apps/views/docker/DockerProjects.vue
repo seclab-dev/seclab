@@ -87,10 +87,6 @@ const totalPages = computed(() =>
 const hasFilters = computed(() =>
   Boolean(keyword.value || managementKind.value || runtimeState.value),
 )
-const deploymentProgressActive = computed(() => {
-  const progress = store.projectDeploymentProgress
-  return progress?.status === 'queued' || progress?.status === 'running'
-})
 const deploymentProgressItems = computed(() => store.projectDeploymentProgress?.progressItems ?? [])
 const deploymentProgressPhases = computed(() => {
   const phases: dockerType.DockerProjectProgressPhase[] = ['pulling', 'applying']
@@ -457,6 +453,19 @@ onUnmounted(() => {
       </div>
       <div class="toolbar-actions">
         <SecLabButton
+          v-if="store.projectDeploymentProgress && !store.projectDeploymentProgressVisible"
+          type="info"
+          size="small"
+          data-ui="restore-deployment-progress"
+          @click="store.openProjectDeploymentProgress"
+        >
+          {{
+            t('app.docker.projects.deploymentProgress.restore', {
+              percent: store.projectDeploymentProgress.progressPercent,
+            })
+          }}
+        </SecLabButton>
+        <SecLabButton
           type="secondary"
           :loading="store.projectListLoading"
           @click="loadProjects()"
@@ -684,7 +693,7 @@ onUnmounted(() => {
     </SecLabDialog>
 
     <SecLabDialog
-      :visible="Boolean(store.projectDeploymentProgress)"
+      :visible="Boolean(store.projectDeploymentProgress) && store.projectDeploymentProgressVisible"
       :title="t('app.docker.projects.deploymentProgress.title')"
       width="760px"
       :close-on-click-overlay="false"
@@ -855,11 +864,12 @@ onUnmounted(() => {
         />
       </div>
       <template #footer>
-        <SecLabButton
-          :disabled="deploymentProgressActive"
-          @click="store.closeProjectDeploymentProgress"
-          >{{ t('common.close') }}</SecLabButton
-        >
+        <SecLabButton @click="store.closeProjectDeploymentProgress">{{
+          store.projectDeploymentProgress?.status === 'queued' ||
+          store.projectDeploymentProgress?.status === 'running'
+            ? t('app.docker.projects.deploymentProgress.background')
+            : t('common.close')
+        }}</SecLabButton>
       </template>
     </SecLabDialog>
   </div>
@@ -958,6 +968,12 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: var(--sdl-space-3);
+}
+.progress-row > span {
+  width: 44px;
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
 }
 .progress-track {
   flex: 1;
@@ -1102,7 +1118,9 @@ onUnmounted(() => {
   font-size: var(--sdl-font-caption);
 }
 .deployment-item-state {
+  min-width: 64px;
   flex-shrink: 0;
+  justify-content: flex-end;
   gap: var(--sdl-space-3);
 }
 .deployment-bytes {
@@ -1163,6 +1181,9 @@ onUnmounted(() => {
   100% {
     transform: translateX(300%);
   }
+}
+:deep([data-ui='project-deployment-progress-dialog'] .sl-dialog-body) {
+  scrollbar-gutter: stable;
 }
 .compose-editor {
   height: 360px;

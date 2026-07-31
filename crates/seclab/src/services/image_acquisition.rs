@@ -58,6 +58,15 @@ pub enum ImageStage {
     Pulling,
 }
 
+/// Agent 仓库拉取任务返回的单个镜像分层快照。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageLayerProgress {
+    pub id: String,
+    pub status: Option<String>,
+    pub progress_percent: Option<u8>,
+}
+
 /// 主控统一镜像任务快照。
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -70,6 +79,7 @@ pub struct ImageTask {
     pub stage: ImageStage,
     pub progress_percent: u8,
     pub status_text: String,
+    pub layers: Vec<ImageLayerProgress>,
     pub controller_error: Option<String>,
     pub registry_error: Option<String>,
     #[serde(skip)]
@@ -173,6 +183,7 @@ impl ImageAcquisitionService {
             stage: ImageStage::Checking,
             progress_percent: 0,
             status_text: "Waiting to acquire image".to_string(),
+            layers: Vec::new(),
             controller_error: None,
             registry_error: None,
             actor,
@@ -387,7 +398,9 @@ impl ImageAcquisitionService {
                 }
             }
         });
-        if let Some(task) = self.get(task_id) {
+        if let Some(task) = self.get(task_id)
+            && task.actor.is_some()
+        {
             let (event, message_key) = image_log_descriptor(&task.status, task.source.as_ref());
             let actor_name = task
                 .actor
@@ -531,12 +544,19 @@ impl ImageAcquisitionService {
             80,
             "Pulling image from registry",
         );
-        match pull_from_registry(&client, image_ref, cancel, &trace_id, |progress, text| {
-            self.update_optional(task_id, |task| {
-                task.progress_percent = (80 + progress / 5).min(99);
-                task.status_text = text;
-            });
-        })
+        match pull_from_registry(
+            &client,
+            image_ref,
+            cancel,
+            &trace_id,
+            |progress, text, layers| {
+                self.update_optional(task_id, |task| {
+                    task.progress_percent = (80 + progress / 5).min(99);
+                    task.status_text = text;
+                    task.layers = layers;
+                });
+            },
+        )
         .await
         {
             Ok(()) => Ok(ImageSource::Registry),
@@ -749,6 +769,7 @@ async fn transfer_controller_image(
     let request = client
         .client
         .post(client.build_uri(AGENT_LOAD_PATH))
+        .header("x-seclab-image-ref", image_ref)
         .multipart(reqwest::multipart::Form::new().part("file", part))
         .timeout(Duration::from_secs(600));
     let response = client
@@ -771,7 +792,7 @@ async fn pull_from_registry(
     image_ref: &str,
     cancel: &Arc<AtomicBool>,
     trace_id: &str,
-    progress: impl Fn(u8, String),
+    progress: impl Fn(u8, String, Vec<ImageLayerProgress>),
 ) -> anyhow::Result<()> {
     let response: Value = client
         .post_json_with_system_context(
@@ -812,7 +833,8 @@ async fn pull_from_registry(
             .and_then(Value::as_str)
             .unwrap_or("Pulling image from registry")
             .to_string();
-        progress(percent, text);
+        let layers = parse_agent_pull_layers(data)?;
+        progress(percent, text, layers);
         match data.get("status").and_then(Value::as_str) {
             Some("success") => return Ok(()),
             Some("failed") => {
@@ -827,6 +849,15 @@ async fn pull_from_registry(
             _ => tokio::time::sleep(Duration::from_millis(300)).await,
         }
     }
+}
+
+fn parse_agent_pull_layers(data: &Value) -> anyhow::Result<Vec<ImageLayerProgress>> {
+    serde_json::from_value(
+        data.get("layers")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new())),
+    )
+    .context("Agent image pull layers are invalid")
 }
 
 #[cfg(test)]
@@ -858,6 +889,22 @@ mod tests {
             image_log_outcome(ImageTaskStatus::Failed),
             OperationOutcome::Failure
         );
+    }
+
+    #[test]
+    fn agent_registry_layers_preserve_status_and_percent() {
+        let layers = parse_agent_pull_layers(&serde_json::json!({
+            "layers": [{
+                "id": "sha256:abc",
+                "status": "Downloading",
+                "progressPercent": 42
+            }]
+        }))
+        .expect("parse layers");
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].id, "sha256:abc");
+        assert_eq!(layers[0].status.as_deref(), Some("Downloading"));
+        assert_eq!(layers[0].progress_percent, Some(42));
     }
 
     #[test]

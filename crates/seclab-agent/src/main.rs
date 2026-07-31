@@ -18,6 +18,7 @@ use seclab_security::client::build_tls_client;
 use semver::Version;
 use shadow_rs::{formatcp, shadow};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use std::{fs, os::unix::fs::PermissionsExt};
 use tokio::{net::UnixListener, signal, sync::watch};
@@ -82,7 +83,7 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let (app, pools_for_shutdown) = match create_router().await {
+    let (app, pools_for_shutdown, controller_runtime) = match create_router().await {
         Ok(app) => app,
         Err(err) => {
             tracing::error!("SecLab Agent startup failed: {err:#}");
@@ -214,6 +215,7 @@ async fn main() {
     tokio::spawn(run_runtime_supervisor(
         pools_for_shutdown.clone(),
         runtime_stop_rx,
+        controller_runtime,
     ));
 
     tracing::info!("Starting Agent TLS server at {:?}", listen_addr);
@@ -394,7 +396,11 @@ struct RuntimeSessionState {
     listen_port: Option<i64>,
 }
 
-async fn run_runtime_supervisor(pool: DbPool, mut stop_rx: watch::Receiver<bool>) {
+async fn run_runtime_supervisor(
+    pool: DbPool,
+    mut stop_rx: watch::Receiver<bool>,
+    controller_runtime: Arc<services::controller_runtime::ControllerRuntime>,
+) {
     let mut retry_delay_seconds = RUNTIME_RETRY_INITIAL_DELAY_SECONDS;
     loop {
         if *stop_rx.borrow() {
@@ -404,7 +410,11 @@ async fn run_runtime_supervisor(pool: DbPool, mut stop_rx: watch::Receiver<bool>
         match establish_runtime_session(&pool).await {
             Ok(session) => {
                 retry_delay_seconds = RUNTIME_RETRY_INITIAL_DELAY_SECONDS;
+                controller_runtime
+                    .set_session(&session.seclab_url, &session.agent_id, &session.session_id)
+                    .await;
                 let result = maintain_runtime_session(&pool, &mut stop_rx, session).await;
+                controller_runtime.clear_session().await;
                 if let Err(err) = result {
                     tracing::warn!("Runtime session dropped: {}", err);
                     let _ = clear_runtime_session(&pool).await;
