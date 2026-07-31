@@ -114,6 +114,28 @@ impl DockerOperationContext {
         .await;
     }
 
+    /// 写入已取消操作，供后台任务终态使用。
+    pub async fn record_canceled(
+        &self,
+        pool: &DbPool,
+        event_code: &str,
+        target: Option<(&str, &str)>,
+        message_params: Value,
+    ) {
+        docker_activity::record(
+            pool,
+            self.activity(
+                event_code,
+                target,
+                message_params,
+                DockerActivityLevel::Warning,
+                DockerActivityOutcome::Canceled,
+                None,
+            ),
+        )
+        .await;
+    }
+
     /// 根据操作结果写入成功或失败日志，并原样返回业务结果。
     pub async fn finish<T, E: std::fmt::Display>(
         &self,

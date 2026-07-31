@@ -23,7 +23,6 @@ import DockerAllContainers from './DockerAllContainers.vue'
 import DockerImages from './DockerImages.vue'
 import DockerVolumes from './DockerVolumes.vue'
 import DockerNetworks from './DockerNetworks.vue'
-import DockerLogs from './DockerLogs.vue'
 import DockerInstallConsole from './DockerInstallConsole.vue'
 import SecLabIcon from '@/components/icons/SecLabIcon.vue'
 
@@ -80,7 +79,6 @@ const menuItems = computed(() => [
     icon: 'network',
     component: markRaw(DockerNetworks),
   },
-  { key: 'logs', label: t('app.docker.menu.logs'), icon: 'log', component: markRaw(DockerLogs) },
 ])
 
 const activeMenu = ref('overview')

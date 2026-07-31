@@ -3,4 +3,4 @@
 /**
  * 通知注册表中的稳定事件码。
  */
-export type NotificationCode = "nodeDeploymentFinished" | "suiteInstallationFinished" | "scriptRunFinished" | "scheduledTaskOperationFinished" | "scheduledTaskRunFinished" | "fileTaskFinished" | "fileTransferFinished" | "diskOperationFinished" | "dockerImageTaskFinished" | "dockerProjectTaskFinished" | "upgradePlanFinished" | "nodeOffline" | "nodeRecovered" | "loginLockout";
+export type NotificationCode = "nodeDeploymentFinished" | "suiteInstallationFinished" | "scriptRunFinished" | "scheduledTaskOperationFinished" | "scheduledTaskRunFinished" | "fileTaskFinished" | "fileTransferFinished" | "diskOperationFinished" | "dockerImageTaskFinished" | "dockerProjectTaskFinished" | "dockerEngineInstallationFinished" | "upgradePlanFinished" | "nodeOffline" | "nodeRecovered" | "loginLockout";

@@ -81,7 +81,18 @@ describe('OperationLogView', () => {
   })
 
   it('Docker 嵌入模式将时间与结果收进更多筛选并保持主工具栏紧凑', async () => {
-    vi.mocked(operationLogApi.query).mockReset().mockResolvedValue(response('docker-event'))
+    const result = response('docker-event')
+    result.data.items[0] = {
+      ...result.data.items[0],
+      module: 'docker',
+      eventCode: 'docker_compose_project_redeploy',
+    }
+    result.data.items.push({
+      ...result.data.items[0],
+      eventId: 'docker-image-transfer',
+      eventCode: 'docker_image_transferred_from_controller',
+    })
+    vi.mocked(operationLogApi.query).mockReset().mockResolvedValue(result)
     const wrapper = mount(OperationLogView, {
       props: { embedded: true, module: 'docker' },
       global: { plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh, en } })] },
@@ -104,6 +115,11 @@ describe('OperationLogView', () => {
     expect(advancedFilters.find('#operation-log-impact').exists()).toBe(true)
     expect(advancedFilters.find('#operation-log-module').exists()).toBe(false)
     expect(moreFilters.attributes('aria-expanded')).toBe('true')
+    expect(wrapper.find('[data-ui="table"]').text()).toContain('重新部署 Compose 项目')
+    expect(wrapper.find('[data-ui="table"]').text()).toContain('从主控分发镜像')
+    expect(wrapper.find('[data-ui="table"]').text()).not.toContain(
+      'docker compose project redeploy',
+    )
     wrapper.unmount()
   })
 

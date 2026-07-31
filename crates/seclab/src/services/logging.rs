@@ -8,6 +8,7 @@ use std::{
 
 use axum::http::HeaderMap;
 use chrono::{DateTime, Duration, Utc};
+use seclab_contracts::api::ApiResponse as ContractApiResponse;
 use seclab_contracts::logging::{
     AgentOperationEvent, OperationActor, OperationActorKind, OperationImpact, OperationItemStatus,
     OperationLogCapabilities, OperationLogDetail, OperationLogItem, OperationLogPage,
@@ -17,6 +18,7 @@ use seclab_contracts::logging::{
 use seclab_contracts::notification::{
     NotificationAttentionLevel, NotificationCategory, NotificationCode,
 };
+use serde::Serialize;
 use serde_json::Value;
 use sqlx::{FromRow, QueryBuilder, Sqlite, Transaction};
 use tokio::sync::{broadcast, mpsc};
@@ -24,11 +26,14 @@ use tracing::{error, warn};
 
 use crate::{
     models::logging::{LogModule, LogStatus, PlatformLogLevel},
+    models::node_runtime_client::NodeRuntimeClient,
     state::DbPool,
-    types::{ApiError, new_uuid_v7},
+    types::{ApiError, agent_socket_path, new_uuid_v7},
 };
 
 const QUEUE_CAPACITY: usize = 2_048;
+const LOCAL_AGENT_EVENT_BATCH_SIZE: usize = 100;
+const LOCAL_AGENT_EVENT_RELAY_INTERVAL_SECONDS: u64 = 2;
 const MAX_ERROR_SUMMARY_BYTES: usize = 512;
 const RETENTION_DAYS: i64 = 180;
 const RUNTIME_RETENTION_DAYS: i64 = 30;
@@ -692,6 +697,85 @@ pub fn spawn_retention_worker(pool: DbPool) {
     });
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalAgentEventAcknowledgeRequest {
+    event_ids: Vec<String>,
+}
+
+/// 通过本地 Agent Unix Socket 持续归集持久操作事件。
+pub fn spawn_local_agent_event_relay(pool: DbPool) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            LOCAL_AGENT_EVENT_RELAY_INTERVAL_SECONDS,
+        ));
+        let mut consecutive_failures = 0_u64;
+        loop {
+            interval.tick().await;
+            if !agent_socket_path().exists() {
+                consecutive_failures = 0;
+                continue;
+            }
+            match relay_local_agent_events_once(&pool).await {
+                Ok(_) => consecutive_failures = 0,
+                Err(error) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    if consecutive_failures == 1 || consecutive_failures.is_multiple_of(15) {
+                        warn!(
+                            %error,
+                            consecutive_failures,
+                            "Local Agent operation event relay failed; durable retry retained"
+                        );
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// 拉取、幂等持久化并确认一批本地 Agent 操作事件。
+async fn relay_local_agent_events_once(pool: &DbPool) -> anyhow::Result<usize> {
+    let client = NodeRuntimeClient::from_node_route(pool, Some("local")).await?;
+    let response = client
+        .get_json::<ContractApiResponse<Vec<AgentOperationEvent>>>(&format!(
+            "/api/v1/agent/operation-events/pending?limit={LOCAL_AGENT_EVENT_BATCH_SIZE}"
+        ))
+        .await?;
+    if !response.success {
+        anyhow::bail!(
+            "local Agent rejected operation event query: {}",
+            response.message
+        );
+    }
+    let events = response.data.unwrap_or_default();
+    if events.is_empty() {
+        return Ok(0);
+    }
+    let mut accepted_event_ids = Vec::with_capacity(events.len());
+    for event in events {
+        let event_id = event.event_id.clone();
+        store_agent_event(pool, "local", None, event)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        accepted_event_ids.push(event_id);
+    }
+    let acknowledged = client
+        .post_json::<ContractApiResponse<Vec<String>>, _>(
+            "/api/v1/agent/operation-events/acknowledge",
+            &LocalAgentEventAcknowledgeRequest {
+                event_ids: accepted_event_ids.clone(),
+            },
+        )
+        .await?;
+    if !acknowledged.success {
+        anyhow::bail!(
+            "local Agent rejected operation event acknowledgement: {}",
+            acknowledged.message
+        );
+    }
+    Ok(accepted_event_ids.len())
+}
+
 #[derive(Debug, Clone)]
 struct StoredOperationEvent {
     event_id: String,
@@ -1124,29 +1208,53 @@ fn notification_registration(event: &StoredOperationEvent) -> Option<Notificatio
                 NotificationRecipientPolicy::Actor,
             ))
         }
-        _ if event_code.starts_with("docker_image_")
-            || (event.module == OperationModule::Docker
-                && event.task_id.is_some()
-                && matches!(event_code, "image_pull" | "image_pull_cancelled")) =>
-        {
-            Some(task(
-                NotificationCode::DockerImageTaskFinished,
-                NotificationRecipientPolicy::Actor,
-            ))
-        }
-        _ if event.module == OperationModule::Docker
-            && event_code.starts_with("compose_")
-            && ["_succeeded", "_failed", "_cancelled"]
-                .iter()
-                .any(|suffix| event_code.ends_with(suffix)) =>
-        {
-            Some(task(
-                NotificationCode::DockerProjectTaskFinished,
-                NotificationRecipientPolicy::Actor,
-            ))
-        }
+        "docker_engine_install" if event.module == OperationModule::Docker => Some(task(
+            NotificationCode::DockerEngineInstallationFinished,
+            NotificationRecipientPolicy::Actor,
+        )),
+        _ if should_notify_docker_image_task(event) => Some(task(
+            NotificationCode::DockerImageTaskFinished,
+            NotificationRecipientPolicy::Actor,
+        )),
+        _ if should_notify_docker_project_task(event) => Some(task(
+            NotificationCode::DockerProjectTaskFinished,
+            NotificationRecipientPolicy::Actor,
+        )),
         _ => None,
     }
+}
+
+/// 仅将镜像获取任务的异常终态事件投影为个人通知。
+fn should_notify_docker_image_task(event: &StoredOperationEvent) -> bool {
+    event.module == OperationModule::Docker
+        && event.task_id.is_some()
+        && event.outcome != OperationOutcome::Success
+        && matches!(
+            event.event_code.as_str(),
+            "docker_image_pull"
+                | "docker_image_reused_on_target"
+                | "docker_image_transferred_from_controller"
+                | "docker_image_pulled_from_registry"
+                | "docker_image_acquisition_cancelled"
+                | "docker_image_acquisition_failed"
+        )
+}
+
+/// 仅将项目任务的异常终态事件投影为个人通知。
+fn should_notify_docker_project_task(event: &StoredOperationEvent) -> bool {
+    event.module == OperationModule::Docker
+        && event.task_id.is_some()
+        && event.outcome != OperationOutcome::Success
+        && matches!(
+            event.event_code.as_str(),
+            "docker_compose_project_create"
+                | "docker_compose_project_start"
+                | "docker_compose_project_stop"
+                | "docker_compose_project_restart"
+                | "docker_compose_project_redeploy"
+                | "docker_compose_project_scale"
+                | "docker_compose_project_remove"
+        )
 }
 
 async fn notification_recipients(
@@ -1735,6 +1843,55 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    #[tokio::test]
+    async fn local_agent_compose_event_is_stored_once_with_local_origin() {
+        let pool = setup_test_db().await;
+        let event = AgentOperationEvent {
+            event_id: "local-compose-event".to_string(),
+            occurred_at: "2026-07-31T03:08:24Z".to_string(),
+            module: OperationModule::Docker,
+            event_code: "docker_compose_project_stop".to_string(),
+            actor: OperationActor {
+                kind: OperationActorKind::System,
+                user_id: None,
+                display_name: "system".to_string(),
+            },
+            client_ip: None,
+            target: Some(OperationTarget {
+                kind: "composeProject".to_string(),
+                id: "example".to_string(),
+                display_name: Some("example".to_string()),
+                ownership: None,
+            }),
+            outcome: OperationOutcome::Success,
+            impact: OperationImpact::Info,
+            trace_id: "local-compose-trace".to_string(),
+            task_id: Some("local-compose-task".to_string()),
+            parameters: BTreeMap::new(),
+            error_code: None,
+            error_summary: None,
+        };
+
+        store_agent_event(&pool, "local", None, event.clone())
+            .await
+            .unwrap();
+        store_agent_event(&pool, "local", None, event)
+            .await
+            .unwrap();
+
+        let row = sqlx::query_as::<_, (i64, String, String, String)>(
+            "SELECT COUNT(*), origin_kind, origin_node_id, event_code \
+             FROM operation_logs WHERE event_id = 'local-compose-event'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, 1);
+        assert_eq!(row.1, "agent");
+        assert_eq!(row.2, "local");
+        assert_eq!(row.3, "docker_compose_project_stop");
+    }
+
     #[test]
     fn sanitizer_drops_sensitive_and_complex_values() {
         let (parameters, code, summary) = sanitize_parameters(Some(
@@ -1790,6 +1947,94 @@ mod tests {
         assert_eq!(event.event.origin_kind, "agent");
         assert_eq!(event.event.origin_node_id.as_deref(), Some("local"));
         assert_eq!(event.event.origin_node_name.as_deref(), Some("Local Node"));
+    }
+
+    #[test]
+    fn docker_notification_policy_is_selective() {
+        let event = |code: &str, outcome: OperationOutcome, with_task: bool| {
+            let builder = OperationEventBuilder::new("admin", code, "127.0.0.1".parse().unwrap())
+                .user_id(1)
+                .outcome(outcome);
+            if with_task {
+                builder.task_id("task-1").event
+            } else {
+                builder.event
+            }
+        };
+
+        for code in [
+            "docker_compose_project_create",
+            "docker_compose_project_start",
+            "docker_compose_project_stop",
+            "docker_compose_project_restart",
+            "docker_compose_project_redeploy",
+            "docker_compose_project_scale",
+            "docker_compose_project_remove",
+        ] {
+            assert!(
+                notification_registration(&event(code, OperationOutcome::Success, true)).is_none()
+            );
+        }
+        for outcome in [
+            OperationOutcome::Failure,
+            OperationOutcome::Canceled,
+            OperationOutcome::Partial,
+            OperationOutcome::TimedOut,
+        ] {
+            assert_eq!(
+                notification_registration(&event("docker_compose_project_create", outcome, true))
+                    .map(|value| value.code),
+                Some(NotificationCode::DockerProjectTaskFinished)
+            );
+        }
+
+        let configuration = event(
+            "docker_compose_project_configuration_update",
+            OperationOutcome::Failure,
+            false,
+        );
+        assert!(notification_registration(&configuration).is_none());
+
+        for code in [
+            "docker_image_pull",
+            "docker_image_reused_on_target",
+            "docker_image_transferred_from_controller",
+            "docker_image_pulled_from_registry",
+        ] {
+            assert!(
+                notification_registration(&event(code, OperationOutcome::Success, true)).is_none()
+            );
+        }
+        for (code, outcome) in [
+            ("docker_image_pull", OperationOutcome::Failure),
+            ("docker_image_pull", OperationOutcome::Canceled),
+            ("docker_image_pull", OperationOutcome::Partial),
+            ("docker_image_pull", OperationOutcome::TimedOut),
+            (
+                "docker_image_acquisition_cancelled",
+                OperationOutcome::Canceled,
+            ),
+            ("docker_image_acquisition_failed", OperationOutcome::Failure),
+        ] {
+            assert_eq!(
+                notification_registration(&event(code, outcome, true)).map(|value| value.code),
+                Some(NotificationCode::DockerImageTaskFinished)
+            );
+        }
+        let cancel_request = event(
+            "docker_image_pull_cancel_requested",
+            OperationOutcome::Success,
+            true,
+        );
+        assert!(notification_registration(&cancel_request).is_none());
+
+        for outcome in [OperationOutcome::Success, OperationOutcome::Failure] {
+            assert_eq!(
+                notification_registration(&event("docker_engine_install", outcome, false))
+                    .map(|value| value.code),
+                Some(NotificationCode::DockerEngineInstallationFinished)
+            );
+        }
     }
 
     #[test]

@@ -113,6 +113,7 @@ pub async fn create_router() -> Result<(Router, crate::state::DbPool)> {
     crate::services::script_runs::spawn_worker(Arc::clone(&app_state));
     crate::services::file_task_audit::spawn_reconciler(Arc::clone(&app_state));
     crate::services::logging::init_operation_log_writer(app_state.metadata_db.clone());
+    crate::services::logging::spawn_local_agent_event_relay(app_state.metadata_db.clone());
     crate::services::logging::spawn_retention_worker(app_state.metadata_db.clone());
     notifications::spawn_retention_worker(app_state.metadata_db.clone());
     disks::recover_operations(Arc::clone(&app_state)).await?;

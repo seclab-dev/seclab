@@ -257,7 +257,7 @@ pub async fn system_prune(
     context
         .finish(
             &state.metadata_db,
-            "system.prune",
+            "docker_system_prune",
             Some(("system", "docker")),
             json!({}),
             true,

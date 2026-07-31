@@ -338,7 +338,7 @@ pub async fn remove_image(
     context
         .finish(
             &state.metadata_db,
-            "image.remove",
+            "docker_image_remove",
             Some(("image", &id)),
             json!({ "name": image_name }),
             true,
@@ -630,15 +630,6 @@ pub async fn pull_image(
 
     let task_id_for_worker = task_id.clone();
     let worker_context = context.clone();
-    context
-        .record_success(
-            &state.metadata_db,
-            "image.pull.submitted",
-            Some(("image", &image_name)),
-            json!({ "name": image_name.clone(), "tag": tag.clone() }),
-            false,
-        )
-        .await;
     tokio::spawn(async move {
         run_image_pull_task(
             state,
@@ -681,7 +672,7 @@ pub async fn cancel_pull_image(
     context: DockerOperationContext,
     Path(task_id): Path<String>,
 ) -> ApiResult<Response> {
-    let progress = {
+    let (progress, image_ref) = {
         let mut tasks = IMAGE_PULL_TASKS
             .lock()
             .expect("image pull task lock poisoned");
@@ -697,7 +688,10 @@ pub async fn cancel_pull_image(
             }
             ImagePullStatus::Success | ImagePullStatus::Failed | ImagePullStatus::Cancelled => {}
         }
-        task.to_response(task_id.clone())
+        (
+            task.to_response(task_id.clone()),
+            format!("{}:{}", task.image_name, task.tag),
+        )
     };
 
     let response =
@@ -706,9 +700,9 @@ pub async fn cancel_pull_image(
     context
         .record_success(
             &state.metadata_db,
-            "image.pull.cancel",
+            "docker_image_pull_cancel_requested",
             Some(("imagePullTask", &task_id)),
-            json!({ "taskId": task_id }),
+            json!({ "taskId": task_id, "imageRef": image_ref }),
             true,
         )
         .await;
@@ -766,7 +760,7 @@ async fn run_image_pull_task(
             context
                 .record_success(
                     &state.metadata_db,
-                    "image.pull",
+                    "docker_image_pull",
                     Some(("imagePullTask", &task_id)),
                     json!({ "imageRef": target, "name": image_name, "tag": tag }),
                     false,
@@ -775,12 +769,11 @@ async fn run_image_pull_task(
         }
         Err(_) if cancel.load(Ordering::Relaxed) => {
             context
-                .record_success(
+                .record_canceled(
                     &state.metadata_db,
-                    "image.pull.cancelled",
+                    "docker_image_pull",
                     Some(("imagePullTask", &task_id)),
                     json!({ "imageRef": target, "name": image_name, "tag": tag }),
-                    true,
                 )
                 .await;
         }
@@ -788,7 +781,7 @@ async fn run_image_pull_task(
             context
                 .record_failure(
                     &state.metadata_db,
-                    "image.pull",
+                    "docker_image_pull",
                     Some(("imagePullTask", &task_id)),
                     json!({ "imageRef": target, "name": image_name, "tag": tag }),
                     error.to_string(),
@@ -1014,6 +1007,7 @@ fn split_reference_tag(reference: &str) -> Result<(&str, Option<String>), AgentE
 /// 将当前节点 Docker 镜像导出为 tar 流。
 pub async fn export_image(
     State(state): State<Arc<AppState>>,
+    context: DockerOperationContext,
     Query(query): Query<ExportQuery>,
 ) -> ApiResult<Response> {
     let image_name = query.image_name.trim();
@@ -1021,19 +1015,33 @@ pub async fn export_image(
         return Err(AgentError::BadRequest("imageName must not be empty".to_string()).into());
     }
 
-    let docker = state.docker_client().await?;
-    let stream = docker
-        .export_image(image_name)
-        .map(|chunk| chunk.map_err(std::io::Error::other));
-    let body = Body::from_stream(stream);
+    let result: ApiResult<Response> = async {
+        let docker = state.docker_client().await?;
+        docker.inspect_image(image_name).await?;
+        let stream = docker
+            .export_image(image_name)
+            .map(|chunk| chunk.map_err(std::io::Error::other));
+        let body = Body::from_stream(stream);
 
-    Ok(Response::builder()
-        .header(header::CONTENT_TYPE, "application/x-tar")
-        .header(
-            header::CONTENT_DISPOSITION,
-            "attachment; filename=\"image.tar\"",
+        Ok(Response::builder()
+            .header(header::CONTENT_TYPE, "application/x-tar")
+            .header(
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"image.tar\"",
+            )
+            .body(body)?)
+    }
+    .await;
+    context
+        .finish(
+            &state.metadata_db,
+            "docker_image_export_requested",
+            Some(("image", image_name)),
+            json!({ "imageRef": image_name }),
+            false,
+            result,
         )
-        .body(body)?)
+        .await
 }
 
 /// 接收流式上传的镜像 tar 包，并导入到本地 Docker 中。
@@ -1046,7 +1054,7 @@ pub async fn load_image(
     context
         .finish(
             &state.metadata_db,
-            "image.load",
+            "docker_image_load",
             None,
             json!({}),
             false,

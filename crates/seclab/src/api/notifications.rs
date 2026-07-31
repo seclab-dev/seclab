@@ -461,9 +461,9 @@ fn notification_action(
         NotificationCode::FileTaskFinished => "operation-log",
         NotificationCode::FileTransferFinished => "file-manager",
         NotificationCode::DiskOperationFinished => "disk-manager",
-        NotificationCode::DockerImageTaskFinished | NotificationCode::DockerProjectTaskFinished => {
-            "docker-manager"
-        }
+        NotificationCode::DockerImageTaskFinished
+        | NotificationCode::DockerProjectTaskFinished
+        | NotificationCode::DockerEngineInstallationFinished => "docker-manager",
         NotificationCode::LoginLockout => "operation-log",
         NotificationCode::UpgradePlanFinished => return None,
     };
@@ -665,6 +665,9 @@ fn parse_code(value: &str) -> Result<NotificationCode, ApiError> {
         "diskOperationFinished" => Ok(NotificationCode::DiskOperationFinished),
         "dockerImageTaskFinished" => Ok(NotificationCode::DockerImageTaskFinished),
         "dockerProjectTaskFinished" => Ok(NotificationCode::DockerProjectTaskFinished),
+        "dockerEngineInstallationFinished" => {
+            Ok(NotificationCode::DockerEngineInstallationFinished)
+        }
         "upgradePlanFinished" => Ok(NotificationCode::UpgradePlanFinished),
         "nodeOffline" => Ok(NotificationCode::NodeOffline),
         "nodeRecovered" => Ok(NotificationCode::NodeRecovered),

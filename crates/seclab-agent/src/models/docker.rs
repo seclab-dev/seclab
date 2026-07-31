@@ -1097,6 +1097,7 @@ impl DockerActivityLevel {
 pub enum DockerActivityOutcome {
     Success,
     Failure,
+    Canceled,
 }
 
 impl DockerActivityOutcome {
@@ -1105,6 +1106,7 @@ impl DockerActivityOutcome {
         match self {
             Self::Success => "success",
             Self::Failure => "failure",
+            Self::Canceled => "canceled",
         }
     }
 }

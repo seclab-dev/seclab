@@ -71,6 +71,12 @@ pub enum ComposeCommandResult {
 
 /// Agent 启动时关闭不可恢复的旧任务并清理过期记录。
 pub async fn initialize(pool: &DbPool) -> ApiResult<()> {
+    let interrupted_task_ids = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM docker_compose_project_tasks \
+         WHERE status IN ('queued', 'running') ORDER BY created_at ASC",
+    )
+    .fetch_all(pool)
+    .await?;
     sqlx::query(
         "UPDATE docker_compose_project_tasks \
          SET status = 'failed', stage = 'interrupted', progress_percent = 100, \
@@ -79,6 +85,9 @@ pub async fn initialize(pool: &DbPool) -> ApiResult<()> {
     )
     .execute(pool)
     .await?;
+    for task_id in interrupted_task_ids {
+        record_terminal_activity(pool, &task_id).await;
+    }
     cleanup_expired(pool).await?;
     Ok(())
 }
@@ -137,22 +146,6 @@ pub async fn create(
     .bind(&context.trace_id)
     .execute(pool)
     .await?;
-    context
-        .record_success(
-            pool,
-            "compose.task.submitted",
-            Some(("composeProject", request.project_name)),
-            json!({
-                "taskId": id,
-                "name": request.project_name,
-                "operation": request.operation.as_str(),
-                "service": request.service_name,
-                "replicas": request.replicas,
-                "pullImages": request.pull_images,
-            }),
-            false,
-        )
-        .await;
     let cancellation = CancellationToken::new();
     CANCELLATIONS.lock().await.insert(id.clone(), cancellation);
     let (sender, _) = broadcast::channel(TASK_EVENT_BUFFER);
@@ -373,7 +366,7 @@ async fn record_terminal_activity(pool: &DbPool, task_id: &str) {
         "replicas": row.try_get::<Option<i64>, _>("replicas").ok().flatten(),
         "pullImages": row.try_get::<bool, _>("pull_images").unwrap_or(false),
     });
-    let event_code = format!("compose.{operation}.{status}");
+    let event_code = compose_operation_event_code(&operation);
     if status == "failed" {
         let error = row
             .try_get::<Option<String>, _>("error_summary")
@@ -383,22 +376,47 @@ async fn record_terminal_activity(pool: &DbPool, task_id: &str) {
         context
             .record_failure(
                 pool,
-                &event_code,
+                event_code,
                 Some(("composeProject", &project_name)),
                 params,
                 error,
             )
             .await;
     } else {
-        context
-            .record_success(
-                pool,
-                &event_code,
-                Some(("composeProject", &project_name)),
-                params,
-                operation == "redeploy" || operation == "remove" || status == "cancelled",
-            )
-            .await;
+        if status == "cancelled" {
+            context
+                .record_canceled(
+                    pool,
+                    event_code,
+                    Some(("composeProject", &project_name)),
+                    params,
+                )
+                .await;
+        } else {
+            context
+                .record_success(
+                    pool,
+                    event_code,
+                    Some(("composeProject", &project_name)),
+                    params,
+                    operation == "redeploy" || operation == "remove",
+                )
+                .await;
+        }
+    }
+}
+
+/// 将 Compose 任务操作映射为稳定的 Docker 审计事件码。
+fn compose_operation_event_code(operation: &str) -> &'static str {
+    match operation {
+        "create" => "docker_compose_project_create",
+        "start" => "docker_compose_project_start",
+        "stop" => "docker_compose_project_stop",
+        "restart" => "docker_compose_project_restart",
+        "redeploy" => "docker_compose_project_redeploy",
+        "scale" => "docker_compose_project_scale",
+        "remove" => "docker_compose_project_remove",
+        _ => "docker_compose_project_operation",
     }
 }
 
@@ -1120,6 +1138,37 @@ mod tests {
         assert_eq!(task.progress_items.len(), 1);
         assert_eq!(task.progress_items[0].label, "Image nginx");
         assert_eq!(task.progress_percent, 39);
+    }
+
+    #[tokio::test]
+    async fn startup_records_interrupted_compose_task_terminal_event() {
+        let pool = crate::test_support::setup_test_db().await;
+        sqlx::query(
+            "INSERT INTO docker_compose_project_tasks (\
+                id, project_name, operation, status, stage, progress_percent, pull_images, \
+                actor_kind, actor_name\
+             ) VALUES ('task-interrupted', 'demo', 'redeploy', 'running', 'applying', 70, 1, \
+                'system', 'test')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert task");
+
+        initialize(&pool).await.expect("recover tasks");
+
+        let task = get(&pool, "task-interrupted").await.expect("load task");
+        assert_eq!(task.status, DockerProjectTaskStatus::Failed);
+        assert_eq!(task.stage, DockerProjectTaskStage::Interrupted);
+        let events = crate::services::operation_outbox::pending(&pool, 10)
+            .await
+            .expect("load outbox");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_code, "docker_compose_project_redeploy");
+        assert_eq!(
+            events[0].outcome,
+            seclab_contracts::logging::OperationOutcome::Failure
+        );
+        assert_eq!(events[0].task_id.as_deref(), Some("task-interrupted"));
     }
 
     #[tokio::test]

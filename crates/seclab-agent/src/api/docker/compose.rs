@@ -130,58 +130,81 @@ pub async fn project_configuration(
 /// 校验并原子保存 Compose 配置，不触发部署。
 pub async fn update_project_configuration(
     State(state): State<Arc<AppState>>,
+    context: DockerOperationContext,
     Path(name): Path<String>,
     Json(payload): Json<docker::DockerProjectConfigurationUpdateRequest>,
 ) -> ApiResult<Response> {
+    validate_compose_yaml(&payload.compose_yaml).await?;
     let record = load_project_record(&state, &name).await?;
     docker_projects::ensure_mutable(&record)?;
-    validate_compose_yaml(&payload.compose_yaml).await?;
-    if record.config_revision != payload.expected_revision {
-        return Err(ApiError::conflict(
-            ErrorCode::DockerProjectRevisionConflict,
-            "Docker project configuration has changed",
-        ));
-    }
+    let expected_revision = payload.expected_revision;
+    let next_revision = expected_revision
+        .checked_add(1)
+        .ok_or_else(|| ApiError::validation("expectedRevision is out of range"))?;
+    let result: ApiResult<Response> =
+        async {
+            if record.config_revision != expected_revision {
+                return Err(ApiError::conflict(
+                    ErrorCode::DockerProjectRevisionConflict,
+                    "Docker project configuration has changed",
+                ));
+            }
 
-    let compose_file = PathBuf::from(&record.compose_dir).join(COMPOSE_FILE_NAME);
-    let previous = tokio::fs::read(&compose_file).await.ok();
-    let temporary = compose_file.with_extension("yaml.tmp");
-    tokio::fs::write(&temporary, payload.compose_yaml.as_bytes()).await?;
-    tokio::fs::rename(&temporary, &compose_file).await?;
+            let compose_file = PathBuf::from(&record.compose_dir).join(COMPOSE_FILE_NAME);
+            let previous = tokio::fs::read(&compose_file).await.ok();
+            let temporary = compose_file.with_extension("yaml.tmp");
+            tokio::fs::write(&temporary, payload.compose_yaml.as_bytes()).await?;
+            tokio::fs::rename(&temporary, &compose_file).await?;
 
-    let result = sqlx::query(
-        "UPDATE docker_compose_projects SET config_revision = config_revision + 1 \
-         WHERE name = ?1 AND config_revision = ?2",
-    )
-    .bind(&record.name)
-    .bind(payload.expected_revision)
-    .execute(&state.metadata_db)
-    .await;
-    let rows_affected = match result {
-        Ok(result) => result.rows_affected(),
-        Err(error) => {
-            restore_configuration(&compose_file, previous.as_deref()).await;
-            return Err(error.into());
+            let update = sqlx::query(
+                "UPDATE docker_compose_projects SET config_revision = config_revision + 1 \
+             WHERE name = ?1 AND config_revision = ?2",
+            )
+            .bind(&record.name)
+            .bind(expected_revision)
+            .execute(&state.metadata_db)
+            .await;
+            let rows_affected = match update {
+                Ok(update) => update.rows_affected(),
+                Err(error) => {
+                    restore_configuration(&compose_file, previous.as_deref()).await;
+                    return Err(error.into());
+                }
+            };
+            if rows_affected != 1 {
+                restore_configuration(&compose_file, previous.as_deref()).await;
+                return Err(ApiError::conflict(
+                    ErrorCode::DockerProjectRevisionConflict,
+                    "Docker project configuration has changed",
+                ));
+            }
+            let configuration = docker::DockerProjectConfiguration {
+                compose_yaml: payload.compose_yaml,
+                revision: next_revision,
+                applied_revision: record.applied_revision,
+                state: docker::DockerProjectConfigurationState::Pending,
+            };
+            Ok(ApiResponse::success_with_raw(
+                "Docker project configuration saved",
+                Some(configuration),
+            )
+            .into_response())
         }
-    };
-    if rows_affected != 1 {
-        restore_configuration(&compose_file, previous.as_deref()).await;
-        return Err(ApiError::conflict(
-            ErrorCode::DockerProjectRevisionConflict,
-            "Docker project configuration has changed",
-        ));
-    }
-    let revision = record.config_revision + 1;
-    let configuration = docker::DockerProjectConfiguration {
-        compose_yaml: payload.compose_yaml,
-        revision,
-        applied_revision: record.applied_revision,
-        state: docker::DockerProjectConfigurationState::Pending,
-    };
-    Ok(
-        ApiResponse::success_with_raw("Docker project configuration saved", Some(configuration))
-            .into_response(),
-    )
+        .await;
+    context
+        .finish(
+            &state.metadata_db,
+            "docker_compose_project_configuration_update",
+            Some(("composeProject", &record.name)),
+            serde_json::json!({
+                "projectName": record.name,
+                "previousRevision": expected_revision,
+                "revision": next_revision,
+            }),
+            false,
+            result,
+        )
+        .await
 }
 
 /// 校验 Compose 配置并返回可直接展示的结果。

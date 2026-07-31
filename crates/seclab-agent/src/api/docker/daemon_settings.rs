@@ -64,7 +64,7 @@ pub async fn update_settings(
     context
         .finish(
             &state.metadata_db,
-            "daemon.settings.update",
+            "docker_daemon_settings_update",
             Some(("dockerDaemon", "settings")),
             json!({}),
             true,

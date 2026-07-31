@@ -38,7 +38,8 @@ pub async fn record(pool: &DbPool, activity: NewDockerActivity) {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.chars().take(64).collect());
-    let mut task_id = None;
+    let mut task_id =
+        parameter_text(&parameters, "taskId").map(|value| value.chars().take(128).collect());
     let target = match (activity.target_kind, activity.target_id) {
         (Some(kind), Some(id)) if matches!(kind.as_str(), "imagePullTask" | "dockerTask") => {
             task_id = Some(id.chars().take(128).collect());
@@ -74,6 +75,7 @@ pub async fn record(pool: &DbPool, activity: NewDockerActivity) {
         outcome: match activity.outcome {
             DockerActivityOutcome::Success => OperationOutcome::Success,
             DockerActivityOutcome::Failure => OperationOutcome::Failure,
+            DockerActivityOutcome::Canceled => OperationOutcome::Canceled,
         },
         impact: match activity.level {
             DockerActivityLevel::Info => OperationImpact::Info,
@@ -115,6 +117,16 @@ fn parameter_display_name(
         }
         _ => None,
     })
+}
+
+fn parameter_text<'a>(
+    parameters: &'a BTreeMap<String, OperationParameterValue>,
+    key: &str,
+) -> Option<&'a str> {
+    match parameters.get(key) {
+        Some(OperationParameterValue::String(value)) => Some(value),
+        _ => None,
+    }
 }
 
 fn is_opaque_identifier(value: &str) -> bool {
@@ -168,6 +180,8 @@ fn sanitize_error(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::docker::context::DockerOperationContext;
+
     #[test]
     fn removes_sensitive_parameters() {
         let values =
@@ -181,5 +195,32 @@ mod tests {
         let parameters = safe_parameters(&serde_json::json!({"name":"web"}));
         assert_eq!(parameter_display_name(&parameters).as_deref(), Some("web"));
         assert!(is_opaque_identifier("019f6f64-cc8d-7a30-9812-845e0f56f185"));
+    }
+
+    #[tokio::test]
+    async fn canceled_activity_is_persisted_with_safe_parameters() {
+        let pool = crate::test_support::setup_test_db().await;
+        let context = DockerOperationContext::system("test");
+        context
+            .record_canceled(
+                &pool,
+                "docker_image_pull",
+                Some(("imagePullTask", "task-1")),
+                serde_json::json!({
+                    "imageRef": "nginx:latest",
+                    "command": "must-not-be-stored",
+                }),
+            )
+            .await;
+
+        let events = crate::services::operation_outbox::pending(&pool, 10)
+            .await
+            .expect("load outbox");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_code, "docker_image_pull");
+        assert_eq!(events[0].outcome, OperationOutcome::Canceled);
+        assert_eq!(events[0].task_id.as_deref(), Some("task-1"));
+        assert!(events[0].parameters.contains_key("imageRef"));
+        assert!(!events[0].parameters.contains_key("command"));
     }
 }

@@ -385,7 +385,7 @@ async fn handle_terminal_start(
             context
                 .record_failure(
                     &state.metadata_db,
-                    "container.exec",
+                    "docker_container_exec",
                     Some(("container", &payload.container_id)),
                     json!({ "name": payload.container_id }),
                     &message,
@@ -413,7 +413,7 @@ async fn handle_terminal_start(
             context
                 .record_failure(
                     &state.metadata_db,
-                    "container.exec",
+                    "docker_container_exec",
                     Some(("container", &payload.container_id)),
                     json!({ "name": payload.container_id }),
                     &message,
@@ -445,7 +445,7 @@ async fn handle_terminal_start(
         context
             .record_failure(
                 &state.metadata_db,
-                "container.exec",
+                "docker_container_exec",
                 Some(("container", &container_name)),
                 json!({ "name": container_name }),
                 &message,
@@ -509,7 +509,7 @@ async fn handle_terminal_start(
             context
                 .record_failure(
                     &state.metadata_db,
-                    "container.exec",
+                    "docker_container_exec",
                     Some(("container", &container_name)),
                     json!({ "name": container_name }),
                     &message,
@@ -530,7 +530,7 @@ async fn handle_terminal_start(
     context
         .record_success(
             &state.metadata_db,
-            "container.exec",
+            "docker_container_exec",
             Some(("container", &container_name)),
             json!({ "name": container_name }),
             false,

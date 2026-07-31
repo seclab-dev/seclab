@@ -188,7 +188,7 @@ pub async fn create_container(
     context
         .finish(
             &state.metadata_db,
-            "container.create",
+            "docker_container_create",
             Some(("container", &container_name)),
             json!({ "name": container_name, "image": image_name }),
             false,
@@ -266,7 +266,7 @@ pub async fn rename_container(
     context
         .finish(
             &state.metadata_db,
-            "container.rename",
+            "docker_container_rename",
             Some(("container", &id)),
             json!({ "name": id, "newName": new_name }),
             false,
@@ -445,7 +445,7 @@ pub async fn exec_container(
     context
         .finish(
             &state.metadata_db,
-            "container.exec",
+            "docker_container_exec",
             Some(("container", &id)),
             json!({ "name": id }),
             false,
@@ -1011,13 +1011,13 @@ fn ensure_action_allowed(
 /// 返回容器动作对应的稳定审计事件代码。
 const fn action_event_code(action: docker::DockerContainerAction) -> &'static str {
     match action {
-        docker::DockerContainerAction::Start => "container.start",
-        docker::DockerContainerAction::Stop => "container.stop",
-        docker::DockerContainerAction::Restart => "container.restart",
-        docker::DockerContainerAction::Pause => "container.pause",
-        docker::DockerContainerAction::Unpause => "container.unpause",
-        docker::DockerContainerAction::Kill => "container.kill",
-        docker::DockerContainerAction::Remove => "container.remove",
+        docker::DockerContainerAction::Start => "docker_container_start",
+        docker::DockerContainerAction::Stop => "docker_container_stop",
+        docker::DockerContainerAction::Restart => "docker_container_restart",
+        docker::DockerContainerAction::Pause => "docker_container_pause",
+        docker::DockerContainerAction::Unpause => "docker_container_unpause",
+        docker::DockerContainerAction::Kill => "docker_container_kill",
+        docker::DockerContainerAction::Remove => "docker_container_remove",
     }
 }
 

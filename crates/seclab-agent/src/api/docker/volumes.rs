@@ -73,7 +73,7 @@ pub async fn create_volume(
     context
         .finish(
             &state.metadata_db,
-            "volume.create",
+            "docker_volume_create",
             Some(("volume", &volume_name)),
             json!({ "name": volume_name, "management": "custom" }),
             false,
@@ -107,7 +107,7 @@ pub async fn remove_volume(
     context
         .finish(
             &state.metadata_db,
-            "volume.remove",
+            "docker_volume_remove",
             Some(("volume", &name)),
             json!({ "name": name, "management": management }),
             true,

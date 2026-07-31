@@ -54,22 +54,12 @@ pub async fn install(
     context: DockerOperationContext,
     Json(payload): Json<DockerInstallPayload>,
 ) -> ApiResult<Response> {
-    context
-        .record_success(
-            &state.metadata_db,
-            "docker.install.submitted",
-            Some(("dockerEngine", "docker")),
-            json!({}),
-            false,
-        )
-        .await;
+    if payload.mirror.as_deref().unwrap_or("official") != "official" {
+        return Err(ApiError::BadRequest(
+            "only official Docker repository is supported".to_string(),
+        ));
+    }
     let result: ApiResult<Response> = async {
-        if payload.mirror.as_deref().unwrap_or("official") != "official" {
-            return Err(ApiError::BadRequest(
-                "only official Docker repository is supported".to_string(),
-            ));
-        }
-
         let os = read_os_release()?;
         let repo = match os.id.as_str() {
             "ubuntu" => "ubuntu",
@@ -120,7 +110,7 @@ pub async fn install(
     context
         .finish(
             &state.metadata_db,
-            "docker.install",
+            "docker_engine_install",
             Some(("dockerEngine", "docker")),
             json!({}),
             false,

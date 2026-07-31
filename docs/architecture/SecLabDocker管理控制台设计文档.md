@@ -20,14 +20,15 @@
 | **`DockerAllContainers.vue`** | 子组件/展示 | 渲染所有容器列表。 |
 | **`DockerImages.vue`** | 子组件/展示 | 渲染镜像列表。 |
 | **`DockerNetworks.vue`** | 子组件/展示 | 渲染网络列表。 |
-| **`DockerLogs.vue`** | 子组件/展示 | 渲染系统活动与审计日志。 |
 
 ### 2.2 核心布局
 
 组件采用左右分栏布局：
 
-* **左侧侧边栏 (`app-docker-sidebar`)**：固定宽度，用于展示 `menuItems` 列表并控制 `activeMenu` 状态。
+* **左侧侧边栏 (`app-docker-sidebar`)**：固定宽度，用于展示概览、项目、容器、镜像、卷和网络入口，并控制 `activeMenu` 状态。
 * **右侧内容区 (`app-docker-content-area`)**：动态区域，用于显示当前 `activeMenu` 对应的子组件（通过 `<component :is="activeComponent" />` 渲染）。
+
+Docker 状态变更的审计记录统一由全局“操作日志”应用提供，Docker 应用不重复设置日志入口。
 
 ---
 
@@ -78,7 +79,6 @@
 | `updateDaemonSettings` | `/agent/docker/daemon/settings` | `DockerDaemonSettings` | 校验、写入配置并重启当前节点 Docker。 |
 | `listNetworks` | `/agent/docker/networks` | `Network[]` | 获取所有 Docker 网络列表。 |
 | `fetchSdu` | `/agent/docker/sdu` | `number` | 获取 Docker 逻辑磁盘总占用量。 |
-| `fetchDockerLogs` | `/agent/docker/logs` | `LogList` | **日志视图**使用，获取 Agent 侧 Docker 模块操作记录 (REST API)。 |
 | `fetchResourceUsageHistory` | `/agent/docker/stats/history` | `ResourceUsageHistory` | 获取 Docker 资源趋势（时间序列）。 |
 | `fetchContainerResourceUsageSummaries` | `/agent/docker/containers/stats/summary` | `ContainerStatsBatchResponse` | 获取容器资源统计（批量缓存最新值）。 |
 | `fetchContainerResourceUsageHistory` | `/agent/docker/containers/{id}/stats/history` | `ResourceUsageHistory` | 获取单容器资源趋势（时间序列）。 |
@@ -87,12 +87,12 @@
 ### 4.2 WebSocket 实时日志
 
 * **Endpoint**: `ws:///api/v1/agent/websocket/events/ws`
-* **用途**: 前端通过 `useWebSocketStore` 订阅指定容器的实时日志流。
+* **用途**: 容器详情通过 `useWebSocketStore` 订阅指定容器的 stdout/stderr 实时日志流。
 
 ### 4.2.1 当前约束
 
 * 该链路由 `seclab` 统一暴露入口，再转发到目标 `agent`。
-* 它服务于“实时容器日志”场景，不替代审计日志或通知历史查询接口。
+* 它只服务于容器 stdout/stderr 场景，不替代全局操作日志或通知历史查询接口。
 
 ### 4.3 操作接口
 
@@ -106,7 +106,6 @@
 | **容器管理** | 启动/停止/删除 | 1. 触发 `handleContainerAction`。 2. 如果是 `delete`，显示 `ConfirmationModal`。 3. 调用 `dockerApi.performAction`。 4. 成功后，刷新相关列表 (`fetchContainers`/`fetchProjectContainers`/`fetchOverviewData`)。 |
 | **镜像管理** | 删除 | 1. 触发 `handleDeleteImage`。 2. 显示 `ConfirmationModal`。 3. 调用 `dockerApi.performAction`。 4. 成功后，刷新镜像列表和概览数据。 |
 | **镜像设置** | 镜像加速与代理 | 管理 `/etc/docker/daemon.json` 中的 `registry-mirrors` 和 `proxies`。Agent 保留其他字段，使用 `dockerd --validate` 校验并原子写入；重启失败时恢复原配置和 Docker 服务。配置按当前节点生效。 |
-| **日志视图** | 运维日志展示 | `DockerLogs.vue` 在挂载时调用 `dockerApi.fetchDockerLogs`，展示 Docker 模块的操作记录。 |
 
 镜像设置中的单一代理地址同时写入 `http-proxy` 和 `https-proxy`，接受 `http://` 或 `https://` URL。代理 URL 可以携带用户名和密码，凭据会明文保存在目标节点 `/etc/docker/daemon.json` 并向已认证管理员回显，因此不得在平台日志中记录配置内容。保存操作会重启目标节点 Docker，运行中的容器可能短暂中断。
 

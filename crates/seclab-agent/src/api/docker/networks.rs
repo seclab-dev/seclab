@@ -65,7 +65,7 @@ pub async fn create_network(
     context
         .finish(
             &state.metadata_db,
-            "network.create",
+            "docker_network_create",
             Some(("network", &network_name)),
             json!({ "name": network_name }),
             false,
@@ -114,7 +114,7 @@ pub async fn remove_network(
     context
         .finish(
             &state.metadata_db,
-            "network.remove",
+            "docker_network_remove",
             Some(("network", &id)),
             json!({ "name": network_name }),
             true,
@@ -169,7 +169,7 @@ pub async fn connect_network(
     context
         .finish(
             &state.metadata_db,
-            "network.connect",
+            "docker_network_connect",
             Some(("network", &id)),
             json!({ "name": network_name, "container": container_name }),
             false,
@@ -235,9 +235,9 @@ fn disconnect_request(container: &str, force: bool) -> NetworkDisconnectRequest 
 /// 返回断开操作的审计事件及高影响标记。
 fn disconnect_event(force: bool) -> (&'static str, bool) {
     if force {
-        ("network.forceDisconnect", true)
+        ("docker_network_force_disconnect", true)
     } else {
-        ("network.disconnect", false)
+        ("docker_network_disconnect", false)
     }
 }
 
@@ -793,7 +793,13 @@ mod tests {
     #[test]
     fn separates_normal_and_forced_disconnect_semantics() {
         assert_eq!(disconnect_request("container", false).force, Some(false));
-        assert_eq!(disconnect_event(false), ("network.disconnect", false));
-        assert_eq!(disconnect_event(true), ("network.forceDisconnect", true));
+        assert_eq!(
+            disconnect_event(false),
+            ("docker_network_disconnect", false)
+        );
+        assert_eq!(
+            disconnect_event(true),
+            ("docker_network_force_disconnect", true)
+        );
     }
 }

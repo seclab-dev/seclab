@@ -7,6 +7,7 @@ use crate::state::AppState;
 use anyhow::{Context, anyhow};
 use bollard::Docker;
 use futures_util::StreamExt;
+use seclab_contracts::logging::OperationOutcome;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -413,9 +414,7 @@ impl ImageAcquisitionService {
             if let Some(actor) = task.actor.as_ref() {
                 log = log.user_id(actor.user_id).trace_id(&actor.trace_id);
             }
-            if task.status == ImageTaskStatus::Success {
-                log = log.set_success();
-            }
+            log = log.outcome(image_log_outcome(task.status));
             log.finish(&state.metadata_db);
         }
     }
@@ -686,6 +685,17 @@ fn image_log_descriptor(
     }
 }
 
+/// 将镜像任务终态映射为统一操作结果。
+const fn image_log_outcome(status: ImageTaskStatus) -> OperationOutcome {
+    match status {
+        ImageTaskStatus::Success => OperationOutcome::Success,
+        ImageTaskStatus::Cancelled => OperationOutcome::Canceled,
+        ImageTaskStatus::Pending | ImageTaskStatus::Running | ImageTaskStatus::Failed => {
+            OperationOutcome::Failure
+        }
+    }
+}
+
 async fn local_docker() -> anyhow::Result<Docker> {
     let docker =
         Docker::connect_with_local_defaults().context("controller Docker is unavailable")?;
@@ -831,6 +841,22 @@ mod tests {
                 "docker_image_transferred_from_controller",
                 "platformLog.docker.imageAcquisition.controllerTransferred"
             )
+        );
+    }
+
+    #[test]
+    fn image_task_terminal_status_maps_to_operation_outcome() {
+        assert_eq!(
+            image_log_outcome(ImageTaskStatus::Success),
+            OperationOutcome::Success
+        );
+        assert_eq!(
+            image_log_outcome(ImageTaskStatus::Cancelled),
+            OperationOutcome::Canceled
+        );
+        assert_eq!(
+            image_log_outcome(ImageTaskStatus::Failed),
+            OperationOutcome::Failure
         );
     }
 
