@@ -31,10 +31,9 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 use tracing::info_span;
 
-/// 需要 state 的路由
-pub fn state_api_router() -> Router<Arc<AppState>> {
+/// 仅允许 Controller principal 访问的管理路由。
+fn controller_api_router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/runtime/health", get(runtime_health))
         .nest("/docker", docker::docker_router())
         .nest("/disks", disks::disk_router())
         .nest("/files", fs::fs_router())
@@ -51,7 +50,19 @@ pub fn state_api_router() -> Router<Arc<AppState>> {
         .nest("/upgrade", upgrade::upgrade_router())
         .nest("/websocket", websocket::websocket_router())
         .merge(process::process_router())
+}
+
+/// 按 principal 边界组装 Agent API，避免通过 URI 字符串推断授权方式。
+fn state_api_router(state: Arc<AppState>) -> Router {
+    let controller_routes = controller_api_router().layer(axum::middleware::from_fn_with_state(
+        Arc::clone(&state),
+        require_command_credential,
+    ));
+    Router::new()
+        .route("/runtime/health", get(runtime_health))
+        .merge(controller_routes)
         .merge(suite_workloads::suite_workloads_router())
+        .with_state(state)
 }
 
 /// 无状态健康检查；启动期不暴露任何管理能力。
@@ -125,12 +136,7 @@ pub async fn create_router() -> Result<(
         .allow_headers(Any);
 
     // 创建一个需要状态的路由实例，并立即为其提供状态
-    let state_routes = state_api_router()
-        .layer(axum::middleware::from_fn_with_state(
-            Arc::clone(&app_state),
-            require_command_credential,
-        ))
-        .with_state(Arc::clone(&app_state));
+    let state_routes = state_api_router(Arc::clone(&app_state));
 
     let router = Router::new()
         .nest("/api/v1/agent", state_routes)
@@ -164,22 +170,12 @@ pub async fn create_router() -> Result<(
     Ok((router, pool_for_shutdown, controller_runtime))
 }
 
-/// 校验 Master→Agent 管理请求；套件运行时使用独立实例令牌校验。
+/// 校验 Master→Agent 管理请求；该中间件只挂载于 Controller 路由。
 async fn require_command_credential(
     State(state): State<Arc<AppState>>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    if request
-        .uri()
-        .path()
-        .starts_with("/api/v1/agent/suite-runtime/")
-    {
-        return next.run(request).await;
-    }
-    if request.uri().path() == "/api/v1/agent/runtime/health" {
-        return next.run(request).await;
-    }
     let expected = crate::services::settings::get_string_or_default(
         &state.metadata_db,
         "runtime.command_credential_hash",
@@ -214,4 +210,74 @@ async fn require_command_credential(
         .into_response();
     }
     next.run(request).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn principal_routes_use_independent_authorization() {
+        let state = Arc::new(crate::test_support::setup_test_state().await);
+        let controller_token = "controller-command-token";
+        let controller_hash = hex::encode(ring::digest::digest(
+            &ring::digest::SHA256,
+            controller_token.as_bytes(),
+        ));
+        crate::services::settings::set_string(
+            &state.metadata_db,
+            "runtime.command_credential_hash",
+            &controller_hash,
+        )
+        .await
+        .unwrap();
+
+        let app = Router::new().nest("/api/v1/agent", state_api_router(Arc::clone(&state)));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+
+        let suite_response = client
+            .get(format!(
+                "http://{address}/api/v1/agent/suite-runtime/workloads"
+            ))
+            .bearer_auth("invalid-suite-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(suite_response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            suite_response
+                .text()
+                .await
+                .unwrap()
+                .contains("suite runtime token is invalid")
+        );
+
+        let controller_response = client
+            .get(format!("http://{address}/api/v1/agent/system/summary"))
+            .bearer_auth("invalid-suite-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(controller_response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            controller_response
+                .text()
+                .await
+                .unwrap()
+                .contains("Agent command credential is invalid")
+        );
+
+        let health_response = client
+            .get(format!("http://{address}/api/v1/agent/runtime/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health_response.status(), StatusCode::OK);
+        server.abort();
+    }
 }
