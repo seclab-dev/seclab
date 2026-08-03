@@ -34,6 +34,21 @@ const MAX_OVERVIEW_CONTAINERS = 5
 /** 与后端任务快照一致的部署进度项上限 */
 const MAX_PROJECT_PROGRESS_ITEMS = 200
 
+/** 选择概览趋势容器：优先保留有效选择，否则仅默认选择运行中的容器。 */
+export function selectOverviewContainerIds(
+  items: dockerType.TrendContainerItem[],
+  selectedIds: string[],
+) {
+  const availableIds = new Set(items.map((item) => item.id))
+  const retained = selectedIds.filter((id) => availableIds.has(id))
+  if (retained.length > 0) return retained.slice(0, MAX_OVERVIEW_CONTAINERS)
+
+  return items
+    .filter((item) => item.state.toLowerCase() === 'running')
+    .slice(0, MAX_OVERVIEW_CONTAINERS)
+    .map((item) => item.id)
+}
+
 const emptyContainerStates = (): dockerType.ContainerStateCounts => ({
   total: 0,
   running: 0,
@@ -442,19 +457,10 @@ export const useDockerStore = defineStore('docker', () => {
     }
   }
 
-  /** 更新概览趋势容器，并保留仍存在但已停止的选择。 */
+  /** 更新概览趋势容器，并在没有有效选择时默认选择运行中的容器。 */
   const updateOverviewContainerState = (items: dockerType.TrendContainerItem[]) => {
     overviewContainers.value = items
-    const availableIds = new Set(items.map((item) => item.id))
-    const retained = overviewSelectedContainerIds.value.filter((id) => availableIds.has(id))
-    const preferred = [
-      ...items.filter((item) => item.state.toLowerCase() === 'running'),
-      ...items.filter((item) => item.state.toLowerCase() !== 'running'),
-    ]
-    const nextSelected =
-      retained.length > 0
-        ? retained.slice(0, MAX_OVERVIEW_CONTAINERS)
-        : preferred.slice(0, MAX_OVERVIEW_CONTAINERS).map((item) => item.id)
+    const nextSelected = selectOverviewContainerIds(items, overviewSelectedContainerIds.value)
     const selectionChanged = nextSelected.join(',') !== overviewSelectedContainerIds.value.join(',')
     overviewSelectedContainerIds.value = nextSelected
     if (selectionChanged) void fetchOverviewHistoryAll()
