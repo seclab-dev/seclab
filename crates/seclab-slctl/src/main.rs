@@ -231,6 +231,36 @@ fn select_stop_targets(
     }
 }
 
+/// 根据节点角色选择需要卸载的服务。
+fn select_uninstall_targets(role: &str) -> Result<Vec<&'static str>> {
+    match role {
+        "agent" => Ok(vec!["agent"]),
+        "seclab" => Ok(vec!["seclab"]),
+        "all" => Ok(vec!["agent", "seclab"]),
+        _ => Err(anyhow::anyhow!("no SecLab services are installed")),
+    }
+}
+
+/// 按既定顺序卸载服务，并在全部服务卸载成功后统一清理数据。
+fn run_uninstall_sequence<U, P>(
+    targets: &[&str],
+    purge: bool,
+    mut uninstall: U,
+    mut purge_common_dirs: P,
+) -> Result<()>
+where
+    U: FnMut(&str) -> Result<()>,
+    P: FnMut() -> Result<()>,
+{
+    for target in targets {
+        uninstall(target)?;
+    }
+    if purge {
+        purge_common_dirs()?;
+    }
+    Ok(())
+}
+
 /// 读取一行交互输入。
 fn prompt_line(prompt: &str) -> Result<String> {
     print!("{}", prompt);
@@ -698,7 +728,7 @@ impl Context {
     }
 
     /// 卸载指定的服务。
-    fn uninstall_service(&self, target: &str, purge: bool) -> Result<()> {
+    fn uninstall_service(&self, target: &str) -> Result<()> {
         if !command_exists("systemctl") {
             return Err(anyhow::anyhow!("systemctl not found"));
         }
@@ -734,16 +764,8 @@ impl Context {
             self.remove_file_if_exists(&self.db_dir.join("agent.db").to_string_lossy())?;
             self.remove_file_if_exists(&self.db_dir.join("agent.db-shm").to_string_lossy())?;
             self.remove_file_if_exists(&self.db_dir.join("agent.db-wal").to_string_lossy())?;
-
-            if purge {
-                self.purge_common_dirs()?;
-            }
         } else {
             self.remove_file_if_exists(&self.config_dir.join("seclab.toml").to_string_lossy())?;
-
-            if purge {
-                self.purge_common_dirs()?;
-            }
         }
 
         println!("slctl: {} uninstall completed", target);
@@ -955,8 +977,14 @@ fn run_app(cli: Cli, context: Context) -> Result<()> {
             context.entry(regenerate, set, disable)?;
         }
         Commands::Uninstall { purge } => {
-            context.uninstall_service("agent", purge)?;
-            context.uninstall_service("seclab", purge)?;
+            let role = context.detect_node_role();
+            let targets = select_uninstall_targets(&role)?;
+            run_uninstall_sequence(
+                &targets,
+                purge,
+                |target| context.uninstall_service(target),
+                || context.purge_common_dirs(),
+            )?;
         }
         Commands::SelfCmd { action } => match action {
             SelfAction::Uninstall => {
@@ -1006,8 +1034,8 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        Cli, Commands, select_stop_targets, service_has_stopped, validate_password,
-        validate_safe_entry_value,
+        Cli, Commands, run_uninstall_sequence, select_stop_targets, select_uninstall_targets,
+        service_has_stopped, validate_password, validate_safe_entry_value,
     };
 
     #[test]
@@ -1037,6 +1065,89 @@ mod tests {
         assert!(select_stop_targets(Some("unknown"), true, true).is_err());
         assert!(select_stop_targets(Some("agent"), true, false).is_err());
         assert!(select_stop_targets(None, false, false).is_err());
+    }
+
+    #[test]
+    fn uninstall_target_selection_follows_node_role() {
+        assert_eq!(select_uninstall_targets("agent").unwrap(), vec!["agent"]);
+        assert_eq!(select_uninstall_targets("seclab").unwrap(), vec!["seclab"]);
+        assert_eq!(
+            select_uninstall_targets("all").unwrap(),
+            vec!["agent", "seclab"]
+        );
+        assert!(select_uninstall_targets("unknown").is_err());
+    }
+
+    #[test]
+    fn uninstall_sequence_runs_selected_targets_and_purges_once() {
+        let targets = select_uninstall_targets("all").unwrap();
+        let mut uninstalled = Vec::new();
+        let mut purge_count = 0;
+
+        run_uninstall_sequence(
+            &targets,
+            true,
+            |target| {
+                uninstalled.push(target.to_string());
+                Ok(())
+            },
+            || {
+                purge_count += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(uninstalled, vec!["agent", "seclab"]);
+        assert_eq!(purge_count, 1);
+    }
+
+    #[test]
+    fn agent_uninstall_sequence_does_not_include_seclab_or_purge_by_default() {
+        let targets = select_uninstall_targets("agent").unwrap();
+        let mut uninstalled = Vec::new();
+        let mut purge_count = 0;
+
+        run_uninstall_sequence(
+            &targets,
+            false,
+            |target| {
+                uninstalled.push(target.to_string());
+                Ok(())
+            },
+            || {
+                purge_count += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(uninstalled, vec!["agent"]);
+        assert_eq!(purge_count, 0);
+    }
+
+    #[test]
+    fn uninstall_sequence_skips_purge_when_service_uninstall_fails() {
+        let targets = select_uninstall_targets("all").unwrap();
+        let mut purge_count = 0;
+
+        let result = run_uninstall_sequence(
+            &targets,
+            true,
+            |target| {
+                if target == "seclab" {
+                    return Err(anyhow::anyhow!("uninstall failed"));
+                }
+                Ok(())
+            },
+            || {
+                purge_count += 1;
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(purge_count, 0);
     }
 
     #[test]
