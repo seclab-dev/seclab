@@ -38,13 +38,6 @@ pub struct AgentIdentity {
     pub key_pem: Option<Vec<u8>>,
 }
 
-impl AgentIdentity {
-    /// 判断当前模式是否为远程运行。
-    pub fn is_remote(&self) -> bool {
-        self.mode == AgentMode::Remote
-    }
-}
-
 /// 从数据库读取身份信息，不存在则初始化。
 pub async fn load_or_init_identity(
     pool: &DbPool,

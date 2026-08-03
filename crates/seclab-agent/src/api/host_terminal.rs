@@ -1,18 +1,16 @@
 //! 宿主机终端 Agent API。
 
 use crate::{
-    config,
-    models::identity::load_or_init_identity,
     services::host_terminal::{
         self, HostTerminalEvent, HostTerminalSession, MAX_CONTROL_BYTES, MAX_INPUT_BYTES,
     },
     state::AppState,
-    types::{AgentMode, ApiError, ApiResponse, ApiResult},
+    types::{ApiError, ApiResponse, ApiResult},
 };
 use axum::{
     Router,
     extract::{State, WebSocketUpgrade, ws::Message},
-    http::{HeaderMap, StatusCode, header::HeaderName},
+    http::{HeaderMap, header::HeaderName},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -68,35 +66,13 @@ async fn consume_ticket(
     state: &AppState,
     ticket: &str,
 ) -> ApiResult<TerminalTicketConsumeResponse> {
-    let identity = load_or_init_identity(&state.metadata_db, config::get())
+    let runtime = crate::services::agent_runtime::load(&state.metadata_db)
         .await
         .map_err(|_| {
             ApiError::forbidden(ErrorCode::AuthForbidden, "agent identity is unavailable")
         })?;
-    let node_id = match identity.mode {
-        AgentMode::Local => "local".to_string(),
-        AgentMode::Remote => identity.agent_id.ok_or_else(|| {
-            ApiError::forbidden(ErrorCode::AuthForbidden, "agent identity is incomplete")
-        })?,
-    };
-    let seclab_url = identity
-        .seclab_url
-        .filter(|value| !value.trim().is_empty())
-        .map(Ok)
-        .unwrap_or_else(|| match identity.mode {
-            AgentMode::Local => config::local_controller_url().map_err(|error| {
-                ApiError::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    ErrorCode::AgentUnavailable,
-                    "local controller endpoint is unavailable",
-                )
-                .with_detail(error.to_string())
-            }),
-            AgentMode::Remote => Err(ApiError::forbidden(
-                ErrorCode::AuthForbidden,
-                "controller URL is unavailable",
-            )),
-        })?;
+    let node_id = runtime.node_id;
+    let seclab_url = runtime.controller_url;
     let client = seclab_security::client::build_tls_client().map_err(|_| {
         ApiError::forbidden(
             ErrorCode::AuthForbidden,

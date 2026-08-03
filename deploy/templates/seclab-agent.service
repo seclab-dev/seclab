@@ -1,6 +1,6 @@
 [Unit]
 Description=SecLab Distributed Telemetry Agent
-After=network.target
+After=network.target seclab.service
 
 [Service]
 Type=simple

@@ -572,10 +572,7 @@ printf '%s\n' "all" | $PREFIX tee "$SECLAB_CONFIG_DIR/node.role" >/dev/null
 
 log "write service: /etc/systemd/system/seclab-agent.service"
 write_service "seclab-agent"
-log "start service: seclab-agent"
-$PREFIX systemctl daemon-reload
-$PREFIX systemctl enable --now seclab-agent >/dev/null 2>&1
-log "agent service started"
+log "agent service prepared; it will start after SecLab is ready"
 
 log_section "== install seclab"
 log "install binary: /usr/local/bin/seclab"
@@ -604,6 +601,10 @@ log "start service: seclab"
 $PREFIX systemctl daemon-reload
 $PREFIX systemctl enable --now seclab >/dev/null 2>&1
 log "seclab service started"
+
+log "start service: seclab-agent"
+$PREFIX systemctl enable --now seclab-agent >/dev/null 2>&1
+log "agent service started"
 
 log_section "== install completed"
 echo "SecLab initial login information:"

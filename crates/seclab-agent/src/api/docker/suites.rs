@@ -3,9 +3,9 @@
 use crate::api::docker::context::DockerOperationContext;
 use crate::api::suite_workloads;
 use crate::config;
-use crate::models::identity::load_or_init_identity;
+use crate::services::agent_runtime::CommandTransport;
 use crate::state::AppState;
-use crate::types::{AgentError, AgentMode, ApiError, ApiResponse, ApiResult};
+use crate::types::{AgentError, ApiError, ApiResponse, ApiResult};
 use axum::body::Body;
 use axum::extract::{Json, OriginalUri, Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, Method, header};
@@ -15,6 +15,8 @@ use base64::engine::general_purpose::STANDARD;
 use bollard::models::NetworkCreateRequest;
 use bollard::query_parameters;
 use futures_util::StreamExt;
+use ring::digest;
+use ring::rand::{SecureRandom, SystemRandom};
 use seclab_contracts::api::ErrorCode;
 use seclab_security::certs::{AGENT_CA_CERT_PEM, issue_client_cert};
 use serde::{Deserialize, Serialize};
@@ -27,12 +29,15 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::time::{sleep, timeout};
+use uuid::Uuid;
 
 const SUITE_NETWORK_NAME: &str = "seclab-suite-network";
 const COMPOSE_FILE_NAME: &str = "compose.yaml";
 const SUITE_METADATA_FILE: &str = "suite-agent.json";
 const SUITE_RUNTIME_DIR_NAME: &str = "runtime";
-const SUITE_ENV_FILE_NAME: &str = ".env";
+const SUITE_RUNTIME_DESCRIPTOR_FILE: &str = "runtime.json";
+const SUITE_RUNTIME_TOKEN_FILE: &str = "access-token";
+const SUITE_RUNTIME_OVERRIDE_FILE: &str = "compose.runtime.yaml";
 const SUITE_ENTRY_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const SUITE_ENTRY_READY_INTERVAL: Duration = Duration::from_secs(1);
 const SUITE_ENTRY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -78,8 +83,18 @@ pub struct SuiteInstallRequest {
     pub compose_file: String,
     #[serde(default)]
     pub runtime_images: Vec<String>,
+    #[serde(default)]
+    pub agent_access: Option<SuiteAgentAccess>,
     pub files: Vec<SuitePackageFile>,
     pub app_entries: Vec<SuiteAppEntry>,
+}
+
+/// 套件后端需要挂载 Agent 运行时的服务和能力。
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SuiteAgentAccess {
+    pub services: Vec<String>,
+    pub capabilities: Vec<String>,
 }
 
 /// 套件生命周期动作请求。
@@ -122,6 +137,55 @@ pub(crate) struct SuiteAgentMetadata {
     version: String,
     compose_project_name: String,
     app_entries: Vec<SuiteAppEntry>,
+    #[serde(default)]
+    agent_access: Option<SuiteAgentGrant>,
+}
+
+/// Agent 持久化的套件实例授权。
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SuiteAgentGrant {
+    services: Vec<String>,
+    capabilities: Vec<String>,
+    token_hash: String,
+    enabled: bool,
+}
+
+/// 注入套件容器的语言无关 Agent 运行时描述。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SuiteRuntimeDescriptor {
+    schema_version: u32,
+    suite_id: String,
+    instance_id: String,
+    endpoint: SuiteRuntimeEndpoint,
+    credential: SuiteRuntimeCredential,
+    capabilities: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "lowercase",
+    rename_all_fields = "camelCase"
+)]
+enum SuiteRuntimeEndpoint {
+    Unix {
+        socket_path: String,
+        base_url: String,
+    },
+    Https {
+        base_url: String,
+        ca_path: String,
+        client_cert_path: String,
+        client_key_path: String,
+    },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SuiteRuntimeCredential {
+    token_path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -225,6 +289,7 @@ pub async fn install_suite(
 ) -> ApiResult<Response> {
     validate_id("instance_id", &payload.instance_id)?;
     validate_project_name(&payload.compose_project_name)?;
+    validate_agent_access(payload.agent_access.as_ref())?;
     let log_metadata = install_log_metadata(&payload);
     upsert_install_progress(SuiteInstallProgress {
         instance_id: payload.instance_id.clone(),
@@ -412,7 +477,7 @@ async fn install_suite_inner(
         let compose_text = tokio::fs::read_to_string(&compose_source).await?;
         tokio::fs::write(&compose_target, compose_text).await?;
     }
-    prepare_suite_runtime_files(state, payload, dir).await?;
+    let agent_access = prepare_suite_runtime_files(state, payload, dir).await?;
     prepare_compose_images(state, context, payload, &compose_target).await?;
     ensure_install_not_canceled(&payload.instance_id)?;
 
@@ -422,6 +487,7 @@ async fn install_suite_inner(
         version: payload.version.clone(),
         compose_project_name: payload.compose_project_name.clone(),
         app_entries: payload.app_entries.clone(),
+        agent_access,
     };
     let metadata_text = serde_json::to_string_pretty(&metadata)
         .map_err(|err| ApiError::Internal(err.to_string()))?;
@@ -500,6 +566,7 @@ pub async fn enable_suite(
 ) -> ApiResult<Response> {
     validate_suite_project(&project, &payload.compose_project_name)?;
     ensure_suite_network(&state, &context, Some(&payload.compose_project_name)).await?;
+    rotate_suite_runtime_token(&project, true).await?;
     let compose_file = suite_project_dir(&project).join(COMPOSE_FILE_NAME);
     let result =
         run_compose_command(&payload.compose_project_name, &compose_file, &["up", "-d"]).await;
@@ -536,6 +603,7 @@ pub async fn disable_suite(
     validate_suite_project(&project, &payload.compose_project_name)?;
     let compose_file = suite_project_dir(&project).join(COMPOSE_FILE_NAME);
     let result = async {
+        rotate_suite_runtime_token(&project, false).await?;
         let docker = state.docker_client().await?;
         suite_workloads::cleanup_suite_workloads_by_instance(&docker, &payload.suite_instance_id)
             .await?;
@@ -569,6 +637,7 @@ pub async fn uninstall_suite(
 ) -> ApiResult<Response> {
     validate_suite_project(&project, &payload.compose_project_name)?;
     let result = async {
+        rotate_suite_runtime_token(&project, false).await?;
         let docker = state.docker_client().await?;
         suite_workloads::cleanup_suite_workloads_by_instance(&docker, &payload.suite_instance_id)
             .await?;
@@ -976,14 +1045,67 @@ pub(crate) async fn read_suite_metadata(project: &str) -> ApiResult<SuiteAgentMe
         .map_err(|err| ApiError::BadRequest(format!("invalid suite metadata: {err}")))
 }
 
-pub(crate) async fn find_suite_metadata_by_identity(
-    suite_id: &str,
-    instance_id: &str,
-) -> ApiResult<Option<SuiteAgentMetadata>> {
+/// 轮换或撤销套件实例令牌，并原子更新运行时文件和实例元数据。
+async fn rotate_suite_runtime_token(project: &str, enabled: bool) -> ApiResult<()> {
+    let dir = suite_project_dir(project);
+    let metadata_path = dir.join(SUITE_METADATA_FILE);
+    let mut metadata = read_suite_metadata(project).await?;
+    let Some(grant) = metadata.agent_access.as_mut() else {
+        return Ok(());
+    };
+    let token_path = dir
+        .join(SUITE_RUNTIME_DIR_NAME)
+        .join(SUITE_RUNTIME_TOKEN_FILE);
+    if enabled {
+        let token = generate_suite_access_token()?;
+        atomic_write(&token_path, token.as_bytes()).await?;
+        set_secret_file_permissions(&token_path).await?;
+        grant.token_hash = hash_access_token(&token);
+        grant.enabled = true;
+    } else {
+        grant.enabled = false;
+        grant.token_hash.clear();
+        let encoded = serde_json::to_vec_pretty(&metadata)
+            .map_err(|err| ApiError::Internal(format!("failed to encode suite metadata: {err}")))?;
+        atomic_write(&metadata_path, &encoded).await?;
+        match tokio::fs::remove_file(&token_path).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(AgentError::FileOperation(err).into()),
+        }
+        return Ok(());
+    }
+    let encoded = serde_json::to_vec_pretty(&metadata)
+        .map_err(|err| ApiError::Internal(format!("failed to encode suite metadata: {err}")))?;
+    atomic_write(&metadata_path, &encoded).await
+}
+
+/// 已通过实例令牌认证的套件运行时主体。
+#[derive(Debug, Clone)]
+pub(crate) struct SuiteRuntimePrincipal {
+    pub(crate) suite_id: String,
+    pub(crate) instance_id: String,
+    pub(crate) capabilities: Vec<String>,
+}
+
+/// 使用套件实例令牌解析授权主体，不暴露持久化令牌摘要。
+pub(crate) async fn authenticate_suite_runtime(token: &str) -> ApiResult<SuiteRuntimePrincipal> {
+    if token.trim().is_empty() {
+        return Err(ApiError::forbidden(
+            ErrorCode::AuthForbidden,
+            "suite runtime token is required",
+        ));
+    }
+    let token_hash = hash_access_token(token);
     let root = config::compose_root_dir().join("suite");
     let mut entries = match tokio::fs::read_dir(&root).await {
         Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ApiError::forbidden(
+                ErrorCode::AuthForbidden,
+                "suite runtime token is invalid",
+            ));
+        }
         Err(err) => return Err(AgentError::FileOperation(err).into()),
     };
     while let Some(entry) = entries
@@ -1003,11 +1125,21 @@ pub(crate) async fn find_suite_metadata_by_identity(
                 metadata_path.display()
             ))
         })?;
-        if metadata.suite_id == suite_id && metadata.instance_id == instance_id {
-            return Ok(Some(metadata));
+        let Some(grant) = metadata.agent_access.as_ref() else {
+            continue;
+        };
+        if grant.enabled && grant.token_hash == token_hash {
+            return Ok(SuiteRuntimePrincipal {
+                suite_id: metadata.suite_id,
+                instance_id: metadata.instance_id,
+                capabilities: grant.capabilities.clone(),
+            });
         }
     }
-    Ok(None)
+    Err(ApiError::forbidden(
+        ErrorCode::AuthForbidden,
+        "suite runtime token is invalid",
+    ))
 }
 
 pub(crate) fn suite_project_dir(project: &str) -> PathBuf {
@@ -1018,7 +1150,10 @@ async fn prepare_suite_runtime_files(
     state: &Arc<AppState>,
     payload: &SuiteInstallRequest,
     dir: &FsPath,
-) -> ApiResult<()> {
+) -> ApiResult<Option<SuiteAgentGrant>> {
+    let Some(access) = payload.agent_access.as_ref() else {
+        return Ok(None);
+    };
     let runtime_dir = dir.join(SUITE_RUNTIME_DIR_NAME);
     tokio::fs::create_dir_all(&runtime_dir).await?;
     let cert = issue_client_cert(&format!(
@@ -1029,7 +1164,14 @@ async fn prepare_suite_runtime_files(
     tokio::fs::write(runtime_dir.join("agent-client.crt"), &cert.cert_pem).await?;
     tokio::fs::write(runtime_dir.join("agent-client.key"), &cert.key_pem).await?;
     tokio::fs::write(runtime_dir.join("agent-ca.crt"), AGENT_CA_CERT_PEM).await?;
-    write_suite_env_file(state, payload, dir, &runtime_dir).await?;
+    let token = generate_suite_access_token()?;
+    atomic_write(
+        &runtime_dir.join(SUITE_RUNTIME_TOKEN_FILE),
+        token.as_bytes(),
+    )
+    .await?;
+    set_secret_file_permissions(&runtime_dir.join(SUITE_RUNTIME_TOKEN_FILE)).await?;
+    write_suite_runtime_descriptor(state, payload, dir, &runtime_dir, access).await?;
 
     #[cfg(unix)]
     {
@@ -1038,58 +1180,146 @@ async fn prepare_suite_runtime_files(
         tokio::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600)).await?;
     }
 
-    Ok(())
+    Ok(Some(SuiteAgentGrant {
+        services: access.services.clone(),
+        capabilities: access.capabilities.clone(),
+        token_hash: hash_access_token(&token),
+        enabled: true,
+    }))
 }
 
-async fn write_suite_env_file(
+async fn write_suite_runtime_descriptor(
     state: &Arc<AppState>,
     payload: &SuiteInstallRequest,
     dir: &FsPath,
     runtime_dir: &FsPath,
+    access: &SuiteAgentAccess,
 ) -> ApiResult<()> {
-    let identity = load_or_init_identity(&state.metadata_db, config::get())
+    let runtime = crate::services::agent_runtime::load(&state.metadata_db)
         .await
         .map_err(|err| ApiError::Internal(format!("failed to load agent identity: {err}")))?;
-    let runtime_dir = runtime_dir.to_string_lossy();
-    let mut content = format!(
-        "SUITE_INSTANCE_ID={}\nSECLAB_SUITE_RUNTIME_DIR={}\n",
-        escape_env_value(&payload.instance_id),
-        escape_env_value(&runtime_dir),
-    );
-    match identity.mode {
-        AgentMode::Local => {
-            let agent_socket_path = seclab_contracts::types::agent_socket_path();
-            let agent_socket_path = agent_socket_path.to_string_lossy();
-            content.push_str(&format!(
-                "SECLAB_AGENT_SOCKET_HOST_PATH={}\nSECLAB_AGENT_SOCKET_PATH=/run/seclab-agent.sock\n",
-                escape_env_value(&agent_socket_path),
-            ));
-        }
-        AgentMode::Remote => {
-            content.push_str(&format!(
-                "SECLAB_AGENT_BASE_URL={}\nSECLAB_AGENT_ACCEPT_INVALID_HOSTNAMES=true\n",
-                escape_env_value(&suite_agent_base_url(&identity)),
-            ));
-        }
-    }
-    tokio::fs::write(dir.join(SUITE_ENV_FILE_NAME), content).await?;
+    let endpoint = match runtime.command_transport {
+        CommandTransport::Uds => SuiteRuntimeEndpoint::Unix {
+            socket_path: "/run/seclab-agent.sock".to_string(),
+            base_url: "http://local".to_string(),
+        },
+        CommandTransport::Https => SuiteRuntimeEndpoint::Https {
+            base_url: runtime.suite_command_base_url.clone().ok_or_else(|| {
+                ApiError::Internal("suite Agent HTTPS endpoint is unavailable".to_string())
+            })?,
+            ca_path: "/run/seclab-agent/agent-ca.crt".to_string(),
+            client_cert_path: "/run/seclab-agent/agent-client.crt".to_string(),
+            client_key_path: "/run/seclab-agent/agent-client.key".to_string(),
+        },
+    };
+    let descriptor = SuiteRuntimeDescriptor {
+        schema_version: 1,
+        suite_id: payload.suite_id.clone(),
+        instance_id: payload.instance_id.clone(),
+        endpoint,
+        credential: SuiteRuntimeCredential {
+            token_path: "/run/seclab-agent/access-token".to_string(),
+        },
+        capabilities: access.capabilities.clone(),
+    };
+    let descriptor = serde_json::to_vec_pretty(&descriptor)
+        .map_err(|err| ApiError::Internal(format!("failed to encode suite runtime: {err}")))?;
+    atomic_write(
+        &runtime_dir.join(SUITE_RUNTIME_DESCRIPTOR_FILE),
+        &descriptor,
+    )
+    .await?;
+    write_suite_runtime_override(dir, runtime_dir, payload, access, runtime.command_transport)
+        .await?;
     Ok(())
 }
 
-fn suite_agent_base_url(identity: &crate::models::identity::AgentIdentity) -> String {
-    let port = identity
-        .listen_addr
-        .as_deref()
-        .unwrap_or(config::DEFAULT_AGENT_LISTEN_ADDR)
-        .rsplit(':')
-        .next()
-        .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(7311);
-    format!("https://host.docker.internal:{port}")
+/// 为声明 Agent 能力的服务生成节点拓扑专属 Compose override。
+async fn write_suite_runtime_override(
+    dir: &FsPath,
+    runtime_dir: &FsPath,
+    payload: &SuiteInstallRequest,
+    access: &SuiteAgentAccess,
+    transport: CommandTransport,
+) -> ApiResult<()> {
+    let runtime_mount = serde_json::to_string(&format!(
+        "{}:/run/seclab-agent:ro",
+        runtime_dir.to_string_lossy()
+    ))
+    .map_err(|err| ApiError::Internal(err.to_string()))?;
+    let socket_mount = serde_json::to_string(&format!(
+        "{}:/run/seclab-agent.sock",
+        seclab_contracts::types::agent_socket_path().to_string_lossy()
+    ))
+    .map_err(|err| ApiError::Internal(err.to_string()))?;
+    let mut output = String::from("services:\n");
+    for service in &access.services {
+        output.push_str(&format!(
+            "  {service}:\n    environment:\n      SECLAB_SUITE_ID: {}\n      SECLAB_SUITE_INSTANCE_ID: {}\n      SECLAB_AGENT_RUNTIME: /run/seclab-agent/runtime.json\n    volumes:\n      - {runtime_mount}\n",
+            payload.suite_id, payload.instance_id
+        ));
+        match transport {
+            CommandTransport::Uds => {
+                output.push_str(&format!("      - {socket_mount}\n"));
+            }
+            CommandTransport::Https => {
+                output
+                    .push_str("    extra_hosts:\n      - \"host.docker.internal:host-gateway\"\n");
+            }
+        }
+    }
+    atomic_write(&dir.join(SUITE_RUNTIME_OVERRIDE_FILE), output.as_bytes()).await
 }
 
-fn escape_env_value(value: &str) -> String {
-    value.replace('\\', "\\\\").replace(['\n', '\r'], "")
+fn validate_agent_access(access: Option<&SuiteAgentAccess>) -> ApiResult<()> {
+    let Some(access) = access else {
+        return Ok(());
+    };
+    if access.services.is_empty() || access.capabilities.is_empty() {
+        return Err(ApiError::BadRequest(
+            "suite Agent access must declare services and capabilities".to_string(),
+        ));
+    }
+    for service in &access.services {
+        validate_id("suite Agent service", service)?;
+    }
+    for capability in &access.capabilities {
+        if !matches!(capability.as_str(), "workloads.manage" | "captures.manage") {
+            return Err(ApiError::BadRequest(format!(
+                "unsupported suite Agent capability: {capability}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn generate_suite_access_token() -> ApiResult<String> {
+    let mut bytes = [0_u8; 32];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| ApiError::Internal("failed to generate suite access token".to_string()))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn hash_access_token(token: &str) -> String {
+    hex::encode(digest::digest(&digest::SHA256, token.as_bytes()).as_ref())
+}
+
+async fn atomic_write(path: &FsPath, content: &[u8]) -> ApiResult<()> {
+    let temporary = path.with_extension(format!("tmp-{}", Uuid::now_v7()));
+    tokio::fs::write(&temporary, content).await?;
+    tokio::fs::rename(&temporary, path).await?;
+    Ok(())
+}
+
+/// 限制令牌和私钥仅允许宿主机属主读取。
+async fn set_secret_file_permissions(path: &FsPath) -> ApiResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+    }
+    Ok(())
 }
 
 fn proxy_suffix(path_with_query: &str, project: &str, entry_id: &str) -> String {
@@ -1388,13 +1618,13 @@ async fn run_compose_command(project: &str, compose_file: &FsPath, args: &[&str]
             compose_file.display()
         )));
     }
-    let output = Command::new("docker")
-        .args(["compose", "-f"])
-        .arg(compose_file)
-        .args(["-p", project])
-        .args(args)
-        .output()
-        .await?;
+    let mut command = Command::new("docker");
+    command.args(["compose", "-f"]).arg(compose_file);
+    let runtime_override = compose_file.with_file_name(SUITE_RUNTIME_OVERRIDE_FILE);
+    if tokio::fs::metadata(&runtime_override).await.is_ok() {
+        command.arg("-f").arg(&runtime_override);
+    }
+    let output = command.args(["-p", project]).args(args).output().await?;
 
     if !output.status.success() {
         let detail = command_error_detail(&output);

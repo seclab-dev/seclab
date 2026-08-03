@@ -1,8 +1,8 @@
 //! 路由注册：挂载所有 API 子路由并拼装主路由器。
 
 use super::api::{
-    disks, docker, firewall, fs, host_terminal, operation_events, process, runtime_logs,
-    scheduled_tasks, script_runs, suite_workloads, system, system_monitoring, upgrade, websocket,
+    disks, docker, firewall, fs, host_terminal, process, runtime_logs, scheduled_tasks,
+    script_runs, suite_workloads, system, system_monitoring, upgrade, websocket,
 };
 use crate::db;
 use crate::state::DbPool;
@@ -16,9 +16,14 @@ use anyhow::Result;
 use axum::extract::connect_info::ConnectInfo;
 use axum::{
     Router,
-    extract::DefaultBodyLimit,
-    http::{Method, Request},
+    body::Body,
+    extract::{DefaultBodyLimit, State},
+    http::{Method, Request, StatusCode},
+    middleware::Next,
+    response::{IntoResponse, Response},
+    routing::get,
 };
+use seclab_contracts::api::ErrorCode;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
@@ -29,16 +34,13 @@ use tracing::info_span;
 /// 需要 state 的路由
 pub fn state_api_router() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/runtime/health", get(runtime_health))
         .nest("/docker", docker::docker_router())
         .nest("/disks", disks::disk_router())
         .nest("/files", fs::fs_router())
         .nest("/firewall", firewall::firewall_router())
         .nest("/terminal", host_terminal::host_terminal_router())
         .nest("/runtime-logs", runtime_logs::runtime_log_router())
-        .nest(
-            "/operation-events",
-            operation_events::operation_event_router(),
-        )
         .nest("/system", system::system_router())
         .nest(
             "/system-monitoring",
@@ -49,10 +51,12 @@ pub fn state_api_router() -> Router<Arc<AppState>> {
         .nest("/upgrade", upgrade::upgrade_router())
         .nest("/websocket", websocket::websocket_router())
         .merge(process::process_router())
-        .nest(
-            "/suite-workloads",
-            suite_workloads::suite_workloads_router(),
-        )
+        .merge(suite_workloads::suite_workloads_router())
+}
+
+/// 无状态健康检查；启动期不暴露任何管理能力。
+async fn runtime_health() -> StatusCode {
+    StatusCode::OK
 }
 
 /// 创建路由
@@ -121,7 +125,12 @@ pub async fn create_router() -> Result<(
         .allow_headers(Any);
 
     // 创建一个需要状态的路由实例，并立即为其提供状态
-    let state_routes = state_api_router().with_state(Arc::clone(&app_state));
+    let state_routes = state_api_router()
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&app_state),
+            require_command_credential,
+        ))
+        .with_state(Arc::clone(&app_state));
 
     let router = Router::new()
         .nest("/api/v1/agent", state_routes)
@@ -153,4 +162,56 @@ pub async fn create_router() -> Result<(
         ));
 
     Ok((router, pool_for_shutdown, controller_runtime))
+}
+
+/// 校验 Master→Agent 管理请求；套件运行时使用独立实例令牌校验。
+async fn require_command_credential(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if request
+        .uri()
+        .path()
+        .starts_with("/api/v1/agent/suite-runtime/")
+    {
+        return next.run(request).await;
+    }
+    if request.uri().path() == "/api/v1/agent/runtime/health" {
+        return next.run(request).await;
+    }
+    let expected = crate::services::settings::get_string_or_default(
+        &state.metadata_db,
+        "runtime.command_credential_hash",
+        "",
+    )
+    .await
+    .unwrap_or_default();
+    if expected.is_empty() {
+        return crate::types::ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::AgentUnavailable,
+            "Agent runtime registration is not active",
+        )
+        .into_response();
+    }
+    let token = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .unwrap_or_default();
+    let actual = hex::encode(ring::digest::digest(
+        &ring::digest::SHA256,
+        token.as_bytes(),
+    ));
+    if actual != expected {
+        return crate::types::ApiError::forbidden(
+            ErrorCode::AuthForbidden,
+            "Agent command credential is invalid",
+        )
+        .into_response();
+    }
+    next.run(request).await
 }

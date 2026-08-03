@@ -24,7 +24,7 @@ use seclab_contracts::terminal::{TerminalTicketConsumeRequest, TerminalTicketCon
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -33,6 +33,7 @@ use std::time::Instant;
 pub struct RuntimeNodePayload {
     pub advertise_addr: Option<String>,
     pub listen_port: Option<i64>,
+    pub command_transport: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,6 +76,7 @@ pub struct EnrollPayload {
     pub node: RuntimeNodePayload,
     pub certificate_request: Option<CertificateRequestPayload>,
     pub compatibility: Option<RuntimeAgentCompatibilityPayload>,
+    pub command_credential: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -83,6 +85,7 @@ pub struct RegisterPayload {
     pub agent_id: String,
     pub node: RuntimeNodePayload,
     pub compatibility: Option<RuntimeAgentCompatibilityPayload>,
+    pub command_credential: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,19 +116,34 @@ struct OperationEventReportPayload {
     events: Vec<AgentOperationEvent>,
 }
 
+/// 校验 Agent 运行时身份、活动状态和租约。
+async fn require_runtime_session(
+    pool: &crate::state::DbPool,
+    agent_id: &str,
+    session_id: &str,
+) -> ApiResult<crate::models::node_sessions::NodeSessionRecord> {
+    crate::models::node_sessions::get_session_by_id(pool, session_id)
+        .await?
+        .filter(|session| {
+            session.agent_id == agent_id && crate::models::node_sessions::has_live_lease(session)
+        })
+        .ok_or_else(|| {
+            ApiError::forbidden(
+                ErrorCode::AuthForbidden,
+                "runtime session is inactive or expired",
+            )
+        })
+}
+
 /// 校验 Agent 运行时会话并返回会话绑定的节点 ID。
 async fn require_runtime_node(
     pool: &crate::state::DbPool,
     agent_id: &str,
     session_id: &str,
 ) -> ApiResult<String> {
-    let session = crate::models::node_sessions::get_session_by_id(pool, session_id)
+    Ok(require_runtime_session(pool, agent_id, session_id)
         .await?
-        .filter(|session| session.status == "active" && session.agent_id == agent_id)
-        .ok_or_else(|| {
-            ApiError::forbidden(ErrorCode::AuthForbidden, "runtime session is not active")
-        })?;
-    Ok(session.node_id)
+        .node_id)
 }
 
 /// 将 Master 内部镜像任务转换为稳定的运行时契约。
@@ -251,12 +269,7 @@ async fn report_operation_events(
         ));
     }
     let session =
-        crate::models::node_sessions::get_session_by_id(&state.metadata_db, &payload.session_id)
-            .await?
-            .filter(|session| session.status == "active" && session.agent_id == payload.agent_id)
-            .ok_or_else(|| {
-                ApiError::forbidden(ErrorCode::AuthForbidden, "runtime session is not active")
-            })?;
+        require_runtime_session(&state.metadata_db, &payload.agent_id, &payload.session_id).await?;
     let node_name = crate::models::nodes::get_node_by_id(&state.metadata_db, &session.node_id)
         .await?
         .map(|node| node.name);
@@ -509,6 +522,11 @@ pub async fn enroll(
     Json(payload): Json<EnrollPayload>,
 ) -> ApiResult<impl IntoResponse> {
     let controller_compatibility = ensure_runtime_agent_compatible(payload.compatibility.as_ref())?;
+    let command_transport = validate_command_access(
+        false,
+        &payload.node.command_transport,
+        &payload.command_credential,
+    )?;
     let mut platform_log = OperationEventBuilder::new("runtime-agent", "runtime_enroll", addr.ip())
         .module(LogModule::System)
         .target_type("node")
@@ -531,6 +549,13 @@ pub async fn enroll(
     .await;
     let response = match result {
         Ok(result) => {
+            store_command_access(
+                &state.metadata_db,
+                &result.session_id,
+                command_transport,
+                &payload.command_credential,
+            )
+            .await?;
             runtime_metrics::record_enroll(true);
             platform_log = platform_log.target_id(&result.node_id).set_success();
 
@@ -577,6 +602,21 @@ pub async fn register(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<RegisterPayload>,
 ) -> ApiResult<impl IntoResponse> {
+    let is_local = payload.agent_id == "local";
+    let command_transport = validate_command_access(
+        is_local,
+        &payload.node.command_transport,
+        &payload.command_credential,
+    )?;
+    if is_local {
+        if !is_loopback_peer(addr.ip()) {
+            return Err(ApiError::forbidden(
+                ErrorCode::AuthForbidden,
+                "local Agent registration requires a loopback connection",
+            ));
+        }
+        node_runtime::ensure_local_runtime_identity(&state.metadata_db).await?;
+    }
     let controller_compatibility = ensure_runtime_agent_compatible(payload.compatibility.as_ref())?;
     let mut platform_log = OperationEventBuilder::new("runtime-agent", "runtime_register", addr.ip())
         .module(LogModule::System)
@@ -592,6 +632,13 @@ pub async fn register(
     .await;
     match result {
         Ok(result) => {
+            store_command_access(
+                &state.metadata_db,
+                &result.session_id,
+                command_transport,
+                &payload.command_credential,
+            )
+            .await?;
             runtime_metrics::record_register(true);
             platform_log = platform_log.set_success();
             platform_log.finish_runtime_register_success(&state.metadata_db);
@@ -630,6 +677,50 @@ pub async fn register(
             platform_log.finish_runtime_register_failure(&state.metadata_db);
             Err(err)
         }
+    }
+}
+
+/// 识别原生回环地址及双栈监听产生的 IPv4-mapped IPv6 回环地址。
+fn is_loopback_peer(ip: IpAddr) -> bool {
+    ip.is_loopback()
+        || matches!(
+            ip,
+            IpAddr::V6(ipv6)
+                if ipv6
+                    .to_ipv4_mapped()
+                    .is_some_and(|ipv4| ipv4.is_loopback())
+        )
+}
+
+async fn store_command_access(
+    pool: &crate::state::DbPool,
+    session_id: &str,
+    transport: crate::models::node_sessions::AgentCommandTransport,
+    credential: &str,
+) -> ApiResult<()> {
+    crate::models::node_sessions::upsert_session_command_access(
+        pool, session_id, transport, credential,
+    )
+    .await
+    .map_err(|err| ApiError::Internal(err.to_string()))
+}
+
+fn validate_command_access(
+    is_local: bool,
+    transport: &str,
+    credential: &str,
+) -> ApiResult<crate::models::node_sessions::AgentCommandTransport> {
+    if credential.len() != 64 || !credential.bytes().all(|value| value.is_ascii_hexdigit()) {
+        return Err(ApiError::BadRequest(
+            "Agent command credential is invalid".to_string(),
+        ));
+    }
+    match (is_local, transport) {
+        (true, "uds") => Ok(crate::models::node_sessions::AgentCommandTransport::Uds),
+        (false, "https") => Ok(crate::models::node_sessions::AgentCommandTransport::Https),
+        _ => Err(ApiError::BadRequest(
+            "Agent command transport does not match node topology".to_string(),
+        )),
     }
 }
 
@@ -683,6 +774,7 @@ pub async fn deregister(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<DeregisterPayload>,
 ) -> ApiResult<impl IntoResponse> {
+    require_runtime_session(&state.metadata_db, &payload.agent_id, &payload.session_id).await?;
     let mut platform_log =
         OperationEventBuilder::new("runtime-agent", "runtime_deregister", addr.ip())
             .module(LogModule::System)
@@ -721,6 +813,7 @@ pub async fn rotate_certificate(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<RotateCertificatePayload>,
 ) -> ApiResult<impl IntoResponse> {
+    require_runtime_session(&state.metadata_db, &payload.agent_id, &payload.session_id).await?;
     let mut platform_log =
         OperationEventBuilder::new("runtime-agent", "runtime_rotate_certificate", addr.ip())
             .module(LogModule::System)
@@ -817,22 +910,7 @@ pub async fn report_task_runs(
     Json(payload): Json<ReportTaskRunsPayload>,
 ) -> ApiResult<impl IntoResponse> {
     // 校验 session 是否存在且处于活跃状态
-    let session =
-        crate::models::node_sessions::get_session_by_id(&state.metadata_db, &payload.session_id)
-            .await
-            .map_err(|err| ApiError::internal(format!("failed to query session: {err}")))?
-            .ok_or_else(|| ApiError::BadRequest("runtime session not found".to_string()))?;
-
-    if session.status != "active" {
-        return Err(ApiError::BadRequest(
-            "runtime session is not active".to_string(),
-        ));
-    }
-    if session.agent_id != payload.agent_id {
-        return Err(ApiError::BadRequest(
-            "runtime identity mismatch".to_string(),
-        ));
-    }
+    require_runtime_session(&state.metadata_db, &payload.agent_id, &payload.session_id).await?;
 
     if payload.runs.is_empty() || payload.runs.len() > 100 {
         return Err(ApiError::bad_request(
@@ -917,19 +995,7 @@ pub async fn report_script_runs(
     ConnectInfo(_addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<ReportScriptRunsPayload>,
 ) -> ApiResult<impl IntoResponse> {
-    let session =
-        crate::models::node_sessions::get_session_by_id(&state.metadata_db, &payload.session_id)
-            .await
-            .map_err(|error| ApiError::internal(format!("failed to query session: {error}")))?
-            .ok_or_else(|| {
-                ApiError::bad_request(ErrorCode::BadRequest, "runtime session not found")
-            })?;
-    if session.status != "active" || session.agent_id != payload.agent_id {
-        return Err(ApiError::bad_request(
-            ErrorCode::BadRequest,
-            "runtime identity mismatch",
-        ));
-    }
+    require_runtime_session(&state.metadata_db, &payload.agent_id, &payload.session_id).await?;
     if payload.reports.is_empty() || payload.reports.len() > 100 {
         return Err(ApiError::bad_request(
             ErrorCode::BadRequest,
@@ -987,22 +1053,7 @@ pub async fn get_tasks_snapshot(
     State(state): State<Arc<AppState>>,
     Query(params): Query<TasksSnapshotParams>,
 ) -> ApiResult<impl IntoResponse> {
-    let session =
-        crate::models::node_sessions::get_session_by_id(&state.metadata_db, &params.session_id)
-            .await
-            .map_err(|err| ApiError::internal(format!("failed to query session: {err}")))?
-            .ok_or_else(|| ApiError::BadRequest("runtime session not found".to_string()))?;
-
-    if session.status != "active" {
-        return Err(ApiError::BadRequest(
-            "runtime session is not active".to_string(),
-        ));
-    }
-    if session.agent_id != params.agent_id {
-        return Err(ApiError::BadRequest(
-            "runtime identity mismatch".to_string(),
-        ));
-    }
+    require_runtime_session(&state.metadata_db, &params.agent_id, &params.session_id).await?;
 
     let snapshot =
         crate::models::task_scheduler::snapshot(&state.metadata_db, &params.agent_id).await?;
@@ -1039,6 +1090,25 @@ mod tests {
     use super::*;
     use crate::models::node_sessions::{NodeSessionRecord, insert_node_session};
 
+    #[test]
+    fn command_access_transport_is_bound_to_node_topology() {
+        let credential = "ab".repeat(32);
+        assert!(validate_command_access(true, "uds", &credential).is_ok());
+        assert!(validate_command_access(false, "https", &credential).is_ok());
+        assert!(validate_command_access(true, "https", &credential).is_err());
+        assert!(validate_command_access(false, "uds", &credential).is_err());
+        assert!(validate_command_access(false, "https", "too-short").is_err());
+    }
+
+    #[test]
+    fn local_registration_accepts_dual_stack_loopback_only() {
+        assert!(is_loopback_peer("127.0.0.1".parse().unwrap()));
+        assert!(is_loopback_peer("::1".parse().unwrap()));
+        assert!(is_loopback_peer("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(!is_loopback_peer("10.0.0.41".parse().unwrap()));
+        assert!(!is_loopback_peer("::ffff:10.0.0.41".parse().unwrap()));
+    }
+
     #[tokio::test]
     async fn runtime_image_identity_is_bound_to_active_session_node() {
         let pool = crate::test_support::setup_test_db().await;
@@ -1070,7 +1140,7 @@ mod tests {
                 listen_port: None,
                 server_name: Some("节点 81".to_string()),
                 registered_at: "2026-07-31T00:00:00Z".to_string(),
-                lease_expires_at: "2026-07-31T01:00:00Z".to_string(),
+                lease_expires_at: (chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339(),
                 last_heartbeat_at: None,
                 heartbeat_sequence: 0,
                 last_seen_at: None,

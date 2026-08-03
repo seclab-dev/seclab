@@ -177,13 +177,6 @@ fn normalize_history_limit(limit: Option<i64>) -> i64 {
 pub async fn list(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
     let mut nodes = node_read_model::list_node_summaries(&state.metadata_db).await?;
 
-    let local_exists = crate::types::agent_socket_path().exists();
-    let local_status = if local_exists {
-        "online".to_string()
-    } else {
-        "offline".to_string()
-    };
-
     let local_resource = {
         let cache = state.local_node_resource.lock().await;
         cache.clone()
@@ -196,22 +189,12 @@ pub async fn list(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
         obj.insert("resource".to_string(), res);
     }
 
-    let local_node = node_read_model::NodeSummaryView {
-        node_id: "local".to_string(),
-        name: "Local Node".to_string(),
-        group_name: "default".to_string(),
-        description: Some("Local Controller".to_string()),
-        address: Some("127.0.0.1".to_string()),
-        service_port: None,
-        status: local_status.clone(),
-        lifecycle_status: local_status,
-        runtime_status: Some("active".to_string()),
-        health_status: Some("online".to_string()),
-        tags: vec!["local".to_string()],
-        metadata: Some(metadata),
-        last_seen_at: None,
-    };
+    let mut local_node = node_read_model::get_node_summary(&state.metadata_db, "local")
+        .await?
+        .ok_or_else(|| ApiError::Internal("local node summary is unavailable".to_string()))?;
+    local_node.metadata = Some(metadata);
 
+    nodes.retain(|node| node.node_id != "local");
     nodes.insert(0, local_node);
 
     Ok(ApiResponse::success_with_raw("Nodes loaded", Some(nodes)).into_response())

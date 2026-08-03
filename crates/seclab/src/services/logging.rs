@@ -8,7 +8,6 @@ use std::{
 
 use axum::http::HeaderMap;
 use chrono::{DateTime, Duration, Utc};
-use seclab_contracts::api::ApiResponse as ContractApiResponse;
 use seclab_contracts::logging::{
     AgentOperationEvent, OperationActor, OperationActorKind, OperationImpact, OperationItemStatus,
     OperationLogCapabilities, OperationLogDetail, OperationLogItem, OperationLogPage,
@@ -18,7 +17,6 @@ use seclab_contracts::logging::{
 use seclab_contracts::notification::{
     NotificationAttentionLevel, NotificationCategory, NotificationCode,
 };
-use serde::Serialize;
 use serde_json::Value;
 use sqlx::{FromRow, QueryBuilder, Sqlite, Transaction};
 use tokio::sync::{broadcast, mpsc};
@@ -26,14 +24,11 @@ use tracing::{error, warn};
 
 use crate::{
     models::logging::{LogModule, LogStatus, PlatformLogLevel},
-    models::node_runtime_client::NodeRuntimeClient,
     state::DbPool,
-    types::{ApiError, agent_socket_path, new_uuid_v7},
+    types::{ApiError, new_uuid_v7},
 };
 
 const QUEUE_CAPACITY: usize = 2_048;
-const LOCAL_AGENT_EVENT_BATCH_SIZE: usize = 100;
-const LOCAL_AGENT_EVENT_RELAY_INTERVAL_SECONDS: u64 = 2;
 const MAX_ERROR_SUMMARY_BYTES: usize = 512;
 const RETENTION_DAYS: i64 = 180;
 const RUNTIME_RETENTION_DAYS: i64 = 30;
@@ -695,85 +690,6 @@ pub fn spawn_retention_worker(pool: DbPool) {
             }
         }
     });
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct LocalAgentEventAcknowledgeRequest {
-    event_ids: Vec<String>,
-}
-
-/// 通过本地 Agent Unix Socket 持续归集持久操作事件。
-pub fn spawn_local_agent_event_relay(pool: DbPool) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-            LOCAL_AGENT_EVENT_RELAY_INTERVAL_SECONDS,
-        ));
-        let mut consecutive_failures = 0_u64;
-        loop {
-            interval.tick().await;
-            if !agent_socket_path().exists() {
-                consecutive_failures = 0;
-                continue;
-            }
-            match relay_local_agent_events_once(&pool).await {
-                Ok(_) => consecutive_failures = 0,
-                Err(error) => {
-                    consecutive_failures = consecutive_failures.saturating_add(1);
-                    if consecutive_failures == 1 || consecutive_failures.is_multiple_of(15) {
-                        warn!(
-                            %error,
-                            consecutive_failures,
-                            "Local Agent operation event relay failed; durable retry retained"
-                        );
-                    }
-                }
-            }
-        }
-    });
-}
-
-/// 拉取、幂等持久化并确认一批本地 Agent 操作事件。
-async fn relay_local_agent_events_once(pool: &DbPool) -> anyhow::Result<usize> {
-    let client = NodeRuntimeClient::from_node_route(pool, Some("local")).await?;
-    let response = client
-        .get_json::<ContractApiResponse<Vec<AgentOperationEvent>>>(&format!(
-            "/api/v1/agent/operation-events/pending?limit={LOCAL_AGENT_EVENT_BATCH_SIZE}"
-        ))
-        .await?;
-    if !response.success {
-        anyhow::bail!(
-            "local Agent rejected operation event query: {}",
-            response.message
-        );
-    }
-    let events = response.data.unwrap_or_default();
-    if events.is_empty() {
-        return Ok(0);
-    }
-    let mut accepted_event_ids = Vec::with_capacity(events.len());
-    for event in events {
-        let event_id = event.event_id.clone();
-        store_agent_event(pool, "local", None, event)
-            .await
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        accepted_event_ids.push(event_id);
-    }
-    let acknowledged = client
-        .post_json::<ContractApiResponse<Vec<String>>, _>(
-            "/api/v1/agent/operation-events/acknowledge",
-            &LocalAgentEventAcknowledgeRequest {
-                event_ids: accepted_event_ids.clone(),
-            },
-        )
-        .await?;
-    if !acknowledged.success {
-        anyhow::bail!(
-            "local Agent rejected operation event acknowledgement: {}",
-            acknowledged.message
-        );
-    }
-    Ok(accepted_event_ids.len())
 }
 
 #[derive(Debug, Clone)]

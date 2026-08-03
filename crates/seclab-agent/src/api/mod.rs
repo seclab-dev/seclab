@@ -5,7 +5,6 @@ pub mod docker;
 pub mod firewall;
 pub mod fs;
 pub mod host_terminal;
-pub mod operation_events;
 pub mod process;
 pub mod runtime_logs;
 pub mod scheduled_tasks;

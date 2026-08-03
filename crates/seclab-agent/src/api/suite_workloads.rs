@@ -7,10 +7,10 @@ use crate::types::{ApiError, ApiResult};
 use axum::{
     Json, Router,
     extract::{Path, State},
+    http::{HeaderMap, header},
     response::IntoResponse,
     routing::{get, post},
 };
-use base64::Engine;
 use bollard::models::{ContainerCreateBody, HostConfig, PortBinding, RestartPolicy};
 use bollard::query_parameters;
 use seclab_contracts::api::ErrorCode;
@@ -31,8 +31,6 @@ type PortBindings = HashMap<String, Option<Vec<PortBinding>>>;
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartWorkloadRequest {
-    pub suite_id: String,
-    pub suite_instance_id: String,
     pub workload_kind: String,
     pub workload_name: String,
     pub image: String,
@@ -71,18 +69,7 @@ pub struct StartWorkloadResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct StopWorkloadRequest {
-    pub suite_id: String,
-    pub suite_instance_id: String,
-    pub workload_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct StartPcapRequest {
-    pub suite_id: String,
-    pub suite_instance_id: String,
-    pub workload_id: String,
     pub host_port: u16,
 }
 
@@ -91,22 +78,6 @@ pub struct StartPcapRequest {
 pub struct StartPcapResponse {
     pub capture_id: String,
     pub status: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StopPcapRequest {
-    pub suite_id: String,
-    pub suite_instance_id: String,
-    pub workload_id: String,
-    pub capture_id: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StopPcapResponse {
-    pub capture_id: String,
-    pub pcap_bytes_base64: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -127,32 +98,51 @@ pub struct WorkloadPath {
     workload_id: String,
 }
 
-/// 组装 suite workload 路由。
+#[derive(Debug, Deserialize)]
+pub struct CapturePath {
+    workload_id: String,
+    capture_id: String,
+}
+
+/// 组装套件运行时工作负载路由。
 pub fn suite_workloads_router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/start", post(start_workload))
-        .route("/stop", post(stop_workload))
-        .route("/list", get(list_workloads))
-        .route("/pcap/start", post(start_pcap))
-        .route("/pcap/stop", post(stop_pcap))
         .route(
-            "/{workload_id}",
+            "/suite-runtime/workloads",
+            post(start_workload).get(list_workloads),
+        )
+        .route(
+            "/suite-runtime/workloads/{workload_id}",
             get(detail_workload).delete(delete_workload),
+        )
+        .route(
+            "/suite-runtime/workloads/{workload_id}/captures",
+            post(start_pcap),
+        )
+        .route(
+            "/suite-runtime/workloads/{workload_id}/captures/{capture_id}/finish",
+            post(stop_pcap),
         )
 }
 
 async fn start_workload(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(payload): Json<StartWorkloadRequest>,
 ) -> ApiResult<impl IntoResponse> {
-    validate_suite_request(&payload.suite_id, &payload.suite_instance_id).await?;
+    let principal = require_suite_capability(&headers, "workloads.manage").await?;
     validate_workload_request(&payload)?;
     ensure_workload_ports_available(&payload.ports).await?;
 
     let docker = state.docker_client().await?;
     let workload_id = format!("workload-{}", Uuid::now_v7());
     let container_name = workload_container_name(&payload.workload_name, &workload_id);
-    let labels = workload_labels(&payload, &workload_id);
+    let labels = workload_labels(
+        &payload,
+        &workload_id,
+        &principal.suite_id,
+        &principal.instance_id,
+    );
     let (exposed_ports, port_bindings) = port_maps(&payload.ports);
     let mut env = env_map_to_vec(&payload.env)?;
     env.push(format!(
@@ -232,63 +222,27 @@ async fn start_workload(
     }))
 }
 
-async fn stop_workload(
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<StopWorkloadRequest>,
-) -> ApiResult<impl IntoResponse> {
-    validate_suite_request(&payload.suite_id, &payload.suite_instance_id).await?;
-    let docker = state.docker_client().await?;
-    let container_id =
-        find_owned_container(&docker, &payload.suite_instance_id, &payload.workload_id)
-            .await?
-            .ok_or(ApiError::NotFound)?;
-    if let Err(err) = docker
-        .stop_container(
-            &container_id,
-            Some(query_parameters::StopContainerOptions {
-                signal: None,
-                t: Some(5),
-            }),
-        )
-        .await
-    {
-        tracing::debug!(
-            container_id,
-            error = %err,
-            "suite workload stop returned an error before removal"
-        );
-    }
-    docker
-        .remove_container(
-            &container_id,
-            Some(query_parameters::RemoveContainerOptions {
-                force: true,
-                v: false,
-                link: false,
-            }),
-        )
-        .await?;
-    Ok(Json(serde_json::json!({ "status": "deleted" })))
-}
-
 async fn start_pcap(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(path): Path<WorkloadPath>,
     Json(payload): Json<StartPcapRequest>,
 ) -> ApiResult<impl IntoResponse> {
-    validate_suite_request(&payload.suite_id, &payload.suite_instance_id).await?;
-    validate_id("workload_id", &payload.workload_id)?;
+    let principal = require_suite_capability(&headers, "captures.manage").await?;
+    validate_id("workload_id", &path.workload_id)?;
     let docker = state.docker_client().await?;
-    find_owned_container(&docker, &payload.suite_instance_id, &payload.workload_id)
+    let container_id = find_owned_container(&docker, &principal.instance_id, &path.workload_id)
         .await?
         .ok_or(ApiError::NotFound)?;
+    ensure_workload_owns_host_port(&docker, &container_id, payload.host_port).await?;
 
     let capture_id = format!("pcap-{}", Uuid::now_v7());
     PcapMuxHub::global()
         .start_capture_for_workload(
             capture_id.clone(),
             payload.host_port,
-            Some(payload.suite_instance_id.clone()),
-            Some(payload.workload_id.clone()),
+            Some(principal.instance_id.clone()),
+            Some(path.workload_id.clone()),
         )
         .await
         .map_err(|err| ApiError::BadRequest(format!("failed to start pcap capture: {err:#}")))?;
@@ -299,29 +253,65 @@ async fn start_pcap(
     }))
 }
 
+/// 限制抓包目标为当前工作负载实际发布的宿主机端口。
+async fn ensure_workload_owns_host_port(
+    docker: &bollard::Docker,
+    container_id: &str,
+    host_port: u16,
+) -> ApiResult<()> {
+    let detail = docker
+        .inspect_container(
+            container_id,
+            None::<query_parameters::InspectContainerOptions>,
+        )
+        .await?;
+    let owned = detail
+        .host_config
+        .and_then(|config| config.port_bindings)
+        .into_iter()
+        .flat_map(|bindings| bindings.into_values())
+        .flatten()
+        .flatten()
+        .filter_map(|binding| binding.host_port)
+        .filter_map(|port| port.parse::<u16>().ok())
+        .any(|port| port == host_port);
+    if !owned {
+        return Err(ApiError::forbidden(
+            ErrorCode::AuthForbidden,
+            "capture port does not belong to suite workload",
+        ));
+    }
+    Ok(())
+}
+
 async fn stop_pcap(
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<StopPcapRequest>,
+    headers: HeaderMap,
+    Path(path): Path<CapturePath>,
 ) -> ApiResult<impl IntoResponse> {
-    validate_suite_request(&payload.suite_id, &payload.suite_instance_id).await?;
-    validate_id("workload_id", &payload.workload_id)?;
-    validate_id("capture_id", &payload.capture_id)?;
+    let principal = require_suite_capability(&headers, "captures.manage").await?;
+    validate_id("workload_id", &path.workload_id)?;
+    validate_id("capture_id", &path.capture_id)?;
     let docker = state.docker_client().await?;
-    find_owned_container(&docker, &payload.suite_instance_id, &payload.workload_id)
+    find_owned_container(&docker, &principal.instance_id, &path.workload_id)
         .await?
         .ok_or(ApiError::NotFound)?;
 
     let bytes = PcapMuxHub::global()
-        .stop_capture(&payload.capture_id)
+        .stop_capture_owned(&path.capture_id, &principal.instance_id, &path.workload_id)
         .await
         .map_err(|err| ApiError::BadRequest(format!("failed to stop pcap capture: {err:#}")))?;
-    Ok(Json(StopPcapResponse {
-        capture_id: payload.capture_id,
-        pcap_bytes_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
-    }))
+    Ok((
+        [(header::CONTENT_TYPE, "application/vnd.tcpdump.pcap")],
+        bytes,
+    ))
 }
 
-async fn list_workloads(State(state): State<Arc<AppState>>) -> ApiResult<impl IntoResponse> {
+async fn list_workloads(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult<impl IntoResponse> {
+    let principal = require_suite_capability(&headers, "workloads.manage").await?;
     let docker = state.docker_client().await?;
     let mut filters = HashMap::new();
     filters.insert(
@@ -340,6 +330,9 @@ async fn list_workloads(State(state): State<Arc<AppState>>) -> ApiResult<impl In
         .into_iter()
         .filter_map(|container| {
             let labels = container.labels?;
+            if labels.get("seclab.suite_instance_id") != Some(&principal.instance_id) {
+                return None;
+            }
             Some(WorkloadSummary {
                 workload_id: labels.get("seclab.workload_id")?.clone(),
                 suite_id: labels.get("seclab.suite_id")?.clone(),
@@ -360,10 +353,12 @@ async fn list_workloads(State(state): State<Arc<AppState>>) -> ApiResult<impl In
 
 async fn detail_workload(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(path): Path<WorkloadPath>,
 ) -> ApiResult<impl IntoResponse> {
+    let principal = require_suite_capability(&headers, "workloads.manage").await?;
     let docker = state.docker_client().await?;
-    let container_id = find_container_by_workload(&docker, &path.workload_id)
+    let container_id = find_owned_container(&docker, &principal.instance_id, &path.workload_id)
         .await?
         .ok_or(ApiError::NotFound)?;
     let detail = docker
@@ -377,10 +372,12 @@ async fn detail_workload(
 
 async fn delete_workload(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(path): Path<WorkloadPath>,
 ) -> ApiResult<impl IntoResponse> {
+    let principal = require_suite_capability(&headers, "workloads.manage").await?;
     let docker = state.docker_client().await?;
-    let container_id = find_container_by_workload(&docker, &path.workload_id)
+    let container_id = find_owned_container(&docker, &principal.instance_id, &path.workload_id)
         .await?
         .ok_or(ApiError::NotFound)?;
     docker
@@ -480,18 +477,31 @@ fn suite_workload_cleanup_filters(suite_instance_id: &str) -> HashMap<String, Ve
     filters
 }
 
-async fn validate_suite_request(suite_id: &str, suite_instance_id: &str) -> ApiResult<()> {
-    validate_id("suite_id", suite_id)?;
-    validate_id("suite_instance_id", suite_instance_id)?;
-    if suites::find_suite_metadata_by_identity(suite_id, suite_instance_id)
-        .await?
-        .is_none()
+async fn require_suite_capability(
+    headers: &HeaderMap,
+    capability: &str,
+) -> ApiResult<suites::SuiteRuntimePrincipal> {
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ApiError::forbidden(ErrorCode::AuthForbidden, "suite runtime token is required")
+        })?;
+    let principal = suites::authenticate_suite_runtime(token).await?;
+    if !principal
+        .capabilities
+        .iter()
+        .any(|value| value == capability)
     {
-        return Err(ApiError::BadRequest(
-            "suite workload identity does not match installed suite".to_string(),
+        return Err(ApiError::forbidden(
+            ErrorCode::AuthForbidden,
+            "suite runtime capability is not granted",
         ));
     }
-    Ok(())
+    Ok(principal)
 }
 
 fn validate_workload_request(payload: &StartWorkloadRequest) -> ApiResult<()> {
@@ -613,14 +623,19 @@ fn compact_container_id(value: &str) -> String {
         .collect()
 }
 
-fn workload_labels(payload: &StartWorkloadRequest, workload_id: &str) -> HashMap<String, String> {
+fn workload_labels(
+    payload: &StartWorkloadRequest,
+    workload_id: &str,
+    suite_id: &str,
+    suite_instance_id: &str,
+) -> HashMap<String, String> {
     HashMap::from([
         ("seclab.managed_by".to_string(), "seclab-agent".to_string()),
         (WORKLOAD_LABEL.to_string(), WORKLOAD_LABEL_VALUE.to_string()),
-        ("seclab.suite_id".to_string(), payload.suite_id.clone()),
+        ("seclab.suite_id".to_string(), suite_id.to_string()),
         (
             "seclab.suite_instance_id".to_string(),
-            payload.suite_instance_id.clone(),
+            suite_instance_id.to_string(),
         ),
         ("seclab.workload_id".to_string(), workload_id.to_string()),
         (
@@ -691,21 +706,6 @@ async fn find_owned_container(
         vec![
             format!("{WORKLOAD_LABEL}={WORKLOAD_LABEL_VALUE}"),
             format!("seclab.suite_instance_id={suite_instance_id}"),
-            format!("seclab.workload_id={workload_id}"),
-        ],
-    );
-    find_container_with_filters(docker, filters).await
-}
-
-async fn find_container_by_workload(
-    docker: &bollard::Docker,
-    workload_id: &str,
-) -> ApiResult<Option<String>> {
-    let mut filters = HashMap::new();
-    filters.insert(
-        "label".to_string(),
-        vec![
-            format!("{WORKLOAD_LABEL}={WORKLOAD_LABEL_VALUE}"),
             format!("seclab.workload_id={workload_id}"),
         ],
     );

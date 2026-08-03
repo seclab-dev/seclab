@@ -83,6 +83,17 @@ pub struct SuiteRuntime {
     pub project_name_template: Option<String>,
     #[serde(default)]
     pub images: Vec<String>,
+    /// 套件后端访问节点 Agent 的最小能力声明。
+    #[serde(default)]
+    pub agent: Option<SuiteAgentAccessManifest>,
+}
+
+/// 套件需要访问 Agent 的服务与能力。
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SuiteAgentAccessManifest {
+    pub services: Vec<String>,
+    pub capabilities: Vec<String>,
 }
 
 /// 套件应用入口声明。

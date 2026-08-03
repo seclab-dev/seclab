@@ -100,8 +100,11 @@ async fn websocket(
         .map_err(|error| ApiError::internal(error.to_string()))?;
 
     let upstream = runtime_client
-        .client
-        .get(runtime_client.build_ws_uri(AGENT_WS_PATH))
+        .authorize_request(
+            runtime_client
+                .client
+                .get(runtime_client.build_ws_uri(AGENT_WS_PATH)),
+        )
         .header(&TERMINAL_TICKET_HEADER, &ticket)
         .upgrade()
         .send()

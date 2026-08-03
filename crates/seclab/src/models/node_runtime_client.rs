@@ -1,6 +1,6 @@
 //! 节点运行时客户端模型：封装 seclab 到节点执行面的 HTTP/WS 通信。
 
-use crate::models::node_sessions::resolve_active_session_endpoint;
+use crate::models::node_sessions::{AgentCommandTransport, resolve_active_command_access};
 use crate::state::DbPool;
 use crate::types::{AgentClientError, ApiError, ApiResult, agent_socket_path};
 use axum::{
@@ -37,6 +37,7 @@ pub struct NodeRuntimeClient {
     pub client: Client,
     base_url: String,
     ws_base_url: String,
+    command_credential: Option<String>,
 }
 
 /// Master 向 Agent 发起变更请求时注入的可信操作者上下文。
@@ -51,24 +52,32 @@ pub struct AgentOperationContext {
 impl NodeRuntimeClient {
     /// 根据目标节点标识选择 UDS 或 TLS 连接。
     pub async fn from_node_route(pool: &DbPool, node_id: Option<&str>) -> ApiResult<Self> {
-        if let Some(node_id) = node_id
-            && node_id != "local"
-        {
-            let api_url = resolve_active_session_endpoint(pool, node_id).await?;
-            if let Some(url) = api_url {
-                return Self::from_tls(url).map_err(|err| ApiError::Internal(err.to_string()));
+        let target = node_id.unwrap_or("local");
+        let access = resolve_active_command_access(pool, target)
+            .await
+            .map_err(|err| ApiError::Internal(err.to_string()))?
+            .ok_or(AgentClientError::NotFound)?;
+        match access.transport {
+            AgentCommandTransport::Uds => Self::from_uds(Some(access.credential)),
+            AgentCommandTransport::Https => {
+                let address = access
+                    .session
+                    .advertise_addr
+                    .zip(access.session.listen_port)
+                    .map(|(host, port)| format!("https://{host}:{port}"))
+                    .ok_or(AgentClientError::NotFound)?;
+                Self::from_tls(address, Some(access.credential))
             }
-            return Err(AgentClientError::NotFound.into());
         }
-        Self::from_uds().map_err(|err| ApiError::Internal(err.to_string()))
+        .map_err(|err| ApiError::Internal(err.to_string()))
     }
 
     /// 从给定的 API 地址创建 TLS 客户端。
     pub fn from_api_url(base_url: String) -> ApiResult<Self> {
-        Self::from_tls(base_url).map_err(|err| ApiError::Internal(err.to_string()))
+        Self::from_tls(base_url, None).map_err(|err| ApiError::Internal(err.to_string()))
     }
 
-    fn from_uds() -> anyhow::Result<Self> {
+    fn from_uds(command_credential: Option<String>) -> anyhow::Result<Self> {
         let socket_path = agent_socket_path();
         if !socket_path.exists() {
             return Err(anyhow::anyhow!(
@@ -86,10 +95,11 @@ impl NodeRuntimeClient {
             client,
             base_url: "http://local".to_string(),
             ws_base_url: "ws://local".to_string(),
+            command_credential,
         })
     }
 
-    fn from_tls(base_url: String) -> anyhow::Result<Self> {
+    fn from_tls(base_url: String, command_credential: Option<String>) -> anyhow::Result<Self> {
         let client = build_mtls_client("seclab")?;
 
         let base_url = base_url.trim_end_matches('/').to_string();
@@ -98,7 +108,20 @@ impl NodeRuntimeClient {
             client,
             base_url,
             ws_base_url,
+            command_credential,
         })
+    }
+
+    fn authorize(&self, request: RequestBuilder) -> RequestBuilder {
+        match self.command_credential.as_deref() {
+            Some(credential) => request.bearer_auth(credential),
+            None => request,
+        }
+    }
+
+    /// 为需要自行完成 WebSocket upgrade 的请求附加节点命令凭据。
+    pub fn authorize_request(&self, request: RequestBuilder) -> RequestBuilder {
+        self.authorize(request)
     }
 
     /// 构造运行时 WebSocket URI。
@@ -122,7 +145,7 @@ impl NodeRuntimeClient {
     /// 发起 GET 请求并解析 JSON 响应。
     pub async fn get_json<T: DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
         let url = self.build_uri(path);
-        let resp = self.client.get(url).send().await?;
+        let resp = self.authorize(self.client.get(url)).send().await?;
         decode_json_response("GET", path, resp).await
     }
 
@@ -133,7 +156,7 @@ impl NodeRuntimeClient {
         payload: &B,
     ) -> anyhow::Result<T> {
         let url = self.build_uri(path);
-        let mut request = self.client.post(url).json(payload);
+        let mut request = self.authorize(self.client.post(url)).json(payload);
         if is_long_running_request(path) {
             request = request.timeout(Duration::from_secs(PROXY_LONG_RUNNING_REQUEST_TIMEOUT_SECS));
         }
@@ -150,7 +173,7 @@ impl NodeRuntimeClient {
     ) -> anyhow::Result<T> {
         let url = self.build_uri(path);
         let mut request = apply_operation_context(
-            self.client.post(url),
+            self.authorize(self.client.post(url)),
             "user",
             Some(context.actor_user_id),
             &context.actor_name,
@@ -172,7 +195,14 @@ impl NodeRuntimeClient {
         source: &str,
         trace_id: &str,
     ) -> RequestBuilder {
-        apply_operation_context(request, "system", None, source, None, trace_id)
+        apply_operation_context(
+            self.authorize(request),
+            "system",
+            None,
+            source,
+            None,
+            trace_id,
+        )
     }
 
     /// 携带可信系统操作上下文发起 POST 请求。
@@ -216,22 +246,25 @@ impl NodeRuntimeClient {
         payload: &B,
     ) -> anyhow::Result<T> {
         let url = self.build_uri(path);
-        let resp = self.client.put(url).json(payload).send().await?;
+        let resp = self
+            .authorize(self.client.put(url))
+            .json(payload)
+            .send()
+            .await?;
         decode_json_response("PUT", path, resp).await
     }
 
     /// 发起 DELETE 请求并解析 JSON 响应。
     pub async fn delete_json<T: DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
         let url = self.build_uri(path);
-        let resp = self.client.delete(url).send().await?;
+        let resp = self.authorize(self.client.delete(url)).send().await?;
         decode_json_response("DELETE", path, resp).await
     }
 
     /// 读取领域接口并保留 Agent 返回的 HTTP 状态与稳定错误码。
     pub async fn get_domain<T: DeserializeOwned>(&self, path: &str) -> ApiResult<T> {
         let response = self
-            .client
-            .get(self.build_uri(path))
+            .authorize(self.client.get(self.build_uri(path)))
             .send()
             .await
             .map_err(AgentClientError::from)?;
@@ -246,7 +279,7 @@ impl NodeRuntimeClient {
         context: &AgentOperationContext,
     ) -> ApiResult<T> {
         let response = apply_operation_context(
-            self.client.put(self.build_uri(path)),
+            self.authorize(self.client.put(self.build_uri(path))),
             "user",
             Some(context.actor_user_id),
             &context.actor_name,
@@ -268,7 +301,7 @@ impl NodeRuntimeClient {
         context: &AgentOperationContext,
     ) -> ApiResult<T> {
         let response = apply_operation_context(
-            self.client.post(self.build_uri(path)),
+            self.authorize(self.client.post(self.build_uri(path))),
             "user",
             Some(context.actor_user_id),
             &context.actor_name,
@@ -326,7 +359,7 @@ impl NodeRuntimeClient {
         context: &AgentOperationContext,
     ) -> ApiResult<T> {
         let response = apply_operation_context(
-            self.client.delete(self.build_uri(path)),
+            self.authorize(self.client.delete(self.build_uri(path))),
             "user",
             Some(context.actor_user_id),
             &context.actor_name,
@@ -356,8 +389,7 @@ impl NodeRuntimeClient {
         let reqwest_body = reqwest::Body::wrap_stream(reqwest_stream);
 
         let mut req_builder = self
-            .client
-            .request(method, url)
+            .authorize(self.client.request(method, url))
             .headers(headers)
             .body(reqwest_body);
 
@@ -842,10 +874,11 @@ mod tests {
         )
         .await
         .unwrap();
+        let session_id = Uuid::new_v4().to_string();
         insert_node_session(
             &pool,
             &NodeSessionRecord {
-                session_id: Uuid::new_v4().to_string(),
+                session_id: session_id.clone(),
                 node_id: node_id.clone(),
                 agent_id: node_id.clone(),
                 lease_id: Uuid::new_v4().to_string(),
@@ -864,6 +897,14 @@ mod tests {
                 created_at: now.to_rfc3339(),
                 updated_at: now.to_rfc3339(),
             },
+        )
+        .await
+        .unwrap();
+        crate::models::node_sessions::upsert_session_command_access(
+            &pool,
+            &session_id,
+            crate::models::node_sessions::AgentCommandTransport::Https,
+            "test-command-credential-which-is-long-enough",
         )
         .await
         .unwrap();

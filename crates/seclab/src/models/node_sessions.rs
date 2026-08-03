@@ -5,6 +5,38 @@ use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
+/// Agent 命令端点的基础设施传输类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentCommandTransport {
+    Uds,
+    Https,
+}
+
+impl AgentCommandTransport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Uds => "uds",
+            Self::Https => "https",
+        }
+    }
+}
+
+/// 活动会话对应的命令端点与解密凭据。
+#[derive(Debug, Clone)]
+pub struct AgentCommandAccess {
+    pub session: NodeSessionRecord,
+    pub transport: AgentCommandTransport,
+    pub credential: String,
+}
+
+/// 判断会话是否仍处于活跃状态且租约尚未过期。
+pub fn has_live_lease(session: &NodeSessionRecord) -> bool {
+    session.status == "active"
+        && chrono::DateTime::parse_from_rfc3339(&session.lease_expires_at)
+            .map(|expires_at| expires_at.with_timezone(&Utc) > Utc::now())
+            .unwrap_or(false)
+}
+
 /// 节点运行时会话记录。
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 #[serde(rename_all = "camelCase")]
@@ -241,6 +273,72 @@ pub async fn resolve_active_session_endpoint(
             _ => None,
         }),
     )
+}
+
+/// 保存会话命令端点和加密凭据。
+pub async fn upsert_session_command_access(
+    pool: &DbPool,
+    session_id: &str,
+    transport: AgentCommandTransport,
+    credential: &str,
+) -> anyhow::Result<()> {
+    let ciphertext = crate::crypto::encrypt_bytes(credential.as_bytes())
+        .map_err(|err| anyhow::anyhow!("failed to encrypt Agent command credential: {err}"))?;
+    sqlx::query(
+        r#"
+        INSERT INTO node_session_command_access (session_id, transport, credential_ciphertext)
+        VALUES (?, ?, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+            transport = excluded.transport,
+            credential_ciphertext = excluded.credential_ciphertext,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        "#,
+    )
+    .bind(session_id)
+    .bind(transport.as_str())
+    .bind(ciphertext)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// 解析目标节点的活动命令端点和凭据。
+pub async fn resolve_active_command_access(
+    pool: &DbPool,
+    target: &str,
+) -> anyhow::Result<Option<AgentCommandAccess>> {
+    let session = match get_active_session_by_agent_id(pool, target).await? {
+        Some(session) => session,
+        None => match get_active_session_by_node_id(pool, target).await? {
+            Some(session) => session,
+            None => return Ok(None),
+        },
+    };
+    if !has_live_lease(&session) {
+        return Ok(None);
+    }
+    let row = sqlx::query_as::<_, (String, String)>(
+        "SELECT transport, credential_ciphertext FROM node_session_command_access WHERE session_id = ?",
+    )
+    .bind(&session.session_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some((transport, ciphertext)) = row else {
+        return Ok(None);
+    };
+    let transport = match transport.as_str() {
+        "uds" => AgentCommandTransport::Uds,
+        "https" => AgentCommandTransport::Https,
+        other => anyhow::bail!("invalid Agent command transport: {other}"),
+    };
+    let credential = crate::crypto::decrypt_bytes(&ciphertext)
+        .map_err(|err| anyhow::anyhow!("failed to decrypt Agent command credential: {err}"))
+        .and_then(|bytes| String::from_utf8(bytes).map_err(anyhow::Error::from))?;
+    Ok(Some(AgentCommandAccess {
+        session,
+        transport,
+        credential,
+    }))
 }
 
 /// 通过 `session_id` 读取会话。

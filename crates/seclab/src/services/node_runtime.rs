@@ -24,6 +24,41 @@ pub const DEFAULT_LEASE_TTL_SECONDS: i64 = 30;
 /// runtime 默认心跳间隔。
 pub const DEFAULT_HEARTBEAT_INTERVAL_SECONDS: i64 = 10;
 
+/// 创建开发期内置的本地节点和 Agent 身份，使其进入统一 runtime session。
+pub async fn ensure_local_runtime_identity(pool: &DbPool) -> Result<(), ApiError> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO nodes (
+            node_id, name, normalized_name, group_name, status, desired_role,
+            schedulable, metadata, created_at, updated_at
+        ) VALUES ('local', 'Local Node', 'local-node', 'default', 'registered',
+                  'agent', 1, '{"systemManaged":true}', ?, ?)
+        "#,
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO node_identities (
+            identity_id, node_id, agent_id, certificate_fingerprint,
+            certificate_status, public_key_algorithm, certificate_issued_at,
+            created_at, updated_at
+        ) VALUES (?, 'local', 'local', 'local-runtime-agent',
+                  'active', 'ed25519', ?, ?, ?)
+        "#,
+    )
+    .bind(new_uuid_v7())
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// enrollment 成功结果。
 #[derive(Debug, Clone)]
 pub struct RuntimeEnrollResult {
@@ -926,6 +961,14 @@ mod tests {
             .unwrap()
             .expect("active session endpoint missing");
         assert_eq!(endpoint, "https://10.0.0.41:18443");
+        crate::models::node_sessions::upsert_session_command_access(
+            &pool,
+            &enrolled.session_id,
+            crate::models::node_sessions::AgentCommandTransport::Https,
+            "test-command-credential-which-is-long-enough",
+        )
+        .await
+        .unwrap();
 
         let runtime_client = NodeRuntimeClient::from_node_route(&pool, Some(&node_id)).await;
         assert!(runtime_client.is_ok());

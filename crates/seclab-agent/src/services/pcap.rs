@@ -155,6 +155,27 @@ impl PcapMuxHub {
         Ok(bytes)
     }
 
+    /// 仅在抓包任务属于指定套件实例和工作负载时停止并返回数据。
+    pub async fn stop_capture_owned(
+        &self,
+        capture_id: &str,
+        suite_instance_id: &str,
+        workload_id: &str,
+    ) -> anyhow::Result<Vec<u8>> {
+        {
+            let slots = self.active_slots.lock().await;
+            let Some(slot) = slots.get(capture_id) else {
+                anyhow::bail!("pcap capture not found: {capture_id}");
+            };
+            if slot.suite_instance_id.as_deref() != Some(suite_instance_id)
+                || slot.workload_id.as_deref() != Some(workload_id)
+            {
+                anyhow::bail!("pcap capture does not belong to suite workload");
+            }
+        }
+        self.stop_capture(capture_id).await
+    }
+
     /// 停止指定套件实例下的所有抓包任务，返回已停止的抓包 ID。
     pub async fn stop_captures_for_suite_instance(&self, suite_instance_id: &str) -> Vec<String> {
         let captures = {

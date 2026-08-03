@@ -146,33 +146,6 @@ async fn main() {
         }
     };
 
-    // 启动后台定时任务检测本地 agent 在线状态（心跳检测机制）
-    let socket_path = crate::types::agent_socket_path();
-    tokio::spawn(async move {
-        let mut last_online = true;
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        loop {
-            interval.tick().await;
-            let current_online = socket_path.exists();
-            if current_online != last_online {
-                if !current_online {
-                    tracing::warn!(
-                        "[Local Agent] Unix socket not found at {}. seclab-agent might be stopped or crashed; local monitoring and execution features are unavailable.",
-                        socket_path.display()
-                    );
-                } else {
-                    tracing::info!(
-                        "[Local Agent] Unix socket detected at {}. Local agent is back online.",
-                        socket_path.display()
-                    );
-                }
-                last_online = current_online;
-            }
-        }
-    });
-
     let sans = build_controller_cert_sans(runtime_listen.public_host.as_deref());
 
     let certs_dir = crate::config::certs_dir();

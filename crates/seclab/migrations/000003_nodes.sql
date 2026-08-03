@@ -172,6 +172,15 @@ CREATE INDEX IF NOT EXISTS idx_node_sessions_agent_id ON node_sessions (agent_id
 CREATE INDEX IF NOT EXISTS idx_node_sessions_status_lease_expires_at ON node_sessions (status, lease_expires_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_node_sessions_active_node_id ON node_sessions (node_id) WHERE status = 'active';
 
+CREATE TABLE IF NOT EXISTS node_session_command_access (
+    session_id TEXT PRIMARY KEY,
+    transport TEXT NOT NULL CHECK (transport IN ('uds', 'https')),
+    credential_ciphertext TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    FOREIGN KEY (session_id) REFERENCES node_sessions(session_id) ON DELETE CASCADE
+);
+
 CREATE TRIGGER IF NOT EXISTS set_node_sessions_updated_at
 AFTER UPDATE ON node_sessions FOR EACH ROW
 BEGIN

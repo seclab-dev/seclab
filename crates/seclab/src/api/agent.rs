@@ -296,9 +296,7 @@ async fn handle_socket(
 
     // Establish outgoing WebSocket connection using reqwest-websocket
     let target_ws_result = runtime_client
-        .client
-        .get(&url)
-        .headers(headers)
+        .authorize_request(runtime_client.client.get(&url).headers(headers))
         .upgrade()
         .send()
         .await;

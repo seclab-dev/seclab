@@ -351,8 +351,10 @@ pub async fn get_node_summary(
     node_id: &str,
 ) -> sqlx::Result<Option<NodeSummaryView>> {
     if node_id == "local" {
-        let local_exists = crate::types::agent_socket_path().exists();
-        let local_status = if local_exists {
+        let session =
+            crate::models::node_sessions::get_active_session_by_node_id(pool, "local").await?;
+        let session = session.filter(crate::models::node_sessions::has_live_lease);
+        let local_status = if session.is_some() {
             "online".to_string()
         } else {
             "offline".to_string()
@@ -365,12 +367,12 @@ pub async fn get_node_summary(
             address: Some("127.0.0.1".to_string()),
             service_port: None,
             status: local_status.clone(),
-            lifecycle_status: local_status,
-            runtime_status: Some("active".to_string()),
-            health_status: Some("online".to_string()),
+            lifecycle_status: local_status.clone(),
+            runtime_status: session.as_ref().map(|value| value.status.clone()),
+            health_status: Some(local_status.clone()),
             tags: vec!["local".to_string()],
             metadata: None,
-            last_seen_at: None,
+            last_seen_at: session.and_then(|value| value.last_seen_at),
         }));
     }
     Ok(fetch_summary_components(pool, node_id).await?.0)
@@ -489,12 +491,6 @@ pub fn spawn_local_node_monitor(state: std::sync::Arc<crate::state::AppState>) {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             interval.tick().await;
-
-            if !crate::types::agent_socket_path().exists() {
-                let mut cache = state.local_node_resource.lock().await;
-                *cache = None;
-                continue;
-            }
 
             let client =
                 match crate::models::node_runtime_client::NodeRuntimeClient::from_node_route(

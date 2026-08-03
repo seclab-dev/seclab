@@ -564,12 +564,25 @@ async fn run_create_task(
         tokio::fs::create_dir_all(&directory).await?;
         let compose_file = directory.join(COMPOSE_FILE_NAME);
         tokio::fs::write(&compose_file, compose_yaml.as_bytes()).await?;
-        if is_remote_agent() {
-            prepare_remote_compose_images(&state, &task_id, &name, &compose_file, &cancellation)
+        match crate::services::agent_runtime::load(&state.metadata_db)
+            .await
+            .map_err(|err| ApiError::Internal(err.to_string()))?
+            .image_resolution
+        {
+            crate::services::agent_runtime::ImageResolutionStrategy::ControllerMediated => {
+                prepare_remote_compose_images(
+                    &state,
+                    &task_id,
+                    &name,
+                    &compose_file,
+                    &cancellation,
+                )
                 .await?;
-        } else {
-            prepare_local_compose_images(&state, &task_id, &name, &compose_file, &cancellation)
-                .await?;
+            }
+            crate::services::agent_runtime::ImageResolutionStrategy::LocalEngine => {
+                prepare_local_compose_images(&state, &task_id, &name, &compose_file, &cancellation)
+                    .await?;
+            }
         }
         docker_project_tasks::update(
             &state.metadata_db,
@@ -742,24 +755,31 @@ async fn run_redeploy_task(
             }
         } else {
             let compose_file = PathBuf::from(&record.compose_dir).join(COMPOSE_FILE_NAME);
-            if is_remote_agent() {
-                prepare_remote_compose_images(
-                    &state,
-                    &task_id,
-                    &record.name,
-                    &compose_file,
-                    &cancellation,
-                )
-                .await?;
-            } else {
-                prepare_local_compose_images(
-                    &state,
-                    &task_id,
-                    &record.name,
-                    &compose_file,
-                    &cancellation,
-                )
-                .await?;
+            match crate::services::agent_runtime::load(&state.metadata_db)
+                .await
+                .map_err(|err| ApiError::Internal(err.to_string()))?
+                .image_resolution
+            {
+                crate::services::agent_runtime::ImageResolutionStrategy::ControllerMediated => {
+                    prepare_remote_compose_images(
+                        &state,
+                        &task_id,
+                        &record.name,
+                        &compose_file,
+                        &cancellation,
+                    )
+                    .await?;
+                }
+                crate::services::agent_runtime::ImageResolutionStrategy::LocalEngine => {
+                    prepare_local_compose_images(
+                        &state,
+                        &task_id,
+                        &record.name,
+                        &compose_file,
+                        &cancellation,
+                    )
+                    .await?;
+                }
             }
         }
         docker_project_tasks::update(
@@ -818,11 +838,6 @@ async fn run_redeploy_task(
     } else {
         let _ = docker_project_tasks::succeed(&state.metadata_db, &task_id).await;
     }
-}
-
-/// 判断当前进程是否为通过 Master 管理的远程 Agent。
-fn is_remote_agent() -> bool {
-    crate::config::get().mode.as_deref() == Some("remote")
 }
 
 fn compose_up_args(force_recreate: bool, prohibit_pull: bool) -> Vec<String> {

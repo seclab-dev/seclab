@@ -7,6 +7,7 @@ use crate::state::DbPool;
 use crate::types::AgentMode;
 use axum_server::tls_rustls::RustlsConfig;
 use clap::{Parser, Subcommand};
+use ring::rand::{SecureRandom, SystemRandom};
 use routes::create_router;
 use rustls::crypto::ring::default_provider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -105,6 +106,9 @@ async fn main() {
         tracing::warn!("agent_identity.agent_ip is empty; TLS SAN may not match remote address.");
     }
 
+    let (runtime_stop_tx, runtime_stop_rx) = watch::channel(false);
+    let mut runtime_stop_rx = Some(runtime_stop_rx);
+
     if use_uds {
         let socket_path = agent_socket_path();
         if tokio::fs::metadata(&socket_path).await.is_ok() {
@@ -179,21 +183,33 @@ async fn main() {
             "Starting Agent server at {:?}",
             listener.local_addr().unwrap()
         );
+        let runtime_handle = tokio::spawn(run_runtime_supervisor(
+            pools_for_shutdown.clone(),
+            runtime_stop_rx
+                .take()
+                .expect("runtime supervisor receiver is missing"),
+            Arc::clone(&controller_runtime),
+        ));
+        let runtime_stop_tx_for_signal = runtime_stop_tx.clone();
         axum::serve(listener, app.into_make_service())
             .with_graceful_shutdown(async move {
                 shutdown_signal().await;
+                let _ = runtime_stop_tx_for_signal.send(true);
                 tracing::info!(
                     "seclab-agent local listener received shutdown signal. Terminating..."
                 );
-                tracing::info!("Attempting to close agent database connection pool...");
-                pools_for_shutdown.close().await;
-                tracing::info!("Agent database connection pool closed successfully.");
-                if tokio::fs::metadata(&socket_path).await.is_ok() {
-                    tokio::fs::remove_file(&socket_path).await.unwrap();
-                }
             })
             .await
             .unwrap();
+        wait_for_runtime_supervisor(runtime_handle).await;
+        tracing::info!("Attempting to close agent database connection pool...");
+        pools_for_shutdown.close().await;
+        tracing::info!("Agent database connection pool closed successfully.");
+        if tokio::fs::metadata(&socket_path).await.is_ok()
+            && let Err(err) = tokio::fs::remove_file(&socket_path).await
+        {
+            tracing::warn!(error = %err, "failed to remove Agent UDS socket during shutdown");
+        }
         return;
     }
 
@@ -210,11 +226,11 @@ async fn main() {
             std::process::exit(1);
         }
     };
-
-    let (runtime_stop_tx, runtime_stop_rx) = watch::channel(false);
-    tokio::spawn(run_runtime_supervisor(
+    let runtime_handle = tokio::spawn(run_runtime_supervisor(
         pools_for_shutdown.clone(),
-        runtime_stop_rx,
+        runtime_stop_rx
+            .take()
+            .expect("runtime supervisor receiver is missing"),
         controller_runtime,
     ));
 
@@ -250,10 +266,22 @@ async fn main() {
     }
 
     let _ = runtime_stop_tx.send(true);
+    wait_for_runtime_supervisor(runtime_handle).await;
 
     tracing::info!("Attempting to close agent database connection pool...");
     pools_for_shutdown.close().await;
     tracing::info!("Agent database connection pool closed successfully.");
+}
+
+/// 等待 supervisor 完成注销和本地会话清理。
+async fn wait_for_runtime_supervisor(handle: tokio::task::JoinHandle<()>) {
+    match tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => tracing::warn!(error = %err, "runtime supervisor task failed"),
+        Err(_) => {
+            tracing::warn!("runtime supervisor did not finish graceful deregistration in time")
+        }
+    }
 }
 
 fn load_env() {
@@ -275,6 +303,7 @@ struct EnrollRequest {
     node: RuntimeNode,
     certificate_request: CertificateRequest,
     compatibility: RuntimeAgentCompatibility,
+    command_credential: String,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -283,6 +312,7 @@ struct RegisterRequest {
     agent_id: String,
     node: RuntimeNode,
     compatibility: RuntimeAgentCompatibility,
+    command_credential: String,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -302,6 +332,7 @@ struct HeartbeatRequest {
 struct RuntimeNode {
     advertise_addr: Option<String>,
     listen_port: Option<i64>,
+    command_transport: String,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -532,22 +563,22 @@ fn ensure_controller_compatible(
 
 async fn establish_runtime_session(pool: &DbPool) -> anyhow::Result<RuntimeSessionState> {
     let identity = load_or_init_identity(pool, config::get()).await?;
-    if identity.mode != AgentMode::Remote {
-        return Err(anyhow::anyhow!(
-            "runtime supervisor only supports remote mode"
-        ));
-    }
-
-    let seclab_url = identity
-        .seclab_url
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("missing seclab_url"))?;
+    let seclab_url = match identity.mode {
+        AgentMode::Local => config::local_controller_url()?,
+        AgentMode::Remote => identity
+            .seclab_url
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("missing seclab_url"))?,
+    };
     let client = build_tls_client()?;
     let node = build_runtime_node(&identity);
     let compatibility = runtime_agent_compatibility();
     let clear_enrollment_token = identity.enrollment_token.is_some();
+    let command_credential = generate_command_credential()?;
 
-    let session = if let Some(token) = identity.enrollment_token.clone() {
+    let session = if identity.mode == AgentMode::Remote
+        && let Some(token) = identity.enrollment_token.clone()
+    {
         let response = client
             .post(format!(
                 "{}/api/v1/runtime/enroll",
@@ -561,6 +592,7 @@ async fn establish_runtime_session(pool: &DbPool) -> anyhow::Result<RuntimeSessi
                     csr_pem: None,
                 },
                 compatibility: compatibility.clone(),
+                command_credential: command_credential.clone(),
             })
             .send()
             .await?
@@ -575,10 +607,13 @@ async fn establish_runtime_session(pool: &DbPool) -> anyhow::Result<RuntimeSessi
             .data
             .ok_or_else(|| anyhow::anyhow!("missing enroll response data"))?
     } else {
-        let agent_id = identity
-            .agent_id
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("missing agent_id"))?;
+        let agent_id = match identity.mode {
+            AgentMode::Local => "local".to_string(),
+            AgentMode::Remote => identity
+                .agent_id
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("missing agent_id"))?,
+        };
         let response = client
             .post(format!(
                 "{}/api/v1/runtime/register",
@@ -588,6 +623,7 @@ async fn establish_runtime_session(pool: &DbPool) -> anyhow::Result<RuntimeSessi
                 agent_id,
                 node: node.clone(),
                 compatibility: compatibility.clone(),
+                command_credential: command_credential.clone(),
             })
             .send()
             .await?
@@ -603,6 +639,12 @@ async fn establish_runtime_session(pool: &DbPool) -> anyhow::Result<RuntimeSessi
             .ok_or_else(|| anyhow::anyhow!("missing register response data"))?
     };
     ensure_controller_compatible(&session.controller_compatibility)?;
+    services::settings::set_string(
+        pool,
+        "runtime.command_credential_hash",
+        &hash_command_credential(&command_credential),
+    )
+    .await?;
 
     update_runtime_session(
         pool,
@@ -623,6 +665,21 @@ async fn establish_runtime_session(pool: &DbPool) -> anyhow::Result<RuntimeSessi
         advertise_addr: node.advertise_addr,
         listen_port: node.listen_port,
     })
+}
+
+fn generate_command_credential() -> anyhow::Result<String> {
+    let mut bytes = [0_u8; 32];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("failed to generate Agent command credential"))?;
+    Ok(hex::encode(bytes))
+}
+
+fn hash_command_credential(credential: &str) -> String {
+    hex::encode(ring::digest::digest(
+        &ring::digest::SHA256,
+        credential.as_bytes(),
+    ))
 }
 
 async fn report_task_run_to_controller(
@@ -851,6 +908,11 @@ async fn maintain_runtime_session(
                         node: RuntimeNode {
                             advertise_addr: session.advertise_addr.clone(),
                             listen_port: session.listen_port,
+                            command_transport: if session.agent_id == "local" {
+                                "uds".to_string()
+                            } else {
+                                "https".to_string()
+                            },
                         },
                         resource,
                         compatibility: runtime_agent_compatibility(),
@@ -976,13 +1038,21 @@ async fn rotate_runtime_certificate(
 }
 
 fn build_runtime_node(identity: &crate::models::identity::AgentIdentity) -> RuntimeNode {
-    RuntimeNode {
-        advertise_addr: identity.agent_ip.clone(),
-        listen_port: identity
-            .listen_addr
-            .as_deref()
-            .and_then(|value| value.rsplit(':').next())
-            .and_then(|value| value.parse::<i64>().ok()),
+    match identity.mode {
+        AgentMode::Local => RuntimeNode {
+            advertise_addr: None,
+            listen_port: None,
+            command_transport: "uds".to_string(),
+        },
+        AgentMode::Remote => RuntimeNode {
+            advertise_addr: identity.agent_ip.clone(),
+            listen_port: identity
+                .listen_addr
+                .as_deref()
+                .and_then(|value| value.rsplit(':').next())
+                .and_then(|value| value.parse::<i64>().ok()),
+            command_transport: "https".to_string(),
+        },
     }
 }
 

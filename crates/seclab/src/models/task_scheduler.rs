@@ -144,7 +144,16 @@ pub struct ScheduledTaskOperationRow {
 const TASK_SELECT: &str = r#"
     SELECT t.task_id, t.name, t.description, t.node_id,
            CASE WHEN t.node_id = 'local' THEN 'Local Node' ELSE COALESCE(n.name, t.node_id) END AS node_name,
-           CASE WHEN t.node_id = 'local' THEN 'online' ELSE COALESCE(n.status, 'offline') END AS node_status,
+           CASE
+               WHEN EXISTS(
+                   SELECT 1
+                     FROM node_sessions ns
+                    WHERE ns.node_id = t.node_id
+                      AND ns.status = 'active'
+                      AND julianday(ns.lease_expires_at) >= julianday('now')
+               ) THEN 'online'
+               ELSE 'offline'
+           END AS node_status,
            t.command, t.cron_expr, t.time_zone, t.desired_state, t.timeout_seconds,
            t.prevent_overlap, t.ownership_kind, t.owner_id, t.owner_name, t.manager_path,
            t.created_by_user_id, t.created_by_name,

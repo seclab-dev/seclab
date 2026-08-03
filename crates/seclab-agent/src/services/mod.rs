@@ -1,5 +1,6 @@
 //! 服务层入口：聚合业务服务模块。
 
+pub mod agent_runtime;
 pub mod controller_runtime;
 pub mod database_maintenance;
 pub mod disk_inventory;

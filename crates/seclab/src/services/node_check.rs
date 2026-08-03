@@ -305,13 +305,15 @@ async fn check_node_api(
     node_id: &str,
     provisioning: &NodeProvisioningRecord,
 ) -> ApiResult<(HostSystemSummary, Option<DockerStatusSummary>)> {
-    let api_url = match resolve_active_session_endpoint(pool, node_id).await? {
-        Some(endpoint) => endpoint,
-        None => build_probe_endpoint(provisioning).ok_or_else(|| {
-            ApiError::BadRequest("node runtime endpoint must not be empty".to_string())
-        })?,
+    let client = match resolve_active_session_endpoint(pool, node_id).await? {
+        Some(_) => NodeRuntimeClient::from_node_route(pool, Some(node_id)).await?,
+        None => {
+            let api_url = build_probe_endpoint(provisioning).ok_or_else(|| {
+                ApiError::BadRequest("node runtime endpoint must not be empty".to_string())
+            })?;
+            NodeRuntimeClient::from_api_url(api_url)?
+        }
     };
-    let client = NodeRuntimeClient::from_api_url(api_url)?;
     let response: ApiResponse<HostSystemSummary> = client
         .get_json("/api/v1/agent/system/summary")
         .await

@@ -119,6 +119,8 @@ struct AgentSuiteInstallRequest {
     compose_project_name: String,
     compose_file: String,
     runtime_images: Vec<String>,
+    #[serde(default)]
+    agent_access: Option<crate::models::suites::SuiteAgentAccessManifest>,
     files: Vec<SuitePackageFile>,
     app_entries: Vec<SuiteAppEntryManifest>,
 }
@@ -487,6 +489,7 @@ pub async fn install_suite(
         compose_project_name,
         compose_file: manifest.runtime.compose_file.clone(),
         runtime_images: normalize_runtime_images(&manifest.runtime.images),
+        agent_access: manifest.runtime.agent.clone(),
         files: package.files,
         app_entries: manifest.app_entries,
     };
@@ -1873,6 +1876,7 @@ fn validate_manifest(manifest: &SuiteManifest, files: &[SuitePackageFile]) -> Ap
         ));
     }
     validate_runtime_images(&manifest.runtime.images)?;
+    validate_agent_access(manifest, files)?;
     if manifest.app_entries.is_empty() {
         return Err(ApiError::BadRequest(
             "suite must declare at least one app entry".to_string(),
@@ -1896,6 +1900,66 @@ fn validate_manifest(manifest: &SuiteManifest, files: &[SuitePackageFile]) -> Ap
         }
     }
     validate_i18n(manifest)?;
+    Ok(())
+}
+
+/// 校验套件 Agent 能力及其目标 Compose 服务。
+fn validate_agent_access(manifest: &SuiteManifest, files: &[SuitePackageFile]) -> ApiResult<()> {
+    let Some(access) = manifest.runtime.agent.as_ref() else {
+        return Ok(());
+    };
+    if access.services.is_empty() {
+        return Err(ApiError::BadRequest(
+            "runtime.agent.services must not be empty".to_string(),
+        ));
+    }
+    if access.capabilities.is_empty() {
+        return Err(ApiError::BadRequest(
+            "runtime.agent.capabilities must not be empty".to_string(),
+        ));
+    }
+    const ALLOWED_CAPABILITIES: [&str; 2] = ["workloads.manage", "captures.manage"];
+    let mut capabilities = BTreeSet::new();
+    for capability in &access.capabilities {
+        let capability = capability.trim();
+        if !ALLOWED_CAPABILITIES.contains(&capability) {
+            return Err(ApiError::BadRequest(format!(
+                "unsupported runtime.agent capability: {capability}"
+            )));
+        }
+        if !capabilities.insert(capability) {
+            return Err(ApiError::BadRequest(format!(
+                "duplicate runtime.agent capability: {capability}"
+            )));
+        }
+    }
+
+    let compose = files
+        .iter()
+        .find(|file| file.path == manifest.runtime.compose_file)
+        .ok_or_else(|| ApiError::BadRequest("suite compose file is missing".to_string()))
+        .and_then(decode_package_text)?;
+    let compose: serde_yaml::Value = serde_yaml::from_str(&compose)
+        .map_err(|err| ApiError::BadRequest(format!("invalid compose file: {err}")))?;
+    let services = compose
+        .get("services")
+        .and_then(serde_yaml::Value::as_mapping)
+        .ok_or_else(|| ApiError::BadRequest("compose services are missing".to_string()))?;
+    let mut declared_services = BTreeSet::new();
+    for service in &access.services {
+        let service = service.trim();
+        validate_id("runtime.agent service", service)?;
+        if !declared_services.insert(service) {
+            return Err(ApiError::BadRequest(format!(
+                "duplicate runtime.agent service: {service}"
+            )));
+        }
+        if !services.contains_key(serde_yaml::Value::String(service.to_string())) {
+            return Err(ApiError::BadRequest(format!(
+                "runtime.agent service does not exist in compose: {service}"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -2378,6 +2442,48 @@ mod suite_asset_tests {
     }
 
     #[test]
+    fn agent_access_requires_known_capabilities_and_existing_services() {
+        let manifest = serde_yaml::from_str::<SuiteManifest>(
+            r#"
+apiVersion: seclab.io/v1alpha1
+kind: ComposeSuite
+metadata:
+  suiteId: suite.example
+  slug: example
+  version: 1.0.0
+  name: Example
+  icon: assets/icon.png
+runtime:
+  type: compose
+  composeFile: compose.yaml
+  agent:
+    services: [api]
+    capabilities: [workloads.manage, captures.manage]
+appEntries: []
+"#,
+        )
+        .unwrap();
+        let files = vec![SuitePackageFile {
+            path: "compose.yaml".to_string(),
+            content_base64: STANDARD.encode("services:\n  api:\n    image: example/api:1\n"),
+        }];
+        assert!(validate_agent_access(&manifest, &files).is_ok());
+
+        let mut unknown_capability = manifest.clone();
+        unknown_capability
+            .runtime
+            .agent
+            .as_mut()
+            .unwrap()
+            .capabilities = vec!["docker.admin".to_string()];
+        assert!(validate_agent_access(&unknown_capability, &files).is_err());
+
+        let mut unknown_service = manifest;
+        unknown_service.runtime.agent.as_mut().unwrap().services = vec!["missing".to_string()];
+        assert!(validate_agent_access(&unknown_service, &files).is_err());
+    }
+
+    #[test]
     fn suite_images_merge_compose_and_runtime_images() {
         let compose = r#"services:
   api:
@@ -2395,6 +2501,7 @@ mod suite_asset_tests {
                 "example/engine:1.0".to_string(),
                 "example/api:1.0".to_string(),
             ],
+            agent_access: None,
             files: vec![SuitePackageFile {
                 path: "compose.yaml".to_string(),
                 content_base64: STANDARD.encode(compose),
