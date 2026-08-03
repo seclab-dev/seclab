@@ -27,6 +27,7 @@ import {
 import { CanvasRenderer } from 'echarts/renderers'
 import { useI18n } from 'vue-i18n'
 import { useDockerStore } from '@/stores/docker'
+import { formatPercent as formatDockerPercent } from '@/utils/docker-format'
 
 echarts.use([
   PieChart,
@@ -146,7 +147,7 @@ function formatBytesPerSecond(value: number) {
 }
 
 function formatPercent(value?: number) {
-  return value === undefined ? '-' : `${value.toFixed(1)}%`
+  return value === undefined ? '-' : formatDockerPercent(value)
 }
 
 function formatTimestamp(timestamp?: number | null, full = false) {

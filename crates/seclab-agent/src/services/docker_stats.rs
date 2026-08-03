@@ -14,6 +14,8 @@ use std::sync::Arc;
 use tokio::time::{Duration, timeout};
 use tracing::{debug, warn};
 
+const CONTAINER_STATS_TIMEOUT: Duration = Duration::from_secs(3);
+
 #[derive(Debug, FromRow)]
 struct LatestSummaryRow {
     created_at: i64,
@@ -301,12 +303,9 @@ async fn fetch_container_stats_snapshot(
     docker: &bollard::Docker,
     id: &str,
 ) -> Option<ContainerResourceUsageSample> {
-    let stats_options = query_parameters::StatsOptionsBuilder::new()
-        .stream(false)
-        .one_shot(true)
-        .build();
+    let stats_options = container_stats_options();
     let mut stream = docker.stats(id, Some(stats_options));
-    let sample = timeout(Duration::from_millis(1200), stream.next())
+    let sample = timeout(CONTAINER_STATS_TIMEOUT, stream.next())
         .await
         .ok()??
         .ok()?;
@@ -363,6 +362,14 @@ async fn fetch_container_stats_snapshot(
     })
 }
 
+/// 构造一次非流式双周期 Docker 统计请求。
+fn container_stats_options() -> query_parameters::StatsOptions {
+    query_parameters::StatsOptionsBuilder::new()
+        .stream(false)
+        .one_shot(false)
+        .build()
+}
+
 /// 将 Docker 多核 CPU 百分比归一化为宿主机总容量占比。
 fn normalize_cpu_host_percent(cpu_core_percent: f64, online_cpus: u64) -> f64 {
     (cpu_core_percent / online_cpus.max(1) as f64).clamp(0.0, 100.0)
@@ -396,14 +403,26 @@ fn calculate_cpu_percent(stats: &bollard::models::ContainerStatsResponse) -> f64
         return 0.0;
     }
 
-    let online_cpus = cpu_stats.online_cpus.unwrap_or(1) as f64;
+    let online_cpus = cpu_stats
+        .online_cpus
+        .filter(|value| *value > 0)
+        .or_else(|| {
+            cpu_stats
+                .cpu_usage
+                .as_ref()
+                .and_then(|usage| usage.percpu_usage.as_ref())
+                .map(|usage| usage.len() as u32)
+                .filter(|value| *value > 0)
+        })
+        .unwrap_or(1) as f64;
     (cpu_delta as f64 / system_delta as f64) * online_cpus * 100.0
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        calculate_cpu_percent, cleanup_old_stats, normalize_cpu_host_percent, resolve_sample_status,
+        calculate_cpu_percent, cleanup_old_stats, container_stats_options,
+        normalize_cpu_host_percent, resolve_sample_status,
     };
     use crate::config;
     use crate::models::docker::ResourceSampleStatus;
@@ -465,6 +484,25 @@ mod tests {
         let stats = make_stats(200, 100, 300, 100);
         let percent = calculate_cpu_percent(&stats);
         assert!((percent - 100.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn calculate_cpu_percent_falls_back_to_per_cpu_usage_count() {
+        let mut stats = make_stats(200, 100, 300, 100);
+        let cpu_stats = stats.cpu_stats.as_mut().unwrap();
+        cpu_stats.online_cpus = None;
+        cpu_stats.cpu_usage.as_mut().unwrap().percpu_usage = Some(vec![50, 50, 50, 50]);
+
+        let percent = calculate_cpu_percent(&stats);
+
+        assert!((percent - 200.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn container_stats_waits_for_two_non_streaming_samples() {
+        let options = container_stats_options();
+        assert!(!options.stream);
+        assert!(!options.one_shot);
     }
 
     #[test]

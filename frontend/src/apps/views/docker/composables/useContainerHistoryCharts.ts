@@ -1,4 +1,5 @@
 import type * as dockerType from '@/api/interface/docker'
+import { formatPercent } from '@/utils/docker-format'
 import { nextTick, ref } from 'vue'
 import * as echarts from 'echarts/core'
 import { LineChart } from 'echarts/charts'
@@ -33,9 +34,11 @@ export const useContainerHistoryCharts = ({ t }: UseContainerHistoryChartsOption
   let networkHistoryChart: echarts.ECharts | null = null
   let historyResizeObserver: ResizeObserver | null = null
 
-  const formatPercent = (value?: number) => {
-    if (value === undefined) return '0.0%'
-    return `${Math.max(value, 0).toFixed(1)}%`
+  const formatPercentAxis = (value: number) => {
+    const normalized = Math.max(value, 0)
+    if (normalized === 0) return '0%'
+    if (normalized < 1) return `${Number(normalized.toPrecision(2))}%`
+    return `${normalized.toFixed(0)}%`
   }
 
   const formatBytes = (bytes?: number) => {
@@ -118,7 +121,7 @@ export const useContainerHistoryCharts = ({ t }: UseContainerHistoryChartsOption
       type: 'value',
       min: 0,
       axisLabel: {
-        formatter: (val: number) => `${val.toFixed(0)}%`,
+        formatter: (val: number) => formatPercentAxis(val),
         fontSize: 10,
         color: '#6c757d',
       },

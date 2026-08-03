@@ -12,11 +12,13 @@ export { formatBytes } from '@/utils/units'
 
 /**
  * 格式化百分比数值为带 % 后缀的字符串。
- * @param value 百分比数值 (0-100)
+ * @param value 百分比数值；多核 CPU 指标允许超过 100
  */
 export const formatPercent = (value?: number): string => {
-  if (value === undefined) return '0.0%'
-  return `${Math.min(Math.max(value, 0), 100).toFixed(1)}%`
+  if (value === undefined || !Number.isFinite(value)) return '0.0%'
+  const normalized = Math.max(value, 0)
+  if (normalized > 0 && normalized < 0.1) return '<0.1%'
+  return `${normalized.toFixed(1)}%`
 }
 
 /**
