@@ -249,14 +249,19 @@ function buildTrendOption(
       borderColor: getCssVar('--sdl-border-default') || '#202B40',
       textStyle: { color: getCssVar('--sdl-text-primary') || '#E6EDF7' },
       formatter: (
-        params: Array<{ seriesName: string; data: number | null; dataIndex: number }>,
+        params: Array<{
+          seriesName: string
+          marker: string
+          data: number | null
+          dataIndex: number
+        }>,
       ) => {
         const first = params[0]
         if (!first) return ''
         const lines = params.map((item) =>
           item.data === null || item.data === undefined
-            ? `${item.seriesName}: -`
-            : `${item.seriesName}: ${formatTrendValue(item.data)}`,
+            ? `${item.marker}${item.seriesName}: -`
+            : `${item.marker}${item.seriesName}: ${formatTrendValue(item.data)}`,
         )
         return [formatTimestamp(timestamps[first.dataIndex], true), ...lines].join('<br/>')
       },
