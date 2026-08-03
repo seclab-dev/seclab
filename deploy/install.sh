@@ -46,6 +46,49 @@ command_exists() {
   command -v "$1" >/dev/null 2>&1
 }
 
+capture_running_suite_socket_containers() {
+  local socket_path="$1"
+  RUNNING_SUITE_SOCKET_CONTAINERS=()
+  command_exists docker || return 0
+
+  local container_id
+  while IFS= read -r container_id; do
+    [[ -n "$container_id" ]] || continue
+    local mount_sources
+    mount_sources="$($PREFIX docker inspect --format '{{range .Mounts}}{{println .Source}}{{end}}' "$container_id" 2>/dev/null || true)"
+    if grep -Fxq "$socket_path" <<<"$mount_sources"; then
+      RUNNING_SUITE_SOCKET_CONTAINERS+=("$container_id")
+    fi
+  done < <($PREFIX docker ps --quiet --filter 'label=seclab.owner=suite')
+}
+
+stop_running_suite_socket_containers() {
+  if (( ${#RUNNING_SUITE_SOCKET_CONTAINERS[@]} == 0 )); then
+    return 0
+  fi
+  log "stop suite containers bound to the current Agent socket: ${#RUNNING_SUITE_SOCKET_CONTAINERS[@]}"
+  $PREFIX docker stop "${RUNNING_SUITE_SOCKET_CONTAINERS[@]}" >/dev/null
+}
+
+wait_for_agent_socket() {
+  local socket_path="$1"
+  for _ in {1..30}; do
+    if $PREFIX systemctl is-active --quiet seclab-agent && $PREFIX test -S "$socket_path"; then
+      return 0
+    fi
+    sleep 1
+  done
+  fail "seclab-agent did not create a ready Unix socket within 30 seconds: $socket_path"
+}
+
+restore_running_suite_socket_containers() {
+  if (( ${#RUNNING_SUITE_SOCKET_CONTAINERS[@]} == 0 )); then
+    return 0
+  fi
+  log "restore suite containers with the new Agent socket: ${#RUNNING_SUITE_SOCKET_CONTAINERS[@]}"
+  $PREFIX docker start "${RUNNING_SUITE_SOCKET_CONTAINERS[@]}" >/dev/null
+}
+
 random_chars() {
   local length="$1"
   local charset="$2"
@@ -405,6 +448,7 @@ SECLAB_DB_DIR="${SECLAB_HOME}/database"
 SECLAB_LOG_DIR="${SECLAB_HOME}/logs"
 SECLAB_RUN_DIR="${SECLAB_HOME}/run"
 SECLAB_AGENT_SOCKET="${SECLAB_RUN_DIR}/seclab-agent.sock"
+RUNNING_SUITE_SOCKET_CONTAINERS=()
 
 DEFAULT_ADMIN_USERNAME="seclab"
 DEFAULT_ADMIN_PASSWORD="$(random_chars 16 'A-Za-z0-9!@#$%^&*')"
@@ -430,6 +474,8 @@ fi
 validate_safe_entry "$SAFE_ENTRY" || fail "Safe entry must be 8-32 ASCII letters or digits and must not use a reserved path prefix"
 
 if [[ "$installed" == "true" ]]; then
+  capture_running_suite_socket_containers "$SECLAB_AGENT_SOCKET"
+  stop_running_suite_socket_containers
   log "Stopping existing SecLab services for overwrite..."
   $PREFIX systemctl stop seclab >/dev/null 2>&1 || true
   $PREFIX systemctl stop seclab-agent >/dev/null 2>&1 || true
@@ -604,7 +650,9 @@ log "seclab service started"
 
 log "start service: seclab-agent"
 $PREFIX systemctl enable --now seclab-agent >/dev/null 2>&1
+wait_for_agent_socket "$SECLAB_AGENT_SOCKET"
 log "agent service started"
+restore_running_suite_socket_containers
 
 log_section "== install completed"
 echo "SecLab initial login information:"
