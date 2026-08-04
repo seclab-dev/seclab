@@ -95,7 +95,7 @@ pnpm -C frontend build
 版本同步：
 
 ```bash
-pnpm version:set 0.1.0-alpha.1
+./scripts/set-version.sh 0.1.0-alpha.1
 ```
 
 ## 文档
