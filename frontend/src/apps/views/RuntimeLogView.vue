@@ -13,6 +13,7 @@ import {
   SecLabLoading,
   SecLabSelect,
   SecLabTag,
+  SecLabTooltip,
 } from '@/components/ui'
 
 const { t } = useI18n()
@@ -31,6 +32,7 @@ const nextCursor = ref<string>()
 const hasMore = ref(false)
 const scanTruncated = ref(false)
 const filtersExpanded = ref(false)
+const truncatedFields = reactive(new Set<string>())
 let filesSequence = 0
 let querySequence = 0
 let filesController: AbortController | undefined
@@ -83,11 +85,10 @@ function formatBytes(value: number) {
   return `${size.toFixed(size >= 10 ? 0 : 1)} ${units[index]}`
 }
 function formatTime(value?: string) {
-  return value
-    ? new Intl.DateTimeFormat(undefined, { dateStyle: 'short', timeStyle: 'medium' }).format(
-        new Date(value),
-      )
-    : ''
+  if (!value) return ''
+  const date = new Date(value)
+  const pad = (part: number) => String(part).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
 }
 function levelTag(level?: string) {
   const value = level?.toUpperCase()
@@ -99,6 +100,14 @@ function levelTag(level?: string) {
         ? 'info'
         : 'default'
 }
+
+/** 根据当前网格列宽更新日志字段的截断状态。 */
+function updateFieldTruncation(event: PointerEvent, fieldKey: string) {
+  const wrapper = event.currentTarget as HTMLElement
+  const field = wrapper.querySelector<HTMLElement>('[data-slot="log-field"]')
+  if (field && field.scrollWidth > field.clientWidth) truncatedFields.add(fieldKey)
+  else truncatedFields.delete(fieldKey)
+}
 async function loadFiles() {
   const sequence = ++filesSequence
   filesController?.abort()
@@ -106,6 +115,7 @@ async function loadFiles() {
   filesController = new AbortController()
   filesLoading.value = true
   filesError.value = ''
+  truncatedFields.clear()
   lines.value = []
   nextCursor.value = undefined
   hasMore.value = false
@@ -172,6 +182,7 @@ async function queryLogs(loadMore = false) {
       }
       throw new Error(response.message)
     }
+    if (!loadMore) truncatedFields.clear()
     lines.value = loadMore ? [...lines.value, ...response.data.lines] : response.data.lines
     nextCursor.value = response.data.nextCursor
     hasMore.value = response.data.hasMore
@@ -366,11 +377,29 @@ onBeforeUnmount(() => {
           data-slot="log-line"
         >
           <time>{{ formatTime(line.timestamp) }}</time>
-          <SecLabTag :type="levelTag(line.level)">{{
-            line.level || t('app.runtimeLog.unparsed')
-          }}</SecLabTag>
-          <span class="target">{{ line.target || '' }}</span>
-          <span class="message">{{ line.message }}</span>
+          <div class="level-cell" data-slot="log-level">
+            <SecLabTag :type="levelTag(line.level)">{{
+              line.level || t('app.runtimeLog.unparsed')
+            }}</SecLabTag>
+          </div>
+          <SecLabTooltip
+            class="log-field-tooltip target-tooltip"
+            :text="line.target || ''"
+            :disabled="!line.target || !truncatedFields.has(`${line.offset}:target`)"
+            position="bottom"
+            @pointerover.capture="updateFieldTruncation($event, `${line.offset}:target`)"
+          >
+            <span class="target" data-slot="log-field">{{ line.target || '' }}</span>
+          </SecLabTooltip>
+          <SecLabTooltip
+            class="log-field-tooltip"
+            :text="line.message"
+            :disabled="!truncatedFields.has(`${line.offset}:message`)"
+            position="bottom"
+            @pointerover.capture="updateFieldTruncation($event, `${line.offset}:message`)"
+          >
+            <span class="message" data-slot="log-field">{{ line.message }}</span>
+          </SecLabTooltip>
         </div>
         <div class="load-more" data-slot="load-more">
           <SecLabButton v-if="hasMore" :loading="queryLoading" @click="queryLogs(true)">{{
@@ -454,9 +483,9 @@ onBeforeUnmount(() => {
 }
 .log-line {
   display: grid;
-  grid-template-columns: 165px 74px minmax(120px, 220px) minmax(320px, 1fr);
-  align-items: start;
-  gap: var(--sdl-space-2);
+  grid-template-columns: 19ch 74px 25ch minmax(0, 1fr);
+  align-items: center;
+  gap: var(--sdl-space-4);
   padding: var(--sdl-space-2) var(--sdl-space-3);
   border-bottom: 1px solid var(--sdl-border-subtle);
 }
@@ -464,12 +493,22 @@ onBeforeUnmount(() => {
 .target {
   color: var(--sdl-text-muted);
 }
-.log-line > .target {
-  margin-inline-start: var(--sdl-space-8);
-}
+.log-line time,
+.log-field-tooltip,
+.target,
 .message {
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.target,
+.message {
+  display: block;
+}
+.level-cell {
+  display: flex;
+  justify-content: center;
 }
 .load-more {
   display: flex;

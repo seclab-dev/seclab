@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { nodesApi } from '@/api/modules/nodes'
 import { runtimeLogApi } from '@/api/modules/runtime-log'
 import RuntimeLogView from '@/apps/views/RuntimeLogView.vue'
+import { SecLabTooltip } from '@/components/ui'
 import en from '@/locales/en'
 import zh from '@/locales/zh'
 
@@ -50,6 +51,80 @@ describe('RuntimeLogView', () => {
     expect(wrapper.find('#runtime-log-target').attributes('name')).toBe('runtimeLogTarget')
     expect(wrapper.find('#runtime-log-keyword').attributes('name')).toBe('runtimeLogKeyword')
     expect(actions.find('button').attributes('aria-expanded')).toBe('true')
+    wrapper.unmount()
+  })
+
+  it('保持日志单行布局并仅为被截断的字段启用完整内容气泡', async () => {
+    const target = 'seclab_agent::api::docker::containers'
+    const message = '这是一条宽度不足时必须保持单行并省略显示的长日志消息'
+    vi.mocked(nodesApi.list).mockResolvedValue({
+      success: true,
+      code: 200,
+      message: '',
+      data: [],
+    })
+    vi.mocked(runtimeLogApi.files).mockResolvedValue({
+      success: true,
+      code: 200,
+      message: '',
+      data: {
+        availability: 'available',
+        files: [
+          {
+            service: 'master',
+            fileId: 'master-current',
+            fileVersion: '1',
+            fileName: 'seclab.log',
+            sizeBytes: 1024,
+          },
+        ],
+      },
+    })
+    vi.mocked(runtimeLogApi.query).mockResolvedValue({
+      success: true,
+      code: 200,
+      message: '',
+      data: {
+        lines: [
+          {
+            offset: 1,
+            timestamp: '2026-08-04T03:02:01',
+            level: 'INFO',
+            target,
+            message,
+            parseError: false,
+          },
+        ],
+        hasMore: false,
+        scanTruncated: false,
+        fileVersion: '1',
+      },
+    })
+
+    const wrapper = mountView()
+    await flushPromises()
+    await wrapper.findAll('[data-ui="toolbar-actions"] button')[1].trigger('click')
+    await flushPromises()
+
+    const fields = wrapper.findAll<HTMLElement>('[data-slot="log-field"]')
+    Object.defineProperties(fields[0].element, {
+      clientWidth: { configurable: true, value: 160 },
+      scrollWidth: { configurable: true, value: 320 },
+    })
+    Object.defineProperties(fields[1].element, {
+      clientWidth: { configurable: true, value: 260 },
+      scrollWidth: { configurable: true, value: 520 },
+    })
+    await fields[0].trigger('pointerover')
+    await fields[1].trigger('pointerover')
+
+    const tooltips = wrapper.findAllComponents(SecLabTooltip)
+    expect(tooltips.map((tooltip) => tooltip.props('text'))).toEqual([target, message])
+    expect(tooltips.every((tooltip) => tooltip.props('disabled') === false)).toBe(true)
+    expect(wrapper.find('time').text()).toBe('2026-08-04 03:02:01')
+    expect(wrapper.find('[data-slot="log-level"]').exists()).toBe(true)
+    expect(fields[0].text()).toBe(target)
+    expect(fields[1].text()).toBe(message)
     wrapper.unmount()
   })
 })
