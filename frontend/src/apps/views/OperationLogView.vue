@@ -29,7 +29,7 @@ import {
 } from '@/components/ui'
 import type { SecLabTableColumn } from '@/components/ui/SecLabTable.vue'
 
-const { t, te } = useI18n()
+const { t, te, locale } = useI18n()
 const nodeStore = useNodeStore()
 const props = defineProps<{
   module?: OperationModule
@@ -137,7 +137,7 @@ const detailItems = computed(() => {
   const value = detail.value
   return [
     { label: t('app.operationLog.columns.time'), value: formatTime(value.occurredAt) },
-    { label: t('app.operationLog.columns.operation'), value: eventLabel(value.eventCode) },
+    { label: t('app.operationLog.columns.operation'), value: eventLabel(value) },
     { label: t('app.operationLog.columns.actor'), value: actorLabel(value.actor) },
     { label: t('app.operationLog.columns.originNode'), value: originNodeLabel(value) },
     ...(value.clientIp
@@ -202,9 +202,12 @@ function label(group: string, value: string) {
   const key = `app.operationLog.${group}.${value}`
   return te(key) ? t(key) : value
 }
-function eventLabel(value: string) {
-  const key = `app.operationLog.events.${value}`
-  return te(key) ? t(key) : value.replaceAll('_', ' ')
+function eventLabel(value: Pick<OperationLogSummary, 'eventCode' | 'eventLabel'>) {
+  if (value.eventLabel) {
+    return locale.value === 'en' ? value.eventLabel.enUs : value.eventLabel.zhCn
+  }
+  const key = `app.operationLog.events.${value.eventCode}`
+  return te(key) ? t(key) : value.eventCode.replaceAll('_', ' ')
 }
 function actorLabel(actor: OperationLogSummary['actor']) {
   if (actor.kind === 'anonymous') return t('app.operationLog.actorKinds.anonymous')
@@ -553,7 +556,7 @@ onBeforeUnmount(() => {
           <span data-ui="origin-node">{{ originNodeLabel(row) }}</span>
         </template>
         <template #operation="{ row }: { row: OperationLogSummary }">{{
-          eventLabel(row.eventCode)
+          eventLabel(row)
         }}</template>
         <template #outcome="{ row }: { row: OperationLogSummary }"
           ><SecLabTag :type="outcomeTag(row.outcome)">{{

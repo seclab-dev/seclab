@@ -214,10 +214,7 @@ struct SuiteRuntimeLog<'a> {
 async fn finish_suite_runtime_log(state: &Arc<AppState>, log: SuiteRuntimeLog<'_>) {
     let context = log.context;
     let event_code = suite_event_code(log.event);
-    let high_impact = matches!(
-        event_code,
-        "suite.uninstall" | "suite.install.cancelled" | "suite.image.pull.cancelled"
-    );
+    let high_impact = matches!(event_code, "suite_uninstall" | "suite_install_canceled");
     let _ = log.request_path;
     if let Some(error) = log.error {
         context
@@ -244,14 +241,11 @@ async fn finish_suite_runtime_log(state: &Arc<AppState>, log: SuiteRuntimeLog<'_
 
 fn suite_event_code(event: &str) -> &str {
     match event {
-        "suite_runtime_install" => "suite.install",
-        "suite_runtime_install_canceled" => "suite.install.cancelled",
-        "suite_runtime_enable" => "suite.enable",
-        "suite_runtime_disable" => "suite.disable",
-        "suite_runtime_uninstall" => "suite.uninstall",
-        "suite_network_create" => "suite.network.create",
-        "suite_image_pull" => "suite.image.pull",
-        "suite_image_pull_canceled" => "suite.image.pull.cancelled",
+        "suite_runtime_install" => "suite_install",
+        "suite_runtime_install_canceled" => "suite_install_canceled",
+        "suite_runtime_enable" => "suite_enable",
+        "suite_runtime_disable" => "suite_disable",
+        "suite_runtime_uninstall" => "suite_uninstall",
         other => other,
     }
 }
@@ -301,11 +295,11 @@ pub async fn install_suite(
         error: None,
         cancel_requested: false,
     });
-    ensure_suite_network(&state, &context, Some(&payload.compose_project_name)).await?;
+    ensure_suite_network(&state).await?;
 
     let dir = suite_project_dir(&payload.compose_project_name);
     ensure_suite_project_available(&state, &payload.compose_project_name, &dir).await?;
-    let result = install_suite_inner(&state, &context, &payload, &dir).await;
+    let result = install_suite_inner(&state, &payload, &dir).await;
     if let Err(err) = result {
         let canceled = is_install_cancel_requested(&payload.instance_id);
         update_install_progress(
@@ -443,7 +437,6 @@ fn is_install_cancel_requested(instance_id: &str) -> bool {
 /// 执行套件安装事务，只有镜像全部可用后才持久化 Agent 元数据。
 async fn install_suite_inner(
     state: &Arc<AppState>,
-    context: &DockerOperationContext,
     payload: &SuiteInstallRequest,
     dir: &FsPath,
 ) -> ApiResult<()> {
@@ -478,7 +471,7 @@ async fn install_suite_inner(
         tokio::fs::write(&compose_target, compose_text).await?;
     }
     let agent_access = prepare_suite_runtime_files(state, payload, dir).await?;
-    prepare_compose_images(state, context, payload, &compose_target).await?;
+    prepare_compose_images(state, payload, &compose_target).await?;
     ensure_install_not_canceled(&payload.instance_id)?;
 
     let metadata = SuiteAgentMetadata {
@@ -565,7 +558,7 @@ pub async fn enable_suite(
     Json(payload): Json<SuiteActionRequest>,
 ) -> ApiResult<Response> {
     validate_suite_project(&project, &payload.compose_project_name)?;
-    ensure_suite_network(&state, &context, Some(&payload.compose_project_name)).await?;
+    ensure_suite_network(&state).await?;
     rotate_suite_runtime_token(&project, true).await?;
     let compose_file = suite_project_dir(&project).join(COMPOSE_FILE_NAME);
     let result =
@@ -771,6 +764,7 @@ async fn wait_for_suite_entry_ready(
 /// 代理套件 Web 入口。
 pub async fn proxy_suite_entry(
     State(state): State<Arc<AppState>>,
+    context: DockerOperationContext,
     OriginalUri(uri): OriginalUri,
     Path(path): Path<SuiteProxyPath>,
     method: Method,
@@ -780,6 +774,19 @@ pub async fn proxy_suite_entry(
     validate_project_name(&path.project)?;
     validate_id("entry_id", &path.entry_id)?;
     let metadata = read_suite_metadata(&path.project).await?;
+    let operation_context_id = if matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
+        Some(
+            crate::api::suite_operation_logs::issue_operation_context(
+                &state.metadata_db,
+                &metadata.suite_id,
+                &metadata.instance_id,
+                &context,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let entry = metadata
         .app_entries
         .iter()
@@ -812,10 +819,16 @@ pub async fn proxy_suite_entry(
     let client = reqwest::Client::new();
     let mut request = client.request(method, target_url.clone());
     for (name, value) in headers.iter() {
-        if name.as_str().eq_ignore_ascii_case("host") {
+        if name.as_str().eq_ignore_ascii_case("host") || name.as_str().starts_with("x-seclab-") {
             continue;
         }
         request = request.header(name, value);
+    }
+    if let Some(operation_context_id) = operation_context_id {
+        request = request.header(
+            crate::api::suite_operation_logs::SUITE_OPERATION_CONTEXT_HEADER,
+            operation_context_id,
+        );
     }
     let body_stream = body
         .into_data_stream()
@@ -925,11 +938,7 @@ fn strip_hop_by_hop_headers(headers: &mut HeaderMap) {
     headers.remove(HeaderName::from_static("keep-alive"));
 }
 
-async fn ensure_suite_network(
-    state: &Arc<AppState>,
-    context: &DockerOperationContext,
-    compose_project_name: Option<&str>,
-) -> ApiResult<()> {
+async fn ensure_suite_network(state: &Arc<AppState>) -> ApiResult<()> {
     let docker = state.docker_client().await?;
     let labels = suite_network_labels();
     if let Ok(network) = docker
@@ -967,26 +976,7 @@ async fn ensure_suite_network(
         labels: Some(labels),
         ..Default::default()
     };
-    let result = docker.create_network(request).await;
-    let error = result.as_ref().err().map(ToString::to_string);
-    finish_suite_runtime_log(
-        state,
-        SuiteRuntimeLog {
-            event: "suite_network_create",
-            target_type: "docker_network",
-            target_id: SUITE_NETWORK_NAME,
-            context,
-            request_path: "/api/v1/agent/docker/suites/install",
-            metadata: json!({
-                "network": SUITE_NETWORK_NAME,
-                "driver": "bridge",
-                "compose_project_name": compose_project_name,
-            }),
-            error: error.as_deref(),
-        },
-    )
-    .await;
-    result?;
+    docker.create_network(request).await?;
     Ok(())
 }
 
@@ -1284,7 +1274,10 @@ fn validate_agent_access(access: Option<&SuiteAgentAccess>) -> ApiResult<()> {
         validate_id("suite Agent service", service)?;
     }
     for capability in &access.capabilities {
-        if !matches!(capability.as_str(), "workloads.manage" | "captures.manage") {
+        if !matches!(
+            capability.as_str(),
+            "workloads.manage" | "captures.manage" | "operation-logs.write"
+        ) {
             return Err(ApiError::BadRequest(format!(
                 "unsupported suite Agent capability: {capability}"
             )));
@@ -1383,7 +1376,6 @@ fn validate_suite_project(path_project: &str, payload_project: &str) -> ApiResul
 /// 解析 Compose 中的镜像，并确保每个镜像在目标节点本地可用。
 async fn prepare_compose_images(
     state: &Arc<AppState>,
-    context: &DockerOperationContext,
     payload: &SuiteInstallRequest,
     compose_file: &FsPath,
 ) -> ApiResult<()> {
@@ -1427,7 +1419,7 @@ async fn prepare_compose_images(
     let image_count = images.len().max(1);
     for (index, image) in images.iter().enumerate() {
         ensure_install_not_canceled(&payload.instance_id)?;
-        ensure_image_available(state, context, payload, image, index, image_count).await?;
+        ensure_image_available(state, payload, image, index, image_count).await?;
     }
     Ok(())
 }
@@ -1460,7 +1452,6 @@ fn collect_install_images(
 /// 本地镜像存在时直接复用，否则从镜像仓库拉取固定版本镜像。
 async fn ensure_image_available(
     state: &Arc<AppState>,
-    context: &DockerOperationContext,
     payload: &SuiteInstallRequest,
     image: &str,
     image_index: usize,
@@ -1495,13 +1486,12 @@ async fn ensure_image_available(
     }
 
     ensure_install_not_canceled(&payload.instance_id)?;
-    pull_image_with_progress(state, context, payload, image, image_index, image_count).await
+    pull_image_with_progress(state, payload, image, image_index, image_count).await
 }
 
 /// 通过 Docker API 拉取镜像，并把 pull stream 转换为套件安装进度。
 async fn pull_image_with_progress(
     state: &Arc<AppState>,
-    context: &DockerOperationContext,
     payload: &SuiteInstallRequest,
     image: &str,
     image_index: usize,
@@ -1542,36 +1532,6 @@ async fn pull_image_with_progress(
     .await
     .map_err(|err| ApiError::BadRequest(format!("suite image `{image}` pull failed: {err}")));
 
-    let error = result.as_ref().err().map(ToString::to_string);
-    let canceled = error
-        .as_deref()
-        .is_some_and(is_suite_install_canceled_error);
-    finish_suite_runtime_log(
-        state,
-        SuiteRuntimeLog {
-            event: if canceled {
-                "suite_image_pull_canceled"
-            } else {
-                "suite_image_pull"
-            },
-            target_type: "docker_image",
-            target_id: image,
-            context,
-            request_path: "/api/v1/agent/docker/suites/install",
-            metadata: json!({
-                "suite_id": payload.suite_id,
-                "version": payload.version,
-                "instance_id": payload.instance_id,
-                "compose_project_name": payload.compose_project_name,
-                "image": image,
-                "image_index": image_index + 1,
-                "image_count": image_count,
-                "canceled": canceled,
-            }),
-            error: if canceled { None } else { error.as_deref() },
-        },
-    )
-    .await;
     result?;
 
     update_install_progress(
@@ -1646,7 +1606,22 @@ async fn run_compose_command(project: &str, compose_file: &FsPath, args: &[&str]
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_install_images, parse_compose_images};
+    use super::{collect_install_images, parse_compose_images, suite_event_code};
+
+    #[test]
+    fn suite_lifecycle_events_use_registered_operation_codes() {
+        assert_eq!(suite_event_code("suite_runtime_install"), "suite_install");
+        assert_eq!(suite_event_code("suite_runtime_enable"), "suite_enable");
+        assert_eq!(
+            suite_event_code("suite_runtime_install_canceled"),
+            "suite_install_canceled"
+        );
+        assert_eq!(suite_event_code("suite_runtime_disable"), "suite_disable");
+        assert_eq!(
+            suite_event_code("suite_runtime_uninstall"),
+            "suite_uninstall"
+        );
+    }
 
     #[test]
     fn parse_compose_images_removes_blank_lines_and_duplicates() {

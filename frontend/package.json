@@ -15,6 +15,7 @@
     "build-only": "vite build",
     "type-check": "pnpm run generate:contracts && vue-tsc --build",
     "lint:eslint": "eslint . --fix --cache",
+    "lint:i18n": "node ../scripts/check-i18n-usage.mjs",
     "lint": "run-s lint:*",
     "format": "prettier --write src/",
     "sync:contracts": "pnpm run generate:contracts"

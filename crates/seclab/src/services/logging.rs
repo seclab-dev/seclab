@@ -1,4 +1,4 @@
-//! 操作审计服务：事件归一化、best-effort 队列、查询与保留清理。
+//! 操作审计服务：事件归一化、持久化发件箱、查询与保留清理。
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -9,17 +9,18 @@ use std::{
 use axum::http::HeaderMap;
 use chrono::{DateTime, Duration, Utc};
 use seclab_contracts::logging::{
-    AgentOperationEvent, OperationActor, OperationActorKind, OperationImpact, OperationItemStatus,
-    OperationLogCapabilities, OperationLogDetail, OperationLogItem, OperationLogPage,
-    OperationLogQuery, OperationLogSummary, OperationModule, OperationOrigin, OperationOriginKind,
-    OperationOutcome, OperationParameterValue, OperationTarget,
+    AgentOperationEvent, OperationActor, OperationActorKind, OperationEventLabel, OperationImpact,
+    OperationItemStatus, OperationLogCapabilities, OperationLogDetail, OperationLogItem,
+    OperationLogPage, OperationLogQuery, OperationLogSummary, OperationModule, OperationOrigin,
+    OperationOriginKind, OperationOutcome, OperationParameterValue, OperationTarget,
 };
 use seclab_contracts::notification::{
     NotificationAttentionLevel, NotificationCategory, NotificationCode,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{FromRow, QueryBuilder, Sqlite, Transaction};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 use tracing::{error, warn};
 
 use crate::{
@@ -28,15 +29,16 @@ use crate::{
     types::{ApiError, new_uuid_v7},
 };
 
-const QUEUE_CAPACITY: usize = 2_048;
 const MAX_ERROR_SUMMARY_BYTES: usize = 512;
+const OUTBOX_BATCH_SIZE: i64 = 100;
+const OUTBOX_DELIVERED_RETENTION_DAYS: i64 = 7;
 const RETENTION_DAYS: i64 = 180;
 const RUNTIME_RETENTION_DAYS: i64 = 30;
 const RUNTIME_REGISTER_SUMMARY_MINUTES: i64 = 10;
 const RUNTIME_REGISTER_IDLE_MINUTES: i64 = 60;
 const RUNTIME_REGISTER_MAX_IDENTITIES: usize = 4_096;
 const INCREMENTAL_VACUUM_MAX_PAGES: i64 = 1_024;
-static WRITER: OnceLock<mpsc::Sender<StoredOperationEvent>> = OnceLock::new();
+static OUTBOX_POOL: OnceLock<DbPool> = OnceLock::new();
 static RUNTIME_REGISTER_AGGREGATOR: OnceLock<Mutex<RuntimeRegisterAggregator>> = OnceLock::new();
 static NOTIFICATION_CHANGES: OnceLock<broadcast::Sender<i64>> = OnceLock::new();
 
@@ -57,17 +59,18 @@ pub fn publish_notification_change(recipient_user_id: i64) {
     let _ = notification_changes().send(recipient_user_id);
 }
 
-/// 初始化进程内唯一的操作日志写入队列。
+/// 初始化操作日志持久化发件箱消费者。
 pub fn init_operation_log_writer(pool: DbPool) {
-    let (sender, mut receiver) = mpsc::channel::<StoredOperationEvent>(QUEUE_CAPACITY);
-    if WRITER.set(sender).is_err() {
+    if OUTBOX_POOL.set(pool.clone()).is_err() {
         return;
     }
     tokio::spawn(async move {
-        while let Some(mut event) = receiver.recv().await {
-            enrich_target_display_name(&pool, &mut event).await;
-            if let Err(err) = insert_event(&pool, &event).await {
-                error!(event_id = %event.event_id, error = %err, "Operation audit event write failed");
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            if let Err(err) = deliver_outbox_batch(&pool).await {
+                error!(error = %err, "Operation audit outbox delivery failed");
             }
         }
     });
@@ -103,6 +106,7 @@ impl OperationEventBuilder {
                 occurred_at: Utc::now().to_rfc3339(),
                 module,
                 event_code: normalize_event_code(event_code),
+                event_label: None,
                 actor_kind: if display_name == "anonymous" {
                     "anonymous"
                 } else if display_name == "system" {
@@ -256,33 +260,33 @@ impl OperationEventBuilder {
         self
     }
 
-    /// 非阻塞提交到统一队列；队列不可用时只记录运行警告，不改变业务结果。
-    pub fn finish(mut self, _pool: &DbPool) {
+    /// 非阻塞提交到持久化发件箱，不依赖进程内队列或全局初始化状态。
+    pub fn finish(mut self, pool: &DbPool) {
         self.prepare_for_storage();
-        enqueue_event(self.event);
+        spawn_outbox_persist(pool.clone(), self.event);
     }
 
     /// 聚合相同身份与原因的连续运行时注册失败。
-    pub fn finish_runtime_register_failure(mut self, _pool: &DbPool) {
+    pub fn finish_runtime_register_failure(mut self, pool: &DbPool) {
         self.prepare_for_storage();
         let events = runtime_register_aggregator()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .record_failure(self.event, Utc::now());
         for event in events {
-            enqueue_event(event);
+            spawn_outbox_persist(pool.clone(), event);
         }
     }
 
     /// 刷新当前身份的注册失败汇总后记录恢复成功。
-    pub fn finish_runtime_register_success(mut self, _pool: &DbPool) {
+    pub fn finish_runtime_register_success(mut self, pool: &DbPool) {
         self.prepare_for_storage();
         let events = runtime_register_aggregator()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .record_success(self.event, Utc::now());
         for event in events {
-            enqueue_event(event);
+            spawn_outbox_persist(pool.clone(), event);
         }
     }
 
@@ -297,13 +301,102 @@ impl OperationEventBuilder {
     }
 }
 
-/// 将审计事件以 best-effort 方式提交到单一写入队列。
+/// 将审计事件提交到持久化发件箱；写入失败保留运行日志告警。
 fn enqueue_event(event: StoredOperationEvent) {
-    match WRITER.get() {
-        Some(sender) if sender.try_send(event).is_ok() => {}
-        Some(_) => warn!("Operation audit queue is full; event was dropped"),
-        None => warn!("Operation audit queue is not initialized; event was dropped"),
+    let Some(pool) = OUTBOX_POOL.get().cloned() else {
+        warn!("Operation audit outbox is not initialized; event was not persisted");
+        return;
+    };
+    spawn_outbox_persist(pool, event);
+}
+
+/// 异步写入持久化发件箱；数据库错误会显式记录，后续调用不受内存背压影响。
+fn spawn_outbox_persist(pool: DbPool, event: StoredOperationEvent) {
+    tokio::spawn(async move {
+        if let Err(error) = persist_outbox_event(&pool, &event).await {
+            error!(event_id = %event.event_id, %error, "Operation audit event could not be persisted");
+        }
+    });
+}
+
+/// 直接持久化事件，供必须等待审计落盘的调用点使用。
+pub async fn persist_event(builder: OperationEventBuilder, pool: &DbPool) -> Result<(), ApiError> {
+    let mut builder = builder;
+    builder.prepare_for_storage();
+    persist_outbox_event(pool, &builder.event).await
+}
+
+async fn persist_outbox_event(pool: &DbPool, event: &StoredOperationEvent) -> Result<(), ApiError> {
+    let payload = serde_json::to_string(event).map_err(|error| {
+        ApiError::internal(format!("failed to serialize operation event: {error}"))
+    })?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO operation_event_outbox \
+         (event_id,event_json,created_at,next_attempt_at) VALUES (?,?,?,?)",
+    )
+    .bind(&event.event_id)
+    .bind(payload)
+    .bind(&event.occurred_at)
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn deliver_outbox_batch(pool: &DbPool) -> Result<(), ApiError> {
+    let now = Utc::now();
+    let rows = sqlx::query_as::<_, OperationOutboxRow>(
+        "SELECT event_id,event_json FROM operation_event_outbox \
+         WHERE delivered_at IS NULL AND next_attempt_at <= ? \
+         ORDER BY created_at,event_id LIMIT ?",
+    )
+    .bind(now.to_rfc3339())
+    .bind(OUTBOX_BATCH_SIZE)
+    .fetch_all(pool)
+    .await?;
+    for row in rows {
+        let mut event = match serde_json::from_str::<StoredOperationEvent>(&row.event_json) {
+            Ok(event) => event,
+            Err(error) => {
+                mark_outbox_failure(pool, &row.event_id, &error.to_string()).await?;
+                continue;
+            }
+        };
+        enrich_target_display_name(pool, &mut event).await;
+        match insert_event(pool, &event).await {
+            Ok(()) => {
+                sqlx::query(
+                    "UPDATE operation_event_outbox SET delivered_at=?,last_error=NULL WHERE event_id=?",
+                )
+                .bind(Utc::now().to_rfc3339())
+                .bind(&row.event_id)
+                .execute(pool)
+                .await?;
+            }
+            Err(error) => mark_outbox_failure(pool, &row.event_id, &error.to_string()).await?,
+        }
     }
+    let cutoff = (now - Duration::days(OUTBOX_DELIVERED_RETENTION_DAYS)).to_rfc3339();
+    sqlx::query(
+        "DELETE FROM operation_event_outbox WHERE delivered_at IS NOT NULL AND delivered_at < ?",
+    )
+    .bind(cutoff)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn mark_outbox_failure(pool: &DbPool, event_id: &str, detail: &str) -> Result<(), ApiError> {
+    sqlx::query(
+        "UPDATE operation_event_outbox SET attempts=attempts+1,last_error=?, \
+         next_attempt_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','+' || min(300, 2 << min(attempts,7)) || ' seconds') \
+         WHERE event_id=?",
+    )
+    .bind(redact_error(detail))
+    .bind(event_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// 返回进程内唯一的运行时注册失败聚合器。
@@ -573,6 +666,7 @@ pub async fn store_agent_event(
         occurred_at: event.occurred_at,
         module: event.module,
         event_code: normalize_event_code(&event.event_code),
+        event_label: event.event_label.map(sanitize_event_label),
         actor_kind: actor_kind_value(event.actor.kind).to_string(),
         actor_user_id: event.actor.user_id,
         actor_display_name: truncate(&event.actor.display_name, 128),
@@ -692,12 +786,13 @@ pub fn spawn_retention_worker(pool: DbPool) {
     });
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredOperationEvent {
     event_id: String,
     occurred_at: String,
     module: OperationModule,
     event_code: String,
+    event_label: Option<OperationEventLabel>,
     actor_kind: String,
     actor_user_id: Option<i64>,
     actor_display_name: String,
@@ -722,11 +817,19 @@ struct StoredOperationEvent {
 }
 
 #[derive(Debug, FromRow)]
+struct OperationOutboxRow {
+    event_id: String,
+    event_json: String,
+}
+
+#[derive(Debug, FromRow)]
 struct OperationLogRow {
     event_id: String,
     occurred_at: String,
     module: String,
     event_code: String,
+    event_label_zh: Option<String>,
+    event_label_en: Option<String>,
     actor_kind: String,
     actor_user_id: Option<i64>,
     actor_display_name: String,
@@ -807,6 +910,10 @@ impl OperationLogRow {
             occurred_at: self.occurred_at,
             module: parse_module(&self.module)?,
             event_code: self.event_code,
+            event_label: match (self.event_label_zh, self.event_label_en) {
+                (Some(zh_cn), Some(en_us)) => Some(OperationEventLabel { zh_cn, en_us }),
+                _ => None,
+            },
             actor: OperationActor {
                 kind: parse_actor_kind(&self.actor_kind)?,
                 user_id: self.actor_user_id,
@@ -848,8 +955,9 @@ impl OperationLogRow {
 
 async fn insert_event(pool: &DbPool, event: &StoredOperationEvent) -> Result<(), ApiError> {
     let mut transaction = pool.begin().await?;
-    let result = sqlx::query("INSERT OR IGNORE INTO operation_logs (event_id,occurred_at,module,event_code,actor_kind,actor_user_id,actor_display_name,origin_kind,origin_node_id,origin_node_name,target_kind,target_id,target_display_name,target_ownership,outcome,impact,trace_id,task_id,client_ip,request_method,route_template,parameters_json,error_code,error_summary) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    let result = sqlx::query("INSERT OR IGNORE INTO operation_logs (event_id,occurred_at,module,event_code,event_label_zh,event_label_en,actor_kind,actor_user_id,actor_display_name,origin_kind,origin_node_id,origin_node_name,target_kind,target_id,target_display_name,target_ownership,outcome,impact,trace_id,task_id,client_ip,request_method,route_template,parameters_json,error_code,error_summary) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
         .bind(&event.event_id).bind(&event.occurred_at).bind(event.module.as_str()).bind(&event.event_code)
+        .bind(event.event_label.as_ref().map(|label| &label.zh_cn)).bind(event.event_label.as_ref().map(|label| &label.en_us))
         .bind(&event.actor_kind).bind(event.actor_user_id).bind(&event.actor_display_name).bind(&event.origin_kind)
         .bind(&event.origin_node_id).bind(&event.origin_node_name).bind(&event.target_kind).bind(&event.target_id)
         .bind(&event.target_display_name).bind(&event.target_ownership).bind(event.outcome.as_str()).bind(event.impact.as_str())
@@ -1333,7 +1441,217 @@ fn push_filters(builder: &mut QueryBuilder<'_, Sqlite>, query: &OperationLogQuer
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct EventRegistration {
+    code: &'static str,
+    module: OperationModule,
+    high_impact: bool,
+}
+
+macro_rules! events {
+    ($module:ident, $high:expr, [$($code:literal),* $(,)?]) => {
+        &[$(EventRegistration { code: $code, module: OperationModule::$module, high_impact: $high }),*]
+    };
+}
+
+const REGISTERED_EVENT_GROUPS: &[&[EventRegistration]] = &[
+    events!(
+        Auth,
+        false,
+        ["user_login", "user_logout", "auth_username_update"]
+    ),
+    events!(Auth, true, ["auth_password_update"]),
+    events!(
+        Nodes,
+        false,
+        [
+            "node_deploy_create",
+            "node_update",
+            "node_deploy",
+            "node_repair",
+            "runtime_enroll",
+            "runtime_register",
+            "runtime_deregister",
+            "runtime_rotate_certificate",
+            "node_seclab_url_sync",
+        ]
+    ),
+    events!(
+        Nodes,
+        true,
+        ["node_remove", "node_retire", "node_uninstall"]
+    ),
+    events!(
+        Suites,
+        false,
+        [
+            "suite_import",
+            "suite_install",
+            "suite_install_start",
+            "suite_install_completed",
+            "suite_enable",
+        ]
+    ),
+    events!(
+        Suites,
+        true,
+        [
+            "suite_delete",
+            "suite_install_canceled",
+            "suite_install_failed",
+            "suite_disable",
+            "suite_uninstall",
+        ]
+    ),
+    events!(
+        Docker,
+        false,
+        [
+            "docker_engine_install",
+            "docker_compose_project_configuration_update",
+            "docker_compose_project_create",
+            "docker_compose_project_start",
+            "docker_compose_project_stop",
+            "docker_compose_project_restart",
+            "docker_compose_project_redeploy",
+            "docker_compose_project_scale",
+            "docker_container_create",
+            "docker_container_rename",
+            "docker_container_start",
+            "docker_container_stop",
+            "docker_container_restart",
+            "docker_container_pause",
+            "docker_container_unpause",
+            "docker_image_pull",
+            "docker_image_pull_cancel_requested",
+            "docker_image_reused_on_target",
+            "docker_image_transferred_from_controller",
+            "docker_image_pulled_from_registry",
+            "docker_image_acquisition_cancelled",
+            "docker_image_acquisition_failed",
+            "docker_image_load",
+            "docker_image_export_requested",
+            "docker_volume_create",
+            "docker_network_create",
+            "docker_network_connect",
+            "docker_network_disconnect",
+        ]
+    ),
+    events!(
+        Docker,
+        true,
+        [
+            "docker_daemon_settings_update",
+            "docker_system_prune",
+            "docker_compose_project_remove",
+            "docker_container_kill",
+            "docker_container_remove",
+            "docker_container_exec",
+            "docker_image_remove",
+            "docker_volume_remove",
+            "docker_network_remove",
+            "docker_network_force_disconnect",
+        ]
+    ),
+    events!(
+        Files,
+        false,
+        [
+            "file_create",
+            "file_content_update",
+            "directory_create",
+            "file_task_submitted",
+            "file_task_succeeded",
+        ]
+    ),
+    events!(Files, true, ["file_task_failed"]),
+    events!(Processes, false, ["process_signal_terminate"]),
+    events!(Processes, true, ["process_signal_force_kill"]),
+    events!(
+        Disks,
+        true,
+        ["disk_operation_submitted", "disk_operation_finished"]
+    ),
+    events!(Monitoring, false, ["system_monitoring_settings_update"]),
+    events!(Monitoring, true, ["system_monitoring_history_clear"]),
+    events!(
+        Scripts,
+        false,
+        [
+            "script_created",
+            "script_updated",
+            "script_run_submitted",
+            "script_run_completed",
+            "script_run_cancel_requested",
+        ]
+    ),
+    events!(Scripts, true, ["script_removed"]),
+    events!(
+        ScheduledTasks,
+        false,
+        [
+            "scheduled_task_create_submitted",
+            "scheduled_task_update_submitted",
+            "scheduled_task_state_change_submitted",
+            "scheduled_task_run_submitted",
+            "scheduled_task_run_completed",
+            "scheduled_task_run_cancel_submitted",
+            "scheduled_task_operation_cancel_submitted",
+            "scheduled_task_batch_submitted",
+        ]
+    ),
+    events!(
+        ScheduledTasks,
+        true,
+        [
+            "scheduled_task_remove_submitted",
+            "scheduled_task_migration_submitted",
+        ]
+    ),
+    events!(
+        Upgrades,
+        false,
+        [
+            "upgrade_releases_sync",
+            "upgrade_release_upload",
+            "upgrade_plan_created",
+            "upgrade_plan_started",
+            "upgrade_plan_succeeded",
+        ]
+    ),
+    events!(
+        Upgrades,
+        true,
+        [
+            "upgrade_release_delete",
+            "upgrade_plan_canceled",
+            "upgrade_plan_failed",
+        ]
+    ),
+    events!(
+        Terminal,
+        false,
+        ["terminal_session_start", "terminal_session_end"]
+    ),
+    events!(
+        Settings,
+        false,
+        ["seclab_network_update", "settings_security_update"]
+    ),
+];
+
+fn registered_event(event: &str) -> Option<EventRegistration> {
+    REGISTERED_EVENT_GROUPS
+        .iter()
+        .flat_map(|group| group.iter())
+        .copied()
+        .find(|registration| registration.code == event)
+}
+
 fn module_for_event(event: &str) -> OperationModule {
+    if let Some(registration) = registered_event(event) {
+        return registration.module;
+    }
     if event.starts_with("user_") || event.starts_with("auth_") {
         OperationModule::Auth
     } else if event.starts_with("node_") || event.starts_with("runtime_") {
@@ -1367,6 +1685,9 @@ fn normalize_event_code(value: &str) -> String {
     truncate(&value.trim().to_ascii_lowercase().replace('-', "_"), 128)
 }
 fn is_high_impact(event: &str) -> bool {
+    if let Some(registration) = registered_event(event) {
+        return registration.high_impact;
+    }
     [
         "delete",
         "remove",
@@ -1519,6 +1840,12 @@ fn sanitize_operation_item(mut item: OperationLogItem) -> OperationLogItem {
     item
 }
 
+fn sanitize_event_label(mut label: OperationEventLabel) -> OperationEventLabel {
+    label.zh_cn = truncate(label.zh_cn.trim(), 128);
+    label.en_us = truncate(label.en_us.trim(), 128);
+    label
+}
+
 fn normalize_operation_target(
     event: &mut StoredOperationEvent,
     parameters: &BTreeMap<String, OperationParameterValue>,
@@ -1666,6 +1993,7 @@ fn actor_kind_value(value: OperationActorKind) -> &'static str {
         OperationActorKind::Anonymous => "anonymous",
         OperationActorKind::System => "system",
         OperationActorKind::Agent => "agent",
+        OperationActorKind::Suite => "suite",
     }
 }
 fn parse_module(value: &str) -> Result<OperationModule, ApiError> {
@@ -1720,6 +2048,7 @@ fn parse_actor_kind(value: &str) -> Result<OperationActorKind, ApiError> {
         "anonymous" => Ok(OperationActorKind::Anonymous),
         "system" => Ok(OperationActorKind::System),
         "agent" => Ok(OperationActorKind::Agent),
+        "suite" => Ok(OperationActorKind::Suite),
         _ => Err(ApiError::Internal("invalid operation actor".to_string())),
     }
 }
@@ -1767,6 +2096,7 @@ mod tests {
             occurred_at: "2026-07-31T03:08:24Z".to_string(),
             module: OperationModule::Docker,
             event_code: "docker_compose_project_stop".to_string(),
+            event_label: None,
             actor: OperationActor {
                 kind: OperationActorKind::System,
                 user_id: None,
@@ -1816,6 +2146,7 @@ mod tests {
             occurred_at: "2026-07-31T03:55:28Z".to_string(),
             module: OperationModule::Docker,
             event_code: "docker_image_remove".to_string(),
+            event_label: None,
             actor: OperationActor {
                 kind: OperationActorKind::User,
                 user_id: None,
@@ -2222,6 +2553,7 @@ mod tests {
                     occurred_at: "2025-01-01T00:00:00Z".to_string(),
                     module: OperationModule::Nodes,
                     event_code: "node_update".to_string(),
+                    event_label: None,
                     actor_kind: "user".to_string(),
                     actor_user_id: None,
                     actor_display_name: "admin".to_string(),
@@ -2355,6 +2687,41 @@ mod tests {
                     .any(|(_, name, _, _, partial)| name == expected && *partial == 1)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn durable_outbox_retries_and_delivers_idempotently() {
+        let pool = setup_test_db().await;
+        let mut builder =
+            OperationEventBuilder::new("admin", "node_update", "127.0.0.1".parse().unwrap())
+                .set_success();
+        builder.prepare_for_storage();
+        let event = builder.event;
+
+        persist_outbox_event(&pool, &event).await.unwrap();
+        persist_outbox_event(&pool, &event).await.unwrap();
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM operation_event_outbox WHERE delivered_at IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(pending, 1);
+
+        deliver_outbox_batch(&pool).await.unwrap();
+        deliver_outbox_batch(&pool).await.unwrap();
+        let operation_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM operation_logs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let delivered: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM operation_event_outbox WHERE delivered_at IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(operation_count, 1);
+        assert_eq!(delivered, 1);
     }
 
     #[tokio::test]

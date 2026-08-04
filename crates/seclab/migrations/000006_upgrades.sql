@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS upgrade_plans (
     ) DEFAULT 'draft',
     requested_by_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
     requested_by TEXT NOT NULL,
+    client_ip TEXT,
+    trace_id TEXT,
     started_at TEXT,
     finished_at TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),

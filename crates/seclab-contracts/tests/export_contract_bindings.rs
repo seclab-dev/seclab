@@ -8,7 +8,11 @@ use seclab_contracts::{
     },
     files::{FileDocument, FileSaveResult, UpdateFileContentRequest},
     firewall::{FirewallRuleDetail, FirewallRuleListPage},
-    logging::{OperationLogDetail, OperationLogPage, OperationLogQuery, OperationLogSummary},
+    logging::{
+        AgentOperationEvent, OperationEventLabel, OperationImpact, OperationLogDetail,
+        OperationLogPage, OperationLogQuery, OperationLogSummary, OperationOutcome,
+        OperationParameterValue, OperationTarget, SuiteOperationEventRequest,
+    },
     monitoring::{SystemMonitoringOverview, SystemMonitoringSeriesPage, SystemMonitoringSettings},
     notification::{
         NotificationAction, NotificationArchiveScope, NotificationArchiveStateRequest,
@@ -37,6 +41,7 @@ use seclab_contracts::{
     seclab::{SeclabNetworkConfig, SeclabNetworkUpdateResult},
     terminal::{TerminalAccess, TerminalClientMessage, TerminalServerMessage},
 };
+use std::collections::BTreeMap;
 use std::path::Path;
 use ts_rs::{Config, Dummy, TS};
 
@@ -85,6 +90,9 @@ fn export_contract_bindings() {
     export_type::<OperationLogDetail>(&cfg);
     export_type::<OperationLogQuery>(&cfg);
     export_type::<OperationLogPage>(&cfg);
+    export_type::<OperationEventLabel>(&cfg);
+    export_type::<AgentOperationEvent>(&cfg);
+    export_type::<SuiteOperationEventRequest>(&cfg);
     export_type::<SystemMonitoringOverview>(&cfg);
     export_type::<SystemMonitoringSeriesPage>(&cfg);
     export_type::<SystemMonitoringSettings>(&cfg);
@@ -138,4 +146,50 @@ fn export_contract_bindings() {
     export_type::<TerminalAccess>(&cfg);
     export_type::<TerminalClientMessage>(&cfg);
     export_type::<TerminalServerMessage>(&cfg);
+}
+
+#[test]
+fn suite_operation_event_matches_runtime_sdk_fixture() {
+    let request = SuiteOperationEventRequest {
+        event_id: "0198f021-7f1a-7000-8000-000000000001".to_string(),
+        operation_context_id: Some("0198f021-7f1a-7000-8000-000000000010".to_string()),
+        event_code: "scan_submitted".to_string(),
+        event_label: OperationEventLabel {
+            zh_cn: "提交扫描".to_string(),
+            en_us: "Submit scan".to_string(),
+        },
+        outcome: OperationOutcome::Success,
+        impact: OperationImpact::Info,
+        target: Some(OperationTarget {
+            kind: "scan_task".to_string(),
+            id: "task-1".to_string(),
+            display_name: Some("192.0.2.0/24".to_string()),
+            ownership: None,
+        }),
+        task_id: Some("task-1".to_string()),
+        parameters: BTreeMap::from([(
+            "hostCount".to_string(),
+            OperationParameterValue::Number(254.0),
+        )]),
+        error_code: None,
+        error_summary: None,
+    };
+    let actual = serde_json::to_value(request).unwrap();
+    let expected: serde_json::Value = serde_json::from_str(
+        r#"{
+          "eventId": "0198f021-7f1a-7000-8000-000000000001",
+          "operationContextId": "0198f021-7f1a-7000-8000-000000000010",
+          "eventCode": "scan_submitted",
+          "eventLabel": { "zhCn": "提交扫描", "enUs": "Submit scan" },
+          "outcome": "success",
+          "impact": "info",
+          "target": { "kind": "scan_task", "id": "task-1", "displayName": "192.0.2.0/24", "ownership": null },
+          "taskId": "task-1",
+          "parameters": { "hostCount": 254.0 },
+          "errorCode": null,
+          "errorSummary": null
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(actual, expected);
 }

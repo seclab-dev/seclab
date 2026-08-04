@@ -1,21 +1,26 @@
 //! 安全设置 API：安全入口、账号凭证与密码复杂度管理。
 
 use crate::api::auth::AuthenticatedAdmin;
+use crate::models::logging::{LogModule, LogStatus, PlatformLogLevel};
 use crate::models::system_config;
 use crate::security::password::validate_password;
 use crate::security::safe_entry_rules::{SafeEntryValidationError, validate_safe_entry_value};
-use crate::services::user_service::hash_password;
+use crate::services::{
+    logging::{self, OperationEventBuilder},
+    user_service::hash_password,
+};
 use crate::state::AppState;
 use crate::types::{ApiError, ApiResponse, ApiResult};
 use axum::{
     Json, Router,
     extract::State,
-    http::header,
+    http::{HeaderMap, header},
     response::{IntoResponse, Response},
     routing::{get, put},
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use serde_json::{Value, json};
+use std::{net::IpAddr, sync::Arc};
 
 /// 安全配置响应。
 #[derive(Debug, Serialize)]
@@ -74,24 +79,51 @@ async fn get_settings(
 
 async fn update_settings(
     State(state): State<Arc<AppState>>,
-    _admin: AuthenticatedAdmin,
+    admin: AuthenticatedAdmin,
+    headers: HeaderMap,
     Json(payload): Json<UpdateSecuritySettings>,
 ) -> ApiResult<Response> {
     let safe_entry = payload.safe_entry.trim();
-    if !safe_entry.is_empty() {
-        validate_safe_entry_for_api(safe_entry)?;
+    let previous_safe_entry = system_config::get_safe_entry(&state.metadata_db).await;
+    let previous_complexity = system_config::password_complexity_enabled(&state.metadata_db).await;
+    let result: ApiResult<()> = async {
+        if !safe_entry.is_empty() {
+            validate_safe_entry_for_api(safe_entry)?;
+        }
+        system_config::update_security_settings(
+            &state.metadata_db,
+            safe_entry,
+            payload.password_complexity,
+        )
+        .await
+        .map_err(ApiError::from)
     }
-    let previous_safe_entry = system_config::get_safe_entry(&state.metadata_db).await?;
-    system_config::update_security_settings(
-        &state.metadata_db,
-        safe_entry,
-        payload.password_complexity,
+    .await;
+    let previous_safe_entry_value = previous_safe_entry
+        .as_ref()
+        .ok()
+        .and_then(|value| value.as_deref());
+    audit_security_change(
+        &state,
+        &admin,
+        &headers,
+        "settings_security_update",
+        "security_settings",
+        true,
+        &result,
+        json!({
+            "safeEntryEnabled": !safe_entry.is_empty(),
+            "safeEntryChanged": previous_safe_entry_value != Some(safe_entry),
+            "passwordComplexity": payload.password_complexity,
+            "passwordComplexityChanged": previous_complexity.as_ref().ok().is_some_and(|value| *value != payload.password_complexity),
+        }),
     )
-    .await?;
+    .await;
+    result?;
     let mut body = ApiResponse::ok("Security settings updated");
     body.message_key = Some("api.security.settingsUpdated".to_string());
     let mut resp = body.into_response();
-    if previous_safe_entry.as_deref() != Some(safe_entry) {
+    if previous_safe_entry_value != Some(safe_entry) {
         resp.headers_mut().append(
             header::SET_COOKIE,
             crate::security::safe_entry::clear_safe_entry_cookie()
@@ -105,19 +137,37 @@ async fn update_settings(
 async fn update_password(
     State(state): State<Arc<AppState>>,
     admin: AuthenticatedAdmin,
+    headers: HeaderMap,
     Json(payload): Json<UpdatePasswordPayload>,
-) -> ApiResult<impl IntoResponse> {
-    let enforce_complexity = system_config::password_complexity_enabled(&state.metadata_db).await?;
-    validate_password(&payload.new_password, enforce_complexity).map_err(|err| {
-        ApiError::validation(err.to_string()).with_message_key("api.security.passwordInvalid")
-    })?;
-    let password_hash =
-        hash_password(&payload.new_password).map_err(|err| ApiError::internal(err.to_string()))?;
-    sqlx::query("UPDATE users SET password_hash = ?1 WHERE id = ?2")
-        .bind(password_hash)
-        .bind(admin.id)
-        .execute(&state.metadata_db)
-        .await?;
+) -> ApiResult<Response> {
+    let result: ApiResult<()> = async {
+        let enforce_complexity =
+            system_config::password_complexity_enabled(&state.metadata_db).await?;
+        validate_password(&payload.new_password, enforce_complexity).map_err(|err| {
+            ApiError::validation(err.to_string()).with_message_key("api.security.passwordInvalid")
+        })?;
+        let password_hash = hash_password(&payload.new_password)
+            .map_err(|err| ApiError::internal(err.to_string()))?;
+        sqlx::query("UPDATE users SET password_hash = ?1 WHERE id = ?2")
+            .bind(password_hash)
+            .bind(admin.id)
+            .execute(&state.metadata_db)
+            .await?;
+        Ok(())
+    }
+    .await;
+    audit_security_change(
+        &state,
+        &admin,
+        &headers,
+        "auth_password_update",
+        &admin.id.to_string(),
+        true,
+        &result,
+        json!({}),
+    )
+    .await;
+    result?;
     let mut body = ApiResponse::ok("Password updated");
     body.message_key = Some("api.security.passwordUpdated".to_string());
     Ok(body.into_response())
@@ -126,25 +176,99 @@ async fn update_password(
 async fn update_username(
     State(state): State<Arc<AppState>>,
     admin: AuthenticatedAdmin,
+    headers: HeaderMap,
     Json(payload): Json<UpdateUsernamePayload>,
-) -> ApiResult<impl IntoResponse> {
+) -> ApiResult<Response> {
     let username = payload.new_username.trim();
-    validate_username(username)?;
-    sqlx::query("UPDATE users SET username = ?1 WHERE id = ?2")
-        .bind(username)
-        .bind(admin.id)
-        .execute(&state.metadata_db)
-        .await
-        .map_err(|err| {
-            if matches!(err, sqlx::Error::Database(ref db_err) if db_err.is_unique_violation()) {
-                ApiError::from(crate::errors::AuthError::UsernameExists)
-            } else {
-                ApiError::from(err)
-            }
-        })?;
+    let result: ApiResult<()> = async {
+        validate_username(username)?;
+        sqlx::query("UPDATE users SET username = ?1 WHERE id = ?2")
+            .bind(username)
+            .bind(admin.id)
+            .execute(&state.metadata_db)
+            .await
+            .map_err(|err| {
+                if matches!(err, sqlx::Error::Database(ref db_err) if db_err.is_unique_violation())
+                {
+                    ApiError::from(crate::errors::AuthError::UsernameExists)
+                } else {
+                    ApiError::from(err)
+                }
+            })?;
+        Ok(())
+    }
+    .await;
+    audit_security_change(
+        &state,
+        &admin,
+        &headers,
+        "auth_username_update",
+        &admin.id.to_string(),
+        false,
+        &result,
+        json!({ "newUsername": username }),
+    )
+    .await;
+    result?;
     let mut body = ApiResponse::ok("Username updated");
     body.message_key = Some("api.security.usernameUpdated".to_string());
     Ok(body.into_response())
+}
+
+/// 持久化安全设置与凭据变更事件，不记录任何凭据内容。
+#[allow(clippy::too_many_arguments)]
+async fn audit_security_change<T>(
+    state: &AppState,
+    admin: &AuthenticatedAdmin,
+    headers: &HeaderMap,
+    event_code: &str,
+    target_id: &str,
+    high_impact: bool,
+    result: &ApiResult<T>,
+    mut metadata: Value,
+) {
+    let Some(client_ip) = admin
+        .session
+        .client_ip
+        .as_deref()
+        .and_then(|value| value.parse::<IpAddr>().ok())
+    else {
+        tracing::error!(event_code, "security audit is missing a trusted client IP");
+        return;
+    };
+    if let Some(values) = metadata.as_object_mut() {
+        values.insert(
+            "result".to_string(),
+            json!(if result.is_ok() { "success" } else { "failed" }),
+        );
+        if let Err(error) = result {
+            values.insert("errorCode".to_string(), json!(error.code.as_str()));
+        }
+    }
+    let failed = result.is_err();
+    let builder = OperationEventBuilder::new(&admin.username, event_code, client_ip)
+        .user_id(admin.id)
+        .module(LogModule::System)
+        .target_type("user")
+        .target_id(target_id)
+        .trace_id(&logging::resolve_trace_id(headers))
+        .request("PUT", "/api/v1/security")
+        .status(if failed {
+            LogStatus::Failed
+        } else {
+            LogStatus::Success
+        })
+        .level(if failed {
+            PlatformLogLevel::Error
+        } else if high_impact {
+            PlatformLogLevel::Warning
+        } else {
+            PlatformLogLevel::Info
+        })
+        .metadata(metadata);
+    if let Err(error) = logging::persist_event(builder, &state.metadata_db).await {
+        tracing::error!(event_code, %error, "security audit could not be persisted");
+    }
 }
 
 fn validate_safe_entry_for_api(value: &str) -> ApiResult<()> {

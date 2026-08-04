@@ -101,6 +101,16 @@ pub enum OperationActorKind {
     Anonymous,
     System,
     Agent,
+    Suite,
+}
+
+/// 动态操作事件的双语名称快照。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "logging/")]
+pub struct OperationEventLabel {
+    pub zh_cn: String,
+    pub en_us: String,
 }
 
 /// 操作者摘要。
@@ -208,6 +218,7 @@ pub struct OperationLogSummary {
     pub occurred_at: String,
     pub module: OperationModule,
     pub event_code: String,
+    pub event_label: Option<OperationEventLabel>,
     pub actor: OperationActor,
     pub client_ip: Option<String>,
     pub origin: OperationOrigin,
@@ -275,12 +286,32 @@ pub struct AgentOperationEvent {
     pub occurred_at: String,
     pub module: OperationModule,
     pub event_code: String,
+    pub event_label: Option<OperationEventLabel>,
     pub actor: OperationActor,
     pub client_ip: Option<String>,
     pub target: Option<OperationTarget>,
     pub outcome: OperationOutcome,
     pub impact: OperationImpact,
     pub trace_id: String,
+    pub task_id: Option<String>,
+    #[ts(type = "Record<string, string | number | boolean>")]
+    pub parameters: BTreeMap<String, OperationParameterValue>,
+    pub error_code: Option<String>,
+    pub error_summary: Option<String>,
+}
+
+/// 套件运行时提交的语义操作事件。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "logging/", optional_fields)]
+pub struct SuiteOperationEventRequest {
+    pub event_id: String,
+    pub operation_context_id: Option<String>,
+    pub event_code: String,
+    pub event_label: OperationEventLabel,
+    pub outcome: OperationOutcome,
+    pub impact: OperationImpact,
+    pub target: Option<OperationTarget>,
     pub task_id: Option<String>,
     #[ts(type = "Record<string, string | number | boolean>")]
     pub parameters: BTreeMap<String, OperationParameterValue>,

@@ -194,6 +194,48 @@ describe('OperationLogView', () => {
     wrapper.unmount()
   })
 
+  it('动态套件事件优先使用当前语言的名称快照', async () => {
+    const result = response('suite-event')
+    result.data.items[0] = {
+      ...result.data.items[0],
+      module: 'suites',
+      eventCode: 'suite_packet_lab_capture_started',
+      eventLabel: { zhCn: '开始抓包', enUs: 'Start capture' },
+      actor: { kind: 'suite', displayName: 'packet-lab/instance-1' },
+    }
+    vi.mocked(operationLogApi.query).mockReset().mockResolvedValue(result)
+    const wrapper = mount(OperationLogView, {
+      global: { plugins: [createI18n({ legacy: false, locale: 'en', messages: { zh, en } })] },
+    })
+    await flushPromises()
+    expect(wrapper.text()).toContain('Start capture')
+    expect(wrapper.text()).not.toContain('suite packet lab capture started')
+    wrapper.unmount()
+  })
+
+  it.each([
+    ['suite_install', '安装套件'],
+    ['suite_enable', '启用套件'],
+  ])('内置套件事件 %s 使用当前语言翻译', async (eventCode, translatedLabel) => {
+    const result = response(eventCode)
+    result.data.items[0] = {
+      ...result.data.items[0],
+      module: 'suites',
+      eventCode,
+      actor: { kind: 'user', displayName: 'admin' },
+      origin: { kind: 'agent', nodeId: 'local', nodeName: '本地节点' },
+    }
+    vi.mocked(operationLogApi.query).mockReset().mockResolvedValue(result)
+    const wrapper = mount(OperationLogView, {
+      global: { plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh, en } })] },
+    })
+    await flushPromises()
+
+    expect(wrapper.text()).toContain(translatedLabel)
+    expect(wrapper.text()).not.toContain(eventCode)
+    wrapper.unmount()
+  })
+
   it('主控镜像分发使用可读动作与系统操作者', async () => {
     const result = response('controller-image-transfer')
     result.data.items[0] = {

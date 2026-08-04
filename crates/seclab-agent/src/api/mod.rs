@@ -9,6 +9,7 @@ pub mod process;
 pub mod runtime_logs;
 pub mod scheduled_tasks;
 pub mod script_runs;
+pub mod suite_operation_logs;
 pub mod suite_workloads;
 pub mod system;
 pub mod system_monitoring;

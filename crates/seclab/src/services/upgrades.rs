@@ -47,6 +47,15 @@ pub struct UpgradePlanCreatePayload {
     pub failure_threshold_percent: Option<u32>,
 }
 
+/// 升级操作的可信审计上下文。
+#[derive(Debug, Clone)]
+pub struct UpgradeAuditContext {
+    pub user_id: i64,
+    pub username: String,
+    pub client_ip: String,
+    pub trace_id: String,
+}
+
 /// 升级计划详情视图。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -247,8 +256,7 @@ pub fn build_release_view(release: UpgradeReleaseRecord) -> UpgradeReleaseView {
 pub async fn create_plan(
     pool: &DbPool,
     payload: UpgradePlanCreatePayload,
-    requested_by_user_id: i64,
-    requested_by: &str,
+    audit: &UpgradeAuditContext,
 ) -> ApiResult<UpgradePlanDetail> {
     let target_version = normalize_version(&payload.target_version)?;
 
@@ -334,8 +342,10 @@ pub async fn create_plan(
         scope: scope.to_string(),
         strategy: strategy.to_string(),
         status: "draft".to_string(),
-        requested_by_user_id,
-        requested_by: requested_by.to_string(),
+        requested_by_user_id: audit.user_id,
+        requested_by: audit.username.clone(),
+        client_ip: Some(audit.client_ip.clone()),
+        trace_id: Some(audit.trace_id.clone()),
         started_at: None,
         finished_at: None,
         created_at: now.clone(),
@@ -511,7 +521,11 @@ fn node_target_triple_from_metadata(metadata: &str) -> ApiResult<String> {
 }
 
 /// 启动升级计划；执行器未接入前仅进入可调度状态。
-pub async fn start_plan(pool: &DbPool, plan_id: &str) -> ApiResult<UpgradePlanDetail> {
+pub async fn start_plan(
+    pool: &DbPool,
+    plan_id: &str,
+    audit: &UpgradeAuditContext,
+) -> ApiResult<UpgradePlanDetail> {
     let plan = get_plan(pool, plan_id).await?.ok_or(ApiError::NotFound)?;
     if plan.status != "draft" && plan.status != "paused" {
         return Err(ApiError::BadRequest(
@@ -519,6 +533,7 @@ pub async fn start_plan(pool: &DbPool, plan_id: &str) -> ApiResult<UpgradePlanDe
         ));
     }
     let now = Utc::now().to_rfc3339();
+    update_plan_audit_context(pool, plan_id, audit).await?;
     update_plan_status(pool, plan_id, "running", Some(&now), None).await?;
     record_event(
         pool,
@@ -533,7 +548,11 @@ pub async fn start_plan(pool: &DbPool, plan_id: &str) -> ApiResult<UpgradePlanDe
 }
 
 /// 取消升级计划中尚未执行的目标。
-pub async fn cancel_plan(pool: &DbPool, plan_id: &str) -> ApiResult<UpgradePlanDetail> {
+pub async fn cancel_plan(
+    pool: &DbPool,
+    plan_id: &str,
+    audit: &UpgradeAuditContext,
+) -> ApiResult<UpgradePlanDetail> {
     let plan = get_plan(pool, plan_id).await?.ok_or(ApiError::NotFound)?;
     if matches!(plan.status.as_str(), "succeeded" | "failed" | "canceled") {
         return Err(ApiError::BadRequest(
@@ -542,6 +561,7 @@ pub async fn cancel_plan(pool: &DbPool, plan_id: &str) -> ApiResult<UpgradePlanD
     }
     let affected =
         update_targets_status(pool, plan_id, &["pending", "deferred"], "canceled").await?;
+    update_plan_audit_context(pool, plan_id, audit).await?;
     let now = Utc::now().to_rfc3339();
     update_plan_status(pool, plan_id, "canceled", None, Some(&now)).await?;
     // 遵循用户规则：不再于取消计划时自动删除版本包文件，交由用户在升级页面手动按需管理和清理
@@ -555,6 +575,24 @@ pub async fn cancel_plan(pool: &DbPool, plan_id: &str) -> ApiResult<UpgradePlanD
     )
     .await?;
     detail(pool, plan_id).await
+}
+
+async fn update_plan_audit_context(
+    pool: &DbPool,
+    plan_id: &str,
+    audit: &UpgradeAuditContext,
+) -> ApiResult<()> {
+    sqlx::query(
+        "UPDATE upgrade_plans SET requested_by_user_id=?,requested_by=?,client_ip=?,trace_id=? WHERE plan_id=?",
+    )
+    .bind(audit.user_id)
+    .bind(&audit.username)
+    .bind(&audit.client_ip)
+    .bind(&audit.trace_id)
+    .bind(plan_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// 启动在线升级后台调度器。
@@ -1190,14 +1228,6 @@ async fn refresh_plan_terminal_status(pool: &DbPool, plan_id: &str) -> ApiResult
     Ok(())
 }
 
-#[allow(dead_code)]
-async fn clean_upgrade_cache(version: &str) {
-    let cache_dir = PathBuf::from(&crate::config::get().upgrade.download_cache_dir).join(version);
-    if cache_dir.exists() {
-        let _ = tokio::fs::remove_dir_all(&cache_dir).await;
-    }
-}
-
 fn unwrap_runtime_api_response<T>(response: RuntimeApiResponse<T>) -> ApiResult<T> {
     if !response.success {
         return Err(ApiError::BadRequest(response.message));
@@ -1309,7 +1339,6 @@ pub async fn get_latest_plan(pool: &DbPool) -> ApiResult<Option<UpgradePlanDetai
 }
 
 /// 生成 agent 从主控下载制品的短期令牌。
-#[allow(dead_code)]
 pub async fn issue_artifact_download_token(
     pool: &DbPool,
     plan_id: &str,
@@ -1922,14 +1951,29 @@ async fn record_event(
     )
     .await?;
 
-    let plan = get_plan(pool, plan_id).await.ok().flatten();
-    let username = if let Some(plan) = plan.as_ref() {
-        plan.requested_by.clone()
-    } else {
-        "system".to_string()
-    };
+    if !matches!(
+        event_type,
+        "plan_created" | "plan_started" | "plan_canceled" | "plan_succeeded" | "plan_failed"
+    ) {
+        return Ok(());
+    }
 
-    let client_ip = "127.0.0.1".parse::<std::net::IpAddr>().unwrap();
+    let Some(plan) = get_plan(pool, plan_id).await.ok().flatten() else {
+        tracing::error!(plan_id, event_type, "upgrade audit context is unavailable");
+        return Ok(());
+    };
+    let Some(client_ip) = plan
+        .client_ip
+        .as_deref()
+        .and_then(|value| value.parse::<std::net::IpAddr>().ok())
+    else {
+        tracing::error!(
+            plan_id,
+            event_type,
+            "upgrade audit client IP is unavailable"
+        );
+        return Ok(());
+    };
     let status = if event_type.contains("failed")
         || event_type.contains("error")
         || message.to_lowercase().contains("failed")
@@ -1977,20 +2021,24 @@ async fn record_event(
     }
 
     let mut operation = crate::services::logging::OperationEventBuilder::new(
-        &username,
+        &plan.requested_by,
         &format!("upgrade_{}", event_type),
         client_ip,
-    );
-    if let Some(plan) = plan.as_ref() {
-        operation = operation.user_id(plan.requested_by_user_id);
+    )
+    .user_id(plan.requested_by_user_id);
+    if let Some(trace_id) = plan.trace_id.as_deref() {
+        operation = operation.trace_id(trace_id);
     }
-    operation
-        .module(crate::models::logging::LogModule::System)
-        .target_type("upgrade_plan")
-        .target_id(plan_id)
-        .outcome(outcome)
-        .metadata(serde_json::Value::Object(log_meta))
-        .finish(pool);
+    crate::services::logging::persist_event(
+        operation
+            .module(crate::models::logging::LogModule::System)
+            .target_type("upgrade_plan")
+            .target_id(plan_id)
+            .outcome(outcome)
+            .metadata(serde_json::Value::Object(log_meta)),
+        pool,
+    )
+    .await?;
 
     Ok(())
 }
@@ -2042,6 +2090,8 @@ mod tests {
             status: "running".to_string(),
             requested_by_user_id: 1,
             requested_by: "tester".to_string(),
+            client_ip: Some("127.0.0.1".to_string()),
+            trace_id: Some("upgrade-test-trace".to_string()),
             started_at: Some(now.clone()),
             finished_at: None,
             created_at: now.clone(),

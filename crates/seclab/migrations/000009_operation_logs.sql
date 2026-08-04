@@ -4,6 +4,8 @@ CREATE TABLE operation_logs (
     occurred_at TEXT NOT NULL,
     module TEXT NOT NULL,
     event_code TEXT NOT NULL,
+    event_label_zh TEXT,
+    event_label_en TEXT,
     actor_kind TEXT NOT NULL,
     actor_user_id INTEGER NULL REFERENCES users(id) ON DELETE SET NULL,
     actor_display_name TEXT NOT NULL,
@@ -36,6 +38,25 @@ CREATE INDEX idx_operation_logs_actor_occurred
 CREATE INDEX idx_operation_logs_origin_occurred
     ON operation_logs (origin_node_id, occurred_at DESC, event_id DESC)
     WHERE origin_node_id IS NOT NULL;
+
+-- Master 操作审计持久化发件箱，避免进程内队列丢失事件。
+CREATE TABLE operation_event_outbox (
+    event_id TEXT PRIMARY KEY,
+    event_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    next_attempt_at TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    delivered_at TEXT
+);
+
+CREATE INDEX idx_operation_event_outbox_pending
+    ON operation_event_outbox (next_attempt_at, created_at, event_id)
+    WHERE delivered_at IS NULL;
+
+CREATE INDEX idx_operation_event_outbox_delivered
+    ON operation_event_outbox (delivered_at)
+    WHERE delivered_at IS NOT NULL;
 
 CREATE TABLE operation_log_items (
     event_id TEXT NOT NULL REFERENCES operation_logs(event_id) ON DELETE CASCADE,

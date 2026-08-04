@@ -60,8 +60,13 @@ pub async fn record(pool: &DbPool, activity: NewDockerActivity) {
     let event = AgentOperationEvent {
         event_id: uuid::Uuid::now_v7().to_string(),
         occurred_at: Utc::now().to_rfc3339(),
-        module: OperationModule::Docker,
+        module: if activity.event_code.starts_with("suite_") {
+            OperationModule::Suites
+        } else {
+            OperationModule::Docker
+        },
         event_code: activity.event_code.chars().take(128).collect(),
+        event_label: None,
         actor: OperationActor {
             kind: match activity.actor_kind {
                 DockerActivityActorKind::System => OperationActorKind::System,
@@ -222,5 +227,27 @@ mod tests {
         assert_eq!(events[0].task_id.as_deref(), Some("task-1"));
         assert!(events[0].parameters.contains_key("imageRef"));
         assert!(!events[0].parameters.contains_key("command"));
+    }
+
+    #[tokio::test]
+    async fn suite_activity_is_persisted_in_suites_module() {
+        let pool = crate::test_support::setup_test_db().await;
+        let context = DockerOperationContext::system("test");
+        context
+            .record_success(
+                &pool,
+                "suite_enable",
+                Some(("suite_instance", "instance-1")),
+                serde_json::json!({"suiteName": "Packet"}),
+                false,
+            )
+            .await;
+
+        let events = crate::services::operation_outbox::pending(&pool, 10)
+            .await
+            .expect("load outbox");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_code, "suite_enable");
+        assert_eq!(events[0].module, OperationModule::Suites);
     }
 }

@@ -1,18 +1,20 @@
 //! 在线升级 API：发布版本同步、计划创建与计划状态查询。
 
 use crate::api::auth::AuthenticatedAdmin;
-use crate::services::logging::OperationEventBuilder;
-use crate::services::upgrades::{self, UpgradePlanCreatePayload};
+use crate::models::logging::{LogModule, LogStatus, PlatformLogLevel};
+use crate::services::logging::{self, OperationEventBuilder};
+use crate::services::upgrades::{self, UpgradeAuditContext, UpgradePlanCreatePayload};
 use crate::state::AppState;
 use crate::types::{ApiResponse, ApiResult};
 use axum::{
     Json, Router,
-    extract::{Multipart, Path, State, connect_info::ConnectInfo},
+    extract::{Multipart, Path, State},
+    http::HeaderMap,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
-use std::net::SocketAddr;
-use std::sync::Arc;
+use serde_json::{Value, json};
+use std::{net::IpAddr, sync::Arc};
 
 /// 查询已同步的发布版本。
 pub async fn list_releases(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
@@ -21,8 +23,25 @@ pub async fn list_releases(State(state): State<Arc<AppState>>) -> ApiResult<Resp
 }
 
 /// 从 GitHub 同步发布版本。
-pub async fn sync_releases(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
-    let releases = upgrades::sync_github_releases(&state.metadata_db).await?;
+pub async fn sync_releases(
+    State(state): State<Arc<AppState>>,
+    admin: AuthenticatedAdmin,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let result = upgrades::sync_github_releases(&state.metadata_db).await;
+    record_upgrade_change(
+        &state,
+        &admin,
+        &headers,
+        "upgrade_releases_sync",
+        "upgrade_releases",
+        "catalog",
+        false,
+        &result,
+        json!({ "releaseCount": result.as_ref().ok().map(Vec::len) }),
+    )
+    .await?;
+    let releases = result?;
     Ok(ApiResponse::success_with_raw("Upgrade releases synced", Some(releases)).into_response())
 }
 
@@ -30,35 +49,27 @@ pub async fn sync_releases(State(state): State<Arc<AppState>>) -> ApiResult<Resp
 pub async fn upload_release(
     State(state): State<Arc<AppState>>,
     admin: AuthenticatedAdmin,
-    ConnectInfo(conn): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     mut multipart: Multipart,
 ) -> ApiResult<Response> {
     let release_res = upgrades::upload_release_package(&state.metadata_db, &mut multipart).await;
-    match &release_res {
-        Ok(release) => {
-            OperationEventBuilder::new(&admin.username, "upgrade_release_upload", conn.ip())
-                .module(crate::models::logging::LogModule::System)
-                .target_type("upgrade_release")
-                .target_id(&release.version)
-                .set_success()
-                .metadata(serde_json::json!({
-                    "version": release.version,
-                    "channel": release.channel,
-                    "source": release.source,
-                }))
-                .finish(&state.metadata_db);
-        }
-        Err(err) => {
-            OperationEventBuilder::new(&admin.username, "upgrade_release_upload", conn.ip())
-                .module(crate::models::logging::LogModule::System)
-                .target_type("upgrade_release")
-                .status(crate::models::logging::LogStatus::Failed)
-                .metadata(serde_json::json!({
-                    "error": err.to_string(),
-                }))
-                .finish(&state.metadata_db);
-        }
-    }
+    let target_id = release_res
+        .as_ref()
+        .ok()
+        .map(|release| release.version.as_str())
+        .unwrap_or("upload");
+    record_upgrade_change(
+        &state,
+        &admin,
+        &headers,
+        "upgrade_release_upload",
+        "upgrade_release",
+        target_id,
+        false,
+        &release_res,
+        json!({ "version": release_res.as_ref().ok().map(|release| &release.version) }),
+    )
+    .await?;
     let release = upgrades::build_release_view(release_res?);
     Ok(ApiResponse::success_with_raw("Upgrade release uploaded", Some(release)).into_response())
 }
@@ -67,10 +78,11 @@ pub async fn upload_release(
 pub async fn create_plan(
     State(state): State<Arc<AppState>>,
     admin: AuthenticatedAdmin,
+    headers: HeaderMap,
     Json(payload): Json<UpgradePlanCreatePayload>,
 ) -> ApiResult<Response> {
-    let detail =
-        upgrades::create_plan(&state.metadata_db, payload, admin.id, &admin.username).await?;
+    let audit = upgrade_audit_context(&admin, &headers)?;
+    let detail = upgrades::create_plan(&state.metadata_db, payload, &audit).await?;
     Ok(ApiResponse::success_with_raw("Upgrade plan created", Some(detail)).into_response())
 }
 
@@ -78,8 +90,11 @@ pub async fn create_plan(
 pub async fn start_plan(
     State(state): State<Arc<AppState>>,
     Path(plan_id): Path<String>,
+    admin: AuthenticatedAdmin,
+    headers: HeaderMap,
 ) -> ApiResult<Response> {
-    let detail = upgrades::start_plan(&state.metadata_db, &plan_id).await?;
+    let audit = upgrade_audit_context(&admin, &headers)?;
+    let detail = upgrades::start_plan(&state.metadata_db, &plan_id, &audit).await?;
     Ok(ApiResponse::success_with_raw("Upgrade plan started", Some(detail)).into_response())
 }
 
@@ -102,8 +117,11 @@ pub async fn latest_plan(State(state): State<Arc<AppState>>) -> ApiResult<Respon
 pub async fn cancel_plan(
     State(state): State<Arc<AppState>>,
     Path(plan_id): Path<String>,
+    admin: AuthenticatedAdmin,
+    headers: HeaderMap,
 ) -> ApiResult<Response> {
-    let detail = upgrades::cancel_plan(&state.metadata_db, &plan_id).await?;
+    let audit = upgrade_audit_context(&admin, &headers)?;
+    let detail = upgrades::cancel_plan(&state.metadata_db, &plan_id, &audit).await?;
     Ok(ApiResponse::success_with_raw("Upgrade plan canceled", Some(detail)).into_response())
 }
 
@@ -111,37 +129,98 @@ pub async fn cancel_plan(
 pub async fn delete_release(
     State(state): State<Arc<AppState>>,
     admin: AuthenticatedAdmin,
-    ConnectInfo(conn): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Path(version): Path<String>,
 ) -> ApiResult<Response> {
     let res = upgrades::delete_release(&state.metadata_db, &version).await;
-    match &res {
-        Ok(_) => {
-            OperationEventBuilder::new(&admin.username, "upgrade_release_delete", conn.ip())
-                .module(crate::models::logging::LogModule::System)
-                .target_type("upgrade_release")
-                .target_id(&version)
-                .set_success()
-                .metadata(serde_json::json!({
-                    "version": version,
-                }))
-                .finish(&state.metadata_db);
-        }
-        Err(err) => {
-            OperationEventBuilder::new(&admin.username, "upgrade_release_delete", conn.ip())
-                .module(crate::models::logging::LogModule::System)
-                .target_type("upgrade_release")
-                .target_id(&version)
-                .status(crate::models::logging::LogStatus::Failed)
-                .metadata(serde_json::json!({
-                    "version": version,
-                    "error": err.to_string(),
-                }))
-                .finish(&state.metadata_db);
-        }
-    }
+    record_upgrade_change(
+        &state,
+        &admin,
+        &headers,
+        "upgrade_release_delete",
+        "upgrade_release",
+        &version,
+        true,
+        &res,
+        json!({ "version": version }),
+    )
+    .await?;
     res?;
     Ok(ApiResponse::success_with_raw("Upgrade release deleted", Some(())).into_response())
+}
+
+fn upgrade_audit_context(
+    admin: &AuthenticatedAdmin,
+    headers: &HeaderMap,
+) -> ApiResult<UpgradeAuditContext> {
+    let client_ip = admin.session.client_ip.clone().ok_or_else(|| {
+        crate::types::ApiError::forbidden(
+            seclab_contracts::api::ErrorCode::AuthForbidden,
+            "authenticated session is missing a trusted client IP",
+        )
+    })?;
+    client_ip.parse::<IpAddr>().map_err(|_| {
+        crate::types::ApiError::forbidden(
+            seclab_contracts::api::ErrorCode::AuthForbidden,
+            "authenticated session has an invalid trusted client IP",
+        )
+    })?;
+    Ok(UpgradeAuditContext {
+        user_id: admin.id,
+        username: admin.username.clone(),
+        client_ip,
+        trace_id: logging::resolve_trace_id(headers),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_upgrade_change<T>(
+    state: &AppState,
+    admin: &AuthenticatedAdmin,
+    headers: &HeaderMap,
+    event_code: &str,
+    target_kind: &str,
+    target_id: &str,
+    high_impact: bool,
+    result: &ApiResult<T>,
+    mut metadata: Value,
+) -> ApiResult<()> {
+    let audit = upgrade_audit_context(admin, headers)?;
+    let failed = result.is_err();
+    if let Some(values) = metadata.as_object_mut() {
+        values.insert(
+            "result".to_string(),
+            json!(if failed { "failed" } else { "success" }),
+        );
+        if let Err(error) = result {
+            values.insert("errorCode".to_string(), json!(error.code.as_str()));
+        }
+    }
+    let builder = OperationEventBuilder::new(
+        &audit.username,
+        event_code,
+        audit.client_ip.parse().expect("validated audit IP"),
+    )
+    .user_id(audit.user_id)
+    .module(LogModule::System)
+    .target_type(target_kind)
+    .target_id(target_id)
+    .trace_id(&audit.trace_id)
+    .request("POST", "/api/v1/upgrades")
+    .status(if failed {
+        LogStatus::Failed
+    } else {
+        LogStatus::Success
+    })
+    .level(if failed {
+        PlatformLogLevel::Error
+    } else if high_impact {
+        PlatformLogLevel::Warning
+    } else {
+        PlatformLogLevel::Info
+    })
+    .metadata(metadata);
+    logging::persist_event(builder, &state.metadata_db).await
 }
 
 /// 在线升级 API 路由。

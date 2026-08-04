@@ -64,6 +64,7 @@ mod tests {
             occurred_at: Utc::now().to_rfc3339(),
             module: OperationModule::Docker,
             event_code: "docker_started".into(),
+            event_label: None,
             actor: OperationActor {
                 kind: OperationActorKind::User,
                 user_id: Some(7),
@@ -79,6 +80,7 @@ mod tests {
             error_code: None,
             error_summary: None,
         };
+        enqueue(&pool, &event).await.unwrap();
         enqueue(&pool, &event).await.unwrap();
         let pending_events = pending(&pool, 20).await.unwrap();
         assert_eq!(pending_events.len(), 1);

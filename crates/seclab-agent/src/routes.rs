@@ -2,7 +2,8 @@
 
 use super::api::{
     disks, docker, firewall, fs, host_terminal, process, runtime_logs, scheduled_tasks,
-    script_runs, suite_workloads, system, system_monitoring, upgrade, websocket,
+    script_runs, suite_operation_logs, suite_workloads, system, system_monitoring, upgrade,
+    websocket,
 };
 use crate::db;
 use crate::state::DbPool;
@@ -61,6 +62,7 @@ fn state_api_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/runtime/health", get(runtime_health))
         .merge(controller_routes)
+        .merge(suite_operation_logs::router())
         .merge(suite_workloads::suite_workloads_router())
         .with_state(state)
 }

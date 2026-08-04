@@ -11,3 +11,19 @@ CREATE TABLE operation_event_outbox (
 CREATE INDEX idx_operation_event_outbox_pending
     ON operation_event_outbox (next_attempt_at, created_at, event_id)
     WHERE delivered_at IS NULL;
+
+-- 套件代理请求的可信用户上下文；仅允许匹配的套件实例在有效期内引用。
+CREATE TABLE suite_operation_contexts (
+    context_id TEXT PRIMARY KEY,
+    suite_id TEXT NOT NULL,
+    instance_id TEXT NOT NULL,
+    actor_user_id INTEGER NOT NULL,
+    actor_name TEXT NOT NULL,
+    client_ip TEXT NOT NULL,
+    trace_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_suite_operation_contexts_expiry
+    ON suite_operation_contexts (expires_at);

@@ -18,8 +18,10 @@ use crate::services::logging::{self, OperationEventBuilder};
 use crate::state::{AppState, DbPool};
 use crate::types::{ApiError, ApiResponse, ApiResult, new_uuid_v7};
 use axum::body::Body;
-use axum::extract::{Multipart, OriginalUri, Path, Query, State, connect_info::ConnectInfo};
-use axum::http::{HeaderMap, Method, header};
+use axum::extract::{
+    Multipart, OriginalUri, Path, Query, Request, State, connect_info::ConnectInfo,
+};
+use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, delete, get, post};
 use axum::{Json, Router};
@@ -1676,12 +1678,16 @@ fn respond_suite_asset(package: &SuitePackageSnapshot, asset_path: &str) -> ApiR
 /// 将套件入口请求代理到目标 Agent。
 pub async fn proxy_suite_entry(
     State(state): State<Arc<AppState>>,
+    admin: AuthenticatedAdmin,
+    ConnectInfo(conn): ConnectInfo<SocketAddr>,
     OriginalUri(uri): OriginalUri,
     Path(path): Path<SuiteProxyPath>,
-    method: Method,
-    headers: HeaderMap,
-    body: Body,
+    request: Request,
 ) -> ApiResult<Response> {
+    let (request_parts, body) = request.into_parts();
+    let method = request_parts.method;
+    let headers = request_parts.headers;
+    let audit_context = SuiteAuditContext::from_request(&admin, &headers, conn);
     let instance = fetch_instance(&state.metadata_db, &path.instance_id)
         .await?
         .ok_or_else(|| {
@@ -1710,7 +1716,13 @@ pub async fn proxy_suite_entry(
     );
     let agent_path = raw_path.replacen(&public_prefix, &agent_prefix, 1);
     client
-        .forward_streaming(method, &agent_path, headers, body)
+        .forward_streaming_with_operation_context(
+            method,
+            &agent_path,
+            headers,
+            body,
+            &audit_context.agent_operation_context(),
+        )
         .await
 }
 
@@ -1918,7 +1930,11 @@ fn validate_agent_access(manifest: &SuiteManifest, files: &[SuitePackageFile]) -
             "runtime.agent.capabilities must not be empty".to_string(),
         ));
     }
-    const ALLOWED_CAPABILITIES: [&str; 2] = ["workloads.manage", "captures.manage"];
+    const ALLOWED_CAPABILITIES: [&str; 3] = [
+        "workloads.manage",
+        "captures.manage",
+        "operation-logs.write",
+    ];
     let mut capabilities = BTreeSet::new();
     for capability in &access.capabilities {
         let capability = capability.trim();
