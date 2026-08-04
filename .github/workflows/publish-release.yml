@@ -106,9 +106,13 @@ jobs:
           fi
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ inputs.rust_target }}
+        env:
+          RUST_TARGET: ${{ inputs.rust_target }}
+        shell: bash
+        run: |
+          rustup show active-toolchain
+          rustup target add "$RUST_TARGET"
+          rustup target list --installed
 
       - name: Install system dependencies
         run: |
