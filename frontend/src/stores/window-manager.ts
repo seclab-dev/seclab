@@ -28,7 +28,15 @@ export interface WindowInstance {
   isMaximized: boolean
   zIndex: number
   payload?: Record<string, unknown>
+  /** 窗口创建时固化的节点上下文，避免应用目录刷新后发生语义漂移。 */
+  nodeContext: WindowNodeContext
   runtimeState?: WindowRuntimeState
+}
+
+export interface WindowNodeContext {
+  nodeId?: string
+  nodeScope: AppConfig['nodeScope']
+  nodeSwitchPolicy: AppConfig['nodeSwitchPolicy']
 }
 
 export type NodeSwitchBlockLevel = 'open' | 'dirty' | 'active' | 'busy' | 'unknown'
@@ -280,8 +288,8 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
           title: item.title || item.appId,
           i18nTitleKey: '',
           icon: normalizeAppIconName(appId, item.icon || 'package'),
-          nodeScope: 'global',
-          nodeSwitchPolicy: 'allow',
+          nodeScope: 'current-node',
+          nodeSwitchPolicy: 'block-while-open',
           contextMenuPolicy: 'native',
           sourceType: 'suite',
         }) as AppConfig
@@ -334,7 +342,9 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
     })
   }
 
-  function getDefaultRuntimeState(appConfig: AppConfig): WindowRuntimeState {
+  function getDefaultRuntimeState(
+    appConfig: Pick<AppConfig, 'nodeScope' | 'nodeSwitchPolicy'>,
+  ): WindowRuntimeState {
     if (appConfig.nodeScope === 'global' || appConfig.nodeSwitchPolicy === 'allow') {
       return { allowsNodeSwitch: true }
     }
@@ -350,8 +360,8 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
   }
 
   function resolveRuntimeBlocker(windowInstance: WindowInstance): WindowGuardBlocker | null {
-    const appConfig = availableAppsState[windowInstance.appId]
-    const runtimeState = windowInstance.runtimeState ?? getDefaultRuntimeState(appConfig)
+    const runtimeState =
+      windowInstance.runtimeState ?? getDefaultRuntimeState(windowInstance.nodeContext)
 
     const level: NodeSwitchBlockLevel | null =
       runtimeState.blockLevel ??
@@ -836,6 +846,9 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
       minWidth?: number
       minHeight?: number
       i18nTitleKey?: string
+      nodeId?: string
+      nodeScope?: AppConfig['nodeScope']
+      nodeSwitchPolicy?: AppConfig['nodeSwitchPolicy']
     },
   ) {
     const instanceId = options?.instanceId ?? id
@@ -853,6 +866,12 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
       options?.i18nTitleKey ??
       (options?.title || !appConfig.i18nTitleKey ? undefined : appConfig.i18nTitleKey)
     const contextMenuPolicy = appConfig.contextMenuPolicy ?? 'shell'
+    const payloadNodeId = typeof payload?.nodeId === 'string' ? payload.nodeId : undefined
+    const nodeContext: WindowNodeContext = {
+      nodeId: options?.nodeId ?? payloadNodeId,
+      nodeScope: options?.nodeScope ?? appConfig.nodeScope,
+      nodeSwitchPolicy: options?.nodeSwitchPolicy ?? appConfig.nodeSwitchPolicy,
+    }
 
     if (windowInstance) {
       // 窗口已存在：恢复并聚焦
@@ -868,6 +887,7 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
       windowInstance.minWidth = minWidth
       windowInstance.minHeight = minHeight
       windowInstance.contextMenuPolicy = contextMenuPolicy
+      windowInstance.nodeContext = nodeContext
       if (options?.width) {
         windowInstance.width = Math.max(options.width, minWidth)
       } else if (windowInstance.width < minWidth) {
@@ -915,7 +935,8 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
         isMaximized: false,
         zIndex: newZIndex,
         payload,
-        runtimeState: getDefaultRuntimeState(appConfig),
+        nodeContext,
+        runtimeState: getDefaultRuntimeState(nodeContext),
       }
       openWindows.value = [...openWindows.value, newWindow]
     }
@@ -942,6 +963,9 @@ export const useWindowManagerStore = defineStore('windowManager', () => {
             height: appConfig.defaultHeight,
             minWidth: appConfig.minWidth,
             minHeight: appConfig.minHeight,
+            nodeId: appConfig.nodeId,
+            nodeScope: appConfig.nodeScope,
+            nodeSwitchPolicy: appConfig.nodeSwitchPolicy,
           },
         )
         return
