@@ -10,6 +10,7 @@ use bollard::query_parameters;
 use chrono::Utc;
 use futures_util::stream::{self, StreamExt};
 use sqlx::FromRow;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::time::{Duration, timeout};
 use tracing::{debug, warn};
@@ -209,28 +210,55 @@ async fn collect_samples_and_summary(
     HostResourceUsageSummary,
     Vec<(String, ContainerResourceUsageSample)>,
 )> {
-    let options = query_parameters::ListContainersOptionsBuilder::new()
-        .all(true)
-        .build();
-    let containers = docker.list_containers(Some(options)).await?;
-    let running_ids: Vec<String> = containers
-        .into_iter()
-        .filter(|container| container.state == Some(ContainerSummaryStateEnum::RUNNING))
-        .filter_map(|container| container.id)
-        .collect();
-
-    let running_container_count = running_ids.len();
-    let samples: Vec<(String, ContainerResourceUsageSample)> = stream::iter(running_ids)
+    let running_ids = list_running_container_ids(docker).await?;
+    let attempts = stream::iter(running_ids)
         .map(|id| async {
             let summary = fetch_container_stats_snapshot(docker, &id).await;
-            summary.map(|value| (id, value))
+            (id, summary)
         })
         .buffer_unordered(6)
-        .filter_map(|value| async move { value })
-        .collect()
+        .collect::<Vec<_>>()
         .await;
+    let mut samples = Vec::with_capacity(attempts.len());
+    let mut failed_ids = Vec::new();
+    for (id, sample) in attempts {
+        match sample {
+            Some(sample) => samples.push((id, sample)),
+            None => failed_ids.push(id),
+        }
+    }
 
     let sampled_container_count = samples.len();
+    let running_container_count = if failed_ids.is_empty() {
+        sampled_container_count
+    } else {
+        let refreshed_running_ids = match list_running_container_ids(docker).await {
+            Ok(ids) => Some(ids.into_iter().collect::<HashSet<_>>()),
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    failed_container_count = failed_ids.len(),
+                    "Docker stats failure state recheck failed; preserving partial sample status"
+                );
+                None
+            }
+        };
+        resolve_running_container_count(
+            sampled_container_count,
+            &failed_ids,
+            refreshed_running_ids.as_ref(),
+        )
+    };
+
+    if running_container_count < sampled_container_count + failed_ids.len() {
+        debug!(
+            sampled_container_count,
+            failed_container_count = failed_ids.len(),
+            running_container_count,
+            "Docker stats failures caused by container lifecycle changes were excluded"
+        );
+    }
+
     let mut cpu_core_percent = 0.0_f64;
     let mut memory_working_set_bytes = 0_u64;
     let mut memory_limit_bytes = 0_u64;
@@ -280,6 +308,35 @@ async fn collect_samples_and_summary(
     };
 
     Ok((summary, samples))
+}
+
+/// 返回当前处于运行状态且具备有效 ID 的容器列表。
+async fn list_running_container_ids(docker: &bollard::Docker) -> anyhow::Result<Vec<String>> {
+    let options = query_parameters::ListContainersOptionsBuilder::new()
+        .all(true)
+        .build();
+    let containers = docker.list_containers(Some(options)).await?;
+    Ok(containers
+        .into_iter()
+        .filter(|container| container.state == Some(ContainerSummaryStateEnum::RUNNING))
+        .filter_map(|container| container.id)
+        .collect())
+}
+
+/// 根据失败容器的最新运行状态修正本次采样分母。
+fn resolve_running_container_count(
+    sampled_container_count: usize,
+    failed_ids: &[String],
+    refreshed_running_ids: Option<&HashSet<String>>,
+) -> usize {
+    let still_running_failure_count =
+        refreshed_running_ids.map_or(failed_ids.len(), |running_ids| {
+            failed_ids
+                .iter()
+                .filter(|id| running_ids.contains(id.as_str()))
+                .count()
+        });
+    sampled_container_count + still_running_failure_count
 }
 
 async fn cleanup_old_stats(state: &AppState) -> anyhow::Result<()> {
@@ -422,13 +479,14 @@ fn calculate_cpu_percent(stats: &bollard::models::ContainerStatsResponse) -> f64
 mod tests {
     use super::{
         calculate_cpu_percent, cleanup_old_stats, container_stats_options,
-        normalize_cpu_host_percent, resolve_sample_status,
+        normalize_cpu_host_percent, resolve_running_container_count, resolve_sample_status,
     };
     use crate::config;
     use crate::models::docker::ResourceSampleStatus;
     use crate::test_support::setup_test_state;
     use bollard::models::{ContainerCpuStats, ContainerCpuUsage, ContainerStatsResponse};
     use chrono::Utc;
+    use std::collections::HashSet;
 
     fn make_stats(
         cpu_total: u64,
@@ -525,6 +583,63 @@ mod tests {
             resolve_sample_status(100, 90, 0, 0),
             ResourceSampleStatus::Fresh
         );
+    }
+
+    #[test]
+    fn running_count_excludes_failed_containers_that_stopped() {
+        let failed_ids = vec!["stopped".to_string()];
+        let running_ids = HashSet::new();
+
+        assert_eq!(
+            resolve_running_container_count(3, &failed_ids, Some(&running_ids)),
+            3
+        );
+        assert_eq!(
+            resolve_sample_status(100, 90, 3, 3),
+            ResourceSampleStatus::Fresh
+        );
+    }
+
+    #[test]
+    fn running_count_keeps_failed_containers_that_are_still_running() {
+        let failed_ids = vec!["running".to_string()];
+        let running_ids = HashSet::from(["running".to_string()]);
+
+        assert_eq!(
+            resolve_running_container_count(3, &failed_ids, Some(&running_ids)),
+            4
+        );
+        assert_eq!(
+            resolve_sample_status(100, 90, 4, 3),
+            ResourceSampleStatus::Partial
+        );
+    }
+
+    #[test]
+    fn running_count_only_keeps_failed_containers_still_running() {
+        let failed_ids = vec![
+            "running".to_string(),
+            "paused".to_string(),
+            "removed".to_string(),
+        ];
+        let running_ids = HashSet::from(["running".to_string()]);
+
+        assert_eq!(
+            resolve_running_container_count(2, &failed_ids, Some(&running_ids)),
+            3
+        );
+    }
+
+    #[test]
+    fn running_count_preserves_failures_when_recheck_is_unavailable() {
+        let failed_ids = vec!["first".to_string(), "second".to_string()];
+
+        assert_eq!(resolve_running_container_count(2, &failed_ids, None), 4);
+    }
+
+    #[test]
+    fn running_count_matches_samples_when_nothing_failed() {
+        assert_eq!(resolve_running_container_count(4, &[], None), 4);
     }
 
     #[tokio::test]
