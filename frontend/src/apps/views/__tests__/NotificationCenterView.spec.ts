@@ -3,6 +3,7 @@ import { createI18n } from 'vue-i18n'
 import { flushPromises, mount } from '@vue/test-utils'
 import { describe, expect, it, vi } from 'vitest'
 import { notificationsApi } from '@/api/modules/notifications'
+import type { NotificationDetail, NotificationSummary } from '@/api/generated'
 import NotificationCenterView from '@/apps/views/NotificationCenterView.vue'
 import en from '@/locales/en'
 import zh from '@/locales/zh'
@@ -128,6 +129,67 @@ describe('NotificationCenterView', () => {
     await flushPromises()
     expect(wrapper.find('[data-ui="selection-bar"]').exists()).toBe(false)
     expect(wrapper.get('[data-ui="table-row-selection"] input').element.checked).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('无业务结果时在列表和详情中显示占位符', async () => {
+    const notification = {
+      notificationId: 'node-offline',
+      createdAt: '2026-08-09T08:31:58Z',
+      code: 'nodeOffline',
+      category: 'system',
+      attentionLevel: 'warning',
+      outcome: null,
+      source: { module: 'nodes' },
+      subject: { kind: 'node', id: 'node-1', displayName: 'Node 1' },
+      operationEventId: 'event-node-offline',
+      parameters: { reason: 'leaseExpired' },
+      readAt: '2026-08-09T08:32:00Z',
+      capabilities: {
+        canViewDetails: true,
+        canMarkRead: false,
+        canMarkUnread: true,
+        canArchive: true,
+        canRestore: false,
+        canOpenTarget: false,
+      },
+    } as unknown as NotificationSummary
+    vi.mocked(notificationsApi.query)
+      .mockReset()
+      .mockResolvedValue({
+        success: true,
+        code: 200,
+        message: '',
+        data: { total: 1, page: 1, pageSize: 20, items: [notification] },
+      })
+    vi.mocked(notificationsApi.detail).mockResolvedValue({
+      success: true,
+      code: 200,
+      message: '',
+      data: {
+        ...notification,
+        outcome: undefined,
+        traceId: 'trace-node-offline',
+      } as NotificationDetail,
+    })
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(wrapper.get('[data-slot="outcome-empty"]').text()).toBe('—')
+    expect(wrapper.get('[data-ui="notification-table"]').text()).not.toContain('成功')
+
+    await (
+      wrapper.vm as unknown as {
+        openDetail: (item: NotificationSummary) => Promise<void>
+      }
+    ).openDetail(notification)
+    const detailItems = (
+      wrapper.vm as unknown as {
+        detailItems: Array<{ label: string; value: string }>
+      }
+    ).detailItems
+
+    expect(detailItems.find((item) => item.label === '结果')).toMatchObject({ value: '—' })
     wrapper.unmount()
   })
 

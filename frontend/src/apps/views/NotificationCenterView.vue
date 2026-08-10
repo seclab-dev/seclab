@@ -73,6 +73,7 @@ const detailError = ref<string>()
 const pendingIds = ref(new Set<string>())
 const readAllPending = ref(false)
 const batchPending = ref(false)
+const emptyValue = '—'
 
 let listSequence = 0
 let listController: AbortController | undefined
@@ -188,12 +189,10 @@ const detailItems = computed(() => {
       label: t('app.notificationCenter.detail.attentionLevel'),
       value: t(`app.notificationCenter.attentionLevel.${current.attentionLevel}`),
     },
-    current.outcome
-      ? {
-          label: t('app.notificationCenter.detail.outcome'),
-          value: t(`app.notificationCenter.outcome.${current.outcome}`),
-        }
-      : null,
+    {
+      label: t('app.notificationCenter.detail.outcome'),
+      value: current.outcome ? t(`app.notificationCenter.outcome.${current.outcome}`) : emptyValue,
+    },
     {
       label: t('app.notificationCenter.detail.module'),
       value: t(`app.operationLog.modules.${current.source.module}`),
@@ -695,6 +694,7 @@ onBeforeUnmount(() => {
           <SecLabTag v-if="row.outcome" :type="outcomeTagType(row.outcome)" size="small">
             {{ t(`app.notificationCenter.outcome.${row.outcome}`) }}
           </SecLabTag>
+          <span v-else class="empty-value" data-slot="outcome-empty">{{ emptyValue }}</span>
         </template>
         <template #content="{ row }: { row: NotificationSummary }">
           <button
@@ -909,6 +909,10 @@ onBeforeUnmount(() => {
 
 .target-cell {
   word-break: break-word;
+}
+
+.empty-value {
+  color: var(--sdl-text-muted);
 }
 
 .footer {
