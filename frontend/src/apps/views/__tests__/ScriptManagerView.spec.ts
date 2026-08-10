@@ -16,6 +16,11 @@ vi.mock('@/components/editor/MonacoEditor.vue', () => ({
   },
 }))
 vi.mock('@/api/modules/nodes', () => ({ nodesApi: { list: vi.fn() } }))
+vi.mock('@/stores/window-manager', () => ({
+  useWindowManagerStore: () => ({
+    updateWindowRuntimeState: vi.fn(),
+  }),
+}))
 vi.mock('@/api/modules/scripts', () => ({
   scriptsApi: {
     list: vi.fn(),

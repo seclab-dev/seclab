@@ -8,6 +8,8 @@ import NotificationCenterView from '@/apps/views/NotificationCenterView.vue'
 import en from '@/locales/en'
 import zh from '@/locales/zh'
 
+const openWindowWithPayloadMock = vi.hoisted(() => vi.fn())
+
 vi.mock('@/api/modules/notifications', () => ({
   notificationsApi: {
     query: vi.fn(),
@@ -18,6 +20,12 @@ vi.mock('@/api/modules/notifications', () => ({
     updateArchiveState: vi.fn(),
     updateBatchArchiveState: vi.fn(),
   },
+}))
+
+vi.mock('@/stores/window-manager', () => ({
+  useWindowManagerStore: () => ({
+    openWindowWithPayload: openWindowWithPayloadMock,
+  }),
 }))
 
 const response = (notificationId: string) => ({
