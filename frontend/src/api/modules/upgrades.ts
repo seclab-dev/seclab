@@ -22,12 +22,36 @@ export interface UpgradeReleaseRecord {
   assets: string
   checksumStatus: string
   signatureStatus: string
+  supportedSuiteContractVersions: string
   upgradeEligible: boolean
   upgradeBlockReason?: string
   syncedAt: string
   publishedAt?: string
   createdAt: string
   updatedAt: string
+}
+
+export interface SuiteCompatibilityInstance {
+  instanceId: string
+  suiteId: string
+  suiteName: string
+  nodeId: string
+  nodeName: string
+  platformContractVersion: number
+  status: 'compatible' | 'incompatible'
+  reason: 'supported' | 'contractVersionNotSupported'
+}
+
+export interface SuiteCompatibilityReport {
+  releaseVersion: string
+  supportedSuiteContractVersions: number[]
+  compatible: boolean
+  summary: {
+    total: number
+    compatible: number
+    incompatible: number
+  }
+  instances: SuiteCompatibilityInstance[]
 }
 
 export interface UpgradePlanRecord {
@@ -105,4 +129,8 @@ export const upgradesApi = {
   latestPlan: () => http.get<UpgradePlanDetail>('/upgrades/plan/latest'),
   cancelPlan: (planId: string) => http.post<UpgradePlanDetail>(`/upgrades/plan/${planId}/cancel`),
   deleteRelease: (version: string) => http.delete<void>(`/upgrades/release/${version}/delete`),
+  checkSuiteCompatibility: (version: string, nodeIds?: string[]) =>
+    http.post<SuiteCompatibilityReport>(`/upgrades/release/${version}/compatibility/check`, {
+      nodeIds,
+    }),
 }

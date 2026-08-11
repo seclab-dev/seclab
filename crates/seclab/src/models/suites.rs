@@ -12,12 +12,20 @@ pub struct SuiteManifest {
     pub api_version: String,
     pub kind: String,
     pub metadata: SuiteManifestInfo,
+    pub compatibility: SuiteCompatibility,
     pub runtime: SuiteRuntime,
     #[serde(default)]
     pub app_entries: Vec<SuiteAppEntryManifest>,
     /// 仅覆盖套件中心、应用库和桌面入口的展示文案，不参与运行时配置。
     #[serde(default)]
     pub i18n: Option<SuiteManifestI18n>,
+}
+
+/// 套件与 SecLab 平台运行契约的兼容声明。
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SuiteCompatibility {
+    pub platform_contract_version: u32,
 }
 
 /// 套件基础信息。
@@ -176,6 +184,7 @@ pub struct SuiteInstanceSummary {
     pub instance_id: String,
     pub suite_id: String,
     pub version: String,
+    pub platform_contract_version: i64,
     pub node_id: String,
     pub compose_project_name: String,
     pub status: String,
@@ -276,6 +285,7 @@ pub async fn list_suites(
             SELECT instance_id,
                    suite_id,
                    version,
+                   platform_contract_version,
                    node_id,
                    compose_project_name,
                    status,
@@ -296,6 +306,7 @@ pub async fn list_suites(
             SELECT instance_id,
                    suite_id,
                    version,
+                   platform_contract_version,
                    node_id,
                    compose_project_name,
                    status,
@@ -482,14 +493,16 @@ pub async fn insert_instance(pool: &DbPool, instance: &SuiteInstanceSummary) -> 
     sqlx::query(
         r#"
         INSERT INTO suite_instances (
-            instance_id, suite_id, version, node_id, compose_project_name, status, last_error
+            instance_id, suite_id, version, platform_contract_version, node_id,
+            compose_project_name, status, last_error
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
         "#,
     )
     .bind(&instance.instance_id)
     .bind(&instance.suite_id)
     .bind(&instance.version)
+    .bind(instance.platform_contract_version)
     .bind(&instance.node_id)
     .bind(&instance.compose_project_name)
     .bind(&instance.status)
@@ -509,6 +522,7 @@ pub async fn fetch_instance(
         SELECT instance_id,
                suite_id,
                version,
+               platform_contract_version,
                node_id,
                compose_project_name,
                status,
@@ -535,6 +549,7 @@ pub async fn fetch_instance_by_suite_and_node(
         SELECT instance_id,
                suite_id,
                version,
+               platform_contract_version,
                node_id,
                compose_project_name,
                status,
@@ -966,8 +981,10 @@ mod install_task_tests {
                 "slug": "suite-count",
                 "version": "1.0.0",
                 "name": "Suite Count",
-                "icon": "icon.png"
+                "icon": "icon.png",
+                "minSeclabVersion": "0.1.0-alpha.1"
             },
+            "compatibility": { "platformContractVersion": 1 },
             "runtime": { "type": "compose", "composeFile": "compose.yaml" }
         });
         sqlx::query(
@@ -988,6 +1005,7 @@ mod install_task_tests {
                     instance_id: format!("instance-{node_id}"),
                     suite_id: "suite-count".to_string(),
                     version: "1.0.0".to_string(),
+                    platform_contract_version: 1,
                     node_id: node_id.to_string(),
                     compose_project_name: format!("suite-count-{node_id}"),
                     status: "installed".to_string(),

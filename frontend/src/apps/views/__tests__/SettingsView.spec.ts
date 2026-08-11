@@ -14,6 +14,7 @@ const api = vi.hoisted(() => ({
   fetchNetwork: vi.fn(),
   fetchSecurity: vi.fn(),
   listReleases: vi.fn(),
+  checkSuiteCompatibility: vi.fn(),
 }))
 
 const windowManager = vi.hoisted(() => ({
@@ -52,6 +53,7 @@ vi.mock('@/api/modules/upgrades', () => ({
     startPlan: vi.fn(),
     detail: vi.fn(),
     deleteRelease: vi.fn(),
+    checkSuiteCompatibility: api.checkSuiteCompatibility,
   },
 }))
 
@@ -129,6 +131,15 @@ describe('SettingsView', () => {
       success({ safeEntry: '', safeEntryEnabled: false, passwordComplexity: false }),
     )
     api.listReleases.mockResolvedValue(success([]))
+    api.checkSuiteCompatibility.mockResolvedValue(
+      success({
+        releaseVersion: '1.0.0',
+        supportedSuiteContractVersions: [1],
+        compatible: true,
+        summary: { total: 0, compatible: 0, incompatible: 0 },
+        instances: [],
+      }),
+    )
   })
 
   it('初次打开由分区组件自行加载数据', async () => {

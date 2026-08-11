@@ -126,15 +126,25 @@ if [[ "$SECLAB_VERSION" == *-* ]]; then
   CHANNEL="prerelease"
 fi
 RELEASE_CHANNEL="${SECLAB_RELEASE_CHANNEL:-$CHANNEL}"
+COMPATIBILITY_FILE="$ROOT_DIR/release-compatibility.json"
+SUPPORTED_SUITE_CONTRACT_VERSIONS="$(sed -n 's/.*"supportedSuiteContractVersions"[[:space:]]*:[[:space:]]*\(\[[^]]*\]\).*/\1/p' "$COMPATIBILITY_FILE")"
+if [[ -z "$SUPPORTED_SUITE_CONTRACT_VERSIONS" ]]; then
+  echo "invalid release compatibility config: $COMPATIBILITY_FILE" >&2
+  exit 1
+fi
 
 cat <<EOF > "$STAGING_DIR/$BUNDLE_DIR_NAME/release.json"
 {
   "version": "${SECLAB_VERSION}",
   "channel": "${RELEASE_CHANNEL}",
   "targetTriple": "${TARGET_TRIPLE}",
-  "publishedAt": "${PUBLISHED_AT}"
+  "publishedAt": "${PUBLISHED_AT}",
+  "compatibility": {
+    "supportedSuiteContractVersions": ${SUPPORTED_SUITE_CONTRACT_VERSIONS}
+  }
 }
 EOF
+sign_file "$STAGING_DIR/$BUNDLE_DIR_NAME/release.json"
 
 OUT_FILE="$(dirname "$OUT_FILE")/seclab-${SECLAB_VERSION}-${TARGET_TRIPLE}.tar.gz"
 tar \

@@ -6,6 +6,7 @@ import { formatDateTime } from '@/utils/time'
 import { securityApi } from '@/api/modules/security'
 import {
   upgradesApi,
+  type SuiteCompatibilityReport,
   type UpgradePlanDetail,
   type UpgradeReleaseRecord,
 } from '@/api/modules/upgrades'
@@ -15,6 +16,7 @@ import { useConfirmationModalStore } from '@/stores/confirmation-modal'
 import { forgetLoginEntry, rememberLoginEntry } from '@/utils/login-entry'
 import {
   SecLabButton,
+  SecLabAlert,
   SecLabCard,
   SecLabFormItem,
   SecLabMenu,
@@ -67,6 +69,8 @@ const upgradeUploading = ref(false)
 const upgradeReleases = ref<UpgradeReleaseRecord[]>([])
 const selectedUpgradeVersion = ref('')
 const upgradePlan = ref<UpgradePlanDetail | null>(null)
+const compatibilityCheckingVersion = ref('')
+const compatibilityReport = ref<SuiteCompatibilityReport | null>(null)
 
 // 上传与回显相关变量
 const uploadFile = ref<File | null>(null)
@@ -194,7 +198,7 @@ const releaseColumns = computed<SecLabTableColumn[]>(() => [
   {
     prop: 'version',
     label: t('app.settings.upgrade.actions'),
-    width: 180,
+    width: 290,
     slot: 'actions',
     align: 'center',
   },
@@ -517,6 +521,24 @@ const startUpgradeForVersion = async (version: string) => {
   if (!confirmed) return
   selectedUpgradeVersion.value = version
   await startClusterUpgrade(overwriteSameVersion)
+}
+
+/** 检测目标版本与当前已安装套件的平台契约兼容性。 */
+const checkSuiteCompatibility = async (version: string) => {
+  compatibilityCheckingVersion.value = version
+  try {
+    const response = await upgradesApi.checkSuiteCompatibility(version)
+    if (!response.success || !response.data) {
+      toastStore.error(response.message || t('app.settings.upgrade.compatibilityCheckFailed'))
+      return
+    }
+    compatibilityReport.value = response.data
+  } catch (error) {
+    console.error('Failed to check suite compatibility', error)
+    toastStore.error(t('app.settings.upgrade.compatibilityCheckFailed'))
+  } finally {
+    compatibilityCheckingVersion.value = ''
+  }
 }
 
 const isUpgradeFinished = (status?: string) => {
@@ -845,6 +867,15 @@ onBeforeUnmount(stopUpgradeRefreshTimer)
                       </SecLabButton>
                       <SecLabButton
                         size="small"
+                        type="secondary"
+                        :loading="compatibilityCheckingVersion === row.version"
+                        data-ui="suite-compatibility-check"
+                        @click="checkSuiteCompatibility(row.version)"
+                      >
+                        {{ t('app.settings.upgrade.checkCompatibility') }}
+                      </SecLabButton>
+                      <SecLabButton
+                        size="small"
                         type="danger"
                         @click="deleteReleaseForVersion(row.version)"
                       >
@@ -859,6 +890,49 @@ onBeforeUnmount(stopUpgradeRefreshTimer)
                   class="releases-empty"
                   :description="t('app.settings.upgrade.noReleases')"
                 />
+
+                <div
+                  v-if="compatibilityReport"
+                  class="compatibility-report"
+                  data-ui="suite-compatibility-report"
+                >
+                  <SecLabAlert
+                    :type="compatibilityReport.compatible ? 'success' : 'warning'"
+                    :title="
+                      t(
+                        compatibilityReport.compatible
+                          ? 'app.settings.upgrade.compatibilityPassed'
+                          : 'app.settings.upgrade.compatibilityWarning',
+                        {
+                          version: compatibilityReport.releaseVersion,
+                          total: compatibilityReport.summary.total,
+                          incompatible: compatibilityReport.summary.incompatible,
+                          contracts: compatibilityReport.supportedSuiteContractVersions.join(', '),
+                        },
+                      )
+                    "
+                    show-icon
+                  />
+                  <ul
+                    v-if="compatibilityReport.summary.incompatible > 0"
+                    class="compatibility-instances"
+                    data-slot="incompatible-suite-instances"
+                  >
+                    <li
+                      v-for="instance in compatibilityReport.instances.filter(
+                        (item) => item.status === 'incompatible',
+                      )"
+                      :key="instance.instanceId"
+                    >
+                      {{ instance.suiteName }} · {{ instance.nodeName }} ·
+                      {{
+                        t('app.settings.upgrade.contractVersion', {
+                          version: instance.platformContractVersion,
+                        })
+                      }}
+                    </li>
+                  </ul>
+                </div>
               </div>
             </div>
 
@@ -1158,6 +1232,24 @@ onBeforeUnmount(stopUpgradeRefreshTimer)
   gap: var(--sdl-space-2);
   justify-content: center;
   align-items: center;
+}
+
+.compatibility-report {
+  display: grid;
+  gap: var(--sdl-space-3);
+  margin-top: var(--sdl-space-4);
+}
+
+.compatibility-instances {
+  display: grid;
+  gap: var(--sdl-space-2);
+  margin: 0;
+  padding: var(--sdl-space-3) var(--sdl-space-5);
+  color: var(--sdl-text-secondary);
+  font-size: var(--sdl-font-body-sm);
+  background: var(--sdl-bg-muted);
+  border: 1px solid var(--sdl-border-subtle);
+  border-radius: var(--sdl-radius-md);
 }
 
 /* 进度条通用样式 */

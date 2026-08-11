@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS upgrade_releases (
     signature_status TEXT NOT NULL CHECK (
         signature_status IN ('unknown', 'missing', 'verified', 'failed')
     ) DEFAULT 'unknown',
+    supported_suite_contract_versions TEXT NOT NULL,
     synced_at TEXT NOT NULL,
     published_at TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),

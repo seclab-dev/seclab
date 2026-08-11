@@ -3,7 +3,9 @@
 use crate::api::auth::AuthenticatedAdmin;
 use crate::models::logging::{LogModule, LogStatus, PlatformLogLevel};
 use crate::services::logging::{self, OperationEventBuilder};
-use crate::services::upgrades::{self, UpgradeAuditContext, UpgradePlanCreatePayload};
+use crate::services::upgrades::{
+    self, SuiteCompatibilityCheckPayload, UpgradeAuditContext, UpgradePlanCreatePayload,
+};
 use crate::state::AppState;
 use crate::types::{ApiResponse, ApiResult};
 use axum::{
@@ -72,6 +74,16 @@ pub async fn upload_release(
     .await?;
     let release = upgrades::build_release_view(release_res?);
     Ok(ApiResponse::success_with_raw("Upgrade release uploaded", Some(release)).into_response())
+}
+
+/// 检测指定升级版本与已安装套件的契约兼容性。
+pub async fn check_suite_compatibility(
+    State(state): State<Arc<AppState>>,
+    Path(version): Path<String>,
+    Json(payload): Json<SuiteCompatibilityCheckPayload>,
+) -> ApiResult<Response> {
+    let report = upgrades::check_suite_compatibility(&state.metadata_db, &version, payload).await?;
+    Ok(ApiResponse::success_with_raw("Suite compatibility checked", Some(report)).into_response())
 }
 
 /// 创建升级计划。
@@ -230,6 +242,10 @@ pub fn upgrades_router() -> Router<Arc<AppState>> {
         .route("/releases/sync", post(sync_releases))
         .route("/releases/upload", post(upload_release))
         .route("/release/{version}/delete", delete(delete_release))
+        .route(
+            "/release/{version}/compatibility/check",
+            post(check_suite_compatibility),
+        )
         .route("/plan/create", post(create_plan))
         .route("/plan/latest", get(latest_plan))
         .route("/plan/{plan_id}/start", post(start_plan))

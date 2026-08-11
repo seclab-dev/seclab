@@ -10,7 +10,8 @@ use crate::models::upgrades::{
     get_artifact_token_by_hash, get_plan, get_release_by_version, insert_artifact_token,
     insert_event, insert_plan, insert_target, list_events_by_plan, list_releases,
     list_schedulable_targets, list_targets_by_plan, mark_target_failed, update_plan_status,
-    update_target_status, update_targets_status, upsert_release,
+    update_release_suite_contract_versions, update_target_status, update_targets_status,
+    upsert_release,
 };
 use crate::state::DbPool;
 use crate::types::{ApiError, ApiResult, new_uuid_v7};
@@ -27,7 +28,7 @@ use seclab_upgrade::{
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -45,6 +46,56 @@ pub struct UpgradePlanCreatePayload {
     pub overwrite_same_version: Option<bool>,
     pub max_concurrency: Option<u32>,
     pub failure_threshold_percent: Option<u32>,
+}
+
+/// 套件兼容性检测范围。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuiteCompatibilityCheckPayload {
+    pub node_ids: Option<Vec<String>>,
+}
+
+/// 已安装套件实例与目标版本的兼容状态。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuiteCompatibilityInstance {
+    pub instance_id: String,
+    pub suite_id: String,
+    pub suite_name: String,
+    pub node_id: String,
+    pub node_name: String,
+    pub platform_contract_version: u32,
+    pub status: String,
+    pub reason: String,
+}
+
+/// 目标升级版本与已安装套件的兼容性报告。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuiteCompatibilityReport {
+    pub release_version: String,
+    pub supported_suite_contract_versions: Vec<u32>,
+    pub compatible: bool,
+    pub summary: SuiteCompatibilitySummary,
+    pub instances: Vec<SuiteCompatibilityInstance>,
+}
+
+/// 套件兼容性检测汇总。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuiteCompatibilitySummary {
+    pub total: usize,
+    pub compatible: usize,
+    pub incompatible: usize,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct SuiteCompatibilityInstanceRow {
+    instance_id: String,
+    suite_id: String,
+    suite_name: String,
+    node_id: String,
+    platform_contract_version: i64,
 }
 
 /// 升级操作的可信审计上下文。
@@ -145,6 +196,151 @@ pub async fn list_synced_releases(pool: &DbPool) -> ApiResult<Vec<UpgradeRelease
     Ok(releases.into_iter().map(build_release_view).collect())
 }
 
+/// 检测目标版本与当前已安装套件实例的平台契约兼容性。
+pub async fn check_suite_compatibility(
+    pool: &DbPool,
+    version: &str,
+    payload: SuiteCompatibilityCheckPayload,
+) -> ApiResult<SuiteCompatibilityReport> {
+    let version = normalize_version(version)?;
+    let release = get_release_by_version(pool, &version)
+        .await?
+        .ok_or_else(|| ApiError::BadRequest(format!("release {version} is not synced")))?;
+    let mut supported = serde_json::from_str::<Vec<u32>>(
+        &release.supported_suite_contract_versions,
+    )
+    .map_err(|err| ApiError::Internal(format!("failed to parse release compatibility: {err}")))?;
+    if supported.is_empty() && release.source == "github" {
+        supported = resolve_github_release_compatibility(pool, &release).await?;
+    }
+    validate_supported_suite_contract_versions(&supported)?;
+
+    let requested_nodes = payload
+        .node_ids
+        .map(|values| values.into_iter().collect::<HashSet<_>>());
+    let node_names = list_nodes(pool)
+        .await?
+        .into_iter()
+        .map(|node| (node.node_id, node.name))
+        .collect::<HashMap<_, _>>();
+    let rows = sqlx::query_as::<_, SuiteCompatibilityInstanceRow>(
+        r#"
+        SELECT
+            instance.instance_id,
+            instance.suite_id,
+            catalog.name AS suite_name,
+            instance.node_id,
+            instance.platform_contract_version
+        FROM suite_instances AS instance
+        INNER JOIN suite_catalog_items AS catalog ON catalog.suite_id = instance.suite_id
+        WHERE instance.uninstalled_at IS NULL
+        ORDER BY catalog.name, instance.node_id
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let instances = rows
+        .into_iter()
+        .filter(|row| {
+            requested_nodes
+                .as_ref()
+                .is_none_or(|node_ids| node_ids.contains(&row.node_id))
+        })
+        .map(|row| {
+            let contract_version = u32::try_from(row.platform_contract_version).unwrap_or(0);
+            let compatible = supported.contains(&contract_version);
+            SuiteCompatibilityInstance {
+                instance_id: row.instance_id,
+                suite_id: row.suite_id,
+                suite_name: row.suite_name,
+                node_name: node_names
+                    .get(&row.node_id)
+                    .cloned()
+                    .unwrap_or_else(|| row.node_id.clone()),
+                node_id: row.node_id,
+                platform_contract_version: contract_version,
+                status: if compatible {
+                    "compatible"
+                } else {
+                    "incompatible"
+                }
+                .to_string(),
+                reason: if compatible {
+                    "supported".to_string()
+                } else {
+                    "contractVersionNotSupported".to_string()
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    let compatible_count = instances
+        .iter()
+        .filter(|instance| instance.status == "compatible")
+        .count();
+    let incompatible_count = instances.len() - compatible_count;
+
+    Ok(SuiteCompatibilityReport {
+        release_version: version,
+        supported_suite_contract_versions: supported,
+        compatible: incompatible_count == 0,
+        summary: SuiteCompatibilitySummary {
+            total: instances.len(),
+            compatible: compatible_count,
+            incompatible: incompatible_count,
+        },
+        instances,
+    })
+}
+
+/// 下载并校验 GitHub 完整版本包，解析其签名保护的兼容声明。
+async fn resolve_github_release_compatibility(
+    pool: &DbPool,
+    release: &UpgradeReleaseRecord,
+) -> ApiResult<Vec<u32>> {
+    let assets = serde_json::from_str::<Vec<UpgradeAsset>>(&release.assets)
+        .map_err(|err| ApiError::Internal(format!("failed to parse release assets: {err}")))?;
+    let target_triple = current_target_triple();
+    let package = select_release_package_asset(&assets, target_triple)?;
+    let names = release_package_names(&release.version, target_triple)
+        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    let package_bytes = download_bytes(&package.download_url).await?;
+    let checksum_text =
+        download_text(&signature_or_checksum_url(&assets, &names.checksum)?).await?;
+    let expected = parse_checksum_text(&checksum_text, &names.package)
+        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    verify_sha256(&package_bytes, &expected)
+        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    let package_signature =
+        download_text(&signature_or_checksum_url(&assets, &names.signature)?).await?;
+    verify_release_signature(&package_bytes, &package_signature)
+        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+
+    let package_path =
+        std::env::temp_dir().join(format!("seclab-release-metadata-{}.tar.gz", new_uuid_v7()));
+    tokio::fs::write(&package_path, &package_bytes)
+        .await
+        .map_err(ApiError::Io)?;
+    let metadata_result = parse_release_metadata(&package_path);
+    let _ = tokio::fs::remove_file(&package_path).await;
+    let metadata = metadata_result?;
+    let metadata_target = normalize_target_triple(&metadata.target_triple)
+        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    if normalize_version(&metadata.version)? != release.version || metadata_target != target_triple
+    {
+        return Err(ApiError::BadRequest(
+            "release.json does not match the selected release package".to_string(),
+        ));
+    }
+
+    let supported = metadata.compatibility.supported_suite_contract_versions;
+    let serialized = serde_json::to_string(&supported).map_err(|err| {
+        ApiError::Internal(format!("failed to serialize release compatibility: {err}"))
+    })?;
+    update_release_suite_contract_versions(pool, &release.version, &serialized).await?;
+    Ok(supported)
+}
+
 /// 从 GitHub 同步发布版本元数据。
 pub async fn sync_github_releases(pool: &DbPool) -> ApiResult<Vec<UpgradeReleaseView>> {
     let config = &crate::config::get().upgrade;
@@ -205,6 +401,11 @@ pub async fn sync_github_releases(pool: &DbPool) -> ApiResult<Vec<UpgradeRelease
                 .iter()
                 .all(|asset| asset.signature_status.as_deref() == Some("verified")),
         );
+        let supported_suite_contract_versions = get_release_by_version(pool, &version)
+            .await?
+            .filter(|existing| existing.source == "github")
+            .map(|existing| existing.supported_suite_contract_versions)
+            .unwrap_or_else(|| "[]".to_string());
 
         upsert_release(
             pool,
@@ -218,6 +419,7 @@ pub async fn sync_github_releases(pool: &DbPool) -> ApiResult<Vec<UpgradeRelease
                 assets: serde_json::to_string(&assets).unwrap_or_else(|_| "[]".to_string()),
                 checksum_status: checksum_status.to_string(),
                 signature_status: signature_status.to_string(),
+                supported_suite_contract_versions,
                 synced_at: synced_at.clone(),
                 published_at: release.published_at,
                 created_at: synced_at.clone(),
@@ -1460,7 +1662,7 @@ pub async fn ensure_artifact_cached(
     })
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ReleaseMetadata {
     version: String,
     channel: String,
@@ -1468,6 +1670,40 @@ struct ReleaseMetadata {
     target_triple: String,
     #[serde(rename = "publishedAt")]
     published_at: Option<String>,
+    compatibility: ReleaseCompatibilityMetadata,
+}
+
+/// 升级版本声明支持的套件平台契约版本。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReleaseCompatibilityMetadata {
+    supported_suite_contract_versions: Vec<u32>,
+}
+
+/// 读取当前构建版本的套件平台契约支持范围。
+pub(crate) fn current_supported_suite_contract_versions() -> ApiResult<Vec<u32>> {
+    let compatibility: ReleaseCompatibilityMetadata = serde_json::from_str(include_str!(
+        "../../../../release-compatibility.json"
+    ))
+    .map_err(|err| ApiError::Internal(format!("invalid release compatibility config: {err}")))?;
+    validate_supported_suite_contract_versions(&compatibility.supported_suite_contract_versions)?;
+    Ok(compatibility.supported_suite_contract_versions)
+}
+
+/// 校验发布版本的套件平台契约支持范围。
+fn validate_supported_suite_contract_versions(versions: &[u32]) -> ApiResult<()> {
+    if versions.is_empty() || versions.contains(&0) {
+        return Err(ApiError::BadRequest(
+            "supportedSuiteContractVersions must contain positive integers".to_string(),
+        ));
+    }
+    let unique = versions.iter().copied().collect::<HashSet<_>>();
+    if unique.len() != versions.len() {
+        return Err(ApiError::BadRequest(
+            "supportedSuiteContractVersions must not contain duplicates".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_release_metadata(package_path: &std::path::Path) -> ApiResult<ReleaseMetadata> {
@@ -1480,6 +1716,8 @@ fn parse_release_metadata(package_path: &std::path::Path) -> ApiResult<ReleaseMe
             "Failed to unpack tar archive (invalid gzip or corrupted format): {err}"
         ))
     })?;
+    let mut metadata_content = None;
+    let mut metadata_signature = None;
     for entry in entries {
         let mut entry = entry
             .map_err(|err| ApiError::BadRequest(format!("Failed to read archive entry: {err}")))?;
@@ -1489,22 +1727,37 @@ fn parse_release_metadata(package_path: &std::path::Path) -> ApiResult<ReleaseMe
         let path = entry
             .path()
             .map_err(|err| ApiError::BadRequest(format!("Failed to read entry path: {err}")))?;
-        if path.to_string_lossy().ends_with("release.json") {
-            let mut content = String::new();
-            std::io::Read::read_to_string(&mut entry, &mut content).map_err(|err| {
+        let file_name = path.file_name().and_then(|value| value.to_str());
+        if file_name == Some("release.json") {
+            let mut content = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut content).map_err(|err| {
                 ApiError::BadRequest(format!("Failed to read release.json content: {err}"))
             })?;
-            let metadata: ReleaseMetadata = serde_json::from_str(&content).map_err(|err| {
-                ApiError::BadRequest(format!(
-                    "Invalid release.json metadata (JSON format error): {err}"
-                ))
+            metadata_content = Some(content);
+        } else if file_name == Some("release.json.sig") {
+            let mut signature = String::new();
+            std::io::Read::read_to_string(&mut entry, &mut signature).map_err(|err| {
+                ApiError::BadRequest(format!("Failed to read release.json signature: {err}"))
             })?;
-            return Ok(metadata);
+            metadata_signature = Some(signature);
         }
     }
-    Err(ApiError::BadRequest(
-        "release.json not found in package".to_string(),
-    ))
+    let content = metadata_content
+        .ok_or_else(|| ApiError::BadRequest("release.json not found in package".to_string()))?;
+    let signature = metadata_signature.ok_or_else(|| {
+        ApiError::BadRequest("release.json signature not found in package".to_string())
+    })?;
+    verify_release_signature(&content, &signature)
+        .map_err(|err| ApiError::BadRequest(format!("release.json signature is invalid: {err}")))?;
+    let metadata: ReleaseMetadata = serde_json::from_slice(&content).map_err(|err| {
+        ApiError::BadRequest(format!(
+            "Invalid release.json metadata (JSON format error): {err}"
+        ))
+    })?;
+    validate_supported_suite_contract_versions(
+        &metadata.compatibility.supported_suite_contract_versions,
+    )?;
+    Ok(metadata)
 }
 
 /// 上传完整版本包并写入发布版本记录。
@@ -1641,6 +1894,20 @@ pub async fn upload_release_package(
                 "uploaded release conflicts with GitHub release source".to_string(),
             ));
         }
+        let existing_supported = serde_json::from_str::<Vec<u32>>(
+            &existing.supported_suite_contract_versions,
+        )
+        .map_err(|err| {
+            ApiError::Internal(format!(
+                "failed to parse existing release compatibility: {err}"
+            ))
+        })?;
+        if existing_supported != metadata.compatibility.supported_suite_contract_versions {
+            return Err(ApiError::BadRequest(
+                "packages for the same release must declare identical suite contract versions"
+                    .to_string(),
+            ));
+        }
         serde_json::from_str::<Vec<UpgradeAsset>>(&existing.assets).unwrap_or_default()
     } else {
         Vec::new()
@@ -1672,6 +1939,12 @@ pub async fn upload_release_package(
         assets: serde_json::to_string(&assets).unwrap_or_else(|_| "[]".to_string()),
         checksum_status: "verified".to_string(),
         signature_status: "verified".to_string(),
+        supported_suite_contract_versions: serde_json::to_string(
+            &metadata.compatibility.supported_suite_contract_versions,
+        )
+        .map_err(|err| {
+            ApiError::Internal(format!("failed to serialize release compatibility: {err}"))
+        })?,
         synced_at: now.clone(),
         published_at: metadata.published_at.clone().or_else(|| Some(now.clone())),
         created_at: now.clone(),
@@ -2123,6 +2396,96 @@ mod tests {
             created_at: now.clone(),
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn current_release_starts_with_suite_contract_version_one() {
+        assert_eq!(
+            current_supported_suite_contract_versions().unwrap(),
+            vec![1]
+        );
+        assert!(validate_supported_suite_contract_versions(&[1]).is_ok());
+        assert!(validate_supported_suite_contract_versions(&[]).is_err());
+        assert!(validate_supported_suite_contract_versions(&[0]).is_err());
+        assert!(validate_supported_suite_contract_versions(&[1, 1]).is_err());
+    }
+
+    #[tokio::test]
+    async fn reports_installed_suite_contract_incompatibility_and_honors_node_scope() {
+        let pool = crate::test_support::setup_test_db().await;
+        let now = Utc::now().to_rfc3339();
+        upsert_release(
+            &pool,
+            &UpgradeReleaseRecord {
+                release_id: "release-contract-test".to_string(),
+                version: "9.0.0".to_string(),
+                tag_name: "v9.0.0".to_string(),
+                channel: "stable".to_string(),
+                source: "upload".to_string(),
+                release_url: "upload://contract-test".to_string(),
+                assets: "[]".to_string(),
+                checksum_status: "verified".to_string(),
+                signature_status: "verified".to_string(),
+                supported_suite_contract_versions: "[1]".to_string(),
+                synced_at: now.clone(),
+                published_at: Some(now.clone()),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO suite_catalog_items (
+                suite_id, version, name, manifest_json, package_json, checksum
+            ) VALUES ('suite-contract-test', '1.0.0', '契约测试套件', '{}', '{}', 'checksum')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (instance_id, node_id, contract_version) in [
+            ("instance-compatible", "local", 1),
+            ("instance-incompatible", "node-2", 2),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO suite_instances (
+                    instance_id, suite_id, version, node_id, compose_project_name, status,
+                    platform_contract_version
+                ) VALUES (?, 'suite-contract-test', '1.0.0', ?, ?, 'installed', ?)
+                "#,
+            )
+            .bind(instance_id)
+            .bind(node_id)
+            .bind(format!("contract-test-{node_id}"))
+            .bind(contract_version)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let report =
+            check_suite_compatibility(&pool, "9.0.0", SuiteCompatibilityCheckPayload::default())
+                .await
+                .unwrap();
+        assert!(!report.compatible);
+        assert_eq!(report.summary.total, 2);
+        assert_eq!(report.summary.incompatible, 1);
+        assert_eq!(report.instances[1].reason, "contractVersionNotSupported");
+
+        let local_report = check_suite_compatibility(
+            &pool,
+            "9.0.0",
+            SuiteCompatibilityCheckPayload {
+                node_ids: Some(vec!["local".to_string()]),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(local_report.compatible);
+        assert_eq!(local_report.summary.total, 1);
     }
 
     #[tokio::test]

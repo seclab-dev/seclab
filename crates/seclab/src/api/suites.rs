@@ -475,6 +475,7 @@ pub async fn install_suite(
         instance_id: instance_id.clone(),
         suite_id: manifest.metadata.suite_id.clone(),
         version: manifest.metadata.version.clone(),
+        platform_contract_version: i64::from(manifest.compatibility.platform_contract_version),
         node_id: node_id.clone(),
         compose_project_name: compose_project_name.clone(),
         status: "installing".to_string(),
@@ -1883,6 +1884,7 @@ fn validate_manifest(manifest: &SuiteManifest, files: &[SuitePackageFile]) -> Ap
         ));
     }
     validate_min_seclab_version(&manifest.metadata.min_seclab_version)?;
+    validate_platform_contract_version(manifest.compatibility.platform_contract_version)?;
     if manifest.runtime.compose_file != "compose.yaml" {
         return Err(ApiError::BadRequest(
             "suite compose file must be compose.yaml".to_string(),
@@ -1926,6 +1928,20 @@ fn validate_min_seclab_version(value: &str) -> ApiResult<()> {
         return Err(ApiError::BadRequest(format!(
             "suite requires SecLab {} or newer, current version is {}",
             minimum, current
+        )));
+    }
+    Ok(())
+}
+
+fn validate_platform_contract_version(value: u32) -> ApiResult<()> {
+    if value == 0 {
+        return Err(ApiError::BadRequest(
+            "compatibility.platformContractVersion must be a positive integer".to_string(),
+        ));
+    }
+    if !crate::services::upgrades::current_supported_suite_contract_versions()?.contains(&value) {
+        return Err(ApiError::BadRequest(format!(
+            "suite platform contract version {value} is not supported by this SecLab release"
         )));
     }
     Ok(())
@@ -2421,11 +2437,19 @@ mod suite_asset_tests {
     }
 
     #[test]
+    fn suite_platform_contract_requires_supported_positive_version() {
+        assert!(validate_platform_contract_version(1).is_ok());
+        assert!(validate_platform_contract_version(0).is_err());
+        assert!(validate_platform_contract_version(2).is_err());
+    }
+
+    #[test]
     fn app_entry_inherits_suite_icon() {
         let instance = SuiteInstanceSummary {
             instance_id: "instance-1".to_string(),
             suite_id: "seclab.example".to_string(),
             version: "0.1.0-alpha.1".to_string(),
+            platform_contract_version: 1,
             node_id: "local".to_string(),
             compose_project_name: "seclab-example".to_string(),
             status: "enabled".to_string(),
@@ -2493,6 +2517,8 @@ metadata:
   minSeclabVersion: 0.1.0-alpha.1
   name: Example
   icon: assets/icon.png
+compatibility:
+  platformContractVersion: 1
 runtime:
   type: compose
   composeFile: compose.yaml

@@ -1799,6 +1799,13 @@ const zh: typeof en = {
         placeholder: '请选择 seclab 升级包 (*.tar.gz)...',
         noReleases: '暂无可用版本包，请在上方上传升级包进行导入',
         startUpgrade: '立即升级',
+        checkCompatibility: '检测套件',
+        compatibilityCheckFailed: '套件兼容性检测失败',
+        compatibilityPassed:
+          '版本 {version} 支持套件契约 {contracts}；已检测 {total} 个已安装实例，全部兼容。',
+        compatibilityWarning:
+          '版本 {version} 支持套件契约 {contracts}；已检测 {total} 个已安装实例，其中 {incompatible} 个不兼容。此结果仅供升级前评估。',
+        contractVersion: '契约版本 {version}',
         fineGrainedLink: '按节点进行精细化升级 >',
         back: '返回列表',
       },

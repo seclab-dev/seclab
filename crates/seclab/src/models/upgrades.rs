@@ -32,6 +32,7 @@ pub struct UpgradeReleaseRecord {
     pub assets: String,
     pub checksum_status: String,
     pub signature_status: String,
+    pub supported_suite_contract_versions: String,
     pub synced_at: String,
     pub published_at: Option<String>,
     pub created_at: String,
@@ -122,9 +123,10 @@ pub async fn upsert_release(pool: &DbPool, record: &UpgradeReleaseRecord) -> sql
             assets,
             checksum_status,
             signature_status,
+            supported_suite_contract_versions,
             synced_at,
             published_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(version) DO UPDATE SET
             tag_name = excluded.tag_name,
             channel = excluded.channel,
@@ -133,6 +135,7 @@ pub async fn upsert_release(pool: &DbPool, record: &UpgradeReleaseRecord) -> sql
             assets = excluded.assets,
             checksum_status = excluded.checksum_status,
             signature_status = excluded.signature_status,
+            supported_suite_contract_versions = excluded.supported_suite_contract_versions,
             synced_at = excluded.synced_at,
             published_at = excluded.published_at
         "#,
@@ -146,6 +149,7 @@ pub async fn upsert_release(pool: &DbPool, record: &UpgradeReleaseRecord) -> sql
     .bind(&record.assets)
     .bind(&record.checksum_status)
     .bind(&record.signature_status)
+    .bind(&record.supported_suite_contract_versions)
     .bind(&record.synced_at)
     .bind(&record.published_at)
     .execute(pool)
@@ -168,6 +172,7 @@ pub async fn list_releases(pool: &DbPool) -> sqlx::Result<Vec<UpgradeReleaseReco
             assets,
             checksum_status,
             signature_status,
+            supported_suite_contract_versions,
             synced_at,
             published_at,
             created_at,
@@ -197,6 +202,7 @@ pub async fn get_release_by_version(
             assets,
             checksum_status,
             signature_status,
+            supported_suite_contract_versions,
             synced_at,
             published_at,
             created_at,
@@ -208,6 +214,22 @@ pub async fn get_release_by_version(
     .bind(version)
     .fetch_optional(pool)
     .await
+}
+
+/// 更新发布版本声明支持的套件平台契约版本。
+pub async fn update_release_suite_contract_versions(
+    pool: &DbPool,
+    version: &str,
+    supported_versions: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE upgrade_releases SET supported_suite_contract_versions = ? WHERE version = ?",
+    )
+    .bind(supported_versions)
+    .bind(version)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// 根据版本删除同步的发布版本。

@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS suite_instances (
     instance_id TEXT PRIMARY KEY,
     suite_id TEXT NOT NULL,
     version TEXT NOT NULL,
+    platform_contract_version INTEGER NOT NULL CHECK (platform_contract_version >= 1),
     node_id TEXT NOT NULL,
     compose_project_name TEXT NOT NULL,
     status TEXT NOT NULL,

@@ -1834,6 +1834,13 @@ const en = {
         placeholder: 'Please select a seclab release package (*.tar.gz)...',
         noReleases: 'No releases available. Please upload a package above to import.',
         startUpgrade: 'Upgrade Now',
+        checkCompatibility: 'Check Suites',
+        compatibilityCheckFailed: 'Failed to check suite compatibility',
+        compatibilityPassed:
+          'Version {version} supports suite contracts {contracts}. All {total} installed instances are compatible.',
+        compatibilityWarning:
+          'Version {version} supports suite contracts {contracts}. {incompatible} of {total} installed instances are incompatible. This result is informational only.',
+        contractVersion: 'Contract version {version}',
         fineGrainedLink: 'Upgrade precisely by nodes >',
         back: 'Back to List',
       },
