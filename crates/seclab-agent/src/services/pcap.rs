@@ -12,6 +12,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tracing::{error, info, warn};
 
 const PCAP_MAX_DURATION_SECS: u64 = 300;
+const PCAP_COMPLETED_RETENTION_SECS: u64 = 300;
 
 #[cfg(target_os = "linux")]
 struct InterfaceListener {
@@ -30,7 +31,7 @@ struct PcapSlot {
     suite_instance_id: Option<String>,
     workload_id: Option<String>,
     pcap_writer_tx: mpsc::Sender<RawPacketFrame>,
-    cancel_tx: oneshot::Sender<()>,
+    cancel_tx: Option<oneshot::Sender<()>>,
     done_rx: oneshot::Receiver<anyhow::Result<Vec<u8>>>,
     watchdog_cancel_tx: Option<oneshot::Sender<()>>,
 }
@@ -143,7 +144,12 @@ impl PcapMuxHub {
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_secs(PCAP_MAX_DURATION_SECS)) => {
                     warn!(capture_id = %capture_id_for_watchdog, "pcap capture reached timeout limit");
-                    let _ = PcapMuxHub::global().stop_capture(&capture_id_for_watchdog).await;
+                    if let Err(err) = PcapMuxHub::global()
+                        .timeout_capture(&capture_id_for_watchdog)
+                        .await
+                    {
+                        warn!(capture_id = %capture_id_for_watchdog, error = %err, "failed to finish timed out pcap capture");
+                    }
                 }
                 _ = watchdog_cancel_rx => {}
             }
@@ -155,7 +161,7 @@ impl PcapMuxHub {
                 suite_instance_id,
                 workload_id,
                 pcap_writer_tx: pcap_tx,
-                cancel_tx,
+                cancel_tx: Some(cancel_tx),
                 done_rx,
                 watchdog_cancel_tx: Some(watchdog_cancel_tx),
             },
@@ -167,7 +173,9 @@ impl PcapMuxHub {
 
         if let Err(err) = self.ensure_global_listener().await {
             if let Some(slot) = self.active_slots.lock().await.remove(&capture_id) {
-                let _ = slot.cancel_tx.send(());
+                if let Some(cancel_tx) = slot.cancel_tx {
+                    let _ = cancel_tx.send(());
+                }
                 if let Some(watchdog_cancel_tx) = slot.watchdog_cancel_tx {
                     let _ = watchdog_cancel_tx.send(());
                 }
@@ -183,14 +191,16 @@ impl PcapMuxHub {
 
     /// 停止指定抓包任务并返回完整 PCAP 字节。
     pub async fn stop_capture(&self, capture_id: &str) -> anyhow::Result<Vec<u8>> {
-        let Some(slot) = self.active_slots.lock().await.remove(capture_id) else {
+        let Some(mut slot) = self.active_slots.lock().await.remove(capture_id) else {
             anyhow::bail!("pcap capture not found: {capture_id}");
         };
         self.port_index
             .lock()
             .await
             .retain(|_, current_capture_id| current_capture_id != capture_id);
-        let _ = slot.cancel_tx.send(());
+        if let Some(cancel_tx) = slot.cancel_tx.take() {
+            let _ = cancel_tx.send(());
+        }
         if let Some(watchdog_cancel_tx) = slot.watchdog_cancel_tx {
             let _ = watchdog_cancel_tx.send(());
         }
@@ -208,6 +218,54 @@ impl PcapMuxHub {
         }
 
         Ok(bytes)
+    }
+
+    /// 到达最长抓包时限后停止写入，但保留结果，等待套件通过 finish 接口领取。
+    async fn timeout_capture(&self, capture_id: &str) -> anyhow::Result<()> {
+        let mut slots = self.active_slots.lock().await;
+        let Some(slot) = slots.get_mut(capture_id) else {
+            return Ok(());
+        };
+        if let Some(cancel_tx) = slot.cancel_tx.take() {
+            let _ = cancel_tx.send(());
+        }
+        slot.watchdog_cancel_tx = None;
+        drop(slots);
+
+        self.port_index
+            .lock()
+            .await
+            .retain(|_, current_capture_id| current_capture_id != capture_id);
+        if self.port_index.lock().await.is_empty()
+            && let Some(handle) = self.global_listener_handle.lock().await.take()
+        {
+            handle.abort();
+            info!("pcap raw socket listener stopped because no captures remain");
+        }
+        let capture_id = capture_id.to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(
+                PCAP_COMPLETED_RETENTION_SECS,
+            ))
+            .await;
+            PcapMuxHub::global()
+                .discard_completed_capture(&capture_id)
+                .await;
+        });
+        Ok(())
+    }
+
+    async fn discard_completed_capture(&self, capture_id: &str) {
+        let mut slots = self.active_slots.lock().await;
+        let is_completed = slots
+            .get(capture_id)
+            .is_some_and(|slot| slot.cancel_tx.is_none());
+        let slot = is_completed.then(|| slots.remove(capture_id)).flatten();
+        drop(slots);
+        if let Some(slot) = slot {
+            let _ = slot.done_rx.await;
+            warn!(capture_id, "discarded unclaimed timed out pcap capture");
+        }
     }
 
     /// 仅在抓包任务属于指定套件实例和工作负载时停止并返回数据。
@@ -650,7 +708,10 @@ async fn run_interface_raw_socket_listener(
 
 #[cfg(test)]
 mod tests {
-    use super::{CaptureTransport, parse_ip_and_ports};
+    use super::{
+        CaptureTransport, PcapMuxHub, PcapSlot, PortKey, RawPacketFrame, parse_ip_and_ports,
+    };
+    use tokio::sync::{mpsc, oneshot};
 
     fn ethernet_ipv4(protocol: u8, source: u16, destination: u16) -> Vec<u8> {
         let mut packet = vec![0_u8; 14 + 20 + 8];
@@ -702,5 +763,44 @@ mod tests {
         fragment[20..22].copy_from_slice(&1_u16.to_be_bytes());
         assert_eq!(parse_ip_and_ports(&fragment), None);
         assert_eq!(parse_ip_and_ports(&ethernet_ipv4(1, 0, 0)), None);
+    }
+
+    #[tokio::test]
+    async fn timed_out_capture_remains_available_to_finish() {
+        let hub = PcapMuxHub::new();
+        let (writer_tx, _writer_rx) = mpsc::channel::<RawPacketFrame>(1);
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let (done_tx, done_rx) = oneshot::channel();
+        let (watchdog_cancel_tx, _watchdog_cancel_rx) = oneshot::channel();
+        done_tx.send(Ok(vec![1, 2, 3])).unwrap();
+
+        hub.active_slots.lock().await.insert(
+            "capture-1".to_string(),
+            PcapSlot {
+                suite_instance_id: Some("suite-1".to_string()),
+                workload_id: Some("workload-1".to_string()),
+                pcap_writer_tx: writer_tx,
+                cancel_tx: Some(cancel_tx),
+                done_rx,
+                watchdog_cancel_tx: Some(watchdog_cancel_tx),
+            },
+        );
+        hub.port_index.lock().await.insert(
+            PortKey {
+                transport: CaptureTransport::Tcp,
+                port: 445,
+            },
+            "capture-1".to_string(),
+        );
+
+        hub.timeout_capture("capture-1").await.unwrap();
+
+        assert!(cancel_rx.await.is_ok());
+        assert!(hub.port_index.lock().await.is_empty());
+        let bytes = hub
+            .stop_capture_owned("capture-1", "suite-1", "workload-1")
+            .await
+            .unwrap();
+        assert_eq!(bytes, vec![1, 2, 3]);
     }
 }
