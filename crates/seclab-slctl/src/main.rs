@@ -3,6 +3,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use rusqlite::OpenFlags;
 use serde::Deserialize;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -11,6 +12,21 @@ const RESERVED_SAFE_ENTRY_PREFIXES: &[&str] = &[
     "api", "assets", "images", "favicon", "static", "public", "health", "metrics", "ws", "wss",
     "robots",
 ];
+const NODE_UNINSTALL_PREVIEW_LIMIT: usize = 5;
+
+/// 卸载守卫展示的非本地节点摘要。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NonLocalNodeSummary {
+    name: String,
+    status: String,
+}
+
+/// 主控数据库中的非本地节点统计结果。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct NonLocalNodeInventory {
+    total: i64,
+    preview: Vec<NonLocalNodeSummary>,
+}
 
 #[derive(Parser)]
 #[command(name = "slctl")]
@@ -241,17 +257,73 @@ fn select_uninstall_targets(role: &str) -> Result<Vec<&'static str>> {
     }
 }
 
-/// 按既定顺序卸载服务，并在全部服务卸载成功后统一清理数据。
-fn run_uninstall_sequence<U, P>(
+/// 判断卸载目标是否包含主控，并需要执行节点清理预检。
+fn uninstall_requires_node_check(targets: &[&str]) -> bool {
+    targets.contains(&"seclab")
+}
+
+/// 查询主控数据库中仍然保留的非本地节点。
+fn query_non_local_nodes(conn: &rusqlite::Connection) -> Result<NonLocalNodeInventory> {
+    let total = conn.query_row(
+        "SELECT COUNT(*) FROM nodes WHERE node_id != 'local';",
+        [],
+        |row| row.get(0),
+    )?;
+    let mut statement = conn.prepare(
+        "SELECT name, status FROM nodes WHERE node_id != 'local' \
+         ORDER BY name, node_id LIMIT ?;",
+    )?;
+    let preview = statement
+        .query_map([NODE_UNINSTALL_PREVIEW_LIMIT as i64], |row| {
+            Ok(NonLocalNodeSummary {
+                name: row.get(0)?,
+                status: row.get(1)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(NonLocalNodeInventory { total, preview })
+}
+
+/// 生成主控卸载被节点守卫阻止时的用户提示。
+fn format_uninstall_blocked_message(inventory: &NonLocalNodeInventory) -> String {
+    let node_label = if inventory.total == 1 {
+        "node still exists"
+    } else {
+        "nodes still exist"
+    };
+    let mut message = format!(
+        "uninstall blocked\n\n{} non-local {}:",
+        inventory.total, node_label
+    );
+    for node in &inventory.preview {
+        message.push_str(&format!("\n  - {} [{}]", node.name, node.status));
+    }
+    if inventory.total > inventory.preview.len() as i64 {
+        message.push_str(&format!(
+            "\n  - ... and {} more",
+            inventory.total - inventory.preview.len() as i64
+        ));
+    }
+    message.push_str(
+        "\n\nRemove all nodes in Web > Node Management, then retry.\nOtherwise, their Agents will go offline and keep retrying the connection.",
+    );
+    message
+}
+
+/// 按既定顺序执行预检和卸载，并在全部服务卸载成功后统一清理数据。
+fn run_uninstall_sequence<V, U, P>(
     targets: &[&str],
     purge: bool,
+    mut validate: V,
     mut uninstall: U,
     mut purge_common_dirs: P,
 ) -> Result<()>
 where
+    V: FnMut() -> Result<()>,
     U: FnMut(&str) -> Result<()>,
     P: FnMut() -> Result<()>,
 {
+    validate()?;
     for target in targets {
         uninstall(target)?;
     }
@@ -772,6 +844,49 @@ impl Context {
         Ok(())
     }
 
+    /// 确认主控卸载前已经在 Web 中清理全部非本地节点。
+    fn ensure_uninstall_allowed(&self, targets: &[&str]) -> Result<()> {
+        if !uninstall_requires_node_check(targets) {
+            return Ok(());
+        }
+
+        let database_path = self.db_dir.join("seclab.db");
+        let database_exists = database_path.try_exists().map_err(|error| {
+            anyhow::anyhow!(
+                "cannot verify managed nodes from {}: {}",
+                database_path.display(),
+                error
+            )
+        })?;
+        if !database_exists {
+            return Ok(());
+        }
+
+        let conn =
+            rusqlite::Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "cannot verify managed nodes from {}: {}",
+                        database_path.display(),
+                        error
+                    )
+                })?;
+        let inventory = query_non_local_nodes(&conn).map_err(|error| {
+            anyhow::anyhow!(
+                "cannot verify managed nodes from {}: {}",
+                database_path.display(),
+                error
+            )
+        })?;
+        if inventory.total == 0 {
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!(format_uninstall_blocked_message(
+            &inventory
+        )))
+    }
+
     /// 卸载 `slctl` 工具自身。
     fn uninstall_self(&self) -> Result<()> {
         self.remove_file_if_exists("/usr/local/bin/slctl")?;
@@ -982,6 +1097,7 @@ fn run_app(cli: Cli, context: Context) -> Result<()> {
             run_uninstall_sequence(
                 &targets,
                 purge,
+                || context.ensure_uninstall_allowed(&targets),
                 |target| context.uninstall_service(target),
                 || context.purge_common_dirs(),
             )?;
@@ -1034,8 +1150,10 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        Cli, Commands, run_uninstall_sequence, select_stop_targets, select_uninstall_targets,
-        service_has_stopped, validate_password, validate_safe_entry_value,
+        Cli, Commands, NonLocalNodeInventory, NonLocalNodeSummary,
+        format_uninstall_blocked_message, query_non_local_nodes, run_uninstall_sequence,
+        select_stop_targets, select_uninstall_targets, service_has_stopped,
+        uninstall_requires_node_check, validate_password, validate_safe_entry_value,
     };
 
     #[test]
@@ -1087,6 +1205,7 @@ mod tests {
         run_uninstall_sequence(
             &targets,
             true,
+            || Ok(()),
             |target| {
                 uninstalled.push(target.to_string());
                 Ok(())
@@ -1111,6 +1230,7 @@ mod tests {
         run_uninstall_sequence(
             &targets,
             false,
+            || Ok(()),
             |target| {
                 uninstalled.push(target.to_string());
                 Ok(())
@@ -1134,6 +1254,7 @@ mod tests {
         let result = run_uninstall_sequence(
             &targets,
             true,
+            || Ok(()),
             |target| {
                 if target == "seclab" {
                     return Err(anyhow::anyhow!("uninstall failed"));
@@ -1147,6 +1268,93 @@ mod tests {
         );
 
         assert!(result.is_err());
+        assert_eq!(purge_count, 0);
+    }
+
+    #[test]
+    fn only_master_uninstall_targets_require_node_check() {
+        assert!(!uninstall_requires_node_check(&["agent"]));
+        assert!(uninstall_requires_node_check(&["seclab"]));
+        assert!(uninstall_requires_node_check(&["agent", "seclab"]));
+    }
+
+    #[test]
+    fn node_query_excludes_local_and_includes_every_other_status() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE nodes (node_id TEXT PRIMARY KEY, name TEXT NOT NULL, status TEXT NOT NULL);\
+             INSERT INTO nodes VALUES ('local', 'Local Node', 'online');\
+             INSERT INTO nodes VALUES ('draft-node', 'Draft Node', 'draft');\
+             INSERT INTO nodes VALUES ('retired-node', 'Retired Node', 'retired');",
+        )
+        .unwrap();
+
+        let inventory = query_non_local_nodes(&conn).unwrap();
+
+        assert_eq!(inventory.total, 2);
+        assert_eq!(inventory.preview.len(), 2);
+        assert_eq!(inventory.preview[0].name, "Draft Node");
+        assert_eq!(inventory.preview[1].name, "Retired Node");
+    }
+
+    #[test]
+    fn node_query_allows_inventory_with_only_local_node() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE nodes (node_id TEXT PRIMARY KEY, name TEXT NOT NULL, status TEXT NOT NULL);\
+             INSERT INTO nodes VALUES ('local', 'Local Node', 'online');",
+        )
+        .unwrap();
+
+        let inventory = query_non_local_nodes(&conn).unwrap();
+
+        assert_eq!(inventory.total, 0);
+        assert!(inventory.preview.is_empty());
+    }
+
+    #[test]
+    fn node_query_fails_when_inventory_cannot_be_verified() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        assert!(query_non_local_nodes(&conn).is_err());
+    }
+
+    #[test]
+    fn uninstall_blocked_message_omits_node_id_and_uses_readable_layout() {
+        let inventory = NonLocalNodeInventory {
+            total: 1,
+            preview: vec![NonLocalNodeSummary {
+                name: "7".to_string(),
+                status: "online".to_string(),
+            }],
+        };
+
+        let message = format_uninstall_blocked_message(&inventory);
+
+        assert!(message.starts_with("uninstall blocked\n\n1 non-local node still exists:"));
+        assert!(message.contains("\n  - 7 [online]\n\n"));
+    }
+
+    #[test]
+    fn uninstall_preflight_failure_happens_before_service_changes() {
+        let mut uninstall_count = 0;
+        let mut purge_count = 0;
+
+        let result = run_uninstall_sequence(
+            &["agent", "seclab"],
+            false,
+            || Err(anyhow::anyhow!("managed nodes still exist")),
+            |_| {
+                uninstall_count += 1;
+                Ok(())
+            },
+            || {
+                purge_count += 1;
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(uninstall_count, 0);
         assert_eq!(purge_count, 0);
     }
 
