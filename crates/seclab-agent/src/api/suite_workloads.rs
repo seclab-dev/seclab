@@ -410,21 +410,28 @@ async fn delete_workload(
     Path(path): Path<WorkloadPath>,
 ) -> ApiResult<impl IntoResponse> {
     let principal = require_suite_capability(&headers, "workloads.manage").await?;
+    validate_id("workload_id", &path.workload_id)?;
     let docker = state.docker_client().await?;
-    let container_id = find_owned_container(&docker, &principal.instance_id, &path.workload_id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-    docker
-        .remove_container(
-            &container_id,
-            Some(query_parameters::RemoveContainerOptions {
-                force: true,
-                v: false,
-                link: false,
-            }),
-        )
-        .await?;
-    Ok(Json(serde_json::json!({ "deleted": true })))
+    let container_id =
+        find_owned_container(&docker, &principal.instance_id, &path.workload_id).await?;
+    if let Some(container_id) = container_id.as_deref() {
+        docker
+            .remove_container(
+                container_id,
+                Some(query_parameters::RemoveContainerOptions {
+                    force: true,
+                    v: false,
+                    link: false,
+                }),
+            )
+            .await?;
+    }
+    PcapMuxHub::global()
+        .stop_captures_for_workload(&principal.instance_id, &path.workload_id)
+        .await;
+    Ok(Json(serde_json::json!({
+        "deleted": container_id.is_some()
+    })))
 }
 
 /// 清理指定套件实例下由 suite workload API 创建的所有容器和抓包任务。

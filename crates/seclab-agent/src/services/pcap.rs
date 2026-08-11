@@ -205,10 +205,10 @@ impl PcapMuxHub {
             let _ = watchdog_cancel_tx.send(());
         }
 
-        let bytes = slot
+        let result = slot
             .done_rx
             .await
-            .context("pcap writer stopped before returning capture data")??;
+            .context("pcap writer stopped before returning capture data")?;
 
         if self.active_slots.lock().await.is_empty()
             && let Some(handle) = self.global_listener_handle.lock().await.take()
@@ -217,7 +217,7 @@ impl PcapMuxHub {
             info!("pcap raw socket listener stopped because no captures remain");
         }
 
-        Ok(bytes)
+        result
     }
 
     /// 到达最长抓包时限后停止写入，但保留结果，等待套件通过 finish 接口领取。
@@ -313,6 +313,49 @@ impl PcapMuxHub {
                 }
                 Err(err) => {
                     warn!(capture_id = %capture_id, error = %err, "failed to stop suite workload pcap capture during cleanup")
+                }
+            }
+        }
+        stopped
+    }
+
+    /// 停止并丢弃指定套件工作负载下的全部抓包任务。
+    pub async fn stop_captures_for_workload(
+        &self,
+        suite_instance_id: &str,
+        workload_id: &str,
+    ) -> Vec<String> {
+        let captures = {
+            let slots = self.active_slots.lock().await;
+            slots
+                .iter()
+                .filter(|(_, slot)| {
+                    slot.suite_instance_id.as_deref() == Some(suite_instance_id)
+                        && slot.workload_id.as_deref() == Some(workload_id)
+                })
+                .map(|(capture_id, _)| capture_id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let mut stopped = Vec::new();
+        for capture_id in captures {
+            match self.stop_capture(&capture_id).await {
+                Ok(_) => {
+                    info!(
+                        capture_id = %capture_id,
+                        workload_id,
+                        "stopped suite workload pcap capture during workload cleanup"
+                    );
+                    stopped.push(capture_id);
+                }
+                Err(err) => {
+                    warn!(
+                        capture_id = %capture_id,
+                        workload_id,
+                        error = %err,
+                        "suite workload pcap payload was unavailable during workload cleanup"
+                    );
+                    stopped.push(capture_id);
                 }
             }
         }
@@ -713,6 +756,28 @@ mod tests {
     };
     use tokio::sync::{mpsc, oneshot};
 
+    async fn insert_completed_capture(
+        hub: &PcapMuxHub,
+        capture_id: &str,
+        suite_instance_id: &str,
+        workload_id: &str,
+    ) {
+        let (writer_tx, _writer_rx) = mpsc::channel::<RawPacketFrame>(1);
+        let (done_tx, done_rx) = oneshot::channel();
+        done_tx.send(Ok(vec![1, 2, 3])).unwrap();
+        hub.active_slots.lock().await.insert(
+            capture_id.to_string(),
+            PcapSlot {
+                suite_instance_id: Some(suite_instance_id.to_string()),
+                workload_id: Some(workload_id.to_string()),
+                pcap_writer_tx: writer_tx,
+                cancel_tx: None,
+                done_rx,
+                watchdog_cancel_tx: None,
+            },
+        );
+    }
+
     fn ethernet_ipv4(protocol: u8, source: u16, destination: u16) -> Vec<u8> {
         let mut packet = vec![0_u8; 14 + 20 + 8];
         packet[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
@@ -802,5 +867,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bytes, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn workload_cleanup_only_discards_owned_captures() {
+        let hub = PcapMuxHub::new();
+        insert_completed_capture(&hub, "capture-1", "suite-1", "workload-1").await;
+        insert_completed_capture(&hub, "capture-2", "suite-1", "workload-2").await;
+        insert_completed_capture(&hub, "capture-3", "suite-2", "workload-1").await;
+
+        let stopped = hub
+            .stop_captures_for_workload("suite-1", "workload-1")
+            .await;
+
+        assert_eq!(stopped, vec!["capture-1"]);
+        let slots = hub.active_slots.lock().await;
+        assert!(!slots.contains_key("capture-1"));
+        assert!(slots.contains_key("capture-2"));
+        assert!(slots.contains_key("capture-3"));
+    }
+
+    #[tokio::test]
+    async fn writer_failure_still_releases_the_last_global_listener() {
+        let hub = PcapMuxHub::new();
+        let (writer_tx, _writer_rx) = mpsc::channel::<RawPacketFrame>(1);
+        let (done_tx, done_rx) = oneshot::channel();
+        done_tx.send(Err(anyhow::anyhow!("writer failed"))).unwrap();
+        hub.active_slots.lock().await.insert(
+            "capture-1".to_string(),
+            PcapSlot {
+                suite_instance_id: Some("suite-1".to_string()),
+                workload_id: Some("workload-1".to_string()),
+                pcap_writer_tx: writer_tx,
+                cancel_tx: None,
+                done_rx,
+                watchdog_cancel_tx: None,
+            },
+        );
+        *hub.global_listener_handle.lock().await = Some(tokio::spawn(std::future::pending::<()>()));
+
+        let error = hub.stop_capture("capture-1").await.unwrap_err();
+
+        assert!(error.to_string().contains("writer failed"));
+        assert!(hub.global_listener_handle.lock().await.is_none());
     }
 }
