@@ -1,6 +1,6 @@
 //! 套件工作负载流量取证服务：基于 Linux AF_PACKET 原始套接字捕获端口流量并生成 PCAP。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
@@ -35,10 +35,31 @@ struct PcapSlot {
     watchdog_cancel_tx: Option<oneshot::Sender<()>>,
 }
 
+/// 抓包端点使用的传输协议。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CaptureTransport {
+    Tcp,
+    Udp,
+}
+
+/// 由工作负载所有权校验后传入抓包服务的命名端点。
+#[derive(Debug, Clone)]
+pub struct CaptureEndpoint {
+    pub endpoint_id: String,
+    pub host_port: u16,
+    pub transport: CaptureTransport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PortKey {
+    transport: CaptureTransport,
+    port: u16,
+}
+
 /// Agent 内部共享的原生抓包分发中心。
 pub struct PcapMuxHub {
     active_slots: Arc<Mutex<HashMap<String, PcapSlot>>>,
-    port_index: Arc<Mutex<HashMap<u16, String>>>,
+    port_index: Arc<Mutex<HashMap<PortKey, String>>>,
     global_listener_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
@@ -60,21 +81,50 @@ impl PcapMuxHub {
 
     /// 启动指定宿主机端口的抓包任务。
     pub async fn start_capture(&self, capture_id: String, port: u16) -> anyhow::Result<()> {
-        self.start_capture_for_workload(capture_id, port, None, None)
-            .await
+        self.start_capture_for_workload(
+            capture_id,
+            vec![CaptureEndpoint {
+                endpoint_id: "tcp".to_string(),
+                host_port: port,
+                transport: CaptureTransport::Tcp,
+            }],
+            None,
+            None,
+        )
+        .await
     }
 
     /// 启动指定工作负载宿主机端口的抓包任务。
     pub async fn start_capture_for_workload(
         &self,
         capture_id: String,
-        port: u16,
+        endpoints: Vec<CaptureEndpoint>,
         suite_instance_id: Option<String>,
         workload_id: Option<String>,
     ) -> anyhow::Result<()> {
+        if endpoints.is_empty() {
+            anyhow::bail!("at least one capture endpoint is required");
+        }
+        let endpoint_keys = endpoints
+            .iter()
+            .map(|endpoint| PortKey {
+                transport: endpoint.transport,
+                port: endpoint.host_port,
+            })
+            .collect::<HashSet<_>>();
+        if endpoint_keys.len() != endpoints.len() {
+            anyhow::bail!("capture endpoints contain duplicate transport/port bindings");
+        }
         let mut port_index = self.port_index.lock().await;
-        if port_index.contains_key(&port) {
-            anyhow::bail!("capture already active on port {port}");
+        if let Some(key) = endpoint_keys
+            .iter()
+            .find(|key| port_index.contains_key(key))
+        {
+            anyhow::bail!(
+                "capture already active on {}/{}",
+                key.port,
+                transport_name(key.transport)
+            );
         }
 
         let (pcap_tx, pcap_rx) = mpsc::channel::<RawPacketFrame>(1000);
@@ -92,7 +142,7 @@ impl PcapMuxHub {
         tokio::spawn(async move {
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_secs(PCAP_MAX_DURATION_SECS)) => {
-                    warn!(capture_id = %capture_id_for_watchdog, port, "pcap capture reached timeout limit");
+                    warn!(capture_id = %capture_id_for_watchdog, "pcap capture reached timeout limit");
                     let _ = PcapMuxHub::global().stop_capture(&capture_id_for_watchdog).await;
                 }
                 _ = watchdog_cancel_rx => {}
@@ -110,7 +160,9 @@ impl PcapMuxHub {
                 watchdog_cancel_tx: Some(watchdog_cancel_tx),
             },
         );
-        port_index.insert(port, capture_id.clone());
+        for key in &endpoint_keys {
+            port_index.insert(*key, capture_id.clone());
+        }
         drop(port_index);
 
         if let Err(err) = self.ensure_global_listener().await {
@@ -120,7 +172,10 @@ impl PcapMuxHub {
                     let _ = watchdog_cancel_tx.send(());
                 }
             }
-            self.port_index.lock().await.remove(&port);
+            self.port_index
+                .lock()
+                .await
+                .retain(|_, current_capture_id| current_capture_id != &capture_id);
             return Err(err);
         }
         Ok(())
@@ -281,16 +336,16 @@ fn capture_file_path(capture_id: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{capture_id}.pcap"))
 }
 
-fn parse_ipv4_and_ports(packet: &[u8]) -> Option<(u16, u16, usize)> {
+fn parse_ip_and_ports(packet: &[u8]) -> Option<(CaptureTransport, u16, u16, usize)> {
     if packet.len() < 20 {
         return None;
     }
 
     let mut ip_start = None;
     if packet.len() >= 34 {
-        let proto = u16::from_be_bytes([packet[12], packet[13]]);
+        let ether_type = u16::from_be_bytes([packet[12], packet[13]]);
         let version = packet[14] >> 4;
-        if proto == 0x0800 && version == 4 {
+        if matches!(ether_type, 0x0800 | 0x86dd) && matches!(version, 4 | 6) {
             ip_start = Some(14);
         }
     }
@@ -298,30 +353,61 @@ fn parse_ipv4_and_ports(packet: &[u8]) -> Option<(u16, u16, usize)> {
     if ip_start.is_none() && packet.len() >= 36 {
         let proto = u16::from_be_bytes([packet[14], packet[15]]);
         let version = packet[16] >> 4;
-        if proto == 0x0800 && version == 4 {
+        if matches!(proto, 0x0800 | 0x86dd) && matches!(version, 4 | 6) {
             ip_start = Some(16);
         }
     }
 
     let offset = ip_start?;
     let ip_packet = &packet[offset..];
-    if ip_packet.len() < 20 || ip_packet[9] != 6 {
+    let (transport, transport_offset) = match ip_packet.first().map(|value| value >> 4)? {
+        4 => {
+            if ip_packet.len() < 20 {
+                return None;
+            }
+            let fragment = u16::from_be_bytes([ip_packet[6], ip_packet[7]]) & 0x1fff;
+            if fragment != 0 {
+                return None;
+            }
+            let transport = ip_transport(ip_packet[9])?;
+            let ihl = (ip_packet[0] & 0x0f) as usize * 4;
+            (transport, ihl)
+        }
+        6 => {
+            if ip_packet.len() < 40 {
+                return None;
+            }
+            (ip_transport(ip_packet[6])?, 40)
+        }
+        _ => return None,
+    };
+    if ip_packet.len() < transport_offset + 4 {
         return None;
     }
-    let ihl = (ip_packet[0] & 0x0f) as usize * 4;
-    if ip_packet.len() < ihl + 4 {
-        return None;
-    }
+    let segment = &ip_packet[transport_offset..];
+    let src_port = u16::from_be_bytes([segment[0], segment[1]]);
+    let dst_port = u16::from_be_bytes([segment[2], segment[3]]);
+    Some((transport, src_port, dst_port, offset))
+}
 
-    let tcp_packet = &ip_packet[ihl..];
-    let src_port = u16::from_be_bytes([tcp_packet[0], tcp_packet[1]]);
-    let dst_port = u16::from_be_bytes([tcp_packet[2], tcp_packet[3]]);
-    Some((src_port, dst_port, offset))
+fn ip_transport(protocol: u8) -> Option<CaptureTransport> {
+    match protocol {
+        6 => Some(CaptureTransport::Tcp),
+        17 => Some(CaptureTransport::Udp),
+        _ => None,
+    }
+}
+
+fn transport_name(transport: CaptureTransport) -> &'static str {
+    match transport {
+        CaptureTransport::Tcp => "tcp",
+        CaptureTransport::Udp => "udp",
+    }
 }
 
 async fn run_global_raw_socket_listener(
     active_slots: Arc<Mutex<HashMap<String, PcapSlot>>>,
-    port_index: Arc<Mutex<HashMap<u16, String>>>,
+    port_index: Arc<Mutex<HashMap<PortKey, String>>>,
     listeners: Vec<InterfaceListener>,
 ) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
@@ -493,7 +579,7 @@ fn open_interface_raw_socket(
 async fn run_interface_raw_socket_listener(
     listener: InterfaceListener,
     active_slots: Arc<Mutex<HashMap<String, PcapSlot>>>,
-    port_index: Arc<Mutex<HashMap<u16, String>>>,
+    port_index: Arc<Mutex<HashMap<PortKey, String>>>,
 ) -> anyhow::Result<()> {
     use std::os::fd::AsRawFd;
 
@@ -521,14 +607,22 @@ async fn run_interface_raw_socket_listener(
             }
         }) {
             Ok(Ok(bytes_read)) => {
-                if let Some((src_port, dst_port, ip_offset)) =
-                    parse_ipv4_and_ports(&buf[..bytes_read])
+                if let Some((transport, src_port, dst_port, ip_offset)) =
+                    parse_ip_and_ports(&buf[..bytes_read])
                 {
                     let capture_id = {
                         let port_index = port_index.lock().await;
                         port_index
-                            .get(&src_port)
-                            .or_else(|| port_index.get(&dst_port))
+                            .get(&PortKey {
+                                transport,
+                                port: src_port,
+                            })
+                            .or_else(|| {
+                                port_index.get(&PortKey {
+                                    transport,
+                                    port: dst_port,
+                                })
+                            })
                             .cloned()
                     };
                     if let Some(capture_id) = capture_id {
@@ -551,5 +645,62 @@ async fn run_interface_raw_socket_listener(
             }
             Err(_) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CaptureTransport, parse_ip_and_ports};
+
+    fn ethernet_ipv4(protocol: u8, source: u16, destination: u16) -> Vec<u8> {
+        let mut packet = vec![0_u8; 14 + 20 + 8];
+        packet[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
+        packet[14] = 0x45;
+        packet[23] = protocol;
+        packet[34..36].copy_from_slice(&source.to_be_bytes());
+        packet[36..38].copy_from_slice(&destination.to_be_bytes());
+        packet
+    }
+
+    fn ethernet_ipv6(protocol: u8, source: u16, destination: u16) -> Vec<u8> {
+        let mut packet = vec![0_u8; 14 + 40 + 8];
+        packet[12..14].copy_from_slice(&0x86dd_u16.to_be_bytes());
+        packet[14] = 0x60;
+        packet[20] = protocol;
+        packet[54..56].copy_from_slice(&source.to_be_bytes());
+        packet[56..58].copy_from_slice(&destination.to_be_bytes());
+        packet
+    }
+
+    #[test]
+    fn parses_ipv4_tcp_and_udp_bindings() {
+        assert_eq!(
+            parse_ip_and_ports(&ethernet_ipv4(6, 50_000, 8080)),
+            Some((CaptureTransport::Tcp, 50_000, 8080, 14))
+        );
+        assert_eq!(
+            parse_ip_and_ports(&ethernet_ipv4(17, 53, 40_000)),
+            Some((CaptureTransport::Udp, 53, 40_000, 14))
+        );
+    }
+
+    #[test]
+    fn parses_ipv6_tcp_and_udp_bindings() {
+        assert_eq!(
+            parse_ip_and_ports(&ethernet_ipv6(6, 50_001, 445)),
+            Some((CaptureTransport::Tcp, 50_001, 445, 14))
+        );
+        assert_eq!(
+            parse_ip_and_ports(&ethernet_ipv6(17, 53, 50_002)),
+            Some((CaptureTransport::Udp, 53, 50_002, 14))
+        );
+    }
+
+    #[test]
+    fn rejects_non_initial_ipv4_fragments_and_unknown_protocols() {
+        let mut fragment = ethernet_ipv4(6, 1234, 8080);
+        fragment[20..22].copy_from_slice(&1_u16.to_be_bytes());
+        assert_eq!(parse_ip_and_ports(&fragment), None);
+        assert_eq!(parse_ip_and_ports(&ethernet_ipv4(1, 0, 0)), None);
     }
 }

@@ -1,7 +1,7 @@
 //! 套件工作负载 API：允许已安装套件请求 Agent 创建和回收受控容器。
 
 use crate::api::docker::suites;
-use crate::services::pcap::PcapMuxHub;
+use crate::services::pcap::{CaptureEndpoint, CaptureTransport, PcapMuxHub};
 use crate::state::AppState;
 use crate::types::{ApiError, ApiResult};
 use axum::{
@@ -28,7 +28,7 @@ const MAX_WORKLOAD_CONTAINER_NAME_LEN: usize = 96;
 type ExposedPorts = Vec<String>;
 type PortBindings = HashMap<String, Option<Vec<PortBinding>>>;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartWorkloadRequest {
     pub workload_kind: String,
@@ -44,15 +44,32 @@ pub struct StartWorkloadRequest {
     pub resources: WorkloadResources,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkloadPort {
+    pub endpoint_id: String,
     pub host_port: u16,
     pub container_port: u16,
-    pub protocol: String,
+    pub protocol: WorkloadTransport,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkloadTransport {
+    Tcp,
+    Udp,
+}
+
+impl WorkloadTransport {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkloadResources {
     pub memory_mb: Option<u32>,
@@ -67,17 +84,20 @@ pub struct StartWorkloadResponse {
     pub status: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StartPcapRequest {
-    pub host_port: u16,
-}
-
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartPcapResponse {
     pub capture_id: String,
     pub status: String,
+    pub endpoints: Vec<WorkloadCaptureEndpoint>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkloadCaptureEndpoint {
+    pub endpoint_id: String,
+    pub host_port: u16,
+    pub protocol: WorkloadTransport,
 }
 
 #[derive(Debug, Serialize)]
@@ -131,7 +151,7 @@ async fn start_workload(
     Json(payload): Json<StartWorkloadRequest>,
 ) -> ApiResult<impl IntoResponse> {
     let principal = require_suite_capability(&headers, "workloads.manage").await?;
-    validate_workload_request(&payload)?;
+    validate_workload_request(&payload, &principal.runtime_images)?;
     ensure_workload_ports_available(&payload.ports).await?;
 
     let docker = state.docker_client().await?;
@@ -146,7 +166,7 @@ async fn start_workload(
     let (exposed_ports, port_bindings) = port_maps(&payload.ports);
     let mut env = env_map_to_vec(&payload.env)?;
     env.push(format!(
-        "SECLAB_SIM_CONFIG_JSON={}",
+        "SECLAB_WORKLOAD_CONFIG_JSON={}",
         serde_json::to_string(&payload.config_json).unwrap_or_else(|_| "{}".to_string())
     ));
 
@@ -226,7 +246,6 @@ async fn start_pcap(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(path): Path<WorkloadPath>,
-    Json(payload): Json<StartPcapRequest>,
 ) -> ApiResult<impl IntoResponse> {
     let principal = require_suite_capability(&headers, "captures.manage").await?;
     validate_id("workload_id", &path.workload_id)?;
@@ -234,13 +253,28 @@ async fn start_pcap(
     let container_id = find_owned_container(&docker, &principal.instance_id, &path.workload_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    ensure_workload_owns_host_port(&docker, &container_id, payload.host_port).await?;
+    let endpoints = workload_capture_endpoints(&docker, &container_id).await?;
+    if endpoints.is_empty() {
+        return Err(ApiError::BadRequest(
+            "suite workload has no published endpoints to capture".to_string(),
+        ));
+    }
 
     let capture_id = format!("pcap-{}", Uuid::now_v7());
     PcapMuxHub::global()
         .start_capture_for_workload(
             capture_id.clone(),
-            payload.host_port,
+            endpoints
+                .iter()
+                .map(|endpoint| CaptureEndpoint {
+                    endpoint_id: endpoint.endpoint_id.clone(),
+                    host_port: endpoint.host_port,
+                    transport: match endpoint.protocol {
+                        WorkloadTransport::Tcp => CaptureTransport::Tcp,
+                        WorkloadTransport::Udp => CaptureTransport::Udp,
+                    },
+                })
+                .collect(),
             Some(principal.instance_id.clone()),
             Some(path.workload_id.clone()),
         )
@@ -250,38 +284,38 @@ async fn start_pcap(
     Ok(Json(StartPcapResponse {
         capture_id,
         status: "capturing".to_string(),
+        endpoints,
     }))
 }
 
-/// 限制抓包目标为当前工作负载实际发布的宿主机端口。
-async fn ensure_workload_owns_host_port(
+/// 返回 Agent 在创建工作负载时记录的全部命名端点。
+async fn workload_capture_endpoints(
     docker: &bollard::Docker,
     container_id: &str,
-    host_port: u16,
-) -> ApiResult<()> {
+) -> ApiResult<Vec<WorkloadCaptureEndpoint>> {
     let detail = docker
         .inspect_container(
             container_id,
             None::<query_parameters::InspectContainerOptions>,
         )
         .await?;
-    let owned = detail
-        .host_config
-        .and_then(|config| config.port_bindings)
-        .into_iter()
-        .flat_map(|bindings| bindings.into_values())
-        .flatten()
-        .flatten()
-        .filter_map(|binding| binding.host_port)
-        .filter_map(|port| port.parse::<u16>().ok())
-        .any(|port| port == host_port);
-    if !owned {
-        return Err(ApiError::forbidden(
-            ErrorCode::AuthForbidden,
-            "capture port does not belong to suite workload",
-        ));
-    }
-    Ok(())
+    let encoded = detail
+        .config
+        .and_then(|config| config.labels)
+        .and_then(|labels| labels.get("seclab.workload_ports").cloned())
+        .ok_or_else(|| ApiError::BadRequest("workload endpoint metadata is missing".to_string()))?;
+    serde_json::from_str::<Vec<WorkloadPort>>(&encoded)
+        .map(|ports| {
+            ports
+                .into_iter()
+                .map(|port| WorkloadCaptureEndpoint {
+                    endpoint_id: port.endpoint_id,
+                    host_port: port.host_port,
+                    protocol: port.protocol,
+                })
+                .collect()
+        })
+        .map_err(|err| ApiError::BadRequest(format!("invalid workload endpoint metadata: {err}")))
 }
 
 async fn stop_pcap(
@@ -504,21 +538,47 @@ async fn require_suite_capability(
     Ok(principal)
 }
 
-fn validate_workload_request(payload: &StartWorkloadRequest) -> ApiResult<()> {
+fn validate_workload_request(
+    payload: &StartWorkloadRequest,
+    runtime_images: &[String],
+) -> ApiResult<()> {
     validate_id("workload_kind", &payload.workload_kind)?;
     if payload.workload_name.trim().is_empty() {
         return Err(ApiError::BadRequest("workloadName is required".to_string()));
     }
-    if !payload.image.contains("seclab-") {
+    if !runtime_images.iter().any(|image| image == &payload.image) {
         return Err(ApiError::BadRequest(
-            "suite workload image is not allowed".to_string(),
+            "suite workload image is not declared by the suite manifest".to_string(),
         ));
     }
+    let mut endpoint_ids = std::collections::HashSet::new();
+    let mut bindings = std::collections::HashSet::new();
+    let mut container_bindings = std::collections::HashSet::new();
     for port in &payload.ports {
-        if !matches!(port.protocol.as_str(), "tcp" | "udp") {
+        validate_id("endpoint_id", &port.endpoint_id)?;
+        if !endpoint_ids.insert(port.endpoint_id.as_str()) {
             return Err(ApiError::BadRequest(format!(
-                "unsupported workload port protocol: {}",
-                port.protocol
+                "duplicate workload endpoint id: {}",
+                port.endpoint_id
+            )));
+        }
+        if !bindings.insert((port.protocol, port.host_port)) {
+            return Err(ApiError::BadRequest(format!(
+                "duplicate workload endpoint binding: {}/{}",
+                port.host_port,
+                port.protocol.as_str()
+            )));
+        }
+        if port.host_port == 0 || port.container_port == 0 {
+            return Err(ApiError::BadRequest(
+                "workload endpoint ports must be between 1 and 65535".to_string(),
+            ));
+        }
+        if !container_bindings.insert((port.protocol, port.container_port)) {
+            return Err(ApiError::BadRequest(format!(
+                "duplicate workload container binding: {}/{}",
+                port.container_port,
+                port.protocol.as_str()
             )));
         }
     }
@@ -528,10 +588,9 @@ fn validate_workload_request(payload: &StartWorkloadRequest) -> ApiResult<()> {
 async fn ensure_workload_ports_available(ports: &[WorkloadPort]) -> ApiResult<()> {
     for port in ports {
         let address = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port.host_port);
-        let result = match port.protocol.as_str() {
-            "tcp" => TcpListener::bind(address).await.map(drop),
-            "udp" => UdpSocket::bind(address).await.map(drop),
-            _ => continue,
+        let result = match port.protocol {
+            WorkloadTransport::Tcp => TcpListener::bind(address).await.map(drop),
+            WorkloadTransport::Udp => UdpSocket::bind(address).await.map(drop),
         };
         if let Err(err) = result {
             return Err(ApiError::conflict(
@@ -540,7 +599,8 @@ async fn ensure_workload_ports_available(ports: &[WorkloadPort]) -> ApiResult<()
             )
             .with_detail(format!(
                 "protocol={} hostPort={} error={err}",
-                port.protocol, port.host_port
+                port.protocol.as_str(),
+                port.host_port
             )));
         }
     }
@@ -646,6 +706,10 @@ fn workload_labels(
             "seclab.workload_name".to_string(),
             payload.workload_name.clone(),
         ),
+        (
+            "seclab.workload_ports".to_string(),
+            serde_json::to_string(&payload.ports).unwrap_or_else(|_| "[]".to_string()),
+        ),
     ])
 }
 
@@ -653,7 +717,7 @@ fn port_maps(ports: &[WorkloadPort]) -> (ExposedPorts, PortBindings) {
     let mut exposed = Vec::new();
     let mut bindings = HashMap::new();
     for port in ports {
-        let key = format!("{}/{}", port.container_port, port.protocol);
+        let key = format!("{}/{}", port.container_port, port.protocol.as_str());
         exposed.push(key.clone());
         bindings.insert(
             key,
@@ -746,8 +810,9 @@ fn validate_id(label: &str, value: &str) -> ApiResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_WORKLOAD_CONTAINER_NAME_LEN, WorkloadPort, ensure_workload_ports_available,
-        sanitize_container_segment, suite_workload_cleanup_filters, workload_container_name,
+        MAX_WORKLOAD_CONTAINER_NAME_LEN, StartWorkloadRequest, WorkloadPort, WorkloadResources,
+        WorkloadTransport, ensure_workload_ports_available, sanitize_container_segment,
+        suite_workload_cleanup_filters, validate_workload_request, workload_container_name,
     };
     use seclab_contracts::api::ErrorCode;
     use std::net::{Ipv4Addr, SocketAddrV4};
@@ -814,9 +879,10 @@ mod tests {
             .unwrap();
         let port = listener.local_addr().unwrap().port();
         let err = ensure_workload_ports_available(&[WorkloadPort {
+            endpoint_id: "tcp".to_string(),
             host_port: port,
             container_port: port,
-            protocol: "tcp".to_string(),
+            protocol: WorkloadTransport::Tcp,
         }])
         .await
         .unwrap_err();
@@ -832,14 +898,62 @@ mod tests {
             .unwrap();
         let port = socket.local_addr().unwrap().port();
         let err = ensure_workload_ports_available(&[WorkloadPort {
+            endpoint_id: "udp".to_string(),
             host_port: port,
             container_port: port,
-            protocol: "udp".to_string(),
+            protocol: WorkloadTransport::Udp,
         }])
         .await
         .unwrap_err();
 
         assert_eq!(err.status, axum::http::StatusCode::CONFLICT);
         assert_eq!(err.code, ErrorCode::SuiteWorkloadPortUnavailable);
+    }
+
+    fn request(ports: Vec<WorkloadPort>) -> StartWorkloadRequest {
+        StartWorkloadRequest {
+            workload_kind: "simulation-rule".to_string(),
+            workload_name: "rule-1".to_string(),
+            image: "example/engine:alpha".to_string(),
+            ports,
+            env: serde_json::json!({}),
+            config_json: serde_json::json!({}),
+            resources: WorkloadResources::default(),
+        }
+    }
+
+    #[test]
+    fn workload_request_requires_manifest_declared_image() {
+        let payload = request(Vec::new());
+        assert!(validate_workload_request(&payload, &[]).is_err());
+        assert!(validate_workload_request(&payload, &["example/engine:alpha".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn workload_request_rejects_duplicate_or_zero_endpoint_bindings() {
+        let declared = ["example/engine:alpha".to_string()];
+        let endpoint = WorkloadPort {
+            endpoint_id: "main".to_string(),
+            host_port: 8080,
+            container_port: 80,
+            protocol: WorkloadTransport::Tcp,
+        };
+        assert!(
+            validate_workload_request(
+                &request(vec![endpoint.clone(), endpoint.clone()]),
+                &declared,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_workload_request(
+                &request(vec![WorkloadPort {
+                    host_port: 0,
+                    ..endpoint
+                }]),
+                &declared,
+            )
+            .is_err()
+        );
     }
 }

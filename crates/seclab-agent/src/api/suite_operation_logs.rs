@@ -337,6 +337,7 @@ mod tests {
             suite_id: "seclab.packet".to_string(),
             instance_id: "instance-7".to_string(),
             capabilities: vec!["operation-logs.write".to_string()],
+            runtime_images: Vec::new(),
         };
         let event = build_event(&principal, None, request());
         assert_eq!(event.module, OperationModule::Suites);
@@ -352,6 +353,7 @@ mod tests {
             suite_id: "seclab.packet".to_string(),
             instance_id: "instance-7".to_string(),
             capabilities: vec!["captures.manage".to_string()],
+            runtime_images: Vec::new(),
         };
         assert!(ensure_capability(&principal).is_err());
     }
@@ -378,6 +380,7 @@ mod tests {
             suite_id: "seclab.packet".to_string(),
             instance_id: "instance-7".to_string(),
             capabilities: vec!["operation-logs.write".to_string()],
+            runtime_images: Vec::new(),
         };
         let event = build_event(&principal, Some(&trusted), request());
         assert_eq!(event.actor.kind, OperationActorKind::User);

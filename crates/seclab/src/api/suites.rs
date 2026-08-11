@@ -1882,6 +1882,7 @@ fn validate_manifest(manifest: &SuiteManifest, files: &[SuitePackageFile]) -> Ap
             "suite runtime type must be compose".to_string(),
         ));
     }
+    validate_min_seclab_version(&manifest.metadata.min_seclab_version)?;
     if manifest.runtime.compose_file != "compose.yaml" {
         return Err(ApiError::BadRequest(
             "suite compose file must be compose.yaml".to_string(),
@@ -1912,6 +1913,21 @@ fn validate_manifest(manifest: &SuiteManifest, files: &[SuitePackageFile]) -> Ap
         }
     }
     validate_i18n(manifest)?;
+    Ok(())
+}
+
+fn validate_min_seclab_version(value: &str) -> ApiResult<()> {
+    let minimum = semver::Version::parse(value).map_err(|err| {
+        ApiError::BadRequest(format!("metadata.minSeclabVersion is invalid: {err}"))
+    })?;
+    let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))
+        .map_err(|err| ApiError::Internal(format!("current SecLab version is invalid: {err}")))?;
+    if current < minimum {
+        return Err(ApiError::BadRequest(format!(
+            "suite requires SecLab {} or newer, current version is {}",
+            minimum, current
+        )));
+    }
     Ok(())
 }
 
@@ -2458,6 +2474,13 @@ mod suite_asset_tests {
     }
 
     #[test]
+    fn suite_minimum_version_is_required_and_cannot_exceed_current_build() {
+        assert!(validate_min_seclab_version(env!("CARGO_PKG_VERSION")).is_ok());
+        assert!(validate_min_seclab_version("not-semver").is_err());
+        assert!(validate_min_seclab_version("999.0.0").is_err());
+    }
+
+    #[test]
     fn agent_access_requires_known_capabilities_and_existing_services() {
         let manifest = serde_yaml::from_str::<SuiteManifest>(
             r#"
@@ -2467,6 +2490,7 @@ metadata:
   suiteId: suite.example
   slug: example
   version: 1.0.0
+  minSeclabVersion: 0.1.0-alpha.1
   name: Example
   icon: assets/icon.png
 runtime:

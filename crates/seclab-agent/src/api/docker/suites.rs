@@ -147,6 +147,8 @@ pub(crate) struct SuiteAgentMetadata {
 struct SuiteAgentGrant {
     services: Vec<String>,
     capabilities: Vec<String>,
+    #[serde(default)]
+    runtime_images: Vec<String>,
     token_hash: String,
     enabled: bool,
 }
@@ -156,6 +158,7 @@ struct SuiteAgentGrant {
 #[serde(rename_all = "camelCase")]
 struct SuiteRuntimeDescriptor {
     schema_version: u32,
+    platform_version: String,
     suite_id: String,
     instance_id: String,
     endpoint: SuiteRuntimeEndpoint,
@@ -1076,6 +1079,7 @@ pub(crate) struct SuiteRuntimePrincipal {
     pub(crate) suite_id: String,
     pub(crate) instance_id: String,
     pub(crate) capabilities: Vec<String>,
+    pub(crate) runtime_images: Vec<String>,
 }
 
 /// 使用套件实例令牌解析授权主体，不暴露持久化令牌摘要。
@@ -1123,6 +1127,7 @@ pub(crate) async fn authenticate_suite_runtime(token: &str) -> ApiResult<SuiteRu
                 suite_id: metadata.suite_id,
                 instance_id: metadata.instance_id,
                 capabilities: grant.capabilities.clone(),
+                runtime_images: grant.runtime_images.clone(),
             });
         }
     }
@@ -1173,6 +1178,7 @@ async fn prepare_suite_runtime_files(
     Ok(Some(SuiteAgentGrant {
         services: access.services.clone(),
         capabilities: access.capabilities.clone(),
+        runtime_images: payload.runtime_images.clone(),
         token_hash: hash_access_token(&token),
         enabled: true,
     }))
@@ -1204,6 +1210,7 @@ async fn write_suite_runtime_descriptor(
     };
     let descriptor = SuiteRuntimeDescriptor {
         schema_version: 1,
+        platform_version: env!("CARGO_PKG_VERSION").to_string(),
         suite_id: payload.suite_id.clone(),
         instance_id: payload.instance_id.clone(),
         endpoint,

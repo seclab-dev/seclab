@@ -27,6 +27,7 @@ pub struct SuiteManifestInfo {
     pub suite_id: String,
     pub slug: String,
     pub version: String,
+    pub min_seclab_version: String,
     pub name: String,
     #[serde(default)]
     pub summary: String,
