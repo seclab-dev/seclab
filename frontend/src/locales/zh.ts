@@ -1293,6 +1293,8 @@ const zh: typeof en = {
         runtime_deregister: '节点注销',
         runtime_rotate_certificate: '轮转节点证书',
         node_seclab_url_sync: '同步节点主控地址',
+        node_offline: '节点离线',
+        node_recovered: '节点恢复',
         terminal_session_start: '建立终端会话',
         terminal_session_end: '结束终端会话',
         file_create: '创建文件',

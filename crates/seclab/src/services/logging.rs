@@ -1474,12 +1474,18 @@ const REGISTERED_EVENT_GROUPS: &[&[EventRegistration]] = &[
             "runtime_deregister",
             "runtime_rotate_certificate",
             "node_seclab_url_sync",
+            "node_recovered",
         ]
     ),
     events!(
         Nodes,
         true,
-        ["node_remove", "node_retire", "node_uninstall"]
+        [
+            "node_remove",
+            "node_retire",
+            "node_uninstall",
+            "node_offline",
+        ]
     ),
     events!(
         Suites,
@@ -2226,6 +2232,19 @@ mod tests {
             OperationModule::Scripts
         );
         assert!(is_high_impact("node_remove"));
+        assert_eq!(module_for_event("node_offline"), OperationModule::Nodes);
+        assert!(is_high_impact("node_offline"));
+        assert_eq!(module_for_event("node_recovered"), OperationModule::Nodes);
+        assert!(!is_high_impact("node_recovered"));
+
+        let offline =
+            OperationEventBuilder::new("system", "node_offline", "127.0.0.1".parse().unwrap())
+                .set_success();
+        let recovered =
+            OperationEventBuilder::new("system", "node_recovered", "127.0.0.1".parse().unwrap())
+                .set_success();
+        assert_eq!(offline.event.impact, OperationImpact::Warning);
+        assert_eq!(recovered.event.impact, OperationImpact::Info);
     }
 
     #[test]

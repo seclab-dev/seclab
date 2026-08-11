@@ -61,6 +61,34 @@ afterEach(() => {
 })
 
 describe('OperationLogView', () => {
+  it('使用标准中英文名称展示节点离线与恢复事件', async () => {
+    const result = response('node-offline-event')
+    result.data.total = 2
+    result.data.items = [
+      { ...result.data.items[0], eventId: 'node-offline-event', eventCode: 'node_offline' },
+      { ...result.data.items[0], eventId: 'node-recovered-event', eventCode: 'node_recovered' },
+    ]
+    vi.mocked(operationLogApi.query).mockReset().mockResolvedValue(result)
+    const zhWrapper = mount(OperationLogView, {
+      global: { plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh, en } })] },
+    })
+    await flushPromises()
+
+    expect(zhWrapper.find('[data-ui="table"]').text()).toContain('节点离线')
+    expect(zhWrapper.find('[data-ui="table"]').text()).toContain('节点恢复')
+    zhWrapper.unmount()
+
+    vi.mocked(operationLogApi.query).mockReset().mockResolvedValue(result)
+    const enWrapper = mount(OperationLogView, {
+      global: { plugins: [createI18n({ legacy: false, locale: 'en', messages: { zh, en } })] },
+    })
+    await flushPromises()
+
+    expect(enWrapper.find('[data-ui="table"]').text()).toContain('Node offline')
+    expect(enWrapper.find('[data-ui="table"]').text()).toContain('Node recovered')
+    enWrapper.unmount()
+  })
+
   it('展示子节点来源并把节点筛选传给查询接口', async () => {
     const result = response('remote-docker-event')
     result.data.items[0] = {

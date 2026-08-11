@@ -1318,6 +1318,8 @@ const en = {
         runtime_deregister: 'Deregister node',
         runtime_rotate_certificate: 'Rotate node certificate',
         node_seclab_url_sync: 'Synchronize node controller address',
+        node_offline: 'Node offline',
+        node_recovered: 'Node recovered',
         terminal_session_start: 'Start terminal session',
         terminal_session_end: 'End terminal session',
         file_create: 'Create file',
