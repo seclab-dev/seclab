@@ -449,7 +449,7 @@ const networkColumns = computed<SecLabTableColumn[]>(() => [
     <SecLabAlert
       v-else-if="activeTab === 'process' && processManager.processPartial.value"
       type="warning"
-      :title="t('app.processManager.messages.partial')"
+      :title="t('app.processManager.messages.processPartial')"
       show-icon
       data-ui="process-partial-warning"
     />
@@ -471,9 +471,20 @@ const networkColumns = computed<SecLabTableColumn[]>(() => [
     <SecLabAlert
       v-else-if="activeTab === 'network' && processManager.networkPartial.value"
       type="warning"
-      :title="t('app.processManager.messages.partial')"
+      :title="t('app.processManager.messages.networkPartial')"
       show-icon
       data-ui="network-partial-warning"
+    />
+    <SecLabAlert
+      v-else-if="activeTab === 'network' && processManager.networkOwnerPartial.value"
+      type="warning"
+      :title="
+        t('app.processManager.messages.networkOwnerPartial', {
+          coverage: processManager.networkOwnerCoveragePercent.value,
+        })
+      "
+      show-icon
+      data-ui="network-owner-partial-warning"
     />
 
     <div v-if="activeTab === 'process'" class="content-wrapper" data-slot="process-panel">

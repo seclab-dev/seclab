@@ -155,4 +155,19 @@ describe('useProcessManager', () => {
     expect(api.listNetworkConnections).toHaveBeenCalledTimes(2)
     wrapper.unmount()
   })
+
+  it('区分连接来源不完整与进程归属不完整', async () => {
+    const ownerPartialPage = networkPage()
+    ownerPartialPage.coverage.ownerCoveragePercent = 62.4
+    api.listNetworkConnections.mockResolvedValue(response(ownerPartialPage))
+    const wrapper = mount(Harness)
+
+    wrapper.vm.setActiveView('network')
+    await flushPromises()
+
+    expect(wrapper.vm.networkPartial).toBe(false)
+    expect(wrapper.vm.networkOwnerPartial).toBe(true)
+    expect(wrapper.vm.networkOwnerCoveragePercent).toBe(62.4)
+    wrapper.unmount()
+  })
 })

@@ -2007,7 +2007,10 @@ const zh: typeof en = {
         outcomeUnknown: '信号提交连接已中断，进程 {pid} 的投递结果暂无法确认',
         loadFailed: '进程数据加载失败',
         stale: '刷新失败，当前保留上一次成功数据',
-        partial: '部分进程或连接信息暂不可用，当前数据覆盖不完整',
+        processPartial: '部分进程信息暂不可用，当前进程数据覆盖不完整',
+        networkPartial: '部分网络连接来源暂不可用，当前连接数据覆盖不完整',
+        networkOwnerPartial:
+          '连接列表已完整采集，但部分活动连接暂无法关联到进程，当前进程归属覆盖率为 {coverage}%',
       },
       confirmTerminate: '确认向进程 {pid} 发送 {signal} 信号吗？',
       confirmForceKill: '这将不可逆地强制结束进程 {pid}，确认继续吗？',

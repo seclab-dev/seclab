@@ -265,6 +265,14 @@ export const useProcessManager = (nodeId: string) => {
     createForceKillConfirmation,
     forceKill,
     networkError,
+    networkOwnerCoveragePercent: computed(() => {
+      const coverage = networkPage.value?.coverage.ownerCoveragePercent ?? 100
+      return coverage < 100 ? Math.floor(coverage * 10) / 10 : 100
+    }),
+    networkOwnerPartial: computed(() => {
+      const coverage = networkPage.value?.coverage.ownerCoveragePercent
+      return coverage !== undefined && coverage < 100
+    }),
     networkPage,
     networkPartial: computed(() => networkPage.value?.coverage.status === 'partial'),
     networkPhase,

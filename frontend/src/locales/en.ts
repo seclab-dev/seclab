@@ -2044,7 +2044,11 @@ const en = {
           'The submission connection was interrupted; delivery to process {pid} is not yet known',
         loadFailed: 'Failed to load process data',
         stale: 'Refresh failed. The last successful data is still shown.',
-        partial: 'Some process or connection details are unavailable; coverage is partial.',
+        processPartial: 'Some process details are unavailable; process coverage is partial.',
+        networkPartial:
+          'Some network connection sources are unavailable; connection coverage is partial.',
+        networkOwnerPartial:
+          'The connection list is complete, but some active connections could not be attributed to a process. Process attribution coverage is {coverage}%.',
       },
       confirmTerminate: 'Confirm sending {signal} signal to process {pid}?',
       confirmForceKill: 'This will irreversibly force kill process {pid}. Continue?',

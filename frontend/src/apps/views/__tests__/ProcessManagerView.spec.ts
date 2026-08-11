@@ -210,4 +210,78 @@ describe('ProcessManagerView', () => {
     ])
     wrapper.unmount()
   })
+
+  it('网络连接完整但进程归属不完整时显示独立提示', async () => {
+    api.listNetworkConnections.mockResolvedValue(
+      response({
+        entries: [],
+        page: 1,
+        pageSize: 100,
+        availableTotal: 0,
+        total: 0,
+        byState: {},
+        byProtocol: {},
+        sampledAt: '2026-07-16T00:00:00.000Z',
+        coverage: {
+          status: 'complete',
+          scannedCount: 1,
+          succeededCount: 1,
+          failedCount: 0,
+          ownerCoveragePercent: 75,
+          warnings: ['some network connections could not be attributed to a process'],
+        },
+      }),
+    )
+    const wrapper = mount(ProcessManagerView, {
+      props: { payload: { nodeId: 'node-a' } },
+      global: {
+        plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })],
+      },
+    })
+
+    await wrapper.get('[data-slot="network-tab"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-ui="network-owner-partial-warning"]').exists()).toBe(true)
+    expect(wrapper.find('[data-ui="network-partial-warning"]').exists()).toBe(false)
+    expect(wrapper.text()).toContain('进程归属覆盖率为 75%')
+    wrapper.unmount()
+  })
+
+  it('网络来源不完整时优先显示连接采集告警', async () => {
+    api.listNetworkConnections.mockResolvedValue(
+      response({
+        entries: [],
+        page: 1,
+        pageSize: 100,
+        availableTotal: 0,
+        total: 0,
+        byState: {},
+        byProtocol: {},
+        sampledAt: '2026-07-16T00:00:00.000Z',
+        coverage: {
+          status: 'partial',
+          scannedCount: 1,
+          succeededCount: 0,
+          failedCount: 1,
+          ownerCoveragePercent: 50,
+          warnings: ['tcp connection source was unavailable'],
+        },
+      }),
+    )
+    const wrapper = mount(ProcessManagerView, {
+      props: { payload: { nodeId: 'node-a' } },
+      global: {
+        plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })],
+      },
+    })
+
+    await wrapper.get('[data-slot="network-tab"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-ui="network-partial-warning"]').exists()).toBe(true)
+    expect(wrapper.find('[data-ui="network-owner-partial-warning"]').exists()).toBe(false)
+    expect(wrapper.text()).toContain('部分网络连接来源暂不可用')
+    wrapper.unmount()
+  })
 })

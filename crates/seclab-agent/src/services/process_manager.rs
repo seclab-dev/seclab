@@ -79,6 +79,13 @@ struct NetworkSnapshot {
     coverage: SamplingCoverage,
 }
 
+/// 解析后的连接及其是否具备可追溯的 socket inode。
+#[derive(Debug)]
+struct ParsedNetworkConnection {
+    summary: NetworkConnectionSummary,
+    owner_attribution_expected: bool,
+}
+
 #[derive(Debug)]
 struct PreviousCpuSample {
     sampled_at: Instant,
@@ -1090,9 +1097,9 @@ fn collect_network_snapshot(
         (NetworkProtocol::Udp, "net/udp", false),
         (NetworkProtocol::Udp6, "net/udp6", true),
     ];
-    let mut entries = Vec::new();
+    let mut parsed_connections = Vec::new();
     let mut warnings = Vec::new();
-    let mut failed_count = owner_scan_failures;
+    let mut failed_count = 0_usize;
     let mut scanned_count = 0_usize;
     for (protocol, relative_path, ipv6) in sources {
         match parse_proc_network_file(
@@ -1102,7 +1109,7 @@ fn collect_network_snapshot(
             &owners_by_inode,
         ) {
             Ok((mut source_entries, scanned, failed)) => {
-                entries.append(&mut source_entries);
+                parsed_connections.append(&mut source_entries);
                 scanned_count += scanned;
                 failed_count += failed;
             }
@@ -1115,39 +1122,48 @@ fn collect_network_snapshot(
             }
         }
     }
-    entries.sort_by(|left, right| left.connection_id.cmp(&right.connection_id));
-    entries.dedup_by(|left, right| left.connection_id == right.connection_id);
-    let owned_count = entries
+    parsed_connections
+        .sort_by(|left, right| left.summary.connection_id.cmp(&right.summary.connection_id));
+    parsed_connections
+        .dedup_by(|left, right| left.summary.connection_id == right.summary.connection_id);
+    let owner_expected_count = parsed_connections
         .iter()
-        .filter(|entry| !entry.owners.is_empty())
+        .filter(|entry| entry.owner_attribution_expected)
         .count();
-    let owner_coverage_percent = if entries.is_empty() {
+    let owned_count = parsed_connections
+        .iter()
+        .filter(|entry| entry.owner_attribution_expected && !entry.summary.owners.is_empty())
+        .count();
+    let owner_coverage_percent = if owner_expected_count == 0 {
         Some(100.0)
     } else {
-        Some(owned_count as f64 / entries.len() as f64 * 100.0)
+        Some(owned_count as f64 / owner_expected_count as f64 * 100.0)
     };
-    if owned_count < entries.len() {
+    if owned_count < owner_expected_count {
         warnings.push("some network connections could not be attributed to a process".to_string());
     }
     if owner_scan_failures > 0 {
         warnings.push("some process socket descriptors were unreadable".to_string());
     }
     let mut counts_by_process = HashMap::new();
-    for entry in &entries {
-        for owner in &entry.owners {
+    for entry in &parsed_connections {
+        for owner in &entry.summary.owners {
             *counts_by_process
                 .entry(owner.process_id.clone())
                 .or_insert(0) += 1;
         }
     }
+    let entries = parsed_connections
+        .into_iter()
+        .map(|entry| entry.summary)
+        .collect::<Vec<_>>();
     let succeeded_count = entries.len();
     Ok(NetworkSnapshot {
         entries,
         counts_by_process,
         sampled_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         coverage: SamplingCoverage {
-            status: if failed_count > 0 || owner_coverage_percent.is_some_and(|value| value < 100.0)
-            {
+            status: if failed_count > 0 {
                 SamplingStatus::Partial
             } else {
                 SamplingStatus::Complete
@@ -1168,8 +1184,10 @@ fn collect_socket_owners(
     let mut owners = HashMap::<u64, Vec<NetworkConnectionOwner>>::new();
     let mut failures = 0_usize;
     for identity in identities.values() {
-        let fd_entries = match fs::read_dir(proc_root.join(identity.pid.to_string()).join("fd")) {
+        let process_dir = proc_root.join(identity.pid.to_string());
+        let fd_entries = match fs::read_dir(process_dir.join("fd")) {
             Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => {
                 failures += 1;
                 continue;
@@ -1215,7 +1233,7 @@ fn parse_proc_network_file(
     path: &Path,
     ipv6: bool,
     owners_by_inode: &HashMap<u64, Vec<NetworkConnectionOwner>>,
-) -> Result<(Vec<NetworkConnectionSummary>, usize, usize), ()> {
+) -> Result<(Vec<ParsedNetworkConnection>, usize, usize), ()> {
     let content = fs::read_to_string(path).map_err(|_| ())?;
     let mut entries = Vec::new();
     let mut scanned = 0_usize;
@@ -1243,8 +1261,16 @@ fn parse_proc_network_file(
         } else {
             NetworkConnectionState::Unconnected
         };
-        let inode = fields[9].parse::<u64>().unwrap_or_default();
-        let owners = owners_by_inode.get(&inode).cloned().unwrap_or_default();
+        let Some(inode) = fields[9].parse::<u64>().ok() else {
+            failed += 1;
+            continue;
+        };
+        let owner_attribution_expected = inode != 0;
+        let owners = if owner_attribution_expected {
+            owners_by_inode.get(&inode).cloned().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let connection_key = format!(
             "{}\0{}\0{}\0{}",
             network_protocol_key(protocol),
@@ -1255,13 +1281,16 @@ fn parse_proc_network_file(
                 .map(format_endpoint)
                 .unwrap_or_default()
         );
-        entries.push(NetworkConnectionSummary {
-            connection_id: hex::encode(digest(&SHA256, connection_key.as_bytes()).as_ref()),
-            protocol,
-            local_endpoint,
-            remote_endpoint,
-            state,
-            owners,
+        entries.push(ParsedNetworkConnection {
+            summary: NetworkConnectionSummary {
+                connection_id: hex::encode(digest(&SHA256, connection_key.as_bytes()).as_ref()),
+                protocol,
+                local_endpoint,
+                remote_endpoint,
+                state,
+                owners,
+            },
+            owner_attribution_expected,
         });
     }
     Ok((entries, scanned, failed))
@@ -1493,6 +1522,41 @@ fn network_state_key(state: NetworkConnectionState) -> &'static str {
 mod tests {
     use super::*;
 
+    struct TestProcRoot {
+        path: std::path::PathBuf,
+    }
+
+    impl TestProcRoot {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("seclab-process-test-{}", uuid::Uuid::now_v7()));
+            fs::create_dir_all(path.join("net")).expect("test proc network directory should exist");
+            for source in ["tcp", "tcp6", "udp", "udp6"] {
+                fs::write(path.join("net").join(source), "header\n")
+                    .expect("empty network source should be written");
+            }
+            Self { path }
+        }
+
+        fn write_source(&self, source: &str, rows: &str) {
+            fs::write(
+                self.path.join("net").join(source),
+                format!("header\n{rows}"),
+            )
+            .expect("network source should be written");
+        }
+    }
+
+    impl Drop for TestProcRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn proc_network_row(state: &str, inode: &str) -> String {
+        format!("0: 0100007F:1F90 00000000:0000 {state} 0 0 0 0 0 {inode}\n")
+    }
+
     #[test]
     fn proc_stat_parser_preserves_names_with_spaces() {
         let value =
@@ -1589,6 +1653,71 @@ mod tests {
                 port: 443,
             })
         );
+    }
+
+    #[test]
+    fn time_wait_without_inode_does_not_reduce_network_coverage() {
+        let proc_root = TestProcRoot::new();
+        proc_root.write_source("tcp", &proc_network_row("06", "0"));
+
+        let snapshot = collect_network_snapshot(&proc_root.path, &HashMap::new())
+            .expect("network snapshot should be collected");
+
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.entries[0].state, NetworkConnectionState::TimeWait);
+        assert!(snapshot.entries[0].owners.is_empty());
+        assert_eq!(snapshot.coverage.status, SamplingStatus::Complete);
+        assert_eq!(snapshot.coverage.failed_count, 0);
+        assert_eq!(snapshot.coverage.owner_coverage_percent, Some(100.0));
+    }
+
+    #[test]
+    fn unattributed_live_socket_keeps_data_complete_but_reduces_owner_coverage() {
+        let proc_root = TestProcRoot::new();
+        proc_root.write_source("tcp", &proc_network_row("01", "42"));
+
+        let snapshot = collect_network_snapshot(&proc_root.path, &HashMap::new())
+            .expect("network snapshot should be collected");
+
+        assert_eq!(snapshot.coverage.status, SamplingStatus::Complete);
+        assert_eq!(snapshot.coverage.failed_count, 0);
+        assert_eq!(snapshot.coverage.owner_coverage_percent, Some(0.0));
+        assert!(
+            snapshot
+                .coverage
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("could not be attributed"))
+        );
+    }
+
+    #[test]
+    fn missing_or_malformed_network_source_marks_snapshot_partial() {
+        let proc_root = TestProcRoot::new();
+        proc_root.write_source("tcp", &proc_network_row("01", "invalid"));
+        fs::remove_file(proc_root.path.join("net/udp6")).expect("test source should be removable");
+
+        let snapshot = collect_network_snapshot(&proc_root.path, &HashMap::new())
+            .expect("partial network snapshot should still be returned");
+
+        assert_eq!(snapshot.coverage.status, SamplingStatus::Partial);
+        assert_eq!(snapshot.coverage.scanned_count, 1);
+        assert_eq!(snapshot.coverage.failed_count, 2);
+    }
+
+    #[test]
+    fn exited_process_during_owner_scan_is_not_a_failure() {
+        let proc_root = TestProcRoot::new();
+        let identity = ProcessIdentity {
+            process_id: "a".repeat(64),
+            pid: 424_242,
+            start_time_ticks: 1,
+            name: "exited".to_string(),
+        };
+        let (_, failures) =
+            collect_socket_owners(&proc_root.path, &HashMap::from([(identity.pid, identity)]));
+
+        assert_eq!(failures, 0);
     }
 
     #[test]
