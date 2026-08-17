@@ -32,6 +32,7 @@ type PortBindings = HashMap<String, Option<Vec<PortBinding>>>;
 #[serde(rename_all = "camelCase")]
 pub struct StartWorkloadRequest {
     pub workload_kind: String,
+    /// 套件提供的唯一、可读名称主体，Agent 会为动态工作负载容器添加 `sl-` 前缀。
     pub workload_name: String,
     pub image: String,
     #[serde(default)]
@@ -145,6 +146,9 @@ pub fn suite_workloads_router() -> Router<Arc<AppState>> {
         )
 }
 
+/// 校验套件授权和运行参数，并创建受 Agent 管理的动态工作负载容器。
+///
+/// 容器使用套件实例归属标签并连入共享套件网络；启动失败时立即回收已创建的容器。
 async fn start_workload(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -156,7 +160,7 @@ async fn start_workload(
 
     let docker = state.docker_client().await?;
     let workload_id = format!("workload-{}", Uuid::now_v7());
-    let container_name = workload_container_name(&payload.workload_name, &workload_id);
+    let container_name = workload_container_name(&payload.workload_name);
     let labels = workload_labels(
         &payload,
         &workload_id,
@@ -242,6 +246,9 @@ async fn start_workload(
     }))
 }
 
+/// 为当前套件实例拥有的工作负载启动整负载抓包。
+///
+/// 抓包端点来自容器创建时写入的端口元数据，一次覆盖该负载的全部 TCP/UDP 端点。
 async fn start_pcap(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -318,6 +325,7 @@ async fn workload_capture_endpoints(
         .map_err(|err| ApiError::BadRequest(format!("invalid workload endpoint metadata: {err}")))
 }
 
+/// 结束归属于当前套件实例和工作负载的抓包，并返回原始 PCAP 字节。
 async fn stop_pcap(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -341,6 +349,7 @@ async fn stop_pcap(
     ))
 }
 
+/// 按归属标签列出当前已认证套件实例可见的全部工作负载。
 async fn list_workloads(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -385,6 +394,7 @@ async fn list_workloads(
     Ok(Json(items))
 }
 
+/// 返回当前套件实例拥有的指定工作负载 Docker 详情。
 async fn detail_workload(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -404,6 +414,9 @@ async fn detail_workload(
     Ok(Json(detail))
 }
 
+/// 回收当前套件实例拥有的工作负载及其抓包任务。
+///
+/// 工作负载容器已不存在时仍执行抓包清理，并返回 `deleted: false`。
 async fn delete_workload(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -506,6 +519,7 @@ pub(crate) async fn cleanup_suite_workloads_by_instance(
     Ok(removed)
 }
 
+/// 生成仅匹配指定套件实例动态工作负载的 Docker 清理过滤器。
 fn suite_workload_cleanup_filters(suite_instance_id: &str) -> HashMap<String, Vec<String>> {
     let mut filters = HashMap::new();
     filters.insert(
@@ -518,6 +532,7 @@ fn suite_workload_cleanup_filters(suite_instance_id: &str) -> HashMap<String, Ve
     filters
 }
 
+/// 验证套件运行时令牌，并确认已授予请求所需能力。
 async fn require_suite_capability(
     headers: &HeaderMap,
     capability: &str,
@@ -545,6 +560,7 @@ async fn require_suite_capability(
     Ok(principal)
 }
 
+/// 校验工作负载名称、镜像白名单以及 TCP/UDP 端点绑定的唯一性。
 fn validate_workload_request(
     payload: &StartWorkloadRequest,
     runtime_images: &[String],
@@ -592,6 +608,7 @@ fn validate_workload_request(
     Ok(())
 }
 
+/// 在调用 Docker 前预检测所有宿主机 TCP/UDP 端口是否可绑定。
 async fn ensure_workload_ports_available(ports: &[WorkloadPort]) -> ApiResult<()> {
     for port in ports {
         let address = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port.host_port);
@@ -614,16 +631,18 @@ async fn ensure_workload_ports_available(ports: &[WorkloadPort]) -> ApiResult<()
     Ok(())
 }
 
-fn workload_container_name(workload_name: &str, workload_id: &str) -> String {
-    let suffix = compact_container_id(workload_id);
+/// 生成 Agent 动态工作负载容器名。
+///
+/// Compose 套件主容器由各套件的 `services`/Compose 配置命名；
+/// 本函数仅处理通过 `workloads.manage` 创建的动态容器，并统一添加 `sl-` 前缀。
+fn workload_container_name(workload_name: &str) -> String {
     let max_readable_len = MAX_WORKLOAD_CONTAINER_NAME_LEN
-        .saturating_sub("seclab".len())
-        .saturating_sub(suffix.len())
-        .saturating_sub(2);
+        .saturating_sub("sl".len())
+        .saturating_sub(1);
     let readable =
         truncate_container_segment(&sanitize_container_segment(workload_name), max_readable_len)
             .unwrap_or_else(|| "workload".to_string());
-    format!("seclab-{readable}-{suffix}")
+    format!("sl-{readable}")
 }
 
 fn sanitize_container_segment(value: &str) -> String {
@@ -668,28 +687,9 @@ fn truncate_container_segment(value: &str, max_len: usize) -> Option<String> {
     }
 }
 
-fn compact_container_id(value: &str) -> String {
-    let normalized = value
-        .chars()
-        .filter(|value| value.is_ascii_alphanumeric())
-        .collect::<String>();
-    let compact = if normalized.len() > 12 {
-        &normalized[normalized.len() - 12..]
-    } else {
-        normalized.as_str()
-    };
-    compact
-        .chars()
-        .map(|value| {
-            if value.is_ascii_alphanumeric() {
-                value
-            } else {
-                '-'
-            }
-        })
-        .collect()
-}
-
+/// 构建动态工作负载的归属、身份和端点元数据标签。
+///
+/// 这些标签是列表、详情、删除、抓包和套件卸载清理的资源归属依据。
 fn workload_labels(
     payload: &StartWorkloadRequest,
     workload_id: &str,
@@ -720,6 +720,7 @@ fn workload_labels(
     ])
 }
 
+/// 将具名工作负载端点转换为 Docker 的暴露端口和宿主机绑定。
 fn port_maps(ports: &[WorkloadPort]) -> (ExposedPorts, PortBindings) {
     let mut exposed = Vec::new();
     let mut bindings = HashMap::new();
@@ -737,6 +738,7 @@ fn port_maps(ports: &[WorkloadPort]) -> (ExposedPorts, PortBindings) {
     (exposed, bindings)
 }
 
+/// 将结构化环境变量转换为 Docker `KEY=VALUE` 列表，并校验变量名。
 fn env_map_to_vec(value: &serde_json::Value) -> ApiResult<Vec<String>> {
     let Some(object) = value.as_object() else {
         return Ok(Vec::new());
@@ -766,6 +768,7 @@ fn validate_env_key(key: &str) -> ApiResult<()> {
     Ok(())
 }
 
+/// 通过套件实例和工作负载标签查找当前请求可操作的受管容器。
 async fn find_owned_container(
     docker: &bollard::Docker,
     suite_instance_id: &str,
@@ -826,24 +829,18 @@ mod tests {
     use tokio::net::{TcpListener, UdpSocket};
 
     #[test]
-    fn workload_container_name_uses_rule_id_and_short_workload_id() {
+    fn workload_container_name_adds_only_the_platform_prefix() {
         assert_eq!(
-            workload_container_name(
-                "sim-rule-427001",
-                "workload-019f409d-8e1d-73e0-f3dc45e75209"
-            ),
-            "seclab-sim-rule-427001-f3dc45e75209"
+            workload_container_name("8080-427001-e75209"),
+            "sl-8080-427001-e75209"
         );
     }
 
     #[test]
     fn workload_container_name_sanitizes_readable_segment() {
         assert_eq!(
-            workload_container_name(
-                "  Sim Rule/邮件:427001  ",
-                "workload-019f409d-8e1d-73e0-f3dc45e75209"
-            ),
-            "seclab-sim-rule-427001-f3dc45e75209"
+            workload_container_name("  8080/邮件:427001-e75209  "),
+            "sl-8080-427001-e75209"
         );
         assert_eq!(sanitize_container_segment("...___---"), "");
     }
@@ -852,19 +849,14 @@ mod tests {
     fn workload_container_name_truncates_long_readable_segment() {
         let name = workload_container_name(
             "sim-rule-very-long-name-that-keeps-going-until-it-would-make-the-docker-container-name-too-long",
-            "workload-019f409d-8e1d-73e0-f3dc45e75209",
         );
-        assert!(name.starts_with("seclab-sim-rule-very-long-name"));
-        assert!(name.ends_with("-f3dc45e75209"));
+        assert!(name.starts_with("sl-sim-rule-very-long-name"));
         assert!(name.len() <= MAX_WORKLOAD_CONTAINER_NAME_LEN);
     }
 
     #[test]
     fn workload_container_name_falls_back_when_name_has_no_safe_chars() {
-        assert_eq!(
-            workload_container_name("邮件规则", "workload-019f409d-8e1d-73e0-f3dc45e75209"),
-            "seclab-workload-f3dc45e75209"
-        );
+        assert_eq!(workload_container_name("邮件规则"), "sl-workload");
     }
 
     #[test]
