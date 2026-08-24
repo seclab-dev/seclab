@@ -81,6 +81,18 @@ wait_for_agent_socket() {
   fail "seclab-agent did not create a ready Unix socket within 30 seconds: $socket_path"
 }
 
+wait_for_seclab_listener() {
+  local port="$1"
+  for _ in {1..30}; do
+    if $PREFIX systemctl is-active --quiet seclab \
+      && (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  fail "seclab did not create a ready HTTPS listener within 30 seconds: 127.0.0.1:${port}"
+}
+
 restore_running_suite_socket_containers() {
   if (( ${#RUNNING_SUITE_SOCKET_CONTAINERS[@]} == 0 )); then
     return 0
@@ -477,8 +489,8 @@ if [[ "$installed" == "true" ]]; then
   capture_running_suite_socket_containers "$SECLAB_AGENT_SOCKET"
   stop_running_suite_socket_containers
   log "Stopping existing SecLab services for overwrite..."
-  $PREFIX systemctl stop seclab >/dev/null 2>&1 || true
   $PREFIX systemctl stop seclab-agent >/dev/null 2>&1 || true
+  $PREFIX systemctl stop seclab >/dev/null 2>&1 || true
 fi
 
 if port_in_use "$SECLAB_PORT"; then
@@ -646,6 +658,7 @@ write_service "seclab"
 log "start service: seclab"
 $PREFIX systemctl daemon-reload
 $PREFIX systemctl enable --now seclab >/dev/null 2>&1
+wait_for_seclab_listener "$SECLAB_PORT"
 log "seclab service started"
 
 log "start service: seclab-agent"

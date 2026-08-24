@@ -409,6 +409,31 @@ struct HeartbeatResponse {
     controller_compatibility: RuntimeControllerCompatibility,
 }
 
+/// 拒绝未推进会话序号的心跳，避免等待旧租约自然过期后才重新注册。
+fn ensure_heartbeat_sequence_applied(sequence_ignored: Option<bool>) -> anyhow::Result<()> {
+    if sequence_ignored.unwrap_or(false) {
+        anyhow::bail!("controller ignored heartbeat sequence; runtime re-registration is required");
+    }
+    Ok(())
+}
+
+/// 保留运行时接口的状态码与受限响应正文，便于定位会话拒绝原因。
+async fn require_runtime_response(
+    response: reqwest::Response,
+    operation: &str,
+) -> anyhow::Result<reqwest::Response> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let detail = response.text().await.unwrap_or_default();
+    let detail = detail.trim().chars().take(1024).collect::<String>();
+    if detail.is_empty() {
+        anyhow::bail!("{operation} rejected with HTTP status {status}");
+    }
+    anyhow::bail!("{operation} rejected with HTTP status {status}: {detail}");
+}
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RotateCertificateResponse {
@@ -918,8 +943,8 @@ async fn maintain_runtime_session(
                         compatibility: runtime_agent_compatibility(),
                     })
                     .send()
-                    .await?
-                    .error_for_status()?;
+                    .await?;
+                let response = require_runtime_response(response, "runtime heartbeat").await?;
                 let payload = response
                     .json::<ApiResponse<HeartbeatResponse>>()
                     .await?;
@@ -936,8 +961,8 @@ async fn maintain_runtime_session(
                 if heartbeat.require_re_register {
                     return Err(anyhow::anyhow!("seclab requested re-register"));
                 }
+                ensure_heartbeat_sequence_applied(heartbeat.sequence_ignored)?;
                 let _ = heartbeat.lease_ttl_seconds;
-                let _ = heartbeat.sequence_ignored;
                 session.lease_id = heartbeat.lease_id;
                 session.heartbeat_interval_seconds = heartbeat.heartbeat_interval_seconds.max(1) as u64;
                 session.heartbeat_sequence = session.heartbeat_sequence.saturating_add(1);
@@ -1244,4 +1269,16 @@ fn load_private_key_from_bytes(data: &[u8]) -> anyhow::Result<PrivateKeyDer<'sta
     let mut reader = std::io::Cursor::new(data);
     rustls_pemfile::private_key(&mut reader)?
         .ok_or_else(|| anyhow::anyhow!("No private key found in embedded key"))
+}
+
+#[cfg(test)]
+mod runtime_session_tests {
+    use super::ensure_heartbeat_sequence_applied;
+
+    #[test]
+    fn ignored_heartbeat_sequence_requires_re_registration() {
+        assert!(ensure_heartbeat_sequence_applied(Some(true)).is_err());
+        assert!(ensure_heartbeat_sequence_applied(Some(false)).is_ok());
+        assert!(ensure_heartbeat_sequence_applied(None).is_ok());
+    }
 }

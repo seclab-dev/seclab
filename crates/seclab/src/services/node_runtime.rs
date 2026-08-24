@@ -304,18 +304,9 @@ pub async fn register_node(
     let identity = get_identity_by_agent_id(pool, agent_id)
         .await?
         .ok_or_else(|| ApiError::BadRequest("unknown agent identity".to_string()))?;
-    if let Some(active) = get_active_session_by_agent_id(pool, agent_id).await?
-        && active.advertise_addr == advertise_addr
-        && active.listen_port == listen_port
-    {
-        return Ok(RuntimeRegisterResult {
-            node_id: identity.node_id,
-            agent_id: agent_id.to_string(),
-            session_id: active.session_id,
-            lease_id: active.lease_id,
-            session_replaced: false,
-        });
-    }
+    let session_replaced = get_active_session_by_agent_id(pool, agent_id)
+        .await?
+        .is_some();
     close_active_sessions(
         pool,
         &identity.node_id,
@@ -332,7 +323,7 @@ pub async fn register_node(
         agent_id: agent_id.to_string(),
         session_id: session.session_id,
         lease_id: session.lease_id,
-        session_replaced: true,
+        session_replaced,
     })
 }
 
@@ -645,7 +636,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_node_replaces_previous_active_session() {
+    async fn register_node_replaces_same_endpoint_session_epoch() {
         let pool = setup_test_db().await;
         let node_id = Uuid::new_v4().to_string();
         let token = "register-token";
@@ -662,11 +653,27 @@ mod tests {
         )
         .await
         .unwrap();
-        let second = register_node(&pool, &node_id, Some("10.0.0.10".to_string()), Some(9443))
+        let first_heartbeat = heartbeat(
+            &pool,
+            &node_id,
+            &first.session_id,
+            &first.lease_id,
+            176,
+            Some("10.0.0.9".to_string()),
+            Some(7311),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!first_heartbeat.sequence_ignored);
+
+        let second = register_node(&pool, &node_id, Some("10.0.0.9".to_string()), Some(7311))
             .await
             .unwrap();
 
         assert!(second.session_replaced);
+        assert_ne!(second.session_id, first.session_id);
+        assert_ne!(second.lease_id, first.lease_id);
 
         let sessions = list_sessions_by_node_id(&pool, &node_id, 10).await.unwrap();
         assert_eq!(sessions.len(), 2);
@@ -685,8 +692,36 @@ mod tests {
             .unwrap()
             .expect("missing active session");
         assert_eq!(active.session_id, second.session_id);
-        assert_eq!(active.advertise_addr.as_deref(), Some("10.0.0.10"));
-        assert_eq!(active.listen_port, Some(9443));
+        assert_eq!(active.advertise_addr.as_deref(), Some("10.0.0.9"));
+        assert_eq!(active.listen_port, Some(7311));
+        assert_eq!(active.heartbeat_sequence, 0);
+
+        let recovered_heartbeat = heartbeat(
+            &pool,
+            &node_id,
+            &second.session_id,
+            &second.lease_id,
+            1,
+            Some("10.0.0.9".to_string()),
+            Some(7311),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!recovered_heartbeat.sequence_ignored);
+
+        let stale_heartbeat = heartbeat(
+            &pool,
+            &node_id,
+            &first.session_id,
+            &first.lease_id,
+            177,
+            Some("10.0.0.9".to_string()),
+            Some(7311),
+            None,
+        )
+        .await;
+        assert!(stale_heartbeat.is_err());
     }
 
     #[tokio::test]
