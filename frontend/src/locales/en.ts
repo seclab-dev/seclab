@@ -925,6 +925,28 @@ const en = {
           delete: 'Delete',
           inUse: 'This image is referenced by {count} container(s) and cannot be deleted.',
         },
+        archiveImport: {
+          action: 'Import Image',
+          title: 'Import Image Archive',
+          target: 'Target node: {node}',
+          hint: 'Supports tar archives compressed with gzip, bzip2, xz, or zstd. The maximum file size is 10 GB, and the target node needs enough temporary disk space while loading.',
+          filePlaceholder: 'Select an image archive',
+          selectFile: 'Select File',
+          submit: 'Start Import',
+          invalidFormat:
+            'Select a supported tar, tar.gz, tgz, tar.bz2, tbz, tbz2, tar.xz, txz, tar.zst, or tzst archive.',
+          emptyFile: 'The image archive cannot be empty.',
+          tooLarge: 'The image archive cannot exceed 10 GB.',
+          uploading: 'Uploading archive',
+          loading: 'Loading images',
+          loadingWarning: 'Images are being loaded. Do not close this window.',
+          failedTitle: 'Image import failed',
+          failed: 'Failed to import the image archive. Check the file and target node, then retry.',
+          success: 'The image archive was imported successfully.',
+          cancelled: 'Image import cancelled.',
+          nodeChangedCancelled:
+            'The target node changed, so the image import to the previous node was cancelled.',
+        },
         settings: {
           action: 'Image settings',
           title: 'Settings',

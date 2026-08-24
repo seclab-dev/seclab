@@ -9,7 +9,7 @@ use axum::{
     Json,
     body::Body,
     extract::{Multipart, Path, Query, State},
-    http::{HeaderMap, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
 
@@ -24,11 +24,12 @@ use serde_json::json;
 
 use std::collections::HashMap;
 use std::default::Default;
+use std::path::PathBuf;
 use std::sync::{
     Arc, LazyLock, Mutex,
     atomic::{AtomicBool, Ordering},
 };
-use tokio::fs::File;
+use tokio::fs::{File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio_util::codec::{BytesCodec, FramedRead};
 use tracing::info;
@@ -42,6 +43,71 @@ const DOCKER_HUB_SEARCH_URL: &str = "https://hub.docker.com/v2/search/repositori
 const DOCKER_HUB_TAG_PAGE_SIZE: u32 = 100;
 const DEFAULT_PAGE_SIZE: u32 = 10;
 const MAX_PAGE_SIZE: u32 = 100;
+const MAX_IMAGE_ARCHIVE_BYTES: u64 = 10_000_000_000;
+const MAX_PUBLIC_IMAGE_IMPORT_ERROR_CHARS: usize = 1024;
+const IMAGE_UNPACK_ERROR_PREFIX: &str = "Error unpacking image ";
+const IMAGE_ARCHIVE_SUFFIXES: [&str; 10] = [
+    ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz", ".tbz2", ".tar.xz", ".txz", ".tar.zst", ".tzst",
+];
+
+/// 上传期间持有临时文件路径，确保正常结束或任务取消时都能清理。
+struct TemporaryImageUpload {
+    path: PathBuf,
+    writer: Option<File>,
+}
+
+impl TemporaryImageUpload {
+    async fn create() -> Result<Self, AgentError> {
+        let path = std::env::temp_dir().join(format!("docker-image-{}.archive", Uuid::new_v4()));
+        let writer = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .await
+            .map_err(AgentError::FileOperation)?;
+        Ok(Self {
+            path,
+            writer: Some(writer),
+        })
+    }
+
+    fn writer_mut(&mut self) -> Result<&mut File, AgentError> {
+        self.writer
+            .as_mut()
+            .ok_or_else(|| AgentError::Internal("image upload writer is closed".to_string()))
+    }
+
+    async fn finish_writing(&mut self) -> Result<(), AgentError> {
+        let mut writer = self
+            .writer
+            .take()
+            .ok_or_else(|| AgentError::Internal("image upload writer is closed".to_string()))?;
+        writer.flush().await.map_err(AgentError::FileOperation)?;
+        drop(writer);
+        Ok(())
+    }
+
+    async fn open_reader(&self) -> Result<File, AgentError> {
+        File::open(&self.path)
+            .await
+            .map_err(AgentError::FileOperation)
+    }
+}
+
+impl Drop for TemporaryImageUpload {
+    fn drop(&mut self) {
+        self.writer.take();
+        if let Err(error) = std::fs::remove_file(&self.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::error!(
+                path = %self.path.display(),
+                %error,
+                "Failed to remove Docker image upload temporary file"
+            );
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1054,7 +1120,7 @@ pub async fn export_image(
         .await
 }
 
-/// 接收流式上传的镜像 tar 包，并导入到本地 Docker 中。
+/// 接收流式上传的 Docker 镜像归档，并导入到本地 Docker 中。
 pub async fn load_image(
     State(state): State<Arc<AppState>>,
     context: DockerOperationContext,
@@ -1103,43 +1169,151 @@ fn image_load_audit_event(image_acquisition: bool) -> &'static str {
     }
 }
 
+fn validate_image_archive_name(file_name: &str) -> Result<(), AgentError> {
+    let normalized = file_name.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Err(AgentError::FileMissingName);
+    }
+    if IMAGE_ARCHIVE_SUFFIXES
+        .iter()
+        .any(|suffix| normalized.ends_with(suffix))
+    {
+        return Ok(());
+    }
+    Err(AgentError::BadRequest(
+        "unsupported Docker image archive format".to_string(),
+    ))
+}
+
+fn validate_image_multipart_field(
+    field_name: Option<&str>,
+    has_upload: bool,
+    file_name: Option<&str>,
+) -> Result<bool, AgentError> {
+    if field_name != Some("file") {
+        return if file_name.is_some() {
+            Err(AgentError::BadRequest(
+                "unexpected upload file field".to_string(),
+            ))
+        } else {
+            Ok(false)
+        };
+    }
+    if has_upload {
+        return Err(AgentError::BadRequest(
+            "multiple upload file fields are not allowed".to_string(),
+        ));
+    }
+    validate_image_archive_name(file_name.ok_or(AgentError::FileMissingName)?)?;
+    Ok(true)
+}
+
+fn ensure_image_upload_present(has_upload: bool) -> Result<(), AgentError> {
+    if has_upload {
+        Ok(())
+    } else {
+        Err(AgentError::BadRequest(
+            "missing upload file field".to_string(),
+        ))
+    }
+}
+
+fn ensure_image_archive_not_empty(uploaded_bytes: u64) -> Result<(), AgentError> {
+    if uploaded_bytes > 0 {
+        Ok(())
+    } else {
+        Err(AgentError::BadRequest(
+            "upload file must not be empty".to_string(),
+        ))
+    }
+}
+
+fn checked_image_archive_size(current: u64, chunk_size: usize) -> ApiResult<u64> {
+    let next = current
+        .checked_add(chunk_size as u64)
+        .ok_or_else(image_archive_too_large)?;
+    if next > MAX_IMAGE_ARCHIVE_BYTES {
+        return Err(image_archive_too_large());
+    }
+    Ok(next)
+}
+
+fn image_archive_too_large() -> ApiError {
+    ApiError::new(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        ErrorCode::FileUploadInvalid,
+        "Docker image archive exceeds the 10 GB upload limit",
+    )
+}
+
+/// 从 Docker 普通输出流中识别未通过结构化错误字段返回的镜像解包失败。
+fn image_import_stream_error(message: &str) -> Option<&str> {
+    message
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with(IMAGE_UNPACK_ERROR_PREFIX))
+}
+
+/// 清理并限制可返回给控制台的 Docker 导入错误，完整内容仍保留在服务端诊断详情中。
+fn sanitized_image_import_error(detail: &str) -> String {
+    let without_controls = detail
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    without_controls
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(MAX_PUBLIC_IMAGE_IMPORT_ERROR_CHARS)
+        .collect()
+}
+
+/// 构造镜像导入专用错误，使控制台能显示经过清理的 Docker 失败原因。
+fn image_import_error(detail: impl Into<String>) -> ApiError {
+    let detail = detail.into();
+    let public_detail = sanitized_image_import_error(&detail);
+    let message = if public_detail.is_empty() {
+        "Docker image import failed".to_string()
+    } else {
+        format!("Docker image import failed: {public_detail}")
+    };
+    ApiError::bad_gateway(ErrorCode::DockerOperationFailed, message).with_detail(detail)
+}
+
 async fn load_image_inner(state: Arc<AppState>, mut multipart: Multipart) -> ApiResult<Response> {
     info!("Starting docker image load");
-    let mut temp_file_path = std::env::temp_dir();
-    let file_name = format!("docker-image-{}.tar", Uuid::new_v4());
-    temp_file_path.push(&file_name);
-
-    let mut file = File::create(&temp_file_path)
-        .await
-        .map_err(AgentError::FileOperation)?;
-
-    let mut has_file = false;
-    while let Some(field) = multipart.next_field().await.map_err(AgentError::from)? {
-        let name = field.name().unwrap_or_default().to_string();
-        if name == "file" {
-            has_file = true;
-            let mut stream = field;
-            while let Some(chunk) = stream.next().await {
-                let bytes = chunk.map_err(|e| AgentError::FileUploadInvalid(e.to_string()))?;
-                file.write_all(&bytes)
-                    .await
-                    .map_err(AgentError::FileOperation)?;
-            }
+    let mut upload: Option<TemporaryImageUpload> = None;
+    let mut uploaded_bytes = 0_u64;
+    while let Some(mut field) = multipart.next_field().await.map_err(AgentError::from)? {
+        if !validate_image_multipart_field(field.name(), upload.is_some(), field.file_name())? {
+            continue;
         }
+        let mut temporary_upload = TemporaryImageUpload::create().await?;
+        while let Some(chunk) = field.next().await {
+            let bytes = chunk.map_err(|error| AgentError::FileUploadInvalid(error.to_string()))?;
+            uploaded_bytes = checked_image_archive_size(uploaded_bytes, bytes.len())?;
+            temporary_upload
+                .writer_mut()?
+                .write_all(&bytes)
+                .await
+                .map_err(AgentError::FileOperation)?;
+        }
+        temporary_upload.finish_writing().await?;
+        upload = Some(temporary_upload);
     }
 
-    if !has_file {
-        return Err(AgentError::BadRequest("missing upload file field".to_string()).into());
-    }
+    ensure_image_upload_present(upload.is_some())?;
+    ensure_image_archive_not_empty(uploaded_bytes)?;
+    let upload = upload.expect("upload presence was checked");
 
-    // 确保写入完成并关闭文件
-    file.flush().await.map_err(AgentError::FileOperation)?;
-    drop(file);
-
-    // 重新以只读方式打开文件，用于 load_image
-    let read_file = File::open(&temp_file_path)
-        .await
-        .map_err(AgentError::FileOperation)?;
+    let read_file = upload.open_reader().await?;
     let byte_stream = FramedRead::new(read_file, BytesCodec::new()).map_ok(|bytes| bytes.freeze());
 
     let docker = state.docker_client().await?;
@@ -1150,30 +1324,21 @@ async fn load_image_inner(state: Arc<AppState>, mut multipart: Multipart) -> Api
     let mut stream = docker.import_image_stream(options, byte_stream, None);
     let mut logs = Vec::new();
 
-    // 收集 stream
-    let load_result: Result<(), AgentError> = async {
-        while let Some(msg) = stream
-            .try_next()
-            .await
-            .map_err(|e| AgentError::DockerOperation(e.to_string()))?
-        {
-            if let Some(stream_msg) = msg.stream {
-                logs.push(stream_msg);
-            }
-            if let Some(error_msg) = msg.error_detail.and_then(|detail| detail.message) {
-                return Err(AgentError::DockerOperation(error_msg));
-            }
+    while let Some(msg) = stream
+        .try_next()
+        .await
+        .map_err(|error| image_import_error(error.to_string()))?
+    {
+        if let Some(error_msg) = msg.error_detail.and_then(|detail| detail.message) {
+            return Err(image_import_error(error_msg));
         }
-        Ok(())
+        if let Some(stream_msg) = msg.stream {
+            if let Some(error_msg) = image_import_stream_error(&stream_msg) {
+                return Err(image_import_error(error_msg));
+            }
+            logs.push(stream_msg);
+        }
     }
-    .await;
-
-    // 清理临时文件
-    if let Err(e) = tokio::fs::remove_file(&temp_file_path).await {
-        tracing::error!("Failed to remove temp file {:?}: {}", temp_file_path, e);
-    }
-
-    load_result?;
 
     let log_output = logs.join("");
 
@@ -1197,6 +1362,110 @@ mod tests {
             containers,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn validates_supported_image_archive_names() {
+        for file_name in [
+            "image.tar",
+            "image.tar.gz",
+            "image.tgz",
+            "image.tar.bz2",
+            "image.tbz",
+            "image.tbz2",
+            "image.tar.xz",
+            "image.txz",
+            "image.tar.zst",
+            "image.tzst",
+            "IMAGE.TAR.GZ",
+        ] {
+            assert!(
+                validate_image_archive_name(file_name).is_ok(),
+                "{file_name}"
+            );
+        }
+        for file_name in ["", "image.zip", "image.tar.txt", "image.gz"] {
+            assert!(
+                validate_image_archive_name(file_name).is_err(),
+                "{file_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn requires_exactly_one_named_image_upload_field() {
+        assert!(validate_image_multipart_field(Some("file"), false, Some("image.tar")).unwrap());
+        assert!(validate_image_multipart_field(Some("file"), true, Some("image.tar")).is_err());
+        assert!(validate_image_multipart_field(Some("file"), false, None).is_err());
+        assert!(
+            validate_image_multipart_field(Some("unexpected"), false, Some("image.tar")).is_err()
+        );
+        assert!(!validate_image_multipart_field(Some("metadata"), false, None).unwrap());
+        assert!(ensure_image_upload_present(false).is_err());
+        assert!(ensure_image_upload_present(true).is_ok());
+    }
+
+    #[test]
+    fn enforces_image_archive_size_and_non_empty_content() {
+        assert_eq!(
+            checked_image_archive_size(MAX_IMAGE_ARCHIVE_BYTES - 1, 1).unwrap(),
+            MAX_IMAGE_ARCHIVE_BYTES
+        );
+        let error = checked_image_archive_size(MAX_IMAGE_ARCHIVE_BYTES, 1).unwrap_err();
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(ensure_image_archive_not_empty(0).is_err());
+        assert!(ensure_image_archive_not_empty(1).is_ok());
+    }
+
+    #[test]
+    fn recognizes_unstructured_image_unpack_failure() {
+        let message = concat!(
+            "Loaded image: example/app:latest\n",
+            "Error unpacking image example/app:latest: mismatched image rootfs and manifest layers\n"
+        );
+
+        assert_eq!(
+            image_import_stream_error(message),
+            Some(
+                "Error unpacking image example/app:latest: mismatched image rootfs and manifest layers"
+            )
+        );
+        assert_eq!(
+            image_import_stream_error("Loaded image: example/error-reporter:latest\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn exposes_sanitized_and_bounded_image_import_error() {
+        let detail = format!(
+            "Error unpacking image example/app:latest:\ninvalid\0metadata {}",
+            "x".repeat(MAX_PUBLIC_IMAGE_IMPORT_ERROR_CHARS * 2)
+        );
+        let error = image_import_error(detail.clone());
+        let message = error.message.as_ref();
+        let public_detail = message
+            .strip_prefix("Docker image import failed: ")
+            .expect("public import error must include its reason");
+
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(error.code, ErrorCode::DockerOperationFailed);
+        assert_eq!(error.detail.as_deref(), Some(detail.as_str()));
+        assert!(!public_detail.chars().any(char::is_control));
+        assert!(public_detail.contains("invalid metadata"));
+        assert_eq!(
+            public_detail.chars().count(),
+            MAX_PUBLIC_IMAGE_IMPORT_ERROR_CHARS
+        );
+    }
+
+    #[tokio::test]
+    async fn temporary_image_upload_is_removed_on_drop() {
+        let upload = TemporaryImageUpload::create().await.unwrap();
+        let path = upload.path.clone();
+        assert!(path.exists());
+        drop(upload);
+        assert!(!path.exists());
     }
 
     #[test]

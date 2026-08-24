@@ -498,7 +498,8 @@ fn is_long_running_request(path: &str) -> bool {
 
 fn is_file_content_stream(path: &str) -> bool {
     path.split('?').next().is_some_and(|value| {
-        value.contains("/agent/files/transfer/") && value.ends_with("/content")
+        (value.contains("/agent/files/transfer/") && value.ends_with("/content"))
+            || value.ends_with("/agent/docker/images/load")
     })
 }
 
@@ -803,6 +804,11 @@ mod tests {
         assert!(!is_file_content_stream(
             "/api/v1/agent/files/transfer/transfer-1/detail"
         ));
+        assert!(is_file_content_stream("/api/v1/agent/docker/images/load"));
+        assert!(is_file_content_stream(
+            "/api/v1/node/node-1/agent/docker/images/load"
+        ));
+        assert!(!is_file_content_stream("/api/v1/agent/docker/images"));
     }
 
     #[tokio::test]

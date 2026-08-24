@@ -1,5 +1,13 @@
 import http from '@/api'
 import * as docker from '../interface/docker'
+import type { AxiosProgressEvent } from 'axios'
+
+const IMAGE_UPLOAD_TIMEOUT_MS = 24 * 60 * 60 * 1000
+
+export interface DockerImageLoadOptions {
+  signal?: AbortSignal
+  onUploadProgress?: (progressEvent: AxiosProgressEvent) => void
+}
 
 const buildDockerPath = (path: string, nodeId?: string) => {
   if (!nodeId || nodeId === 'local') {
@@ -200,6 +208,13 @@ const createScopedDockerApi = (nodeId?: string) => ({
   },
   listImages: () => {
     return http.get<docker.DockerImageSummary[]>(buildDockerPath('/agent/docker/images', nodeId))
+  },
+  /** 将 Docker 镜像归档上传并载入当前作用域节点。 */
+  loadImage: (payload: FormData, options: DockerImageLoadOptions = {}) => {
+    return http.upload<string>(buildDockerPath('/agent/docker/images/load', nodeId), payload, {
+      ...options,
+      timeout: IMAGE_UPLOAD_TIMEOUT_MS,
+    })
   },
   fetchDaemonSettings: () => {
     return http.get<docker.DockerDaemonSettings>(
