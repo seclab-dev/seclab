@@ -10,7 +10,7 @@ import { dockerApi } from '@/api/modules/docker'
 import { useDockerStore } from '@/stores/docker'
 import { useNodeStore } from '@/stores/node'
 import { useToastStore } from '@/stores/toast'
-import { formatImageTags, formatBytes } from '@/utils/docker-format'
+import { formatImageTags, formatBytes, formatDockerImageBytes } from '@/utils/docker-format'
 import {
   SecLabAlert,
   SecLabButton,
@@ -301,7 +301,7 @@ onBeforeUnmount(() => {
           <span class="image-id" :title="row.id">{{ shortImageId(row.id) }}</span>
         </template>
         <template #size="{ row }: { row: DockerImageSummary }">
-          {{ formatBytes(row.sizeBytes) }}
+          {{ formatDockerImageBytes(row.sizeBytes) }}
         </template>
         <template #containers="{ row }: { row: DockerImageSummary }">
           <SecLabTag type="info">{{ row.containerCount }}</SecLabTag>

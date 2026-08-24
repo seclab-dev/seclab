@@ -1,5 +1,23 @@
 import { describe, expect, it } from 'vitest'
-import { formatPercent } from '@/utils/docker-format'
+import { formatDockerImageBytes, formatPercent } from '@/utils/docker-format'
+
+describe('formatDockerImageBytes', () => {
+  it('按 Docker CLI 的十进制单位和三位有效数字格式化', () => {
+    expect(formatDockerImageBytes(999)).toBe('999B')
+    expect(formatDockerImageBytes(1_000)).toBe('1kB')
+    expect(formatDockerImageBytes(1_000_000)).toBe('1MB')
+    expect(formatDockerImageBytes(3_183_928_878)).toBe('3.18GB')
+    expect(formatDockerImageBytes(1_000_000_000_000)).toBe('1TB')
+  })
+
+  it('对缺失、非法和非正字节数使用零值回退', () => {
+    expect(formatDockerImageBytes()).toBe('0B')
+    expect(formatDockerImageBytes(Number.NaN)).toBe('0B')
+    expect(formatDockerImageBytes(Number.POSITIVE_INFINITY)).toBe('0B')
+    expect(formatDockerImageBytes(-1)).toBe('0B')
+    expect(formatDockerImageBytes(0)).toBe('0B')
+  })
+})
 
 describe('formatPercent', () => {
   it('formats zero, ordinary, and multi-core percentages', () => {

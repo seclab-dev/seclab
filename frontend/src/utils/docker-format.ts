@@ -11,6 +11,18 @@ import type * as dockerType from '@/api/interface/docker'
 export { formatBytes } from '@/utils/units'
 
 /**
+ * 按 Docker CLI 的十进制单位和三位有效数字格式化镜像大小。
+ * @param bytes Docker Engine 返回的镜像字节数
+ */
+export const formatDockerImageBytes = (bytes?: number): string => {
+  if (bytes === undefined || !Number.isFinite(bytes) || bytes <= 0) return '0B'
+  const units = ['B', 'kB', 'MB', 'GB', 'TB', 'PB']
+  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1000)), units.length - 1)
+  const value = bytes / Math.pow(1000, index)
+  return `${Number(value.toPrecision(3))}${units[index]}`
+}
+
+/**
  * 格式化百分比数值为带 % 后缀的字符串。
  * @param value 百分比数值；多核 CPU 指标允许超过 100
  */
