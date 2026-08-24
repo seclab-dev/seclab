@@ -26,7 +26,7 @@ import {
 } from 'echarts/components'
 import { CanvasRenderer } from 'echarts/renderers'
 import { useI18n } from 'vue-i18n'
-import { useDockerStore } from '@/stores/docker'
+import { MAX_OVERVIEW_CONTAINERS, useDockerStore } from '@/stores/docker'
 import { formatPercent as formatDockerPercent } from '@/utils/docker-format'
 
 echarts.use([
@@ -308,7 +308,7 @@ function buildTrendOption(
       },
       splitLine: { lineStyle: { color: 'rgba(148, 163, 184, 0.12)' } },
     },
-    color: ['#00C8FF', '#00D4B4', '#7C6CFF', '#FFB547', '#FF5E7A'],
+    color: ['#00C8FF', '#00D4B4', '#7C6CFF', '#FFB547', '#FF5E7A', '#1D63ED', '#D96BCB'],
     series: series.map((item) => ({
       type: 'line',
       name: item.name,
@@ -536,7 +536,7 @@ onUnmounted(() => {
               >
                 {{ t('app.docker.overview.containerSelector') }} ({{
                   store.overviewSelectedContainerIds.length
-                }}/5)
+                }}/{{ MAX_OVERVIEW_CONTAINERS }})
               </SecLabButton>
               <div
                 v-if="isContainerSelectorOpen"
@@ -550,7 +550,7 @@ onUnmounted(() => {
                     :model-value="store.overviewSelectedContainerIds.includes(container.id)"
                     :disabled="
                       !store.overviewSelectedContainerIds.includes(container.id) &&
-                      store.overviewSelectedContainerIds.length >= 5
+                      store.overviewSelectedContainerIds.length >= MAX_OVERVIEW_CONTAINERS
                     "
                     @update:model-value="toggleContainer(container.id, $event)"
                   >

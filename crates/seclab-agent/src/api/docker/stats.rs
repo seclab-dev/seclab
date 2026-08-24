@@ -15,6 +15,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::info;
 
+/// 资源趋势批量查询允许的最大容器数。
+const MAX_HISTORY_CONTAINER_IDS: usize = 7;
+
 /// 查询统计历史的时间窗口配置。
 #[derive(Debug, Deserialize)]
 pub struct StatsHistoryQuery {
@@ -169,7 +172,7 @@ pub async fn container_histories(
     Json(payload): Json<docker::ContainerStatsHistoryQuery>,
 ) -> ApiResult<Response> {
     info!("Requesting batch container resource usage history (cache)");
-    let ids = normalize_stats_ids(payload.ids, 5)?;
+    let ids = normalize_stats_ids(payload.ids, MAX_HISTORY_CONTAINER_IDS)?;
     let hours = clamp_hours(payload.hours);
     let cutoff = Utc::now().timestamp() - hours * 3600;
 
@@ -468,7 +471,8 @@ fn network_rates(
 #[cfg(test)]
 mod tests {
     use super::{
-        ContainerRow, normalize_stats_ids, row_to_container_summary, rows_to_container_points,
+        ContainerRow, MAX_HISTORY_CONTAINER_IDS, normalize_stats_ids, row_to_container_summary,
+        rows_to_container_points,
     };
     use crate::config;
     use crate::models::docker::ResourceSampleStatus;
@@ -529,11 +533,28 @@ mod tests {
                 "second".to_string(),
                 "first".to_string(),
             ],
-            5,
+            MAX_HISTORY_CONTAINER_IDS,
         )
         .expect("ids");
         assert_eq!(ids, vec!["first", "second"]);
-        assert!(normalize_stats_ids(Vec::new(), 5).is_err());
-        assert!(normalize_stats_ids(vec!["id".to_string(); 6], 5).is_err());
+        assert!(normalize_stats_ids(Vec::new(), MAX_HISTORY_CONTAINER_IDS).is_err());
+        assert!(
+            normalize_stats_ids(
+                (1..=MAX_HISTORY_CONTAINER_IDS)
+                    .map(|index| format!("id-{index}"))
+                    .collect(),
+                MAX_HISTORY_CONTAINER_IDS,
+            )
+            .is_ok()
+        );
+        assert!(
+            normalize_stats_ids(
+                (1..=MAX_HISTORY_CONTAINER_IDS + 1)
+                    .map(|index| format!("id-{index}"))
+                    .collect(),
+                MAX_HISTORY_CONTAINER_IDS,
+            )
+            .is_err()
+        );
     }
 }

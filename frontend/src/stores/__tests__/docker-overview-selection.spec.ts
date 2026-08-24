@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { TrendContainerItem } from '@/api/interface/docker'
-import { selectOverviewContainerIds } from '@/stores/docker'
+import { MAX_OVERVIEW_CONTAINERS, selectOverviewContainerIds } from '@/stores/docker'
 
 const container = (id: string, state: string): TrendContainerItem => ({
   id,
@@ -10,7 +10,7 @@ const container = (id: string, state: string): TrendContainerItem => ({
 })
 
 describe('Docker Store 概览容器选择', () => {
-  it('默认只选择前五个运行中的容器', () => {
+  it('默认只选择前七个运行中的容器', () => {
     const items = [
       container('exited', 'exited'),
       container('running-1', 'running'),
@@ -20,6 +20,8 @@ describe('Docker Store 概览容器选择', () => {
       container('running-4', 'running'),
       container('running-5', 'running'),
       container('running-6', 'running'),
+      container('running-7', 'running'),
+      container('running-8', 'running'),
     ]
 
     expect(selectOverviewContainerIds(items, [])).toEqual([
@@ -28,7 +30,10 @@ describe('Docker Store 概览容器选择', () => {
       'running-3',
       'running-4',
       'running-5',
+      'running-6',
+      'running-7',
     ])
+    expect(MAX_OVERVIEW_CONTAINERS).toBe(7)
   })
 
   it('没有运行中的容器时不默认选择容器', () => {

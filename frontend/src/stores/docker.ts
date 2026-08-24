@@ -13,6 +13,16 @@ import type * as dockerType from '@/api/interface/docker'
 import { useToastStore } from '@/stores/toast'
 import { useConfirmationModalStore } from '@/stores/confirmation-modal'
 import { useNodeStore } from '@/stores/node'
+import {
+  buildDockerOverviewContainerReferences,
+  MAX_OVERVIEW_CONTAINERS,
+  readDockerOverviewSelection,
+  resolveDockerOverviewContainerIds,
+  writeDockerOverviewSelection,
+  type DockerOverviewContainerReference,
+} from '@/stores/docker-overview-preferences'
+
+export { MAX_OVERVIEW_CONTAINERS } from '@/stores/docker-overview-preferences'
 
 /** 容器资源统计缓存条目 */
 export interface ContainerStatsEntry {
@@ -29,8 +39,6 @@ interface OverviewCacheEntry {
 const CONTAINER_STATS_TTL = 60_000
 /** 概览缓存 TTL (毫秒) */
 const OVERVIEW_CACHE_TTL = 30_000
-/** 概览最大可选容器数 */
-const MAX_OVERVIEW_CONTAINERS = 5
 /** 与后端任务快照一致的部署进度项上限 */
 const MAX_PROJECT_PROGRESS_ITEMS = 200
 
@@ -238,6 +246,9 @@ export const useDockerStore = defineStore('docker', () => {
   let projectDeploymentEventSourceNodeId: string | null = null
   let projectDeploymentEventSourceHealthy = false
   const trackedProjectOperations = new Map<string, dockerType.DockerProjectTask>()
+  let overviewPreferenceNodeId: string | null = null
+  let pendingOverviewSelection: DockerOverviewContainerReference[] | null | undefined
+  let overviewSelectionExplicitlyEmpty = false
 
   // ─── 容器统计批量队列 ───
   let containerStatsTimer: number | null = null
@@ -249,6 +260,30 @@ export const useDockerStore = defineStore('docker', () => {
     if (!img) return ''
     return img.tags[0] || img.id.replace(/^sha256:/, '').substring(0, 12)
   })
+
+  /** 从当前节点的浏览器偏好中重新准备资源趋势选择。 */
+  const restoreOverviewSelectionPreference = () => {
+    const nodeId = nodeStore.currentNodeId || 'local'
+    overviewPreferenceNodeId = nodeId
+    pendingOverviewSelection = readDockerOverviewSelection(nodeId)
+    overviewSelectionExplicitlyEmpty = pendingOverviewSelection?.length === 0
+    overviewSelectedContainerIds.value = []
+  }
+
+  /** 节点变化时切换到对应的资源趋势选择偏好。 */
+  const ensureOverviewSelectionPreference = () => {
+    const nodeId = nodeStore.currentNodeId || 'local'
+    if (overviewPreferenceNodeId === nodeId) return
+    restoreOverviewSelectionPreference()
+  }
+
+  /** 保存当前节点的有效容器选择，不写入趋势数据或时间范围。 */
+  const persistOverviewSelection = (ids: string[]) => {
+    ensureOverviewSelectionPreference()
+    const nodeId = overviewPreferenceNodeId || nodeStore.currentNodeId || 'local'
+    const references = buildDockerOverviewContainerReferences(overviewContainers.value, ids)
+    writeDockerOverviewSelection(nodeId, references)
+  }
 
   // ========================================
   // 数据重置
@@ -264,7 +299,7 @@ export const useDockerStore = defineStore('docker', () => {
     imageCounts.value = { total: 0, dangling: 0 }
     resourceUsage.value = null
     overviewContainers.value = []
-    overviewSelectedContainerIds.value = []
+    restoreOverviewSelectionPreference()
     overviewHistoryMap.value = {}
     overviewHistoryLatestMap.value = {}
     overviewHistoryHours.value = 1
@@ -457,17 +492,53 @@ export const useDockerStore = defineStore('docker', () => {
     }
   }
 
-  /** 更新概览趋势容器，并在没有有效选择时默认选择运行中的容器。 */
+  /** 更新概览趋势容器，并恢复当前节点的浏览器选择偏好。 */
   const updateOverviewContainerState = (items: dockerType.TrendContainerItem[]) => {
+    ensureOverviewSelectionPreference()
     overviewContainers.value = items
-    const nextSelected = selectOverviewContainerIds(items, overviewSelectedContainerIds.value)
+
+    if (items.length === 0) {
+      const selectionChanged = overviewSelectedContainerIds.value.length > 0
+      restoreOverviewSelectionPreference()
+      if (selectionChanged) void fetchOverviewHistoryAll()
+      return
+    }
+
+    let nextSelected: string[]
+    let shouldPersist = false
+    if (pendingOverviewSelection !== undefined) {
+      const savedSelection = pendingOverviewSelection
+      pendingOverviewSelection = undefined
+      if (savedSelection === null) {
+        nextSelected = selectOverviewContainerIds(items, [])
+        overviewSelectionExplicitlyEmpty = false
+        shouldPersist = nextSelected.length > 0
+      } else if (savedSelection.length === 0) {
+        nextSelected = []
+        overviewSelectionExplicitlyEmpty = true
+        shouldPersist = true
+      } else {
+        const restored = resolveDockerOverviewContainerIds(items, savedSelection)
+        nextSelected = restored.length > 0 ? restored : selectOverviewContainerIds(items, [])
+        overviewSelectionExplicitlyEmpty = false
+        shouldPersist = nextSelected.length > 0
+      }
+    } else if (overviewSelectionExplicitlyEmpty) {
+      nextSelected = []
+    } else {
+      nextSelected = selectOverviewContainerIds(items, overviewSelectedContainerIds.value)
+      shouldPersist = nextSelected.length > 0
+    }
+
     const selectionChanged = nextSelected.join(',') !== overviewSelectedContainerIds.value.join(',')
     overviewSelectedContainerIds.value = nextSelected
+    if (shouldPersist) persistOverviewSelection(nextSelected)
     if (selectionChanged) void fetchOverviewHistoryAll()
   }
 
   /** 更新概览选中的容器列表。 */
   const updateOverviewSelectedContainers = (ids: string[]) => {
+    ensureOverviewSelectionPreference()
     const unique = Array.from(new Set(ids))
     let nextIds = unique
     if (unique.length > MAX_OVERVIEW_CONTAINERS) {
@@ -476,7 +547,12 @@ export const useDockerStore = defineStore('docker', () => {
       )
       nextIds = unique.slice(0, MAX_OVERVIEW_CONTAINERS)
     }
+    const availableIds = new Set(overviewContainers.value.map((item) => item.id))
+    nextIds = nextIds.filter((id) => availableIds.has(id))
     overviewSelectedContainerIds.value = nextIds
+    pendingOverviewSelection = undefined
+    overviewSelectionExplicitlyEmpty = nextIds.length === 0
+    persistOverviewSelection(nextIds)
     void fetchOverviewHistoryAll()
   }
 
@@ -1125,6 +1201,7 @@ export const useDockerStore = defineStore('docker', () => {
 
   /** 初始加载流程 */
   const initialLoad = async () => {
+    restoreOverviewSelectionPreference()
     const available = await fetchDockerAvailability()
     if (!available) {
       resetAll()
