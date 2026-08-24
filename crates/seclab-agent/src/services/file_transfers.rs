@@ -10,6 +10,7 @@ use crate::{
 };
 use axum::http::StatusCode;
 use chrono::{DateTime, SecondsFormat, Utc};
+use once_cell::sync::Lazy;
 use ring::digest::{Context, SHA256};
 use seclab_contracts::{
     api::ErrorCode,
@@ -17,16 +18,37 @@ use seclab_contracts::{
 };
 use sqlx::Row;
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex as StdMutex, Weak},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::Mutex;
 use tokio::time::{Duration, interval};
 use uuid::Uuid;
 
 pub const MAX_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const RETENTION_SECONDS: i64 = 24 * 60 * 60;
 const RETENTION_INTERVAL_SECONDS: u64 = 10 * 60;
+
+/// 按传输 ID 串行化分块写入、提交和取消，Weak 避免终态任务常驻内存。
+static TRANSFER_LOCKS: Lazy<StdMutex<HashMap<String, Weak<Mutex<()>>>>> =
+    Lazy::new(|| StdMutex::new(HashMap::new()));
+
+/// 返回指定传输的进程内串行锁，并顺带清理已无持有者的弱引用。
+fn transfer_lock(transfer_id: &str) -> Arc<Mutex<()>> {
+    let mut locks = TRANSFER_LOCKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(transfer_id).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(transfer_id.to_owned(), Arc::downgrade(&lock));
+    lock
+}
 
 /// 传输保存的可信操作者上下文。
 #[derive(Debug, Clone)]
@@ -182,6 +204,8 @@ pub async fn write_chunk(
     total: u64,
     bytes: &[u8],
 ) -> ApiResult<FileTransfer> {
+    let lock = transfer_lock(transfer_id);
+    let _guard = lock.lock().await;
     if bytes.is_empty()
         || bytes.len() > MAX_CHUNK_BYTES
         || end_inclusive < start
@@ -246,6 +270,8 @@ pub async fn write_chunk(
 
 /// 校验大小和可选 SHA-256 后原子提交上传。
 pub async fn complete_upload(pool: &DbPool, transfer_id: &str) -> ApiResult<FileTransfer> {
+    let lock = transfer_lock(transfer_id);
+    let _guard = lock.lock().await;
     let transfer = get(pool, transfer_id).await?;
     if transfer.direction != FileTransferDirection::Upload
         || transfer.status != FileTransferStatus::Ready
@@ -330,6 +356,8 @@ pub async fn active(pool: &DbPool) -> ApiResult<Vec<FileTransfer>> {
 
 /// 取消活动传输并清理上传暂存文件。
 pub async fn cancel(pool: &DbPool, transfer_id: &str) -> ApiResult<FileTransfer> {
+    let lock = transfer_lock(transfer_id);
+    let _guard = lock.lock().await;
     let transfer = get(pool, transfer_id).await?;
     ensure_active(&transfer)?;
     if transfer.direction == FileTransferDirection::Upload
@@ -704,6 +732,70 @@ mod tests {
         let completed = complete_upload(&pool, &transfer.transfer_id).await.unwrap();
         assert_eq!(completed.status, FileTransferStatus::Completed);
         assert_eq!(tokio::fs::read(&target).await.unwrap(), b"1234567890");
+    }
+
+    #[tokio::test]
+    async fn cancellation_wins_before_a_queued_chunk_and_cleans_staging() {
+        let pool = crate::test_support::setup_test_db().await;
+        let root = TestDirectory::new("cancel-race").await;
+        let target = root.0.join("payload.bin");
+        let transfer = create(&pool, "local", actor(), upload_request(&target, 4))
+            .await
+            .unwrap();
+        let staging = temporary_path(&pool, &transfer.transfer_id).await.unwrap();
+        let operation_lock = transfer_lock(&transfer.transfer_id);
+        let guard = operation_lock.lock().await;
+
+        let cancel_pool = pool.clone();
+        let cancel_id = transfer.transfer_id.clone();
+        let cancel_task = tokio::spawn(async move { cancel(&cancel_pool, &cancel_id).await });
+        tokio::task::yield_now().await;
+        let chunk_pool = pool.clone();
+        let chunk_id = transfer.transfer_id.clone();
+        let chunk_task =
+            tokio::spawn(
+                async move { write_chunk(&chunk_pool, &chunk_id, 0, 3, 4, b"data").await },
+            );
+        drop(guard);
+
+        let cancelled = cancel_task.await.unwrap().unwrap();
+        assert_eq!(cancelled.status, FileTransferStatus::Cancelled);
+        assert!(chunk_task.await.unwrap().is_err());
+        assert_eq!(
+            get(&pool, &transfer.transfer_id).await.unwrap().status,
+            FileTransferStatus::Cancelled
+        );
+        assert!(!staging.exists());
+        assert!(!target.exists());
+    }
+
+    #[tokio::test]
+    async fn cancellation_wins_before_a_queued_commit() {
+        let pool = crate::test_support::setup_test_db().await;
+        let root = TestDirectory::new("cancel-commit-race").await;
+        let target = root.0.join("empty.bin");
+        let transfer = create(&pool, "local", actor(), upload_request(&target, 0))
+            .await
+            .unwrap();
+        let operation_lock = transfer_lock(&transfer.transfer_id);
+        let guard = operation_lock.lock().await;
+
+        let cancel_pool = pool.clone();
+        let cancel_id = transfer.transfer_id.clone();
+        let cancel_task = tokio::spawn(async move { cancel(&cancel_pool, &cancel_id).await });
+        tokio::task::yield_now().await;
+        let commit_pool = pool.clone();
+        let commit_id = transfer.transfer_id.clone();
+        let commit_task =
+            tokio::spawn(async move { complete_upload(&commit_pool, &commit_id).await });
+        drop(guard);
+
+        assert_eq!(
+            cancel_task.await.unwrap().unwrap().status,
+            FileTransferStatus::Cancelled
+        );
+        assert!(commit_task.await.unwrap().is_err());
+        assert!(!target.exists());
     }
 
     #[tokio::test]

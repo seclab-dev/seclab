@@ -1,4 +1,5 @@
 import http from '@/api'
+import type { AxiosProgressEvent } from 'axios'
 import type {
   CreateFileOperationTaskRequest,
   CreateFileTransferRequest,
@@ -11,6 +12,12 @@ import type {
   HomeResponse,
   UpdateFileContentRequest,
 } from '../interface/fs'
+
+/** 上传分块的传输控制选项。 */
+export interface UploadChunkOptions {
+  signal?: AbortSignal
+  onProgress?: (loadedBytes: number) => void
+}
 
 const nodePath = (nodeId: string, path: string) =>
   `/node/${encodeURIComponent(nodeId)}/${path.replace(/^\/+/, '')}`
@@ -62,11 +69,14 @@ const createScopedFsApi = (nodeId: string) => ({
     start: number,
     end: number,
     total: number,
+    options: UploadChunkOptions = {},
   ) =>
     http.put<FileTransfer>(
       nodePath(nodeId, `file-transfer/${encodeURIComponent(transferId)}/chunk`),
       chunk,
       {
+        signal: options.signal,
+        onUploadProgress: ({ loaded }: AxiosProgressEvent) => options.onProgress?.(loaded),
         headers: {
           'Content-Type': 'application/octet-stream',
           'Content-Range': `bytes ${start}-${end}/${total}`,

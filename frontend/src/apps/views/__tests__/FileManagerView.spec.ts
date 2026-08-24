@@ -14,7 +14,28 @@ const api = vi.hoisted(() => ({
 const operations = vi.hoisted(() => ({
   removePath: vi.fn(),
   runPathTask: vi.fn(),
+  startUpload: vi.fn(),
+  cancelUpload: vi.fn(),
+  dismissUpload: vi.fn(),
+  uploadActive: { __v_isRef: true, value: false },
+  uploadTask: {
+    visible: false,
+    kind: 'files',
+    displayName: '',
+    targetDirectory: '',
+    status: 'completed',
+    totalFiles: 0,
+    completedFiles: 0,
+    failedFiles: 0,
+    totalBytes: 0,
+    transferredBytes: 0,
+    progressPercent: 0,
+    currentFile: '',
+    failures: [],
+    errorSummary: '',
+  },
 }))
+const windowRuntime = vi.hoisted(() => ({ updateWindowRuntimeState: vi.fn() }))
 const confirmation = vi.hoisted(() => ({
   showConfirmation: vi.fn(),
 }))
@@ -25,7 +46,7 @@ vi.mock('@/stores/node', () => ({
 }))
 vi.mock('@/stores/window-manager', () => ({
   useWindowManagerStore: () => ({
-    updateWindowRuntimeState: vi.fn(),
+    updateWindowRuntimeState: windowRuntime.updateWindowRuntimeState,
     openWindowWithPayload: api.openWindowWithPayload,
   }),
 }))
@@ -43,7 +64,11 @@ vi.mock('@/composables/useFileOperations', () => ({
     renamePath: vi.fn(),
     runPathTask: operations.runPathTask,
     downloadFile: vi.fn(),
-    uploadFile: vi.fn(),
+    uploadTask: operations.uploadTask,
+    uploadActive: operations.uploadActive,
+    startUpload: operations.startUpload,
+    cancelUpload: operations.cancelUpload,
+    dismissUpload: operations.dismissUpload,
     resumeActiveTasks: vi.fn().mockResolvedValue(undefined),
     resumeActiveTransfers: vi.fn().mockResolvedValue(undefined),
   }),
@@ -103,6 +128,24 @@ describe('FileManagerView', () => {
     confirmation.showConfirmation.mockResolvedValue(false)
     operations.removePath.mockResolvedValue(true)
     operations.runPathTask.mockResolvedValue(true)
+    operations.startUpload.mockResolvedValue(false)
+    operations.uploadActive.value = false
+    Object.assign(operations.uploadTask, {
+      visible: false,
+      kind: 'files',
+      displayName: '',
+      targetDirectory: '',
+      status: 'completed',
+      totalFiles: 0,
+      completedFiles: 0,
+      failedFiles: 0,
+      totalBytes: 0,
+      transferredBytes: 0,
+      progressPercent: 0,
+      currentFile: '',
+      failures: [],
+      errorSummary: '',
+    })
   })
 
   it('固定使用窗口节点并让最新路径请求获胜', async () => {
@@ -274,6 +317,123 @@ describe('FileManagerView', () => {
       [{ path: '/home/a' }, { path: '/home/b' }],
       true,
     )
+    wrapper.unmount()
+  })
+
+  it('提供多文件与保留相对路径的文件夹上传入口', async () => {
+    const wrapper = mount(FileManagerView, {
+      props: { payload: { nodeId: 'node-a' } },
+      global: {
+        plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })],
+      },
+    })
+    await flushPromises()
+
+    expect(wrapper.get('input[name="fileManagerUploadFiles"]').attributes()).toHaveProperty(
+      'multiple',
+    )
+    const folderInput = wrapper.get('input[name="fileManagerUploadFolder"]')
+    expect(folderInput.attributes()).toHaveProperty('multiple')
+    expect(folderInput.attributes()).toHaveProperty('webkitdirectory')
+
+    const file = new File(['content'], 'guide.md')
+    Object.defineProperty(file, 'webkitRelativePath', { value: 'docs/guide.md' })
+    const input = { files: [file], value: 'selected' } as unknown as HTMLInputElement
+    await (
+      wrapper.vm as unknown as {
+        runSelectedUpload: (input: HTMLInputElement, kind: 'folder') => Promise<void>
+      }
+    ).runSelectedUpload(input, 'folder')
+
+    expect(operations.startUpload).toHaveBeenCalledWith('/home', {
+      kind: 'folder',
+      displayName: 'docs',
+      files: [{ file, relativePath: 'docs/guide.md' }],
+    })
+    expect(input.value).toBe('')
+    wrapper.unmount()
+  })
+
+  it('在模态框展示可访问上传进度并用上传原因阻止关闭窗口', async () => {
+    operations.uploadActive.value = true
+    Object.assign(operations.uploadTask, {
+      visible: true,
+      kind: 'folder',
+      displayName: 'docs',
+      targetDirectory: '/home',
+      status: 'uploading',
+      totalFiles: 4,
+      completedFiles: 1,
+      failedFiles: 1,
+      totalBytes: 8,
+      transferredBytes: 4,
+      progressPercent: 50,
+      currentFile: 'docs/report.txt',
+      failures: [{ path: 'docs/failed.txt', message: 'conflict' }],
+      errorSummary: '',
+    })
+    const wrapper = mount(FileManagerView, {
+      props: { payload: { nodeId: 'node-a' }, windowId: 'file-window' },
+      global: {
+        plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })],
+      },
+    })
+    await flushPromises()
+
+    expect(wrapper.element.querySelector('[data-slot="upload-progress"]')).toBeNull()
+    const dialog = document.body.querySelector<HTMLElement>('[data-ui="file-upload-dialog"]')
+    expect(dialog).not.toBeNull()
+    const progress = dialog!.querySelector<HTMLElement>('[role="progressbar"]')
+    expect(progress?.getAttribute('aria-valuenow')).toBe('50')
+    expect(dialog!.textContent).toContain('已处理 2 / 4 个文件')
+
+    dialog!.querySelector<HTMLButtonElement>('.sl-dialog-close-btn')?.click()
+    await flushPromises()
+    expect(operations.dismissUpload).not.toHaveBeenCalled()
+    expect(document.body.querySelector('[data-ui="file-upload-dialog"]')).not.toBeNull()
+
+    dialog!.querySelector<HTMLButtonElement>('[data-ui="file-upload-cancel"]')?.click()
+    await flushPromises()
+    expect(operations.cancelUpload).toHaveBeenCalledTimes(1)
+    expect(windowRuntime.updateWindowRuntimeState).toHaveBeenCalledWith(
+      'file-window',
+      expect.objectContaining({
+        busy: true,
+        blockLevel: 'busy',
+        blockReason: '文件正在上传，请完成或取消上传后再关闭窗口或切换节点。',
+      }),
+    )
+    wrapper.unmount()
+  })
+
+  it('上传终态允许从模态框关闭结果', async () => {
+    Object.assign(operations.uploadTask, {
+      visible: true,
+      displayName: 'report.txt',
+      targetDirectory: '/home',
+      status: 'completed',
+      totalFiles: 1,
+      completedFiles: 1,
+      totalBytes: 8,
+      transferredBytes: 8,
+      progressPercent: 100,
+    })
+    const wrapper = mount(FileManagerView, {
+      props: { payload: { nodeId: 'node-a' } },
+      global: {
+        plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })],
+      },
+    })
+    await flushPromises()
+
+    const dismiss = document.body.querySelector<HTMLButtonElement>(
+      '[data-ui="file-upload-dismiss"]',
+    )
+    expect(dismiss).not.toBeNull()
+    dismiss!.click()
+    await flushPromises()
+
+    expect(operations.dismissUpload).toHaveBeenCalledTimes(1)
     wrapper.unmount()
   })
 })

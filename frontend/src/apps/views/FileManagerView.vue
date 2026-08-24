@@ -10,6 +10,7 @@ import { useI18n } from 'vue-i18n'
 import SecLabTable, { type SecLabTableColumn } from '@/components/ui/SecLabTable.vue'
 import {
   SecLabButton,
+  SecLabActionMenu,
   SecLabTag,
   SecLabBreadcrumb,
   SecLabBreadcrumbItem,
@@ -49,7 +50,11 @@ const {
   renamePath,
   runPathTask,
   downloadFile,
-  uploadFile,
+  uploadTask,
+  uploadActive,
+  startUpload,
+  cancelUpload,
+  dismissUpload,
   resumeActiveTasks,
   resumeActiveTransfers,
 } = useFileOperations(targetNodeId)
@@ -137,7 +142,9 @@ const currentPageStats = computed(() => ({
   files: entryCounts.value.fileCount,
 }))
 
-const fileManagerBusy = computed(() => listLoading.value || fileOperationCount.value > 0)
+const fileManagerBusy = computed(
+  () => listLoading.value || fileOperationCount.value > 0 || uploadActive.value,
+)
 
 const entryKindLabel = (kind: FsEntry['kind']) => {
   if (kind === 'directory') return t('app.fileManager.dir')
@@ -157,14 +164,18 @@ const runFileOperation = async <T,>(operation: () => Promise<T>) => {
 }
 
 watch(
-  fileManagerBusy,
-  (busy) => {
+  [fileManagerBusy, uploadActive],
+  ([busy, uploadBusy]) => {
     if (!props.windowId) return
     windowStore.updateWindowRuntimeState(props.windowId, {
       busy,
       allowsNodeSwitch: false,
       blockLevel: busy ? 'busy' : 'open',
-      blockReason: busy ? t('app.fileManager.guardBusy') : t('app.fileManager.guardOpen'),
+      blockReason: uploadBusy
+        ? t('app.fileManager.guardUpload')
+        : busy
+          ? t('app.fileManager.guardBusy')
+          : t('app.fileManager.guardOpen'),
     })
   },
   { immediate: true },
@@ -427,15 +438,76 @@ const confirmDialog = async () => {
 
 // Upload/Download features
 const fileInput = ref<HTMLInputElement | null>(null)
-const triggerUpload = () => fileInput.value?.click()
+const folderInput = ref<HTMLInputElement | null>(null)
+const uploadActions = computed(() => [
+  {
+    label: t('app.fileManager.uploadFile'),
+    icon: 'file',
+    handler: () => fileInput.value?.click(),
+  },
+  {
+    label: t('app.fileManager.uploadFolder'),
+    icon: 'folder',
+    handler: () => folderInput.value?.click(),
+  },
+])
+const uploadProcessedFiles = computed(() => uploadTask.completedFiles + uploadTask.failedFiles)
+const uploadStatusText = computed(() => t(`app.fileManager.uploadTask.${uploadTask.status}`))
+const uploadStatusType = computed(() => {
+  if (uploadTask.status === 'completed') return 'success'
+  if (uploadTask.status === 'partial' || uploadTask.status === 'cancelling') return 'warning'
+  if (uploadTask.status === 'failed') return 'danger'
+  if (uploadTask.status === 'cancelled') return 'default'
+  return 'primary'
+})
+
+/** 上传进行中保持进度模态框可见，终态关闭时清理任务展示。 */
+const handleUploadDialogClose = () => {
+  if (uploadActive.value) return
+  dismissUpload()
+}
+
+/** 将浏览器选择结果转换为固定目标目录上的后台上传任务。 */
+const runSelectedUpload = async (input: HTMLInputElement, kind: 'files' | 'folder') => {
+  const files = Array.from(input.files || [])
+  if (files.length === 0) {
+    toastStore.error(t('app.fileManager.uploadTask.noFiles'))
+    input.value = ''
+    return
+  }
+  if (kind === 'folder' && files.some((file) => !file.webkitRelativePath)) {
+    toastStore.error(t('app.fileManager.uploadTask.folderUnsupported'))
+    input.value = ''
+    return
+  }
+  const relativePaths = files.map((file) =>
+    kind === 'folder' ? file.webkitRelativePath || file.name : file.name,
+  )
+  const displayName =
+    kind === 'folder'
+      ? relativePaths[0]?.split('/')[0] || files[0]!.name
+      : files.length === 1
+        ? files[0]!.name
+        : t('app.fileManager.uploadTask.fileSelection', { count: files.length })
+  const targetDirectory = currentDisplayPath.value
+  const changed = await startUpload(targetDirectory, {
+    kind,
+    displayName,
+    files: files.map((file, index) => ({ file, relativePath: relativePaths[index]! })),
+  })
+  input.value = ''
+  if (changed && currentDisplayPath.value === targetDirectory) await refresh()
+}
+
+/** 接收普通文件选择结果。 */
 const onFileChange = async (e: Event) => {
   const target = e.target as HTMLInputElement
-  if (!target.files?.length) return
-  const file = target.files[0]
-  const path = `${currentDisplayPath.value}/${file.name}`.replace(/\/\//g, '/')
-  const success = await runFileOperation(() => uploadFile(path, file))
-  if (success) await refresh()
-  target.value = ''
+  await runSelectedUpload(target, 'files')
+}
+/** 接收文件夹选择结果并保留浏览器提供的相对路径。 */
+const onFolderChange = async (e: Event) => {
+  const target = e.target as HTMLInputElement
+  await runSelectedUpload(target, 'folder')
 }
 const handleDownload = async (entry: FsEntry) => {
   if (!entry.capabilities.canDownload) return
@@ -521,16 +593,30 @@ onUnmounted(() => document.removeEventListener('click', hideContextMenu))
         <SecLabButton type="secondary" @click="openDialog('dir')">{{
           t('app.fileManager.newDir')
         }}</SecLabButton>
-        <SecLabButton type="secondary" @click="triggerUpload">{{
-          t('app.fileManager.upload')
-        }}</SecLabButton>
+        <SecLabActionMenu
+          :label="t('app.fileManager.upload')"
+          :actions="uploadActions"
+          :disabled="uploadActive"
+          data-ui="file-upload-actions"
+        />
         <input
-          id="file-manager-upload"
+          id="file-manager-upload-files"
           ref="fileInput"
-          name="fileManagerUpload"
+          class="upload-input"
+          name="fileManagerUploadFiles"
           type="file"
-          style="display: none"
+          multiple
           @change="onFileChange"
+        />
+        <input
+          id="file-manager-upload-folder"
+          ref="folderInput"
+          class="upload-input"
+          name="fileManagerUploadFolder"
+          type="file"
+          multiple
+          webkitdirectory=""
+          @change="onFolderChange"
         />
         <SecLabButton type="primary" data-ui="file-refresh" @click="refresh">{{
           t('app.fileManager.refresh')
@@ -772,6 +858,118 @@ onUnmounted(() => document.removeEventListener('click', hideContextMenu))
       </template>
     </SecLabDialog>
 
+    <SecLabDialog
+      :visible="uploadTask.visible"
+      :title="t('app.fileManager.upload')"
+      width="36rem"
+      :close-on-click-overlay="!uploadActive"
+      data-ui="file-upload-dialog"
+      :data-status="uploadTask.status"
+      @close="handleUploadDialogClose"
+    >
+      <div class="upload-task" data-slot="upload-progress">
+        <div class="upload-task-header">
+          <div class="upload-task-title-wrap">
+            <SecLabIcon name="upload" :size="18" />
+            <div class="upload-task-title-content">
+              <strong class="upload-task-title">{{ uploadTask.displayName }}</strong>
+              <span class="upload-task-target" :title="uploadTask.targetDirectory">
+                {{ t('app.fileManager.uploadTask.target', { path: uploadTask.targetDirectory }) }}
+              </span>
+            </div>
+          </div>
+          <SecLabTag :type="uploadStatusType" effect="plain">{{ uploadStatusText }}</SecLabTag>
+        </div>
+
+        <div class="upload-task-progress-meta" aria-live="polite">
+          <span
+            v-if="uploadTask.currentFile"
+            class="upload-task-current"
+            :title="uploadTask.currentFile"
+          >
+            {{ t('app.fileManager.uploadTask.current', { path: uploadTask.currentFile }) }}
+          </span>
+          <span v-else class="upload-task-current">{{ uploadStatusText }}</span>
+          <span class="upload-task-percent">{{ uploadTask.progressPercent }}%</span>
+        </div>
+        <div
+          class="upload-task-track"
+          role="progressbar"
+          data-ui="file-upload-progress"
+          :aria-label="
+            t('app.fileManager.uploadTask.progressAria', { name: uploadTask.displayName })
+          "
+          aria-valuemin="0"
+          aria-valuemax="100"
+          :aria-valuenow="
+            uploadTask.status === 'preparing' ? undefined : uploadTask.progressPercent
+          "
+          :aria-busy="uploadTask.status === 'preparing'"
+        >
+          <div class="upload-task-value" :style="{ width: `${uploadTask.progressPercent}%` }" />
+        </div>
+
+        <div class="upload-task-summary">
+          <span>
+            {{
+              t('app.fileManager.uploadTask.fileProgress', {
+                processed: uploadProcessedFiles,
+                total: uploadTask.totalFiles,
+              })
+            }}
+          </span>
+          <span>
+            {{
+              t('app.fileManager.uploadTask.byteProgress', {
+                transferred: formatBytes(uploadTask.transferredBytes),
+                total: formatBytes(uploadTask.totalBytes),
+              })
+            }}
+          </span>
+        </div>
+
+        <div v-if="uploadTask.errorSummary" class="upload-task-error" role="alert">
+          {{ uploadTask.errorSummary }}
+        </div>
+        <ul v-if="uploadTask.failures.length" class="upload-task-failures" role="list">
+          <li v-for="failure in uploadTask.failures.slice(0, 3)" :key="failure.path">
+            <span :title="failure.path">{{ failure.path }}</span>
+            <span>{{ failure.message }}</span>
+          </li>
+          <li v-if="uploadTask.failures.length > 3">
+            {{
+              t('app.fileManager.uploadTask.moreFailures', {
+                count: uploadTask.failures.length - 3,
+              })
+            }}
+          </li>
+        </ul>
+      </div>
+      <template #footer>
+        <SecLabButton
+          v-if="uploadActive"
+          type="secondary"
+          :disabled="uploadTask.status === 'cancelling'"
+          data-ui="file-upload-cancel"
+          @click="cancelUpload"
+        >
+          {{
+            uploadTask.status === 'cancelling'
+              ? t('app.fileManager.uploadTask.cancelling')
+              : t('app.fileManager.uploadTask.cancel')
+          }}
+        </SecLabButton>
+        <SecLabButton
+          v-else
+          type="secondary"
+          data-ui="file-upload-dismiss"
+          @click="handleUploadDialogClose"
+        >
+          {{ t('app.fileManager.uploadTask.dismiss') }}
+        </SecLabButton>
+      </template>
+    </SecLabDialog>
+
     <SecLabLoading
       :loading="listLoading && !listLoaded"
       :text="t('app.fileManager.loading')"
@@ -843,6 +1041,113 @@ onUnmounted(() => document.removeEventListener('click', hideContextMenu))
   gap: var(--sdl-space-2);
   align-items: center;
   flex-wrap: wrap;
+}
+
+.upload-input {
+  display: none;
+}
+
+.upload-task {
+  display: grid;
+  gap: var(--sdl-space-3);
+}
+
+.upload-task-header,
+.upload-task-progress-meta,
+.upload-task-title-wrap,
+.upload-task-summary {
+  display: flex;
+  align-items: center;
+  gap: var(--sdl-space-3);
+}
+
+.upload-task-header,
+.upload-task-progress-meta {
+  justify-content: space-between;
+}
+
+.upload-task-title-wrap,
+.upload-task-title-content,
+.upload-task-current {
+  min-width: 0;
+}
+
+.upload-task-title-content {
+  display: grid;
+  gap: var(--sdl-space-1);
+}
+
+.upload-task-title,
+.upload-task-target,
+.upload-task-current,
+.upload-task-failures span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.upload-task-title {
+  font: var(--sdl-font-body-sm);
+}
+
+.upload-task-target,
+.upload-task-progress-meta,
+.upload-task-summary,
+.upload-task-failures,
+.upload-task-error {
+  color: var(--sdl-text-muted);
+  font: var(--sdl-font-caption);
+}
+
+.upload-task-target,
+.upload-task-current,
+.upload-task-failures li span:first-child {
+  font-family: var(--sdl-font-mono);
+}
+
+.upload-task-current {
+  flex: 1;
+}
+
+.upload-task-percent {
+  color: var(--sdl-text-primary);
+  font-family: var(--sdl-font-mono);
+}
+
+.upload-task-track {
+  overflow: hidden;
+  height: var(--sdl-space-2);
+  border-radius: var(--sdl-radius-pill);
+  background: var(--sdl-border-default);
+}
+
+.upload-task-value {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--sdl-primary);
+  transition: width 180ms ease;
+}
+
+.upload-task-summary {
+  flex-wrap: wrap;
+}
+
+.upload-task-error {
+  color: var(--sdl-danger);
+}
+
+.upload-task-failures {
+  display: grid;
+  gap: var(--sdl-space-1);
+  margin: 0;
+  padding: var(--sdl-space-2) 0 0 var(--sdl-space-5);
+  border-top: 1px solid var(--sdl-border-subtle);
+}
+
+.upload-task-failures li {
+  display: grid;
+  grid-template-columns: minmax(8rem, 1fr) minmax(8rem, 2fr);
+  gap: var(--sdl-space-3);
 }
 
 .options-bar {
@@ -981,6 +1286,9 @@ onUnmounted(() => document.removeEventListener('click', hideContextMenu))
   .breadcrumb-wrap {
     flex-direction: column;
     align-items: flex-start;
+  }
+  .upload-task-summary {
+    display: grid;
   }
 }
 </style>

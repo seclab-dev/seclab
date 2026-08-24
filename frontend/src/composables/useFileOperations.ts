@@ -2,7 +2,7 @@
  * @file useFileOperations.ts
  * @description 封装固定节点上的同步文件操作、持久任务与分块传输。
  */
-import { computed, type Ref } from 'vue'
+import { computed, reactive, type Ref } from 'vue'
 import { fsApi } from '@/api/modules/fs'
 import type { FileOperation, FileOperationItemRequest, FileOperationTask } from '@/api/interface/fs'
 import { useToastStore } from '@/stores/toast'
@@ -13,15 +13,105 @@ const TASK_POLL_INTERVAL_MS = 500
 const TERMINAL_TASK_STATUSES = new Set(['succeeded', 'failed', 'cancelled'])
 const TERMINAL_TRANSFER_STATUSES = new Set(['completed', 'failed', 'cancelled', 'expired'])
 
+export type FileUploadTaskStatus =
+  | 'preparing'
+  | 'uploading'
+  | 'cancelling'
+  | 'completed'
+  | 'partial'
+  | 'failed'
+  | 'cancelled'
+
+export interface FileUploadSource {
+  file: File
+  relativePath: string
+}
+
+export interface FileUploadSelection {
+  kind: 'files' | 'folder'
+  displayName: string
+  files: FileUploadSource[]
+}
+
+export interface FileUploadFailure {
+  path: string
+  message: string
+}
+
+export interface FileUploadTaskState {
+  visible: boolean
+  kind: FileUploadSelection['kind']
+  displayName: string
+  targetDirectory: string
+  status: FileUploadTaskStatus
+  totalFiles: number
+  completedFiles: number
+  failedFiles: number
+  totalBytes: number
+  transferredBytes: number
+  progressPercent: number
+  currentFile: string
+  failures: FileUploadFailure[]
+  errorSummary: string
+}
+
+const ACTIVE_UPLOAD_STATUSES = new Set<FileUploadTaskStatus>([
+  'preparing',
+  'uploading',
+  'cancelling',
+])
+
 const newIdempotencyKey = () =>
   globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`
 
 const wait = (delayMs: number) => new Promise((resolve) => window.setTimeout(resolve, delayMs))
 
+/** 拼接服务器绝对路径，避免重复分隔符。 */
+const joinAbsolutePath = (directory: string, relativePath: string) => {
+  const root = directory === '/' ? '' : directory.replace(/\/+$/, '')
+  return `${root}/${relativePath}`.replace(/\/{2,}/g, '/')
+}
+
+/** 校验浏览器提供的相对路径，禁止目录逃逸和平台分隔符混用。 */
+const normalizeRelativePath = (path: string) => {
+  if (!path || path.includes('\\') || path.includes('\0') || path.startsWith('/')) {
+    throw new Error('invalid upload relative path')
+  }
+  const segments = path.split('/')
+  if (segments.some((segment) => !segment || segment === '.' || segment === '..')) {
+    throw new Error('invalid upload relative path')
+  }
+  return segments.join('/')
+}
+
 export function useFileOperations(nodeId: Readonly<Ref<string>>) {
   const toastStore = useToastStore()
   const { t } = useI18n()
   const fsClient = computed(() => fsApi.forNode(nodeId.value))
+  const uploadTask = reactive<FileUploadTaskState>({
+    visible: false,
+    kind: 'files',
+    displayName: '',
+    targetDirectory: '',
+    status: 'completed',
+    totalFiles: 0,
+    completedFiles: 0,
+    failedFiles: 0,
+    totalBytes: 0,
+    transferredBytes: 0,
+    progressPercent: 0,
+    currentFile: '',
+    failures: [],
+    errorSummary: '',
+  })
+  const uploadActive = computed(
+    () => uploadTask.visible && ACTIVE_UPLOAD_STATUSES.has(uploadTask.status),
+  )
+  let uploadCancelRequested = false
+  let uploadAbortController: AbortController | null = null
+  let currentTransferId = ''
+  let currentTransferClient: ReturnType<(typeof fsApi)['forNode']> | null = null
+  let currentCancelPromise: Promise<void> | null = null
 
   const createFile = async (path: string, content = '') => {
     const res = await fsClient.value.createFile({ path, content })
@@ -123,12 +213,53 @@ export function useFileOperations(nodeId: Readonly<Ref<string>>) {
     return pollTransfer(res.data.transferId)
   }
 
-  const uploadFile = async (targetPath: string, file: File) => {
-    const client = fsClient.value
+  /** 计算并写入上传任务的整体进度。 */
+  const updateUploadProgress = (
+    settledWorkBytes: number,
+    currentWorkBytes: number,
+    actualTransferredBytes: number,
+  ) => {
+    uploadTask.transferredBytes = Math.min(uploadTask.totalBytes, actualTransferredBytes)
+    if (uploadTask.totalBytes > 0) {
+      uploadTask.progressPercent = Math.min(
+        100,
+        Math.round(((settledWorkBytes + currentWorkBytes) / uploadTask.totalBytes) * 100),
+      )
+      return
+    }
+    const processedFiles = uploadTask.completedFiles + uploadTask.failedFiles
+    uploadTask.progressPercent = uploadTask.totalFiles
+      ? Math.round((processedFiles / uploadTask.totalFiles) * 100)
+      : 0
+  }
+
+  /** 取消当前服务端传输；并发调用复用同一请求。 */
+  const cancelCurrentTransfer = async () => {
+    if (!currentTransferId || !currentTransferClient) return
+    if (currentCancelPromise) return currentCancelPromise
+    const transferId = currentTransferId
+    const client = currentTransferClient
+    currentCancelPromise = client
+      .cancelTransfer(transferId)
+      .then(() => undefined)
+      .catch(() => undefined)
+      .finally(() => {
+        if (currentTransferId === transferId) currentTransferId = ''
+        currentCancelPromise = null
+      })
+    return currentCancelPromise
+  }
+
+  /** 上传一个文件并报告本文件的实际传输字节。 */
+  const uploadOneFile = async (
+    client: ReturnType<(typeof fsApi)['forNode']>,
+    targetPath: string,
+    file: File,
+    onProgress: (uploadedBytes: number) => void,
+  ) => {
     const active = await client.activeTransfers()
     if (!active.success) {
-      toastStore.error(active.message || t('app.fileManager.uploadFailed'))
-      return false
+      throw new Error(active.message || t('app.fileManager.uploadFailed'))
     }
     const resumable = active.data?.find(
       (transfer) =>
@@ -146,38 +277,197 @@ export function useFileOperations(nodeId: Readonly<Ref<string>>) {
           overwrite: false,
         })
     if (!created.success || !created.data) {
-      toastStore.error(created.message || t('app.fileManager.uploadFailed'))
-      return false
+      throw new Error(created.message || t('app.fileManager.uploadFailed'))
     }
 
-    const transferId = created.data.transferId
+    currentTransferId = created.data.transferId
+    currentTransferClient = client
+    let uploadedBytes = created.data.transferredBytes
+    onProgress(uploadedBytes)
+    if (uploadCancelRequested) {
+      await cancelCurrentTransfer()
+      return { completed: false, uploadedBytes }
+    }
+
     try {
-      for (
-        let start = created.data.transferredBytes;
-        start < file.size;
-        start += UPLOAD_CHUNK_BYTES
-      ) {
+      for (let start = uploadedBytes; start < file.size; start += UPLOAD_CHUNK_BYTES) {
+        if (uploadCancelRequested) break
         const endExclusive = Math.min(start + UPLOAD_CHUNK_BYTES, file.size)
         const chunk = await file.slice(start, endExclusive).arrayBuffer()
+        if (uploadCancelRequested) break
+        const controller = new AbortController()
+        uploadAbortController = controller
         const uploaded = await client.uploadChunk(
-          transferId,
+          currentTransferId,
           chunk,
           start,
           endExclusive - 1,
           file.size,
+          {
+            signal: controller.signal,
+            onProgress: (loadedBytes) => {
+              uploadedBytes = Math.max(uploadedBytes, Math.min(endExclusive, start + loadedBytes))
+              onProgress(uploadedBytes)
+            },
+          },
         )
-        if (!uploaded.success)
+        uploadAbortController = null
+        if (!uploaded.success || !uploaded.data) {
           throw new Error(uploaded.message || t('app.fileManager.uploadFailed'))
+        }
+        uploadedBytes = uploaded.data.transferredBytes
+        onProgress(uploadedBytes)
       }
-      const completed = await client.completeTransfer(transferId)
-      if (!completed.success)
+      if (uploadCancelRequested) {
+        await cancelCurrentTransfer()
+        return { completed: false, uploadedBytes }
+      }
+      const completed = await client.completeTransfer(currentTransferId)
+      if (!completed.success) {
         throw new Error(completed.message || t('app.fileManager.uploadFailed'))
-      return true
+      }
+      currentTransferId = ''
+      onProgress(file.size)
+      return { completed: true, uploadedBytes: file.size }
     } catch (error) {
-      await client.cancelTransfer(transferId)
-      toastStore.error(error instanceof Error ? error.message : t('app.fileManager.uploadFailed'))
+      uploadAbortController = null
+      await cancelCurrentTransfer()
+      if (uploadCancelRequested) return { completed: false, uploadedBytes }
+      throw error
+    }
+  }
+
+  /** 启动当前窗口内唯一的后台上传任务。 */
+  const startUpload = async (targetDirectory: string, selection: FileUploadSelection) => {
+    if (uploadActive.value || selection.files.length === 0) return false
+    let files: FileUploadSource[]
+    try {
+      files = selection.files.map((source) => ({
+        file: source.file,
+        relativePath: normalizeRelativePath(source.relativePath),
+      }))
+    } catch {
+      toastStore.error(t('app.fileManager.uploadInvalidPath'))
       return false
     }
+
+    Object.assign(uploadTask, {
+      visible: true,
+      kind: selection.kind,
+      displayName: selection.displayName,
+      targetDirectory,
+      status: 'preparing' as FileUploadTaskStatus,
+      totalFiles: files.length,
+      completedFiles: 0,
+      failedFiles: 0,
+      totalBytes: files.reduce((total, source) => total + source.file.size, 0),
+      transferredBytes: 0,
+      progressPercent: 0,
+      currentFile: '',
+      failures: [],
+      errorSummary: '',
+    })
+    uploadCancelRequested = false
+    const client = fsClient.value
+    currentTransferClient = client
+    let settledWorkBytes = 0
+    let actualTransferredBytes = 0
+
+    try {
+      if (selection.kind === 'folder') {
+        const directories = new Set<string>()
+        files.forEach(({ relativePath }) => {
+          const segments = relativePath.split('/')
+          segments.pop()
+          for (let end = 1; end <= segments.length; end += 1) {
+            directories.add(segments.slice(0, end).join('/'))
+          }
+        })
+        for (const directory of [...directories].sort(
+          (left, right) => left.split('/').length - right.split('/').length,
+        )) {
+          if (uploadCancelRequested) break
+          uploadTask.currentFile = directory
+          const created = await client.mkdir({
+            path: joinAbsolutePath(targetDirectory, directory),
+            recursive: false,
+          })
+          if (!created.success) {
+            throw new Error(created.message || t('app.fileManager.uploadDirectoryFailed'))
+          }
+        }
+      }
+
+      for (const source of files) {
+        if (uploadCancelRequested) break
+        uploadTask.status = 'uploading'
+        uploadTask.currentFile = source.relativePath
+        let currentUploadedBytes = 0
+        try {
+          const result = await uploadOneFile(
+            client,
+            joinAbsolutePath(targetDirectory, source.relativePath),
+            source.file,
+            (uploadedBytes) => {
+              currentUploadedBytes = Math.max(currentUploadedBytes, uploadedBytes)
+              updateUploadProgress(
+                settledWorkBytes,
+                currentUploadedBytes,
+                actualTransferredBytes + currentUploadedBytes,
+              )
+            },
+          )
+          if (!result.completed) break
+          uploadTask.completedFiles += 1
+          actualTransferredBytes += source.file.size
+        } catch (error) {
+          const message = error instanceof Error ? error.message : t('app.fileManager.uploadFailed')
+          uploadTask.failedFiles += 1
+          actualTransferredBytes += currentUploadedBytes
+          uploadTask.failures.push({ path: source.relativePath, message })
+        }
+        settledWorkBytes += source.file.size
+        updateUploadProgress(settledWorkBytes, 0, actualTransferredBytes)
+      }
+
+      if (uploadCancelRequested) {
+        uploadTask.status = 'cancelled'
+      } else if (uploadTask.failedFiles === 0) {
+        uploadTask.status = 'completed'
+        uploadTask.progressPercent = 100
+      } else if (uploadTask.completedFiles > 0) {
+        uploadTask.status = 'partial'
+        uploadTask.progressPercent = 100
+      } else {
+        uploadTask.status = 'failed'
+        uploadTask.progressPercent = 100
+      }
+    } catch (error) {
+      uploadTask.errorSummary =
+        error instanceof Error ? error.message : t('app.fileManager.uploadFailed')
+      uploadTask.status = uploadCancelRequested ? 'cancelled' : 'failed'
+    } finally {
+      uploadAbortController = null
+      currentTransferId = ''
+      currentTransferClient = null
+      currentCancelPromise = null
+      uploadTask.currentFile = ''
+    }
+    return uploadTask.completedFiles > 0
+  }
+
+  /** 请求取消上传，当前分块中止后由服务端清理暂存文件。 */
+  const cancelUpload = async () => {
+    if (!uploadActive.value || uploadTask.status === 'cancelling') return
+    uploadCancelRequested = true
+    uploadTask.status = 'cancelling'
+    uploadAbortController?.abort()
+    await cancelCurrentTransfer()
+  }
+
+  /** 关闭已结束的上传任务摘要。 */
+  const dismissUpload = () => {
+    if (!uploadActive.value) uploadTask.visible = false
   }
 
   /** 页面恢复后继续等待当前节点的活动文件任务。 */
@@ -205,7 +495,11 @@ export function useFileOperations(nodeId: Readonly<Ref<string>>) {
     copyPath,
     runPathTask,
     downloadFile,
-    uploadFile,
+    uploadTask,
+    uploadActive,
+    startUpload,
+    cancelUpload,
+    dismissUpload,
     resumeActiveTasks,
     resumeActiveTransfers,
   }
