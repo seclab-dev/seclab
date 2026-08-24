@@ -20,6 +20,8 @@ const monacoMock = vi.hoisted(() => ({
   restoreViewState: vi.fn(),
   setModelLanguage: vi.fn(),
   updateOptions: vi.fn(),
+  setPosition: vi.fn(),
+  mouseDownHandler: null as ((event: { target: { position: unknown } }) => void) | null,
   createOptions: null as Record<string, unknown> | null,
   editorRoot: null as HTMLDivElement | null,
 }))
@@ -65,6 +67,9 @@ vi.mock('../monaco-workers', () => {
       return {
         addCommand: vi.fn(),
         onDidChangeModelContent: vi.fn(),
+        onMouseDown: vi.fn((handler) => {
+          monacoMock.mouseDownHandler = handler
+        }),
         getValue: () => activeModel?.getValue() ?? '',
         setValue: (value: string) => activeModel?.setValue(value),
         getModel: () => activeModel,
@@ -74,6 +79,7 @@ vi.mock('../monaco-workers', () => {
         },
         saveViewState: monacoMock.saveViewState,
         restoreViewState: monacoMock.restoreViewState,
+        setPosition: monacoMock.setPosition,
         getDomNode: () => root,
         updateOptions: monacoMock.updateOptions,
         layout: vi.fn(),
@@ -105,6 +111,7 @@ describe('MonacoEditor 多文档模型', () => {
     vi.clearAllMocks()
     monacoMock.models.length = 0
     monacoMock.createOptions = null
+    monacoMock.mouseDownHandler = null
   })
 
   it('初始化并动态同步高级视图配置', async () => {
@@ -125,6 +132,7 @@ describe('MonacoEditor 多文档模型', () => {
     expect(monacoMock.createOptions?.minimap).toEqual({ enabled: true })
     expect(monacoMock.createOptions?.stickyScroll).toEqual({ enabled: true })
     expect(monacoMock.createOptions?.renderWhitespace).toBe('selection')
+    expect(monacoMock.createOptions?.fixedOverflowWidgets).toBe(true)
 
     await wrapper.setProps({
       highlightAmbiguousUnicode: false,
@@ -174,6 +182,40 @@ describe('MonacoEditor 多文档模型', () => {
     expect(monacoMock.models).toHaveLength(2)
     expect(monacoMock.setModel).toHaveBeenLastCalledWith(firstModel)
     expect(monacoMock.restoreViewState).toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('点击后接管滚轮，并将只读光标同步到点击位置', () => {
+    const wrapper = mount(MonacoEditor, {
+      props: {
+        modelValue: 'readonly content',
+        documentKey: 'readonly:/script.sh',
+        readOnly: true,
+        wheelFocusOnClick: true,
+        fixedOverflowWidgets: false,
+      },
+      global: {
+        plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh } })],
+      },
+    })
+
+    expect(monacoMock.createOptions?.scrollbar).toMatchObject({
+      handleMouseWheel: false,
+      alwaysConsumeMouseWheel: false,
+    })
+    expect(monacoMock.createOptions?.fixedOverflowWidgets).toBe(false)
+
+    const position = { lineNumber: 2, column: 4 }
+    monacoMock.mouseDownHandler?.({ target: { position } })
+    expect(monacoMock.setPosition).toHaveBeenCalledWith(position, 'mouse')
+    expect(monacoMock.updateOptions).toHaveBeenLastCalledWith({
+      scrollbar: { handleMouseWheel: true },
+    })
+
+    document.body.dispatchEvent(new Event('pointerdown', { bubbles: true, composed: true }))
+    expect(monacoMock.updateOptions).toHaveBeenLastCalledWith({
+      scrollbar: { handleMouseWheel: false },
+    })
     wrapper.unmount()
   })
 

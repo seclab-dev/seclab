@@ -18,10 +18,7 @@ vi.mock('@/api/modules/scripts', () => ({
     update: vi.fn(),
     remove: vi.fn(),
     startRun: vi.fn(),
-    runs: vi.fn(),
-    run: vi.fn(),
-    output: vi.fn(),
-    cancel: vi.fn(),
+    dismissRun: vi.fn(),
   },
 }))
 
@@ -30,6 +27,7 @@ const response = <T>(data: T) => ({ success: true, code: 200, message: '', data 
 const summary = (scriptId: string): ScriptSummary => ({
   scriptId,
   name: scriptId,
+  interactive: false,
   language: 'shell',
   revision: 1,
   ownership: { kind: 'custom' },
@@ -45,7 +43,7 @@ const page = (items: ScriptSummary[]): ScriptListPage => ({
   total: items.length,
   loadedAt: '2026-07-16T00:00:00Z',
 })
-const run = (): ScriptRun => ({
+const run = (status: ScriptRun['status'] = 'queued'): ScriptRun => ({
   runId: 'run-1',
   scriptId: 'script-1',
   scriptName: 'Demo',
@@ -53,10 +51,9 @@ const run = (): ScriptRun => ({
   sourceSha256: 'a'.repeat(64),
   nodeId: 'local',
   nodeName: 'Local',
-  status: 'queued',
+  status,
   queuedAt: '2026-07-16T00:00:00Z',
-  output: { available: false, truncated: false, sizeBytes: 0 },
-  capabilities: { canCancel: true },
+  capabilities: { canCancel: status !== 'succeeded' },
 })
 const deferred = <T>() => {
   let resolve!: (value: T) => void
@@ -75,6 +72,7 @@ describe('useScriptLibrary', () => {
     localStorage.clear()
     vi.mocked(nodesApi.list).mockResolvedValue(response([]))
     api.list.mockResolvedValue(response(page([])))
+    api.dismissRun.mockResolvedValue(response(undefined))
   })
   afterEach(() => {
     vi.useRealTimers()
@@ -109,6 +107,20 @@ describe('useScriptLibrary', () => {
     wrapper.unmount()
   })
 
+  it('创建一次性终端执行且关闭时销毁，不保存恢复状态', async () => {
+    api.startRun.mockResolvedValue(response(run()))
+    const wrapper = mountHarness()
+    await flushPromises()
+    await wrapper.vm.startRun('script-1', 'local', 30)
+    expect(wrapper.vm.currentRun?.status).toBe('queued')
+    expect(localStorage.length).toBe(0)
+
+    await wrapper.vm.dismissRun()
+    expect(api.dismissRun).toHaveBeenCalledWith('run-1')
+    expect(wrapper.vm.currentRun).toBeNull()
+    wrapper.unmount()
+  })
+
   it('重复执行只提交一个幂等请求', async () => {
     const pending = deferred<ReturnType<typeof response<ScriptRun>>>()
     api.startRun.mockImplementation(() => pending.promise)
@@ -119,6 +131,19 @@ describe('useScriptLibrary', () => {
     expect(api.startRun).toHaveBeenCalledTimes(1)
     pending.resolve(response(run()))
     await first
+    wrapper.unmount()
+    expect(api.dismissRun).toHaveBeenCalledWith('run-1')
+  })
+
+  it('执行提交失败后复位加载状态并保留错误', async () => {
+    api.startRun.mockRejectedValue(new Error('node unavailable'))
+    const wrapper = mountHarness()
+    await flushPromises()
+
+    await expect(wrapper.vm.startRun('script-1', 'local', 30)).rejects.toThrow('node unavailable')
+    expect(wrapper.vm.runState.refreshing).toBe(false)
+    expect(wrapper.vm.runState.error).toBe('node unavailable')
+    expect(wrapper.vm.currentRun).toBeNull()
     wrapper.unmount()
   })
 })

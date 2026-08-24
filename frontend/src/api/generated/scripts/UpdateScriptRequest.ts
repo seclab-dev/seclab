@@ -3,4 +3,4 @@
 /**
  * 更新脚本请求。
  */
-export type UpdateScriptRequest = { expectedRevision: number, name: string, description?: string, content: string, timeoutSeconds: number, };
+export type UpdateScriptRequest = { expectedRevision: number, name: string, description?: string, interactive: boolean, content: string, timeoutSeconds: number, };

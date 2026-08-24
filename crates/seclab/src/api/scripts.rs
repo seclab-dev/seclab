@@ -1,29 +1,31 @@
-//! 脚本库公共 API：脚本资产、乐观修订、异步运行、历史和有界输出。
+//! 脚本库公共 API：脚本资产、乐观修订与一次性终端执行。
 
 use crate::{
     api::auth::AuthenticatedAdmin,
     models::{
         logging::{LogModule, LogStatus, PlatformLogLevel},
         node_runtime_client::NodeRuntimeClient,
-        scripts::{self, ScriptActor, ScriptListFilter, ScriptRunListFilter},
+        scripts::{self, ScriptActor, ScriptListFilter},
     },
     services::{
         logging::{self, OperationEventBuilder},
-        node_read_model,
+        node_read_model, script_runs as script_run_service,
     },
     state::AppState,
     types::{ApiError, ApiResponse, ApiResult},
 };
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, WebSocketUpgrade, ws::Message},
     http::{HeaderMap, StatusCode, header::HeaderName},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use futures_util::{SinkExt, StreamExt};
+use reqwest_websocket::{CloseCode, RequestBuilderExt};
 use seclab_contracts::{
     api::ErrorCode,
-    scripts::{CreateScriptRequest, CreateScriptRunRequest, ScriptRunStatus, UpdateScriptRequest},
+    scripts::{CreateScriptRequest, CreateScriptRunRequest, UpdateScriptRequest},
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -39,13 +41,140 @@ pub fn scripts_router() -> Router<Arc<AppState>> {
         .route("/{script_id}/runs", post(start_run))
 }
 
-/// 构建全局脚本运行路由。
+/// 构建临时脚本执行路由。
 pub fn script_runs_router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/", get(list_runs))
-        .route("/{run_id}", get(run_detail))
-        .route("/{run_id}/output", get(run_output))
-        .route("/{run_id}/cancel", post(cancel_run))
+        .route("/{run_id}", axum::routing::delete(dismiss_run))
+        .route("/{run_id}/ws", get(terminal_websocket))
+}
+
+async fn terminal_websocket(
+    State(state): State<Arc<AppState>>,
+    Path(run_id): Path<String>,
+    admin: AuthenticatedAdmin,
+    ws: WebSocketUpgrade,
+) -> ApiResult<Response> {
+    let run = scripts::claim_terminal(&state.metadata_db, &run_id, admin.id).await?;
+    let client = match script_run_service::prepare_terminal(&state, &run).await {
+        Ok(client) => client,
+        Err(error) => {
+            script_run_service::fail_terminal(
+                &state,
+                &run_id,
+                "script terminal node connection failed",
+            )
+            .await?;
+            return Err(error);
+        }
+    };
+    let path = format!("/api/v1/agent/script-runs/{run_id}/ws");
+    let response = match client
+        .authorize_request(client.client.get(client.build_ws_uri(&path)))
+        .upgrade()
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            script_run_service::cancel_prepared_terminal(&client, &run_id).await;
+            script_run_service::fail_terminal(&state, &run_id, "script terminal connection failed")
+                .await?;
+            return Err(ApiError::bad_gateway(
+                ErrorCode::AgentRequestFailed,
+                "script terminal WebSocket connection failed",
+            )
+            .with_detail(error.to_string()));
+        }
+    };
+    if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+        script_run_service::cancel_prepared_terminal(&client, &run_id).await;
+        script_run_service::fail_terminal(
+            &state,
+            &run_id,
+            "script terminal WebSocket was rejected",
+        )
+        .await?;
+        return Err(ApiError::bad_gateway(
+            ErrorCode::AgentRequestFailed,
+            "script terminal WebSocket was rejected",
+        ));
+    }
+    let upstream = match response.into_websocket().await {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            script_run_service::cancel_prepared_terminal(&client, &run_id).await;
+            script_run_service::fail_terminal(&state, &run_id, "script terminal upgrade failed")
+                .await?;
+            return Err(ApiError::bad_gateway(
+                ErrorCode::AgentRequestFailed,
+                "script terminal WebSocket upgrade failed",
+            )
+            .with_detail(error.to_string()));
+        }
+    };
+    scripts::mark_terminal_attached(&state.metadata_db, &run_id).await?;
+    Ok(ws
+        .on_upgrade(move |client| bridge_terminal(client, upstream))
+        .into_response())
+}
+
+async fn bridge_terminal(
+    client: axum::extract::ws::WebSocket,
+    upstream: reqwest_websocket::WebSocket,
+) {
+    let (mut client_tx, mut client_rx) = client.split();
+    let (mut agent_tx, mut agent_rx) = upstream.split();
+    let to_agent = tokio::spawn(async move {
+        while let Some(Ok(message)) = client_rx.next().await {
+            let (close, message) = match message {
+                Message::Text(v) => (false, reqwest_websocket::Message::Text(v.to_string())),
+                Message::Binary(v) => (false, reqwest_websocket::Message::Binary(v)),
+                Message::Ping(v) => (false, reqwest_websocket::Message::Ping(v)),
+                Message::Pong(v) => (false, reqwest_websocket::Message::Pong(v)),
+                Message::Close(frame) => (
+                    true,
+                    reqwest_websocket::Message::Close {
+                        code: frame
+                            .as_ref()
+                            .map(|f| CloseCode::from(f.code))
+                            .unwrap_or(CloseCode::Normal),
+                        reason: frame.map(|f| f.reason.to_string()).unwrap_or_default(),
+                    },
+                ),
+            };
+            if agent_tx.send(message).await.is_err() || close {
+                break;
+            }
+        }
+        let _ = agent_tx
+            .send(reqwest_websocket::Message::Close {
+                code: CloseCode::Normal,
+                reason: String::new(),
+            })
+            .await;
+    });
+    let to_client = tokio::spawn(async move {
+        while let Some(Ok(message)) = agent_rx.next().await {
+            let (close, message) = match message {
+                reqwest_websocket::Message::Text(v) => (false, Message::Text(v.into())),
+                reqwest_websocket::Message::Binary(v) => (false, Message::Binary(v)),
+                reqwest_websocket::Message::Ping(v) => (false, Message::Ping(v)),
+                reqwest_websocket::Message::Pong(v) => (false, Message::Pong(v)),
+                reqwest_websocket::Message::Close { code, reason } => (
+                    true,
+                    Message::Close(Some(axum::extract::ws::CloseFrame {
+                        code: code.into(),
+                        reason: reason.into(),
+                    })),
+                ),
+            };
+            if client_tx.send(message).await.is_err() || close {
+                break;
+            }
+        }
+        let _ = client_tx.send(Message::Close(None)).await;
+    });
+    let _ = tokio::join!(to_agent, to_client);
 }
 
 #[derive(Debug, Deserialize)]
@@ -246,100 +375,37 @@ async fn start_run(
         .into_response())
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RunListQuery {
-    script_id: Option<String>,
-    node_id: Option<String>,
-    status: Option<ScriptRunStatus>,
-    #[serde(default = "default_page")]
-    page: u32,
-    #[serde(default = "default_page_size")]
-    page_size: u32,
-}
-
-async fn list_runs(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<RunListQuery>,
-) -> ApiResult<Response> {
-    validate_page(query.page, query.page_size)?;
-    let data = scripts::list_runs(
-        &state.metadata_db,
-        &ScriptRunListFilter {
-            script_id: query.script_id.as_deref(),
-            node_id: query.node_id.as_deref(),
-            status: query.status,
-            page: query.page,
-            page_size: query.page_size,
-        },
-    )
-    .await?;
-    Ok(ApiResponse::success_with_raw("Script runs loaded", Some(data)).into_response())
-}
-
-async fn run_detail(
-    State(state): State<Arc<AppState>>,
-    Path(run_id): Path<String>,
-) -> ApiResult<Response> {
-    let data = scripts::run(&state.metadata_db, &run_id).await?;
-    Ok(ApiResponse::success_with_raw("Script run loaded", Some(data)).into_response())
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct OutputQuery {
-    #[serde(default)]
-    cursor: u64,
-    #[serde(default = "default_output_limit")]
-    limit: u32,
-}
-
-async fn run_output(
-    State(state): State<Arc<AppState>>,
-    Path(run_id): Path<String>,
-    Query(query): Query<OutputQuery>,
-) -> ApiResult<Response> {
-    if query.limit == 0 || query.limit > 100 {
-        return Err(ApiError::bad_request(
-            ErrorCode::BadRequest,
-            "invalid output page size",
-        ));
-    }
-    let data = scripts::output(&state.metadata_db, &run_id, query.cursor, query.limit).await?;
-    Ok(ApiResponse::success_with_raw("Script run output loaded", Some(data)).into_response())
-}
-
-async fn cancel_run(
+async fn dismiss_run(
     State(state): State<Arc<AppState>>,
     admin: AuthenticatedAdmin,
     headers: HeaderMap,
     Path(run_id): Path<String>,
 ) -> ApiResult<Response> {
     let actor = actor(&admin, &headers)?;
-    let result = scripts::request_cancel(&state.metadata_db, &run_id).await;
-    let target_id = result.as_ref().ok().map(|run| run.script_id.as_str());
-    let target_name = result.as_ref().ok().map(|run| run.script_name.as_str());
-    record_change(
-        &state,
-        &admin,
-        &actor,
-        "script_run_cancel_requested",
-        "POST",
-        target_id,
-        target_name,
-        Some(&run_id),
-        true,
-        &result,
-    );
-    let data = scripts::run_dto(result?)?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(ApiResponse::success_with_raw(
-            "Script run cancellation accepted",
-            data,
-        )),
-    )
-        .into_response())
+    let result = scripts::dismiss_run(&state.metadata_db, &run_id).await;
+    if let Ok(outcome) = &result
+        && let Some(run) = &outcome.run
+    {
+        record_change(
+            &state,
+            &admin,
+            &actor,
+            "script_run_cancel_requested",
+            "DELETE",
+            Some(&run.script_id),
+            Some(&run.script_name),
+            Some(&run_id),
+            true,
+            &result,
+        );
+    }
+    let outcome = result?;
+    Ok(if outcome.cancellation_requested {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::NO_CONTENT
+    }
+    .into_response())
 }
 
 fn actor(admin: &AuthenticatedAdmin, headers: &HeaderMap) -> ApiResult<ScriptActor> {
@@ -434,7 +500,4 @@ fn default_sort_by() -> String {
 }
 fn default_sort_order() -> String {
     "desc".into()
-}
-const fn default_output_limit() -> u32 {
-    50
 }

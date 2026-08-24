@@ -133,13 +133,9 @@ pub async fn start(
 #[cfg(unix)]
 mod unix {
     use super::*;
+    use crate::services::pty;
     use chrono::Utc;
-    use std::{
-        fs::File,
-        io,
-        os::fd::{AsRawFd, FromRawFd, OwnedFd},
-        process::Stdio,
-    };
+    use std::{fs::File, io, os::fd::AsRawFd, process::Stdio};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         process::Command,
@@ -147,23 +143,14 @@ mod unix {
         time::{Instant, sleep_until, timeout},
     };
 
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct Winsize {
-        ws_row: libc::c_ushort,
-        ws_col: libc::c_ushort,
-        ws_xpixel: libc::c_ushort,
-        ws_ypixel: libc::c_ushort,
-    }
-
     pub async fn start(
         cols: u16,
         rows: u16,
     ) -> Result<(HostTerminalSession, mpsc::Receiver<HostTerminalEvent>), String> {
         validate_size(cols, rows).map_err(|_| "invalid terminal size".to_string())?;
         let shell = resolve_shell().ok_or_else(|| "no supported shell is available".to_string())?;
-        let (master_fd, slave_fd) = open_pty().map_err(|error| error.to_string())?;
-        set_size(master_fd.as_raw_fd(), cols, rows).map_err(|error| error.to_string())?;
+        let (master_fd, slave_fd) = pty::open().map_err(|error| error.to_string())?;
+        pty::resize(master_fd.as_raw_fd(), cols, rows).map_err(|error| error.to_string())?;
 
         let slave = File::from(slave_fd);
         let stdin = slave.try_clone().map_err(|error| error.to_string())?;
@@ -259,7 +246,7 @@ mod unix {
                             break TerminalExitReason::TransportClosed;
                         }
                     }
-                    Err(error) if is_pty_eof(&error) => {
+                    Err(error) if pty::is_eof(&error) => {
                         break TerminalExitReason::ProcessExited;
                     }
                     Err(error) => {
@@ -282,7 +269,7 @@ mod unix {
                         warning_sent = false;
                     }
                     Some(HostTerminalCommand::Resize { cols, rows }) => {
-                        if let Err(error) = set_size(writer.as_raw_fd(), cols, rows) {
+                        if let Err(error) = pty::resize(writer.as_raw_fd(), cols, rows) {
                             let _ = send_error(&events, TerminalErrorCode::TerminalIoFailed, format!("failed to resize terminal: {error}"), true).await;
                         }
                     }
@@ -300,11 +287,11 @@ mod unix {
         };
 
         if reason != TerminalExitReason::ProcessExited {
-            signal_process_group(child_pid, libc::SIGHUP);
+            pty::signal_group(child_pid, libc::SIGHUP);
             if let Ok(Ok(status)) = timeout(Duration::from_secs(3), &mut exit_rx).await {
                 exit_code = status.ok().and_then(|status| status.code());
             } else {
-                signal_process_group(child_pid, libc::SIGKILL);
+                pty::signal_group(child_pid, libc::SIGKILL);
                 if let Ok(Ok(status)) = timeout(Duration::from_secs(3), &mut exit_rx).await {
                     exit_code = status.ok().and_then(|status| status.code());
                 }
@@ -338,53 +325,6 @@ mod unix {
                 recoverable,
             }))
             .await
-    }
-
-    fn signal_process_group(pid: libc::pid_t, signal: libc::c_int) {
-        unsafe {
-            libc::kill(-pid, signal);
-        }
-    }
-
-    /// Linux PTY 从设备关闭时会以 EIO 表达正常 EOF。
-    pub(super) fn is_pty_eof(error: &io::Error) -> bool {
-        error.raw_os_error() == Some(libc::EIO)
-    }
-
-    fn set_size(fd: libc::c_int, cols: u16, rows: u16) -> io::Result<()> {
-        let size = Winsize {
-            ws_row: rows,
-            ws_col: cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        let result = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ as _, &size) };
-        if result < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    fn open_pty() -> io::Result<(OwnedFd, OwnedFd)> {
-        unsafe {
-            let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
-            if master < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let master = OwnedFd::from_raw_fd(master);
-            if libc::grantpt(master.as_raw_fd()) < 0 || libc::unlockpt(master.as_raw_fd()) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let slave_name = libc::ptsname(master.as_raw_fd());
-            if slave_name.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-            let slave = libc::open(slave_name, libc::O_RDWR | libc::O_NOCTTY);
-            if slave < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok((master, OwnedFd::from_raw_fd(slave)))
-        }
     }
 }
 
@@ -474,6 +414,6 @@ mod tests {
     #[test]
     fn linux_pty_eio_is_normal_eof() {
         let error = std::io::Error::from_raw_os_error(libc::EIO);
-        assert!(unix::is_pty_eof(&error));
+        assert!(crate::services::pty::is_eof(&error));
     }
 }

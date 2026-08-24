@@ -1,4 +1,4 @@
-//! 脚本库领域契约：脚本资产、单节点运行、输出与 Agent 上报。
+//! 脚本库领域契约：脚本资产、一次性终端运行与 Agent 上报。
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -39,13 +39,63 @@ impl ScriptRunStatus {
     }
 }
 
-/// 输出流类型。
+/// 脚本运行终端稳定错误码。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 #[ts(export_to = "scripts/")]
-pub enum ScriptOutputStream {
-    Stdout,
-    Stderr,
+pub enum ScriptRunTerminalErrorCode {
+    ScriptRunSessionAlreadyAttached,
+    ScriptRunInvalidTerminalSize,
+    ScriptRunTerminalStartFailed,
+    ScriptRunTerminalIoFailed,
+    ScriptRunTerminalAttachTimeout,
+    ScriptRunTerminalProtocolViolation,
+}
+
+/// 浏览器发往脚本运行 WebSocket 的控制消息。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "type", content = "payload", rename_all = "camelCase")]
+#[ts(export_to = "scripts/")]
+pub enum ScriptRunTerminalClientMessage {
+    Start { cols: u16, rows: u16 },
+    Resize { cols: u16, rows: u16 },
+    Close,
+}
+
+/// Agent 发往浏览器的脚本运行控制事件。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "kind", content = "payload", rename_all = "camelCase")]
+#[ts(export_to = "scripts/")]
+pub enum ScriptRunTerminalServerMessage {
+    Started {
+        #[serde(rename = "runId")]
+        #[ts(rename = "runId")]
+        run_id: String,
+        #[serde(rename = "startedAt")]
+        #[ts(rename = "startedAt")]
+        started_at: String,
+        #[serde(rename = "timeoutSeconds")]
+        #[ts(rename = "timeoutSeconds")]
+        timeout_seconds: u32,
+    },
+    Exited {
+        #[serde(rename = "runId")]
+        #[ts(rename = "runId")]
+        run_id: String,
+        #[serde(rename = "exitCode")]
+        #[ts(rename = "exitCode")]
+        exit_code: Option<i32>,
+        status: ScriptRunStatus,
+        #[serde(rename = "endedAt")]
+        #[ts(rename = "endedAt")]
+        ended_at: String,
+    },
+    Error {
+        #[ts(inline)]
+        code: ScriptRunTerminalErrorCode,
+        message: String,
+        recoverable: bool,
+    },
 }
 
 /// 脚本资源归属信息。
@@ -70,17 +120,6 @@ pub struct ScriptCapabilities {
     pub can_run: bool,
 }
 
-/// 最近一次脚本运行摘要。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "scripts/", optional_fields)]
-pub struct ScriptLastRun {
-    pub run_id: String,
-    pub node_id: String,
-    pub status: ScriptRunStatus,
-    pub finished_at: Option<String>,
-}
-
 /// 脚本列表摘要，不包含正文。
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -89,6 +128,7 @@ pub struct ScriptSummary {
     pub script_id: String,
     pub name: String,
     pub description: Option<String>,
+    pub interactive: bool,
     #[ts(type = "\"shell\"")]
     pub language: String,
     pub revision: i64,
@@ -96,7 +136,6 @@ pub struct ScriptSummary {
     pub ownership: ScriptOwnership,
     #[ts(inline)]
     pub capabilities: ScriptCapabilities,
-    pub last_run: Option<ScriptLastRun>,
     pub created_at: String,
     pub updated_at: String,
     pub updated_by: String,
@@ -153,6 +192,7 @@ pub struct ScriptListPage {
 pub struct CreateScriptRequest {
     pub name: String,
     pub description: Option<String>,
+    pub interactive: bool,
     pub content: String,
     pub timeout_seconds: Option<u32>,
 }
@@ -165,6 +205,7 @@ pub struct UpdateScriptRequest {
     pub expected_revision: i64,
     pub name: String,
     pub description: Option<String>,
+    pub interactive: bool,
     pub content: String,
     pub timeout_seconds: u32,
 }
@@ -176,16 +217,6 @@ pub struct UpdateScriptRequest {
 pub struct CreateScriptRunRequest {
     pub node_id: String,
     pub timeout_seconds: Option<u32>,
-}
-
-/// 运行输出摘要。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "scripts/")]
-pub struct ScriptRunOutputSummary {
-    pub available: bool,
-    pub truncated: bool,
-    pub size_bytes: u64,
 }
 
 /// 运行操作能力。
@@ -217,43 +248,7 @@ pub struct ScriptRun {
     pub error_code: Option<String>,
     pub error_summary: Option<String>,
     #[ts(inline)]
-    pub output: ScriptRunOutputSummary,
-    #[ts(inline)]
     pub capabilities: ScriptRunCapabilities,
-}
-
-/// 分页脚本运行记录。
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "scripts/")]
-pub struct ScriptRunPage {
-    pub items: Vec<ScriptRun>,
-    pub page: u32,
-    pub page_size: u32,
-    pub total: u64,
-    pub loaded_at: String,
-}
-
-/// 单个有序输出块。
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "scripts/")]
-pub struct ScriptRunOutputChunk {
-    pub sequence: u64,
-    pub stream: ScriptOutputStream,
-    pub content: String,
-}
-
-/// 游标分页运行输出。
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "scripts/", optional_fields)]
-pub struct ScriptRunOutputPage {
-    pub run_id: String,
-    pub items: Vec<ScriptRunOutputChunk>,
-    pub next_cursor: Option<u64>,
-    pub size_bytes: u64,
-    pub truncated: bool,
 }
 
 /// Master 下发给 Agent 的脚本快照。
@@ -285,9 +280,6 @@ pub struct AgentScriptRunReport {
     pub exit_code: Option<i32>,
     pub error_code: Option<String>,
     pub error_summary: Option<String>,
-    pub output_size_bytes: u64,
-    pub output_truncated: bool,
-    pub output_chunks: Vec<ScriptRunOutputChunk>,
 }
 
 /// Agent 批量上报请求。
@@ -295,4 +287,31 @@ pub struct AgentScriptRunReport {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentScriptRunReportBatch {
     pub reports: Vec<AgentScriptRunReport>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_control_frames_use_tagged_camel_case_payloads() {
+        assert_eq!(
+            serde_json::to_value(ScriptRunTerminalClientMessage::Start { cols: 80, rows: 24 })
+                .unwrap(),
+            serde_json::json!({"type":"start","payload":{"cols":80,"rows":24}})
+        );
+        assert_eq!(
+            serde_json::to_value(ScriptRunTerminalClientMessage::Close).unwrap(),
+            serde_json::json!({"type":"close"})
+        );
+        let error = ScriptRunTerminalServerMessage::Error {
+            code: ScriptRunTerminalErrorCode::ScriptRunTerminalProtocolViolation,
+            message: "invalid".into(),
+            recoverable: false,
+        };
+        assert_eq!(
+            serde_json::to_value(error).unwrap()["payload"]["code"],
+            "SCRIPT_RUN_TERMINAL_PROTOCOL_VIOLATION"
+        );
+    }
 }

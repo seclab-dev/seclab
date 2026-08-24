@@ -17,30 +17,6 @@ const OUTBOX_WARNING_AGE_HOURS: i64 = 24;
 const OPERATION_OUTBOX_WARNING_COUNT: i64 = 1_000;
 const RUN_OUTBOX_WARNING_COUNT: i64 = 100;
 
-const SCRIPT_RUN_CLEANUP: &str = r#"
-WITH ranked AS (
-    SELECT run_id,
-           COALESCE(finished_at, updated_at) AS finished_at,
-           ROW_NUMBER() OVER (
-               PARTITION BY script_id
-               ORDER BY queued_at DESC, run_id DESC
-           ) AS retained_rank
-    FROM script_runs
-    WHERE status IN ('succeeded', 'failed', 'timed_out', 'cancelled')
-)
-DELETE FROM script_runs
-WHERE run_id IN (
-    SELECT ranked.run_id
-    FROM ranked
-    WHERE NOT EXISTS (
-        SELECT 1 FROM script_run_outbox outbox
-        WHERE outbox.run_id = ranked.run_id
-    )
-      AND (ranked.finished_at < ?1 OR ranked.retained_rank > 100)
-    ORDER BY ranked.finished_at, ranked.run_id
-    LIMIT ?2
-)"#;
-
 const TASK_RUN_CLEANUP: &str = r#"
 WITH ranked AS (
     SELECT run_id,
@@ -198,13 +174,6 @@ async fn run_at(pool: &DbPool, now: DateTime<Utc>) -> Result<MaintenanceReport, 
     let delivered_cutoff = (now - Duration::days(DELIVERED_OUTBOX_RETENTION_DAYS)).to_rfc3339();
 
     let mut deleted_rows = 0;
-    deleted_rows += delete_text_batches(
-        pool,
-        SCRIPT_RUN_CLEANUP,
-        &history_cutoff,
-        LARGE_PARENT_BATCH_SIZE,
-    )
-    .await?;
     deleted_rows +=
         delete_text_batches(pool, TASK_RUN_CLEANUP, &history_cutoff, DEFAULT_BATCH_SIZE).await?;
     deleted_rows += delete_integer_batches(
@@ -448,21 +417,9 @@ mod tests {
         let pool = setup_test_db().await;
         let now = Utc::now();
         let old = (now - Duration::days(31)).to_rfc3339();
-        let recent = (now - Duration::days(1)).to_rfc3339();
-        insert_script_run(&pool, "old-script", "script-1", "succeeded", &old).await;
-        insert_script_run(&pool, "pending-script", "script-1", "failed", &old).await;
-        insert_script_run(&pool, "active-script", "script-1", "running", &old).await;
-        insert_script_run(&pool, "recent-script", "script-1", "succeeded", &recent).await;
         insert_task_definition(&pool, "task-1", &old).await;
         insert_task_run(&pool, "old-task-run", "task-1", "succeeded", &old).await;
         insert_task_run(&pool, "pending-task-run", "task-1", "failed", &old).await;
-        sqlx::query(
-            "INSERT INTO script_run_output_chunks \
-             (run_id,sequence,stream,content,size_bytes) VALUES ('old-script',0,'stdout','x',1)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
         sqlx::query(
             "INSERT INTO task_run_outputs (run_id,content,size_bytes,truncated,updated_at) \
              VALUES ('old-task-run','x',1,0,?1),('pending-task-run','x',1,0,?1)",
@@ -474,14 +431,6 @@ mod tests {
         sqlx::query(
             "INSERT INTO task_run_outbox \
              (run_id,payload,created_at,updated_at) VALUES ('pending-task-run','{}',?1,?1)",
-        )
-        .bind(&old)
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO script_run_outbox \
-             (run_id,payload,created_at,updated_at) VALUES ('pending-script','{}',?1,?1)",
         )
         .bind(&old)
         .execute(&pool)
@@ -508,22 +457,6 @@ mod tests {
 
         run_at(&pool, now).await.unwrap();
 
-        let script_ids =
-            sqlx::query_scalar::<_, String>("SELECT run_id FROM script_runs ORDER BY run_id")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
-        assert_eq!(
-            script_ids,
-            vec!["active-script", "pending-script", "recent-script"]
-        );
-        let old_chunks: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM script_run_output_chunks WHERE run_id='old-script'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(old_chunks, 0);
         let file_ids =
             sqlx::query_scalar::<_, String>("SELECT id FROM file_operation_tasks ORDER BY id")
                 .fetch_all(&pool)
@@ -549,20 +482,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keeps_only_one_hundred_terminal_runs_per_definition() {
+    async fn keeps_only_one_hundred_scheduled_task_runs_per_definition() {
         let pool = setup_test_db().await;
         let now = Utc::now();
         let recent = (now - Duration::days(1)).to_rfc3339();
-        for sequence in 0..101 {
-            insert_script_run(
-                &pool,
-                &format!("run-{sequence:03}"),
-                "script-limit",
-                "succeeded",
-                &recent,
-            )
-            .await;
-        }
         insert_task_definition(&pool, "task-limit", &recent).await;
         for sequence in 0..101 {
             insert_task_run(
@@ -577,12 +500,6 @@ mod tests {
 
         run_at(&pool, now).await.unwrap();
 
-        let remaining: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM script_runs WHERE script_id='script-limit'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(remaining, 100);
         let remaining: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM task_runs WHERE task_id='task-limit'")
                 .fetch_one(&pool)
@@ -823,37 +740,6 @@ mod tests {
             .into_iter()
             .map(|row| row.get("detail"))
             .collect()
-    }
-
-    /// 插入最小脚本运行夹具。
-    async fn insert_script_run(
-        pool: &DbPool,
-        run_id: &str,
-        script_id: &str,
-        status: &str,
-        timestamp: &str,
-    ) {
-        sqlx::query(
-            "INSERT INTO script_runs \
-             (run_id,script_id,script_name,script_revision,source_sha256,source_content,timeout_seconds,status,queued_at,finished_at,created_at,updated_at) \
-             VALUES (?1,?2,'script',1,?3,'echo test',60,?4,?5,?6,?5,?5)",
-        )
-        .bind(run_id)
-        .bind(script_id)
-        .bind("0".repeat(64))
-        .bind(status)
-        .bind(timestamp)
-        .bind(if matches!(
-            status,
-            "succeeded" | "failed" | "timed_out" | "cancelled"
-        ) {
-            Some(timestamp)
-        } else {
-            None
-        })
-        .execute(pool)
-        .await
-        .unwrap();
     }
 
     /// 插入最小计划任务定义夹具。

@@ -3,4 +3,4 @@
 /**
  * 创建脚本请求。
  */
-export type CreateScriptRequest = { name: string, description?: string, content: string, timeoutSeconds?: number, };
+export type CreateScriptRequest = { name: string, description?: string, interactive: boolean, content: string, timeoutSeconds?: number, };

@@ -1,4 +1,4 @@
-//! Agent 脚本运行仓储：幂等启动、防重入、取消、有界输出和可靠上报箱。
+//! Agent 脚本运行仓储：幂等终端会话、防重入、取消和可靠上报箱。
 
 use crate::{
     state::DbPool,
@@ -7,10 +7,7 @@ use crate::{
 use chrono::Utc;
 use seclab_contracts::{
     api::ErrorCode,
-    scripts::{
-        AgentScriptRunReport, AgentStartScriptRunRequest, ScriptOutputStream, ScriptRunOutputChunk,
-        ScriptRunStatus,
-    },
+    scripts::{AgentScriptRunReport, AgentStartScriptRunRequest, ScriptRunStatus},
 };
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, Row};
@@ -33,9 +30,8 @@ pub struct ScriptRunRow {
     pub exit_code: Option<i32>,
     pub error_code: Option<String>,
     pub error_summary: Option<String>,
-    pub output_size_bytes: i64,
-    pub output_truncated: bool,
     pub cancel_requested: bool,
+    pub attached_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -115,18 +111,38 @@ pub async fn required(pool: &DbPool, run_id: &str) -> ApiResult<ScriptRunRow> {
         .ok_or_else(|| ApiError::not_found(ErrorCode::ScriptRunNotFound, "script run not found"))
 }
 
-/// 标记运行正在创建进程并写入可靠上报箱。
-pub async fn mark_starting(pool: &DbPool, run_id: &str) -> ApiResult<()> {
-    sqlx::query("UPDATE script_runs SET status='starting',phase='starting',updated_at=? WHERE run_id=? AND status='queued'")
+/// 将运行置为等待 WebSocket 绑定。
+pub async fn mark_awaiting_connection(pool: &DbPool, run_id: &str) -> ApiResult<()> {
+    sqlx::query("UPDATE script_runs SET status='starting',phase='awaiting_connection',updated_at=? WHERE run_id=? AND status='queued'")
         .bind(now()).bind(run_id).execute(pool).await?;
     enqueue_report(pool, run_id).await
 }
 
-/// 标记运行已开始。
-pub async fn mark_running(pool: &DbPool, run_id: &str) -> ApiResult<()> {
+/// 原子绑定终端运行，确保一个运行最多只有一个 WebSocket 会话。
+pub async fn attach_terminal(pool: &DbPool, run_id: &str) -> ApiResult<ScriptRunRow> {
     let timestamp = now();
-    sqlx::query("UPDATE script_runs SET status='running',phase='running',started_at=COALESCE(started_at,?),updated_at=? WHERE run_id=? AND status IN ('queued','starting')")
+    let result = sqlx::query("UPDATE script_runs SET attached_at=?,phase='awaiting_start',updated_at=? WHERE run_id=? AND status='starting' AND attached_at IS NULL")
         .bind(&timestamp).bind(&timestamp).bind(run_id).execute(pool).await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::conflict(
+            ErrorCode::ScriptRunConflict,
+            "script run terminal is already attached or no longer active",
+        ));
+    }
+    required(pool, run_id).await
+}
+
+/// 在创建进程前原子领取运行状态，取消中的运行不得启动。
+pub async fn claim_running(pool: &DbPool, run_id: &str) -> ApiResult<()> {
+    let timestamp = now();
+    let changed = sqlx::query("UPDATE script_runs SET status='running',phase='running',started_at=COALESCE(started_at,?),updated_at=? WHERE run_id=? AND status='starting' AND attached_at IS NOT NULL AND cancel_requested=0")
+        .bind(&timestamp).bind(&timestamp).bind(run_id).execute(pool).await?;
+    if changed.rows_affected() != 1 {
+        return Err(ApiError::conflict(
+            ErrorCode::ScriptRunConflict,
+            "script run was cancelled before the process started",
+        ));
+    }
     enqueue_report(pool, run_id).await
 }
 
@@ -138,6 +154,10 @@ pub async fn request_cancel(pool: &DbPool, run_id: &str) -> ApiResult<ScriptRunR
             ErrorCode::ScriptRunNotCancellable,
             "script run is not cancellable",
         ));
+    }
+    if row.attached_at.is_none() {
+        finish(pool, run_id, ScriptRunStatus::Cancelled, None, None, None).await?;
+        return required(pool, run_id).await;
     }
     sqlx::query("UPDATE script_runs SET cancel_requested=1,status='cancelling',phase='cancelling',updated_at=? WHERE run_id=?")
         .bind(now()).bind(run_id).execute(pool).await?;
@@ -155,8 +175,7 @@ pub async fn cancel_requested(pool: &DbPool, run_id: &str) -> ApiResult<bool> {
     )
 }
 
-/// 原子保存终态、输出和 outbox。
-#[allow(clippy::too_many_arguments)]
+/// 原子保存终态和 outbox。
 pub async fn finish(
     pool: &DbPool,
     run_id: &str,
@@ -164,9 +183,6 @@ pub async fn finish(
     exit_code: Option<i32>,
     error_code: Option<&str>,
     error_summary: Option<&str>,
-    chunks: &[ScriptRunOutputChunk],
-    size_bytes: u64,
-    truncated: bool,
 ) -> ApiResult<()> {
     if !status.is_terminal() {
         return Err(ApiError::internal(
@@ -175,18 +191,9 @@ pub async fn finish(
     }
     let timestamp = now();
     let mut tx = pool.begin().await?;
-    sqlx::query("UPDATE script_runs SET status=?,phase=NULL,finished_at=?,exit_code=?,error_code=?,error_summary=?,output_size_bytes=?,output_truncated=?,overlap_guard=NULL,updated_at=? WHERE run_id=?")
+    sqlx::query("UPDATE script_runs SET status=?,phase=NULL,finished_at=?,exit_code=?,error_code=?,error_summary=?,overlap_guard=NULL,updated_at=? WHERE run_id=?")
         .bind(status_text(status)).bind(&timestamp).bind(exit_code).bind(error_code).bind(error_summary)
-        .bind(size_bytes.min(262_144) as i64).bind(truncated).bind(&timestamp).bind(run_id).execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM script_run_output_chunks WHERE run_id=?")
-        .bind(run_id)
-        .execute(&mut *tx)
-        .await?;
-    for chunk in chunks {
-        sqlx::query("INSERT INTO script_run_output_chunks (run_id,sequence,stream,content,size_bytes) VALUES (?,?,?,?,?)")
-            .bind(run_id).bind(chunk.sequence as i64).bind(stream_text(chunk.stream)).bind(&chunk.content)
-            .bind(chunk.content.len() as i64).execute(&mut *tx).await?;
-    }
+        .bind(&timestamp).bind(run_id).execute(&mut *tx).await?;
     let report = build_report_tx(&mut tx, run_id).await?;
     sqlx::query("INSERT INTO script_run_outbox (run_id,payload,attempts,created_at,updated_at) VALUES (?,?,0,?,?) ON CONFLICT(run_id) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at")
         .bind(run_id).bind(serde_json::to_string(&report).map_err(|_|ApiError::internal("failed to encode script run report"))?)
@@ -206,9 +213,6 @@ pub async fn recover_interrupted(pool: &DbPool) -> ApiResult<()> {
             None,
             Some("SCRIPT_RUN_INTERRUPTED"),
             Some("script run was interrupted by agent restart"),
-            &[],
-            0,
-            false,
         )
         .await?;
     }
@@ -229,13 +233,19 @@ pub async fn pending_reports(pool: &DbPool, limit: u32) -> ApiResult<Vec<AgentSc
         .collect()
 }
 
-/// 确认上报并删除 outbox。
+/// 确认上报；终态执行同时删除本地运行和 outbox。
 pub async fn acknowledge(pool: &DbPool, run_ids: &[String]) -> ApiResult<()> {
     for id in run_ids {
+        let mut tx = pool.begin().await?;
         sqlx::query("DELETE FROM script_run_outbox WHERE run_id=?")
             .bind(id)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM script_runs WHERE run_id=? AND status IN ('succeeded','failed','timed_out','cancelled')")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
     }
     Ok(())
 }
@@ -264,17 +274,6 @@ async fn build_report_tx(
         .bind(run_id)
         .fetch_one(&mut **tx)
         .await?;
-    let output=sqlx::query("SELECT sequence,stream,content FROM script_run_output_chunks WHERE run_id=? ORDER BY sequence").bind(run_id).fetch_all(&mut **tx).await?;
-    let chunks = output
-        .into_iter()
-        .map(|r| {
-            Ok(ScriptRunOutputChunk {
-                sequence: r.try_get::<i64, _>("sequence")?.max(0) as u64,
-                stream: stream_from_text(r.try_get("stream")?)?,
-                content: r.try_get("content")?,
-            })
-        })
-        .collect::<ApiResult<Vec<_>>>()?;
     Ok(AgentScriptRunReport {
         run_id: row.run_id,
         script_id: row.script_id,
@@ -287,9 +286,6 @@ async fn build_report_tx(
         exit_code: row.exit_code,
         error_code: row.error_code,
         error_summary: row.error_summary,
-        output_size_bytes: row.output_size_bytes.max(0) as u64,
-        output_truncated: row.output_truncated,
-        output_chunks: chunks,
     })
 }
 
@@ -316,19 +312,6 @@ fn status_from_text(v: &str) -> ApiResult<ScriptRunStatus> {
         "timed_out" => Ok(ScriptRunStatus::TimedOut),
         "cancelled" => Ok(ScriptRunStatus::Cancelled),
         _ => Err(ApiError::internal("invalid script run status")),
-    }
-}
-fn stream_text(v: ScriptOutputStream) -> &'static str {
-    match v {
-        ScriptOutputStream::Stdout => "stdout",
-        ScriptOutputStream::Stderr => "stderr",
-    }
-}
-fn stream_from_text(v: &str) -> ApiResult<ScriptOutputStream> {
-    match v {
-        "stdout" => Ok(ScriptOutputStream::Stdout),
-        "stderr" => Ok(ScriptOutputStream::Stderr),
-        _ => Err(ApiError::internal("invalid script output stream")),
     }
 }
 fn is_unique(e: &sqlx::Error) -> bool {
@@ -368,17 +351,13 @@ mod tests {
             Some(0),
             None,
             None,
-            &[ScriptRunOutputChunk {
-                sequence: 0,
-                stream: ScriptOutputStream::Stdout,
-                content: "ok".into(),
-            }],
-            2,
-            false,
         )
         .await
         .unwrap();
         assert_eq!(pending_reports(&pool, 10).await.unwrap().len(), 1);
+        acknowledge(&pool, &["run-1".into()]).await.unwrap();
+        assert!(get(&pool, "run-1").await.unwrap().is_none());
+        assert!(pending_reports(&pool, 10).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -391,5 +370,60 @@ mod tests {
             create(&pool, &changed).await.unwrap_err().code,
             ErrorCode::ScriptRunConflict
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_run_attaches_once_and_never_persists_transcript() {
+        let pool = crate::test_support::setup_test_db().await;
+        let request = req("terminal-run");
+        create(&pool, &request).await.unwrap();
+        mark_awaiting_connection(&pool, &request.run_id)
+            .await
+            .unwrap();
+        assert!(attach_terminal(&pool, &request.run_id).await.is_ok());
+        assert!(attach_terminal(&pool, &request.run_id).await.is_err());
+        claim_running(&pool, &request.run_id).await.unwrap();
+        finish(
+            &pool,
+            &request.run_id,
+            ScriptRunStatus::Succeeded,
+            Some(0),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let report = pending_reports(&pool, 10).await.unwrap().pop().unwrap();
+        assert_eq!(report.run_id, request.run_id);
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_unattached_terminal_immediately_finishes_it() {
+        let pool = crate::test_support::setup_test_db().await;
+        let request = req("unattached-run");
+        create(&pool, &request).await.unwrap();
+        mark_awaiting_connection(&pool, &request.run_id)
+            .await
+            .unwrap();
+
+        let cancelled = request_cancel(&pool, &request.run_id).await.unwrap();
+
+        assert_eq!(cancelled.status, "cancelled");
+        let report = pending_reports(&pool, 10).await.unwrap().pop().unwrap();
+        assert_eq!(report.status, ScriptRunStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn cancelled_attached_terminal_cannot_claim_process_start() {
+        let pool = crate::test_support::setup_test_db().await;
+        let request = req("cancelled-before-start");
+        create(&pool, &request).await.unwrap();
+        mark_awaiting_connection(&pool, &request.run_id)
+            .await
+            .unwrap();
+        attach_terminal(&pool, &request.run_id).await.unwrap();
+        request_cancel(&pool, &request.run_id).await.unwrap();
+
+        assert!(claim_running(&pool, &request.run_id).await.is_err());
     }
 }

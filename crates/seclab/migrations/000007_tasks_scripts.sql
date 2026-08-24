@@ -92,6 +92,7 @@ CREATE TABLE scripts (
     name TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 80),
     name_key TEXT NOT NULL,
     description TEXT CHECK(description IS NULL OR length(description) <= 500),
+    interactive INTEGER NOT NULL CHECK(interactive IN (0, 1)),
     language TEXT NOT NULL DEFAULT 'shell' CHECK(language = 'shell'),
     content TEXT NOT NULL CHECK(length(CAST(content AS BLOB)) BETWEEN 1 AND 262144),
     content_size_bytes INTEGER NOT NULL CHECK(content_size_bytes BETWEEN 1 AND 262144),
@@ -106,15 +107,13 @@ CREATE TABLE scripts (
     created_by_name TEXT NOT NULL,
     updated_by_user_id INTEGER NOT NULL,
     updated_by_name TEXT NOT NULL,
-    deleted_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
 
-CREATE UNIQUE INDEX idx_scripts_active_name
-    ON scripts(name_key) WHERE deleted_at IS NULL;
+CREATE UNIQUE INDEX idx_scripts_name_key ON scripts(name_key);
 CREATE INDEX idx_scripts_public_list
-    ON scripts(ownership_kind, deleted_at, updated_at DESC, script_id);
+    ON scripts(ownership_kind, updated_at DESC, script_id);
 
 -- 脚本运行：保存 Master 接受的幂等请求、确定脚本快照、节点和可信用户上下文。
 CREATE TABLE script_runs (
@@ -136,36 +135,22 @@ CREATE TABLE script_runs (
     exit_code INTEGER,
     error_code TEXT,
     error_summary TEXT,
-    output_size_bytes INTEGER NOT NULL DEFAULT 0 CHECK(output_size_bytes BETWEEN 0 AND 262144),
-    output_truncated INTEGER NOT NULL DEFAULT 0 CHECK(output_truncated IN (0, 1)),
     overlap_guard TEXT,
     actor_user_id INTEGER NOT NULL,
     actor_name TEXT NOT NULL,
     client_ip TEXT NOT NULL,
     trace_id TEXT NOT NULL,
     terminal_logged_at TEXT,
+    discard_requested INTEGER NOT NULL DEFAULT 0 CHECK(discard_requested IN (0, 1)),
+    connection_deadline TEXT,
+    attached_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    FOREIGN KEY(script_id) REFERENCES scripts(script_id)
+    FOREIGN KEY(script_id) REFERENCES scripts(script_id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_script_runs_history
-    ON script_runs(queued_at DESC, run_id DESC);
-CREATE INDEX idx_script_runs_script
-    ON script_runs(script_id, queued_at DESC, run_id DESC);
 CREATE INDEX idx_script_runs_active
     ON script_runs(status, updated_at) WHERE status IN ('queued', 'starting', 'running', 'cancelling');
 CREATE UNIQUE INDEX idx_script_runs_overlap_guard
     ON script_runs(overlap_guard)
     WHERE overlap_guard IS NOT NULL AND status IN ('queued', 'starting', 'running', 'cancelling');
-
--- 脚本运行输出：按到达顺序保存 stdout/stderr 有界文本块。
-CREATE TABLE script_run_output_chunks (
-    run_id TEXT NOT NULL,
-    sequence INTEGER NOT NULL CHECK(sequence >= 0),
-    stream TEXT NOT NULL CHECK(stream IN ('stdout', 'stderr')),
-    content TEXT NOT NULL,
-    size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
-    PRIMARY KEY(run_id, sequence),
-    FOREIGN KEY(run_id) REFERENCES script_runs(run_id) ON DELETE CASCADE
-);

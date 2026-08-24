@@ -15,9 +15,8 @@ CREATE TABLE script_runs (
     exit_code INTEGER,
     error_code TEXT,
     error_summary TEXT,
-    output_size_bytes INTEGER NOT NULL DEFAULT 0 CHECK(output_size_bytes BETWEEN 0 AND 262144),
-    output_truncated INTEGER NOT NULL DEFAULT 0 CHECK(output_truncated IN (0, 1)),
     cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK(cancel_requested IN (0, 1)),
+    attached_at TEXT,
     overlap_guard TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -29,17 +28,6 @@ CREATE UNIQUE INDEX idx_agent_script_runs_overlap_guard
 CREATE INDEX idx_agent_script_runs_active
     ON script_runs(status, updated_at)
     WHERE status IN ('queued', 'starting', 'running', 'cancelling');
-
--- 脚本运行输出：按 Agent 实际读取顺序保存 stdout/stderr 有界文本块。
-CREATE TABLE script_run_output_chunks (
-    run_id TEXT NOT NULL,
-    sequence INTEGER NOT NULL CHECK(sequence >= 0),
-    stream TEXT NOT NULL CHECK(stream IN ('stdout', 'stderr')),
-    content TEXT NOT NULL,
-    size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
-    PRIMARY KEY(run_id, sequence),
-    FOREIGN KEY(run_id) REFERENCES script_runs(run_id) ON DELETE CASCADE
-);
 
 -- 脚本运行上报箱：在 Master 确认前可靠保留最新运行事实。
 CREATE TABLE script_run_outbox (

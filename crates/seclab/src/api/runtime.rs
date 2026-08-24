@@ -1007,35 +1007,38 @@ pub async fn report_script_runs(
         crate::models::scripts::save_report(&state.metadata_db, &payload.agent_id, report).await?;
         if let Some(run) =
             crate::models::scripts::claim_terminal_audit(&state.metadata_db, &report.run_id).await?
-            && let Ok(client_ip) = run.client_ip.parse()
         {
-            let failed = matches!(run.status.as_str(), "failed" | "timed_out");
-            OperationEventBuilder::new(&run.actor_name, "script_run_completed", client_ip)
-                .user_id(run.actor_user_id)
-                .module(LogModule::System)
-                .target_type("script")
-                .target_id(&run.script_id)
-                .trace_id(&run.trace_id)
-                .outcome(match run.status.as_str() {
-                    "failed" => seclab_contracts::logging::OperationOutcome::Failure,
-                    "timed_out" => seclab_contracts::logging::OperationOutcome::TimedOut,
-                    "cancelled" => seclab_contracts::logging::OperationOutcome::Canceled,
-                    _ => seclab_contracts::logging::OperationOutcome::Success,
-                })
-                .level(if failed {
-                    PlatformLogLevel::Error
-                } else {
-                    PlatformLogLevel::Warning
-                })
-                .metadata(json!({
-                    "runId": run.run_id,
-                    "scriptName": run.script_name,
-                    "revision": run.script_revision,
-                    "nodeId": run.node_id,
-                    "result": run.status,
-                    "errorCode": run.error_code,
-                }))
-                .finish(&state.metadata_db);
+            if let Ok(client_ip) = run.client_ip.parse() {
+                let failed = matches!(run.status.as_str(), "failed" | "timed_out");
+                OperationEventBuilder::new(&run.actor_name, "script_run_completed", client_ip)
+                    .user_id(run.actor_user_id)
+                    .module(LogModule::System)
+                    .target_type("script")
+                    .target_id(&run.script_id)
+                    .trace_id(&run.trace_id)
+                    .outcome(match run.status.as_str() {
+                        "failed" => seclab_contracts::logging::OperationOutcome::Failure,
+                        "timed_out" => seclab_contracts::logging::OperationOutcome::TimedOut,
+                        "cancelled" => seclab_contracts::logging::OperationOutcome::Canceled,
+                        _ => seclab_contracts::logging::OperationOutcome::Success,
+                    })
+                    .level(if failed {
+                        PlatformLogLevel::Error
+                    } else {
+                        PlatformLogLevel::Warning
+                    })
+                    .metadata(json!({
+                        "runId": run.run_id,
+                        "scriptName": run.script_name,
+                        "revision": run.script_revision,
+                        "nodeId": run.node_id,
+                        "result": run.status,
+                        "errorCode": run.error_code,
+                    }))
+                    .finish(&state.metadata_db);
+            }
+            crate::models::scripts::cleanup_discarded_run(&state.metadata_db, &report.run_id)
+                .await?;
         }
     }
 

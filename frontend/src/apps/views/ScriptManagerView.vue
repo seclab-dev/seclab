@@ -1,24 +1,26 @@
 <script setup lang="ts">
 /**
  * @file ScriptManagerView.vue
- * @description 全局自定义 Shell 脚本资产、修订与异步运行界面。
+ * @description 自定义 Shell 脚本资产管理与单次临时执行界面。
  */
 
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import type { ScriptDetail, ScriptRun, ScriptSummary } from '@/api/modules/scripts'
+import type { ScriptDetail, ScriptSummary } from '@/api/modules/scripts'
+import type { ScriptRunTerminalServerMessage } from '@/api/generated/scripts'
 import { useScriptLibrary } from '@/composables/useScriptLibrary'
 import { useConfirmationModalStore } from '@/stores/confirmation-modal'
 import { useToastStore } from '@/stores/toast'
 import { useWindowManagerStore } from '@/stores/window-manager'
 import MonacoEditor from '@/components/editor/MonacoEditor.vue'
+import ScriptRunTerminal from './scripts/ScriptRunTerminal.vue'
 import SecLabIcon from '@/components/icons/SecLabIcon.vue'
 import {
   SecLabActionMenu,
   SecLabAlert,
   SecLabButton,
+  SecLabCheckbox,
   SecLabDialog,
-  SecLabDrawer,
   SecLabEmpty,
   SecLabFormItem,
   SecLabInput,
@@ -27,6 +29,7 @@ import {
   SecLabSelect,
   SecLabTable,
   SecLabTag,
+  SecLabTooltip,
 } from '@/components/ui'
 import type { SecLabTableColumn } from '@/components/ui/SecLabTable.vue'
 
@@ -37,31 +40,44 @@ const confirmation = useConfirmationModalStore()
 const notifications = useToastStore()
 const windowStore = useWindowManagerStore()
 
-type EditorMode = 'view' | 'create' | 'edit' | 'clone'
+type EditorMode = 'create' | 'edit' | 'clone'
 interface ScriptMenuAction {
   label: string
   icon: string
   className?: string
+  disabled?: boolean
+  tooltip?: string
   handler: () => void
 }
 
-const selectedId = ref('')
-const mode = ref<EditorMode>('view')
+const editorMode = ref<EditorMode>('create')
+const editingScriptId = ref('')
+const formDialogVisible = ref(false)
+const readonlyDialogVisible = ref(false)
+const readonlyDetail = ref<ScriptDetail | null>(null)
 const baseline = ref('')
-const form = ref({ name: '', description: '', content: '', timeoutSeconds: 300 })
+const form = ref({
+  name: '',
+  description: '',
+  interactive: false,
+  content: '',
+  timeoutSeconds: 300,
+})
 const runDialogVisible = ref(false)
+const runScript = ref<ScriptDetail | null>(null)
 const runNodeId = ref('')
 const runTimeoutSeconds = ref(300)
-const runsVisible = ref(false)
-const outputVisible = ref(false)
-const selectedRun = ref<ScriptRun | null>(null)
+const runTerminal = ref<InstanceType<typeof ScriptRunTerminal> | null>(null)
+const remainingSeconds = ref<number | null>(null)
+let countdownTimer: number | null = null
+const stopCountdown = () => {
+  if (countdownTimer !== null) window.clearInterval(countdownTimer)
+  countdownTimer = null
+  remainingSeconds.value = null
+}
 
-const selectedSummary = computed(
-  () => library.scripts.value.find((script) => script.scriptId === selectedId.value) ?? null,
-)
-const isEditing = computed(() => mode.value !== 'view')
 const formSnapshot = computed(() => JSON.stringify(form.value))
-const isDirty = computed(() => isEditing.value && formSnapshot.value !== baseline.value)
+const isDirty = computed(() => formDialogVisible.value && formSnapshot.value !== baseline.value)
 const totalPages = computed(() =>
   Math.max(1, Math.ceil(library.total.value / library.filters.pageSize)),
 )
@@ -73,44 +89,65 @@ const onlineNodeOptions = computed(() =>
       label: node.nodeId === 'local' ? t('app.nodes.master') : node.name || node.nodeId,
     })),
 )
-const currentTrackedRun = computed(() =>
-  selectedRun.value
-    ? (library.trackedRuns.value[selectedRun.value.runId] ?? selectedRun.value)
-    : null,
-)
-const outputText = computed(() =>
-  (library.output.value?.items ?? [])
-    .map((chunk) => `[${chunk.stream}]\n${chunk.content}`)
-    .join('\n'),
-)
+const formTitle = computed(() => {
+  if (editorMode.value === 'create') return t('app.scriptManager.dialog.createTitle')
+  if (editorMode.value === 'clone') return t('app.scriptManager.dialog.cloneTitle')
+  return t('app.scriptManager.dialog.editTitle')
+})
 
-const runColumns = computed<SecLabTableColumn[]>(() => [
-  { prop: 'scriptName', label: t('app.scriptManager.runs.script'), minWidth: 150 },
-  { prop: 'nodeName', label: t('app.scriptManager.runs.node'), minWidth: 120 },
-  { prop: 'status', label: t('app.scriptManager.runs.status'), width: 130, slot: 'status' },
+const columns = computed<SecLabTableColumn[]>(() => [
   {
-    prop: 'queuedAt',
-    label: t('app.scriptManager.runs.queuedAt'),
-    minWidth: 170,
-    slot: 'queuedAt',
+    prop: 'name',
+    label: t('app.scriptManager.fields.name'),
+    minWidth: 180,
+    slot: 'name',
+    align: 'center',
   },
-  { prop: 'actions', label: t('common.actions'), width: 170, align: 'right', slot: 'actions' },
+  {
+    prop: 'interactive',
+    label: t('app.scriptManager.fields.interactive'),
+    width: 110,
+    align: 'center',
+    slot: 'interactive',
+  },
+  {
+    prop: 'description',
+    label: t('app.scriptManager.fields.description'),
+    minWidth: 260,
+    slot: 'description',
+    align: 'center',
+  },
+  {
+    prop: 'updatedAt',
+    label: t('app.scriptManager.fields.time'),
+    width: 190,
+    slot: 'time',
+    align: 'center',
+  },
+  {
+    label: t('common.actions'),
+    width: 130,
+    fixed: 'right',
+    align: 'center',
+    slot: 'actions',
+  },
 ])
 
-const formatTime = (value?: string) => (value ? new Date(value).toLocaleString() : '')
+const formatTime = (value?: string) => (value ? new Date(value).toLocaleString() : '-')
 const statusLabel = (status: string) => t(`app.scriptManager.status.${status}`)
 const statusTag = (status: string) => {
   if (status === 'succeeded') return 'success'
   if (status === 'failed' || status === 'timedOut') return 'danger'
-  if (status === 'cancelled') return 'warning'
+  if (status === 'cancelled' || status === 'cancelling') return 'warning'
   return 'info'
 }
 
-/** 用详情填充编辑表单并记录脏状态基线。 */
-const fillForm = (detail: ScriptDetail) => {
+/** 将脚本详情复制到表单，避免编辑过程污染只读数据。 */
+const fillForm = (detail: ScriptDetail, name = detail.name) => {
   form.value = {
-    name: detail.name,
+    name,
     description: detail.description ?? '',
+    interactive: detail.interactive,
     content: detail.source.content,
     timeoutSeconds: detail.executionDefaults.timeoutSeconds,
   }
@@ -127,59 +164,61 @@ const confirmDiscard = async () => {
   )
 }
 
-/** 选择摘要后按需加载正文，未保存内容必须先明确放弃。 */
-const selectScript = async (script: ScriptSummary) => {
-  if (script.scriptId === selectedId.value && mode.value === 'view') return
-  if (!(await confirmDiscard())) return
-  selectedId.value = script.scriptId
-  mode.value = 'view'
+const loadScriptDetail = async (script: ScriptSummary) => {
   const detail = await library.loadDetail(script.scriptId)
-  if (detail) fillForm(detail)
+  if (!detail) {
+    notifications.error(
+      library.detailState.value.error || t('app.scriptManager.messages.loadDetailFailed'),
+    )
+  }
+  return detail
 }
 
-const startCreate = async () => {
-  if (!(await confirmDiscard())) return
-  selectedId.value = ''
-  mode.value = 'create'
+const openReadonly = async (script: ScriptSummary) => {
+  const detail = await loadScriptDetail(script)
+  if (!detail) return
+  readonlyDetail.value = detail
+  readonlyDialogVisible.value = true
+}
+
+const startCreate = () => {
+  editorMode.value = 'create'
+  editingScriptId.value = ''
   form.value = {
     name: '',
     description: '',
+    interactive: false,
     content: '#!/bin/bash\n\nset -euo pipefail\n',
     timeoutSeconds: 300,
   }
   baseline.value = JSON.stringify(form.value)
+  formDialogVisible.value = true
 }
 
-const startEdit = () => {
-  if (!library.detail.value?.capabilities.canUpdate) return
-  fillForm(library.detail.value)
-  mode.value = 'edit'
+const startEdit = async (script: ScriptSummary) => {
+  if (!script.capabilities.canUpdate) return
+  const detail = await loadScriptDetail(script)
+  if (!detail) return
+  editorMode.value = 'edit'
+  editingScriptId.value = detail.scriptId
+  fillForm(detail)
+  formDialogVisible.value = true
 }
 
-const startClone = async () => {
-  const detail = library.detail.value
-  if (!detail?.capabilities.canClone || !(await confirmDiscard())) return
-  selectedId.value = ''
-  mode.value = 'clone'
-  form.value = {
-    name: t('app.scriptManager.cloneName', { name: detail.name }),
-    description: detail.description ?? '',
-    content: detail.source.content,
-    timeoutSeconds: detail.executionDefaults.timeoutSeconds,
-  }
-  baseline.value = JSON.stringify(form.value)
+const startClone = async (script: ScriptSummary) => {
+  if (!script.capabilities.canClone) return
+  const detail = await loadScriptDetail(script)
+  if (!detail) return
+  editorMode.value = 'clone'
+  editingScriptId.value = ''
+  fillForm(detail, t('app.scriptManager.cloneName', { name: detail.name }))
+  formDialogVisible.value = true
 }
 
-const cancelEdit = async () => {
+const closeForm = async () => {
   if (!(await confirmDiscard())) return
-  mode.value = 'view'
-  const detail = library.detail.value
-  if (detail) {
-    selectedId.value = detail.scriptId
-    fillForm(detail)
-  } else if (library.scripts.value[0]) {
-    await selectScript(library.scripts.value[0])
-  }
+  formDialogVisible.value = false
+  editingScriptId.value = ''
 }
 
 const save = async () => {
@@ -188,25 +227,23 @@ const save = async () => {
   if (!form.value.content.trim())
     return notifications.warning(t('app.scriptManager.messages.contentRequired'))
   try {
+    const payload = {
+      name: form.value.name,
+      description: form.value.description || undefined,
+      interactive: form.value.interactive,
+      content: form.value.content,
+      timeoutSeconds: Number(form.value.timeoutSeconds),
+    }
     const detail =
-      mode.value === 'edit' && library.detail.value
-        ? await library.updateScript(library.detail.value.scriptId, {
-            expectedRevision: library.detail.value.revision,
-            name: form.value.name,
-            description: form.value.description || undefined,
-            content: form.value.content,
-            timeoutSeconds: Number(form.value.timeoutSeconds),
+      editorMode.value === 'edit' && editingScriptId.value
+        ? await library.updateScript(editingScriptId.value, {
+            expectedRevision: library.detail.value?.revision ?? 0,
+            ...payload,
           })
-        : await library.createScript({
-            name: form.value.name,
-            description: form.value.description || undefined,
-            content: form.value.content,
-            timeoutSeconds: Number(form.value.timeoutSeconds),
-          })
-    selectedId.value = detail.scriptId
+        : await library.createScript(payload)
+    baseline.value = JSON.stringify(form.value)
+    formDialogVisible.value = false
     library.detail.value = detail
-    fillForm(detail)
-    mode.value = 'view'
     notifications.success(t('app.scriptManager.messages.saved'))
   } catch (error) {
     notifications.error(
@@ -215,9 +252,8 @@ const save = async () => {
   }
 }
 
-const remove = async () => {
-  const script = selectedSummary.value
-  if (!script?.capabilities.canRemove) return
+const remove = async (script: ScriptSummary) => {
+  if (!script.capabilities.canRemove) return
   const confirmed = await confirmation.showConfirmation(
     t('app.scriptManager.delete.message', { name: script.name }),
     t('app.scriptManager.delete.title'),
@@ -227,8 +263,6 @@ const remove = async () => {
   if (!confirmed) return
   try {
     await library.removeScript(script.scriptId)
-    selectedId.value = ''
-    mode.value = 'view'
     notifications.success(t('app.scriptManager.messages.removed'))
   } catch (error) {
     notifications.error(
@@ -237,26 +271,25 @@ const remove = async () => {
   }
 }
 
-const openRun = () => {
-  const detail = library.detail.value
-  if (!detail?.capabilities.canRun) return
+const openRun = async (script: ScriptSummary) => {
+  if (!script.capabilities.canRun) return
+  const detail = await loadScriptDetail(script)
+  if (!detail) return
+  runScript.value = detail
   runNodeId.value = onlineNodeOptions.value[0]?.value ?? ''
   runTimeoutSeconds.value = detail.executionDefaults.timeoutSeconds
+  stopCountdown()
   runDialogVisible.value = true
 }
 
 const submitRun = async () => {
-  const detail = library.detail.value
-  if (!detail || !runNodeId.value) return
+  if (!runScript.value || !runNodeId.value) return
   try {
-    const run = await library.startRun(
-      detail.scriptId,
+    await library.startRun(
+      runScript.value.scriptId,
       runNodeId.value,
       Number(runTimeoutSeconds.value),
     )
-    runDialogVisible.value = false
-    selectedRun.value = run
-    notifications.success(t('app.scriptManager.messages.runAccepted'))
   } catch (error) {
     notifications.error(
       error instanceof Error ? error.message : t('app.scriptManager.messages.runFailed'),
@@ -264,71 +297,102 @@ const submitRun = async () => {
   }
 }
 
-const openRuns = async () => {
-  runsVisible.value = true
-  await library.loadRuns()
-}
-const openOutput = async (run: ScriptRun) => {
-  selectedRun.value = run
-  outputVisible.value = true
-  await library.loadOutput(run.runId)
-}
-const cancelRun = async (run: ScriptRun) => {
+const closeRun = async () => {
+  const run = library.currentRun.value
+  if (
+    (!run && runScript.value && library.isActionPending(`run:${runScript.value.scriptId}`)) ||
+    (run && library.isActionPending(`dismiss:${run.runId}`))
+  )
+    return
+  if (run && library.isRunActive.value) {
+    const confirmed = await confirmation.showConfirmation(
+      t('app.scriptManager.runDialog.closeMessage'),
+      t('app.scriptManager.runDialog.closeTitle'),
+      t('app.scriptManager.runDialog.cancelAndClose'),
+      t('common.cancel'),
+    )
+    if (!confirmed) return
+  }
   try {
-    selectedRun.value = await library.cancelRun(run.runId)
-    notifications.success(t('app.scriptManager.messages.cancelAccepted'))
+    runTerminal.value?.close()
+    stopCountdown()
+    if (run) await library.dismissRun()
+    runDialogVisible.value = false
+    runScript.value = null
   } catch (error) {
     notifications.error(
-      error instanceof Error ? error.message : t('app.scriptManager.messages.cancelFailed'),
+      error instanceof Error ? error.message : t('app.scriptManager.messages.dismissFailed'),
     )
   }
 }
 
-const refresh = async () => {
-  if (!(await confirmDiscard())) return
-  await library.refreshScripts()
-  if (selectedId.value) {
-    const detail = await library.loadDetail(selectedId.value)
-    if (detail) fillForm(detail)
+/** 将控制事件映射到当前 Dialog 状态，不保存终端转录。 */
+const handleTerminalControl = (message: ScriptRunTerminalServerMessage) => {
+  const run = library.currentRun.value
+  if (!run) return
+  if (message.kind === 'started') {
+    run.status = 'running'
+    const seconds = message.payload.timeoutSeconds
+    remainingSeconds.value = seconds > 0 ? seconds : null
+    if (countdownTimer !== null) window.clearInterval(countdownTimer)
+    if (remainingSeconds.value !== null)
+      countdownTimer = window.setInterval(() => {
+        if (remainingSeconds.value !== null && remainingSeconds.value > 0)
+          remainingSeconds.value -= 1
+      }, 1000)
+  }
+  if (message.kind === 'exited') {
+    run.status = message.payload.status
+    run.exitCode = message.payload.exitCode ?? undefined
+    stopCountdown()
+  }
+  if (message.kind === 'error') {
+    stopCountdown()
+    run.status = 'failed'
+    run.errorSummary = message.payload.message || t('app.scriptManager.runDialog.disconnected')
   }
 }
 
-const rowActions = (script: ScriptSummary): ScriptMenuAction[] => {
-  const actions: ScriptMenuAction[] = [
-    {
-      label: t('app.scriptManager.actions.open'),
-      icon: 'info',
-      handler: () => void selectScript(script),
-    },
-  ]
-  if (script.capabilities.canRun)
-    actions.push({
-      label: t('app.scriptManager.actions.run'),
-      icon: 'play',
-      handler: () => void selectScript(script).then(openRun),
-    })
-  if (script.capabilities.canClone)
-    actions.push({
-      label: t('app.scriptManager.actions.clone'),
-      icon: 'copy',
-      handler: () => void selectScript(script).then(startClone),
-    })
-  if (script.capabilities.canRemove)
-    actions.push({
-      label: t('app.scriptManager.actions.remove'),
-      icon: 'trash',
-      className: 'danger',
-      handler: () => void selectScript(script).then(remove),
-    })
-  return actions
+const handleTerminalDisconnect = () => {
+  const run = library.currentRun.value
+  if (run && library.isRunActive.value) {
+    stopCountdown()
+    run.status = 'failed'
+    run.errorSummary = t('app.scriptManager.runDialog.disconnected')
+  }
 }
 
-watch(
-  () => library.scripts.value,
-  (scripts) => {
-    if (!selectedId.value && mode.value === 'view' && scripts[0]) void selectScript(scripts[0])
+const rowActions = (script: ScriptSummary): ScriptMenuAction[] => [
+  {
+    label: t('app.scriptManager.actions.run'),
+    icon: 'play',
+    disabled: !script.capabilities.canRun,
+    tooltip: !script.capabilities.canRun
+      ? t('app.scriptManager.messages.actionUnavailable')
+      : undefined,
+    handler: () => void openRun(script),
   },
-)
+  {
+    label: t('app.scriptManager.actions.clone'),
+    icon: 'copy',
+    disabled: !script.capabilities.canClone,
+    handler: () => void startClone(script),
+  },
+  {
+    label: t('app.scriptManager.actions.edit'),
+    icon: 'edit',
+    disabled: !script.capabilities.canUpdate,
+    handler: () => void startEdit(script),
+  },
+  {
+    label: t('common.delete'),
+    icon: 'trash',
+    className: 'danger',
+    disabled: !script.capabilities.canRemove,
+    handler: () => void remove(script),
+  },
+]
+
 watch(
   [isDirty, () => library.saveState.value.refreshing],
   ([dirty, saving]) => {
@@ -354,34 +418,35 @@ const beforeUnload = (event: BeforeUnloadEvent) => {
 }
 window.addEventListener('beforeunload', beforeUnload)
 onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
+onBeforeUnmount(() => {
+  stopCountdown()
+})
 </script>
 
 <template>
   <div class="script-library" data-page="script-library" data-seclab-app="script-library">
-    <div class="toolbar" data-ui="toolbar" data-slot="content">
-      <SecLabInput
-        id="script-library-search"
-        v-model="library.filters.keyword"
-        name="scriptLibrarySearch"
-        class="search-input"
-        :aria-label="t('app.scriptManager.search')"
-        :placeholder="t('app.scriptManager.searchPlaceholder')"
-      />
-      <div class="toolbar-actions">
-        <SecLabButton @click="openRuns">
-          <SecLabIcon name="history" :size="14" />
-          {{ t('app.scriptManager.actions.runs') }}
-        </SecLabButton>
-        <SecLabButton
-          :loading="library.listState.value.refreshing"
-          :disabled="library.listState.value.initialLoading"
-          @click="refresh"
+    <div class="toolbar" data-ui="toolbar">
+      <div class="search-field">
+        <SecLabInput
+          id="script-library-search"
+          v-model="library.filters.keyword"
+          name="scriptLibrarySearch"
+          class="search-input"
+          :aria-label="t('app.scriptManager.search')"
+          :placeholder="t('app.scriptManager.searchPlaceholder')"
+        />
+        <button
+          v-if="library.filters.keyword"
+          type="button"
+          class="search-clear"
+          :aria-label="t('app.scriptManager.clearSearch')"
+          @click="library.filters.keyword = ''"
         >
-          <SecLabIcon name="refresh" :size="14" />
-          {{ t('common.refresh') }}
-        </SecLabButton>
+          <SecLabIcon name="x" :size="14" />
+        </button>
+      </div>
+      <div class="toolbar-actions">
         <SecLabButton type="primary" @click="startCreate">
-          <SecLabIcon name="plus" :size="14" />
           {{ t('app.scriptManager.actions.create') }}
         </SecLabButton>
       </div>
@@ -396,107 +461,128 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
       show-icon
     />
     <SecLabAlert
-      v-if="library.activeRuns.value.length"
+      v-if="library.listState.value.error"
       data-ui="alert"
-      type="info"
-      :title="t('app.scriptManager.activeRuns', { count: library.activeRuns.value.length })"
+      type="error"
+      :title="t('app.scriptManager.messages.loadFailed')"
+      :description="library.listState.value.error"
       show-icon
     />
 
-    <div class="workspace" data-ui="workspace" data-slot="content">
-      <div class="script-list" data-ui="script-list">
-        <div class="list-scroll" role="listbox" :aria-label="t('app.scriptManager.listLabel')">
-          <div
-            v-for="script in library.scripts.value"
-            :key="script.scriptId"
-            class="script-row"
-            :class="{ selected: script.scriptId === selectedId }"
+    <div class="table-shell" data-slot="content">
+      <SecLabTable
+        data-ui="table"
+        :data="library.scripts.value"
+        :columns="columns"
+        row-key="scriptId"
+        border
+      >
+        <template #name="{ row }: { row: ScriptSummary }">
+          <button
+            type="button"
+            class="name-button"
+            :aria-label="t('app.scriptManager.actions.viewSource', { name: row.name })"
+            @click="openReadonly(row)"
           >
-            <button
-              type="button"
-              class="script-select"
-              role="option"
-              :aria-selected="script.scriptId === selectedId"
-              @click="selectScript(script)"
-            >
-              <span class="script-name">{{ script.name }}</span>
-              <span v-if="script.description" class="script-description">{{
-                script.description
-              }}</span>
-              <span class="script-meta">
-                {{ t('app.scriptManager.revision', { revision: script.revision }) }}
-                <SecLabTag v-if="script.lastRun" :type="statusTag(script.lastRun.status)">
-                  {{ statusLabel(script.lastRun.status) }}
-                </SecLabTag>
-              </span>
-            </button>
-            <SecLabActionMenu :label="t('common.actions')" :actions="rowActions(script)" />
-          </div>
+            {{ row.name }}
+          </button>
+        </template>
+        <template #interactive="{ row }: { row: ScriptSummary }">
+          <SecLabTag :type="row.interactive ? 'warning' : 'default'">
+            {{
+              row.interactive
+                ? t('app.scriptManager.interactive.yes')
+                : t('app.scriptManager.interactive.no')
+            }}
+          </SecLabTag>
+        </template>
+        <template #description="{ row }: { row: ScriptSummary }">
+          <SecLabTooltip v-if="row.description" :text="row.description" position="top" :delay="300">
+            <span class="description-text">{{ row.description }}</span>
+          </SecLabTooltip>
+          <span v-else class="muted-text">-</span>
+        </template>
+        <template #time="{ row }: { row: ScriptSummary }">
+          {{ formatTime(row.updatedAt) }}
+        </template>
+        <template #actions="{ row }: { row: ScriptSummary }">
+          <SecLabActionMenu :label="t('common.actions')" :actions="rowActions(row)" />
+        </template>
+        <template #empty>
           <SecLabEmpty
-            v-if="!library.listState.value.initialLoading && !library.scripts.value.length"
             :description="
               library.filters.keyword.trim()
                 ? t('app.scriptManager.empty.filtered')
                 : t('app.scriptManager.empty.library')
             "
           />
+        </template>
+      </SecLabTable>
+      <SecLabLoading :loading="library.listState.value.initialLoading" cover />
+    </div>
+
+    <SecLabPagination
+      v-if="library.total.value > library.filters.pageSize"
+      data-ui="pagination"
+      :current-page="library.filters.page"
+      :total-pages="totalPages"
+      @page-change="(page) => (library.filters.page = page)"
+    />
+
+    <SecLabDialog
+      :visible="readonlyDialogVisible"
+      data-ui="script-detail-dialog"
+      :title="readonlyDetail?.name ?? t('app.scriptManager.dialog.viewTitle')"
+      width="min(980px, 92vw)"
+      :close-on-click-overlay="false"
+      @close="readonlyDialogVisible = false"
+    >
+      <div v-if="readonlyDetail" class="detail-dialog" data-slot="body">
+        <div class="detail-meta">
+          <SecLabTag :type="readonlyDetail.interactive ? 'warning' : 'default'">
+            {{
+              readonlyDetail.interactive
+                ? t('app.scriptManager.interactive.script')
+                : t('app.scriptManager.interactive.nonInteractive')
+            }}
+          </SecLabTag>
+          <span>{{ formatTime(readonlyDetail.updatedAt) }}</span>
+          <span v-if="readonlyDetail.description">{{ readonlyDetail.description }}</span>
         </div>
-        <SecLabLoading :loading="library.listState.value.initialLoading" cover />
-        <SecLabPagination
-          v-if="library.total.value > library.filters.pageSize"
-          :current-page="library.filters.page"
-          :total-pages="totalPages"
-          @page-change="(page) => (library.filters.page = page)"
-        />
+        <div class="editor-shell readonly-editor">
+          <label id="script-readonly-source-label" class="editor-label">
+            {{ t('app.scriptManager.fields.source') }}
+          </label>
+          <MonacoEditor
+            id="script-library-readonly-source"
+            :model-value="readonlyDetail.source.content"
+            language="shell"
+            file-path="script.sh"
+            :document-key="`readonly:${readonlyDetail.scriptId}:${readonlyDetail.revision}`"
+            read-only
+            wheel-focus-on-click
+            :aria-labelledby="'script-readonly-source-label'"
+            :minimap="false"
+            :fixed-overflow-widgets="false"
+          />
+        </div>
       </div>
+      <template #footer>
+        <SecLabButton @click="readonlyDialogVisible = false">{{ t('common.close') }}</SecLabButton>
+      </template>
+    </SecLabDialog>
 
-      <div class="editor-pane" data-ui="editor" data-slot="detail">
-        <template v-if="isEditing || library.detail.value">
-          <div class="editor-toolbar">
-            <div class="editor-identity">
-              <strong>{{
-                isEditing
-                  ? form.name || t('app.scriptManager.untitled')
-                  : library.detail.value?.name
-              }}</strong>
-              <SecLabTag v-if="library.detail.value && !isEditing" type="info">
-                {{ t('app.scriptManager.revision', { revision: library.detail.value.revision }) }}
-              </SecLabTag>
-            </div>
-            <div class="editor-actions">
-              <template v-if="isEditing">
-                <SecLabButton @click="cancelEdit">{{ t('common.cancel') }}</SecLabButton>
-                <SecLabButton
-                  type="primary"
-                  :loading="library.isActionPending('save')"
-                  @click="save"
-                >
-                  {{ t('common.save') }}
-                </SecLabButton>
-              </template>
-              <template v-else-if="library.detail.value">
-                <SecLabButton v-if="library.detail.value.capabilities.canRun" @click="openRun">
-                  <SecLabIcon name="play" :size="14" />{{ t('app.scriptManager.actions.run') }}
-                </SecLabButton>
-                <SecLabButton v-if="library.detail.value.capabilities.canClone" @click="startClone">
-                  {{ t('app.scriptManager.actions.clone') }}
-                </SecLabButton>
-                <SecLabButton v-if="library.detail.value.capabilities.canUpdate" @click="startEdit">
-                  {{ t('common.edit') }}
-                </SecLabButton>
-                <SecLabButton
-                  v-if="library.detail.value.capabilities.canRemove"
-                  type="danger"
-                  :loading="library.isActionPending(`remove:${library.detail.value.scriptId}`)"
-                  @click="remove"
-                >
-                  {{ t('common.delete') }}
-                </SecLabButton>
-              </template>
-            </div>
-          </div>
-
-          <div v-if="isEditing" class="metadata-form" data-ui="form">
+    <SecLabDialog
+      :visible="formDialogVisible"
+      data-ui="script-form-dialog"
+      :title="formTitle"
+      width="min(980px, 92vw)"
+      :close-on-click-overlay="false"
+      @close="closeForm"
+    >
+      <div class="form-dialog" data-slot="body">
+        <div class="script-form-stack" data-ui="form">
+          <div data-slot="form-name">
             <SecLabFormItem
               :label="t('app.scriptManager.fields.name')"
               for="script-library-name"
@@ -509,22 +595,53 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
                 :maxlength="80"
               />
             </SecLabFormItem>
-            <SecLabFormItem
-              :label="t('app.scriptManager.fields.timeout')"
-              for="script-library-timeout"
-              required
-            >
+          </div>
+          <div class="form-options-row" data-slot="form-options">
+            <div class="interactive-inline-field">
+              <SecLabTooltip :text="t('app.scriptManager.interactive.hint')" position="top">
+                <SecLabCheckbox
+                  id="script-library-interactive"
+                  v-model="form.interactive"
+                  name="scriptInteractive"
+                >
+                  {{ t('app.scriptManager.interactive.checkbox') }}
+                </SecLabCheckbox>
+              </SecLabTooltip>
+            </div>
+            <div class="timeout-inline-field">
+              <label class="inline-field-label" for="script-library-timeout">
+                {{ t('app.scriptManager.fields.timeout') }}
+              </label>
               <SecLabInput
                 id="script-library-timeout"
                 v-model="form.timeoutSeconds"
+                class="timeout-input"
                 name="scriptTimeoutSeconds"
                 type="number"
                 :min="1"
                 :max="86400"
               />
-            </SecLabFormItem>
+            </div>
+          </div>
+          <div class="editor-shell form-editor" data-slot="form-source">
+            <label id="script-source-label" class="editor-label">
+              {{ t('app.scriptManager.fields.source') }}
+            </label>
+            <MonacoEditor
+              id="script-library-source"
+              v-model="form.content"
+              name="scriptSource"
+              language="shell"
+              file-path="script.sh"
+              :document-key="`form:${editorMode}:${editingScriptId || 'new'}`"
+              :aria-labelledby="'script-source-label'"
+              :minimap="false"
+              wheel-focus-on-click
+              @save="save"
+            />
+          </div>
+          <div data-slot="form-description">
             <SecLabFormItem
-              class="description-field"
               :label="t('app.scriptManager.fields.description')"
               for="script-library-description"
             >
@@ -538,153 +655,122 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
               />
             </SecLabFormItem>
           </div>
-          <div v-else-if="library.detail.value?.description" class="detail-description">
-            {{ library.detail.value.description }}
-          </div>
-
-          <div class="editor-shell">
-            <label id="script-source-label" for="script-library-source" class="editor-label">
-              {{ t('app.scriptManager.fields.source') }}
-            </label>
-            <MonacoEditor
-              id="script-library-source"
-              v-model="form.content"
-              name="scriptSource"
-              language="shell"
-              file-path="script.sh"
-              :document-key="selectedId || mode"
-              :read-only="!isEditing"
-              :aria-labelledby="'script-source-label'"
-              :minimap="false"
-              @save="save"
-            />
-          </div>
-        </template>
-        <SecLabEmpty
-          v-else-if="library.detailState.value.error"
-          :description="library.detailState.value.error"
-        />
-        <SecLabEmpty v-else :description="t('app.scriptManager.empty.selection')" />
-        <SecLabLoading :loading="library.detailState.value.initialLoading" cover />
-      </div>
-    </div>
-
-    <SecLabDialog
-      :visible="runDialogVisible"
-      data-ui="run-dialog"
-      :title="t('app.scriptManager.runDialog.title')"
-      width="480px"
-      @close="runDialogVisible = false"
-    >
-      <div class="dialog-form" data-slot="content">
-        <SecLabAlert type="warning" :title="t('app.scriptManager.runDialog.notice')" show-icon />
-        <SecLabFormItem :label="t('app.scriptManager.fields.node')" for="script-run-node" required>
-          <SecLabSelect
-            id="script-run-node"
-            v-model="runNodeId"
-            name="scriptRunNode"
-            :options="onlineNodeOptions"
-          />
-        </SecLabFormItem>
-        <SecLabFormItem
-          :label="t('app.scriptManager.fields.timeout')"
-          for="script-run-timeout"
-          required
-        >
-          <SecLabInput
-            id="script-run-timeout"
-            v-model="runTimeoutSeconds"
-            name="scriptRunTimeout"
-            type="number"
-            :min="1"
-            :max="86400"
-          />
-        </SecLabFormItem>
+        </div>
       </div>
       <template #footer>
-        <SecLabButton @click="runDialogVisible = false">{{ t('common.cancel') }}</SecLabButton>
-        <SecLabButton
-          type="primary"
-          :disabled="!runNodeId"
-          :loading="
-            library.detail.value
-              ? library.isActionPending(`run:${library.detail.value.scriptId}`)
-              : false
-          "
-          @click="submitRun"
-        >
-          {{ t('app.scriptManager.actions.run') }}
+        <SecLabButton @click="closeForm">{{ t('common.cancel') }}</SecLabButton>
+        <SecLabButton type="primary" :loading="library.isActionPending('save')" @click="save">
+          {{ t('common.save') }}
         </SecLabButton>
       </template>
     </SecLabDialog>
 
-    <SecLabDrawer
-      v-model="runsVisible"
-      data-ui="runs"
-      :title="t('app.scriptManager.runs.title')"
-      width="900px"
+    <SecLabDialog
+      :visible="runDialogVisible"
+      data-ui="run-dialog"
+      :title="t('app.scriptManager.runDialog.title', { name: runScript?.name ?? '' })"
+      width="min(760px, 92vw)"
+      :close-on-click-overlay="false"
+      @close="closeRun"
     >
-      <div class="runs-shell" data-slot="content">
-        <SecLabTable :data="library.runs.value" :columns="runColumns" row-key="runId" border>
-          <template #status="{ row }: { row: ScriptRun }">
-            <SecLabTag :type="statusTag(row.status)">{{ statusLabel(row.status) }}</SecLabTag>
-            <span v-if="row.phase && !row.finishedAt" class="run-phase">{{ row.phase }}</span>
-          </template>
-          <template #queuedAt="{ row }: { row: ScriptRun }">{{
-            formatTime(row.queuedAt)
-          }}</template>
-          <template #actions="{ row }: { row: ScriptRun }">
-            <div class="run-actions">
-              <SecLabButton v-if="row.output.available" size="small" @click="openOutput(row)">
-                {{ t('app.scriptManager.runs.output') }}
-              </SecLabButton>
-              <SecLabButton
-                v-if="row.capabilities.canCancel"
-                size="small"
-                type="danger"
-                :loading="library.isActionPending(`cancel:${row.runId}`)"
-                @click="cancelRun(row)"
-              >
-                {{ t('common.cancel') }}
-              </SecLabButton>
-            </div>
-          </template>
-          <template #empty
-            ><SecLabEmpty :description="t('app.scriptManager.runs.empty')"
-          /></template>
-        </SecLabTable>
-        <SecLabLoading :loading="library.runsState.value.initialLoading" cover />
+      <div class="run-dialog" data-slot="body">
+        <template v-if="!library.currentRun.value">
+          <SecLabAlert
+            v-if="library.nodesState.value.error"
+            type="error"
+            :title="t('app.scriptManager.messages.loadNodesFailed')"
+            :description="library.nodesState.value.error"
+            show-icon
+          />
+          <div class="run-form">
+            <SecLabFormItem
+              :label="t('app.scriptManager.fields.node')"
+              for="script-run-node"
+              required
+            >
+              <SecLabSelect
+                id="script-run-node"
+                v-model="runNodeId"
+                name="scriptRunNode"
+                :options="onlineNodeOptions"
+              />
+            </SecLabFormItem>
+            <SecLabFormItem
+              :label="t('app.scriptManager.fields.timeout')"
+              for="script-run-timeout"
+              required
+            >
+              <SecLabInput
+                id="script-run-timeout"
+                v-model="runTimeoutSeconds"
+                name="scriptRunTimeout"
+                type="number"
+                :min="1"
+                :max="86400"
+              />
+            </SecLabFormItem>
+          </div>
+        </template>
+        <template v-else>
+          <div class="run-status" data-ui="run-status">
+            <span>{{ library.currentRun.value.nodeName }}</span>
+            <span v-if="remainingSeconds !== null" class="remaining-time">{{
+              t('app.scriptManager.runDialog.remaining', { seconds: remainingSeconds })
+            }}</span>
+            <SecLabTag :type="statusTag(library.currentRun.value.status)">
+              {{ statusLabel(library.currentRun.value.status) }}
+            </SecLabTag>
+          </div>
+          <SecLabAlert
+            v-if="library.currentRun.value.errorSummary"
+            type="error"
+            :title="statusLabel(library.currentRun.value.status)"
+            :description="library.currentRun.value.errorSummary"
+            show-icon
+          />
+          <ScriptRunTerminal
+            ref="runTerminal"
+            :run-id="library.currentRun.value.runId"
+            @control="handleTerminalControl"
+            @disconnected="handleTerminalDisconnect"
+          />
+        </template>
       </div>
-    </SecLabDrawer>
-
-    <SecLabDrawer
-      v-model="outputVisible"
-      data-ui="run-output"
-      :title="t('app.scriptManager.runs.outputTitle')"
-      width="760px"
-    >
-      <div class="output-shell" data-slot="content">
-        <SecLabAlert
-          v-if="library.output.value?.truncated"
-          type="warning"
-          :title="t('app.scriptManager.runs.truncated')"
-          show-icon
-        />
-        <SecLabAlert
-          v-if="currentTrackedRun?.errorSummary"
-          type="error"
-          :title="statusLabel(currentTrackedRun.status)"
-          :description="currentTrackedRun.errorSummary"
-          show-icon
-        />
-        <pre v-if="outputText">{{ outputText }}</pre>
-        <SecLabEmpty
-          v-else-if="!library.outputState.value.initialLoading"
-          :description="t('app.scriptManager.runs.noOutput')"
-        />
-        <SecLabLoading :loading="library.outputState.value.initialLoading" cover />
-      </div>
-    </SecLabDrawer>
+      <template #footer>
+        <template v-if="!library.currentRun.value">
+          <SecLabButton
+            :disabled="runScript ? library.isActionPending(`run:${runScript.scriptId}`) : false"
+            @click="closeRun"
+          >
+            {{ t('common.cancel') }}
+          </SecLabButton>
+          <SecLabButton
+            type="primary"
+            :disabled="!runNodeId"
+            :loading="runScript ? library.isActionPending(`run:${runScript.scriptId}`) : false"
+            @click="submitRun"
+          >
+            {{ t('app.scriptManager.actions.run') }}
+          </SecLabButton>
+        </template>
+        <SecLabButton
+          v-else
+          :type="library.isRunActive.value ? 'danger' : undefined"
+          :loading="
+            library.currentRun.value
+              ? library.isActionPending(`dismiss:${library.currentRun.value.runId}`)
+              : false
+          "
+          @click="closeRun"
+        >
+          {{
+            library.isRunActive.value
+              ? t('app.scriptManager.runDialog.cancelAndClose')
+              : t('common.close')
+          }}
+        </SecLabButton>
+      </template>
+    </SecLabDialog>
   </div>
 </template>
 
@@ -700,193 +786,249 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
   overflow: hidden;
   background: var(--sdl-bg-canvas);
 }
+
 .toolbar,
-.editor-toolbar,
 .toolbar-actions,
-.editor-actions,
-.editor-identity,
-.run-actions,
-.script-meta {
+.detail-meta,
+.run-status {
   display: flex;
   align-items: center;
   gap: var(--sdl-space-2);
 }
+
 .toolbar {
+  flex-shrink: 0;
   justify-content: space-between;
   flex-wrap: wrap;
 }
-.search-input {
+
+.search-field {
+  position: relative;
   width: min(360px, 100%);
 }
-.workspace {
+
+.search-input {
+  width: 100%;
+}
+
+.search-field :deep(.sl-input) {
+  padding-right: 36px;
+}
+
+.search-clear {
+  position: absolute;
+  top: 50%;
+  right: var(--sdl-space-2);
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--sdl-radius-sm);
+  color: var(--sdl-text-muted);
+  background: transparent;
+  cursor: pointer;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.search-clear:hover {
+  color: var(--sdl-text-primary);
+  background: var(--sdl-bg-hover);
+}
+
+.search-clear:focus-visible {
+  outline: none;
+  box-shadow: var(--sdl-focus-ring);
+}
+
+.table-shell {
+  position: relative;
   flex: 1;
   min-height: 0;
-  display: grid;
-  grid-template-columns: minmax(240px, 30%) minmax(0, 1fr);
-  overflow: hidden;
+  overflow: auto;
   border: 1px solid var(--sdl-border-subtle);
   border-radius: var(--sdl-radius-lg);
   background: var(--sdl-bg-panel);
 }
-.script-list,
-.editor-pane,
-.runs-shell,
-.output-shell {
-  position: relative;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-}
-.script-list {
-  border-right: 1px solid var(--sdl-border-subtle);
-}
-.list-scroll {
-  flex: 1;
-  min-height: 0;
-  overflow: auto;
-  padding: var(--sdl-space-2);
-}
-.script-row {
-  display: flex;
-  align-items: center;
-  border-radius: var(--sdl-radius-md);
-  border: 1px solid transparent;
-}
-.script-row:hover,
-.script-row.selected {
-  background: var(--sdl-bg-hover);
-  border-color: var(--sdl-border-subtle);
-}
-.script-select {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: var(--sdl-space-1);
-  padding: var(--sdl-space-3);
+
+.name-button {
+  max-width: 100%;
+  padding: 0;
+  overflow: hidden;
   border: 0;
-  color: inherit;
+  color: var(--sdl-primary);
   background: transparent;
+  font: inherit;
+  font-weight: 600;
   text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   cursor: pointer;
 }
-.script-select:focus-visible {
-  outline: 2px solid var(--sdl-focus-ring);
-  outline-offset: -2px;
+
+.name-button:hover {
+  text-decoration: underline;
 }
-.script-name {
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  font-weight: 600;
+
+.name-button:focus-visible {
+  outline: none;
+  box-shadow: var(--sdl-focus-ring);
+  border-radius: var(--sdl-radius-sm);
 }
-.script-description {
+
+.description-text {
+  display: block;
   max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--sdl-text-secondary);
-  font-size: var(--sdl-font-body-sm);
 }
-.script-meta {
+
+.muted-text,
+.detail-meta,
+.remaining-time {
   color: var(--sdl-text-muted);
-  font-size: var(--sdl-font-caption);
 }
-.editor-pane {
-  overflow: hidden;
-}
-.editor-toolbar {
-  min-height: 48px;
-  justify-content: space-between;
-  padding: var(--sdl-space-2) var(--sdl-space-3);
-  border-bottom: 1px solid var(--sdl-border-subtle);
-}
-.metadata-form {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 180px;
-  gap: var(--sdl-space-3);
-  padding: var(--sdl-space-3);
-  border-bottom: 1px solid var(--sdl-border-subtle);
-}
-.description-field {
-  grid-column: 1 / -1;
-}
-.detail-description {
-  padding: var(--sdl-space-3);
-  color: var(--sdl-text-secondary);
-  border-bottom: 1px solid var(--sdl-border-subtle);
-}
-.editor-shell {
-  flex: 1;
-  min-height: 260px;
-  display: flex;
-  flex-direction: column;
-}
-.editor-label {
-  padding: var(--sdl-space-2) var(--sdl-space-3);
-  color: var(--sdl-text-secondary);
-  font-size: var(--sdl-font-body-sm);
-}
-.editor-shell :deep(.monaco-editor-wrapper) {
-  flex: 1;
+
+.detail-dialog,
+.form-dialog,
+.run-dialog {
   min-height: 0;
-}
-.dialog-form {
   display: flex;
   flex-direction: column;
   gap: var(--sdl-space-3);
 }
-.runs-shell {
-  min-height: 420px;
+
+.detail-meta {
+  flex-wrap: wrap;
 }
-.run-actions {
-  justify-content: flex-end;
-}
-.run-phase {
-  margin-left: var(--sdl-space-2);
-  color: var(--sdl-text-muted);
-  font-size: var(--sdl-font-caption);
-}
-.output-shell {
+
+.script-form-stack {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
   gap: var(--sdl-space-3);
 }
-.output-shell pre {
-  min-height: 320px;
-  max-height: calc(100vh - 220px);
-  margin: 0;
-  padding: var(--sdl-space-3);
-  overflow: auto;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  color: var(--sdl-text-primary);
-  background: var(--sdl-bg-base);
+
+.form-options-row {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--sdl-space-6);
+}
+
+.interactive-inline-field,
+.timeout-inline-field {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+
+.timeout-inline-field {
+  gap: var(--sdl-space-2);
+}
+
+.inline-field-label {
+  flex-shrink: 0;
+  color: var(--sdl-text-secondary);
+  font-size: var(--sdl-font-body-sm);
+  font-weight: 600;
+}
+
+.timeout-input {
+  width: 160px;
+}
+
+.editor-shell {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   border: 1px solid var(--sdl-border-subtle);
   border-radius: var(--sdl-radius-md);
-  font-family: var(--sdl-font-mono);
+  background: var(--sdl-bg-panel);
 }
-@media (max-width: 760px) {
-  .workspace {
-    grid-template-columns: 1fr;
-    grid-template-rows: minmax(180px, 34%) minmax(0, 1fr);
+
+.readonly-editor {
+  height: min(52vh, 520px);
+  min-height: 300px;
+}
+
+.form-editor {
+  height: calc(50vh - 220px);
+  min-height: 320px;
+  flex-shrink: 0;
+}
+
+.editor-label {
+  flex-shrink: 0;
+  padding: var(--sdl-space-2) var(--sdl-space-3);
+  border-bottom: 1px solid var(--sdl-border-subtle);
+  color: var(--sdl-text-secondary);
+  font-size: var(--sdl-font-body-sm);
+  font-weight: 600;
+}
+
+.run-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(160px, 220px);
+  gap: var(--sdl-space-3);
+}
+
+.run-status {
+  justify-content: space-between;
+  min-width: 0;
+  padding-bottom: var(--sdl-space-2);
+  border-bottom: 1px solid var(--sdl-border-subtle);
+}
+
+.run-dialog {
+  box-sizing: border-box;
+  width: 100%;
+}
+
+@media (max-width: 680px) {
+  .script-library {
+    padding: var(--sdl-space-2);
   }
-  .script-list {
-    border-right: 0;
-    border-bottom: 1px solid var(--sdl-border-subtle);
-  }
-  .metadata-form {
-    grid-template-columns: 1fr;
-  }
-  .description-field {
-    grid-column: auto;
-  }
-  .editor-toolbar {
-    align-items: flex-start;
-    flex-direction: column;
-  }
-  .editor-actions {
+
+  .toolbar,
+  .toolbar-actions {
     width: 100%;
-    overflow-x: auto;
+  }
+
+  .search-field {
+    width: 100%;
+  }
+
+  .toolbar-actions {
+    justify-content: flex-end;
+  }
+
+  .run-form {
+    grid-template-columns: 1fr;
+  }
+
+  .form-options-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--sdl-space-3);
+  }
+
+  .timeout-input {
+    flex: 1;
+    width: auto;
+  }
+
+  .readonly-editor {
+    min-height: 240px;
+  }
+
+  .form-editor {
+    height: calc(85vh - 280px);
+    min-height: 240px;
   }
 }
 </style>

@@ -43,6 +43,10 @@ interface Props {
   minimap?: boolean
   /** 是否启用 Sticky Scroll */
   stickyScroll?: boolean
+  /** 是否仅在点击编辑器后接管鼠标滚轮 */
+  wheelFocusOnClick?: boolean
+  /** 浮层组件是否使用固定定位 */
+  fixedOverflowWidgets?: boolean
   /** 空白字符显示方式 */
   renderWhitespace?: 'none' | 'selection' | 'all'
   /** 传递到 Monaco 可聚焦编辑区的可访问名称 */
@@ -64,6 +68,8 @@ const props = withDefaults(defineProps<Props>(), {
   highlightAmbiguousUnicode: true,
   minimap: true,
   stickyScroll: true,
+  wheelFocusOnClick: false,
+  fixedOverflowWidgets: true,
   renderWhitespace: 'selection',
   ariaLabel: '',
   ariaLabelledby: '',
@@ -83,6 +89,7 @@ let themesRegistered = false
 let activeDocumentKey = ''
 let standaloneModel: monaco.editor.ITextModel | null = null
 let syncingModel = false
+let wheelCaptureActive = false
 
 interface ManagedDocument {
   model: monaco.editor.ITextModel
@@ -264,6 +271,23 @@ function disposeDocument(documentKey: string) {
   managedDocuments.delete(documentKey)
 }
 
+/** 切换编辑器是否接管鼠标滚轮。 */
+function setWheelCapture(active: boolean) {
+  if (!props.wheelFocusOnClick || wheelCaptureActive === active) return
+  wheelCaptureActive = active
+  editorInstance.value?.updateOptions({
+    scrollbar: { handleMouseWheel: active },
+  })
+}
+
+/** 点击编辑器外部时把滚轮交还给外围滚动容器。 */
+function handleDocumentPointerDown(event: PointerEvent) {
+  if (!wheelCaptureActive) return
+  const container = containerRef.value
+  if (container && event.composedPath().includes(container)) return
+  setWheelCapture(false)
+}
+
 /** 初始化编辑器实例 */
 function createEditor() {
   if (!containerRef.value) return
@@ -303,13 +327,15 @@ function createEditor() {
     guides: { bracketPairs: true, indentation: true },
     padding: { top: 8, bottom: 8 },
     scrollbar: {
+      handleMouseWheel: !props.wheelFocusOnClick,
+      alwaysConsumeMouseWheel: !props.wheelFocusOnClick,
       verticalScrollbarSize: 8,
       horizontalScrollbarSize: 8,
       verticalSliderSize: 8,
       horizontalSliderSize: 8,
     },
     contextmenu: true,
-    fixedOverflowWidgets: true,
+    fixedOverflowWidgets: props.fixedOverflowWidgets,
   })
 
   // 注册 Ctrl+S 保存快捷键
@@ -323,6 +349,13 @@ function createEditor() {
     const value = editor.getValue()
     emit('update:modelValue', value)
     emit('change', value, activeDocumentKey)
+  })
+
+  editor.onMouseDown((event) => {
+    setWheelCapture(true)
+    if (props.readOnly && event.target.position) {
+      editor.setPosition(event.target.position, 'mouse')
+    }
   })
 
   editorInstance.value = editor
@@ -457,9 +490,11 @@ function watchThemeSwitch() {
 onMounted(() => {
   createEditor()
   watchThemeSwitch()
+  document.addEventListener('pointerdown', handleDocumentPointerDown, true)
 })
 
 onUnmounted(() => {
+  document.removeEventListener('pointerdown', handleDocumentPointerDown, true)
   themeObserver?.disconnect()
   themeObserver = null
   resizeObserver?.disconnect()

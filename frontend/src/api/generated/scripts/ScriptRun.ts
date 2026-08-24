@@ -4,4 +4,4 @@ import type { ScriptRunStatus } from "./ScriptRunStatus";
 /**
  * 可恢复跟踪的脚本运行。
  */
-export type ScriptRun = { runId: string, scriptId: string, scriptName: string, scriptRevision: number, sourceSha256: string, nodeId: string, nodeName: string, status: ScriptRunStatus, phase?: string, queuedAt: string, startedAt?: string, finishedAt?: string, exitCode?: number, errorCode?: string, errorSummary?: string, output: { available: boolean, truncated: boolean, sizeBytes: number, }, capabilities: { canCancel: boolean, }, };
+export type ScriptRun = { runId: string, scriptId: string, scriptName: string, scriptRevision: number, sourceSha256: string, nodeId: string, nodeName: string, status: ScriptRunStatus, phase?: string, queuedAt: string, startedAt?: string, finishedAt?: string, exitCode?: number, errorCode?: string, errorSummary?: string, capabilities: { canCancel: boolean, }, };

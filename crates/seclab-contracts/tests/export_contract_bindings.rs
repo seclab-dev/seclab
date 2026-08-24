@@ -36,7 +36,7 @@ use seclab_contracts::{
     },
     scripts::{
         CreateScriptRequest, CreateScriptRunRequest, ScriptDetail, ScriptListPage, ScriptRun,
-        ScriptRunOutputPage, ScriptRunPage, UpdateScriptRequest,
+        ScriptRunTerminalClientMessage, ScriptRunTerminalServerMessage, UpdateScriptRequest,
     },
     seclab::{SeclabNetworkConfig, SeclabNetworkUpdateResult},
     terminal::{TerminalAccess, TerminalClientMessage, TerminalServerMessage},
@@ -141,8 +141,8 @@ fn export_contract_bindings() {
     export_type::<UpdateScriptRequest>(&cfg);
     export_type::<CreateScriptRunRequest>(&cfg);
     export_type::<ScriptRun>(&cfg);
-    export_type::<ScriptRunPage>(&cfg);
-    export_type::<ScriptRunOutputPage>(&cfg);
+    export_type::<ScriptRunTerminalClientMessage>(&cfg);
+    export_type::<ScriptRunTerminalServerMessage>(&cfg);
     export_type::<TerminalAccess>(&cfg);
     export_type::<TerminalClientMessage>(&cfg);
     export_type::<TerminalServerMessage>(&cfg);
