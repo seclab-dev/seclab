@@ -101,4 +101,4 @@ pnpm -C frontend build
 ## 文档
 
 - 当前仓库文档入口：[docs/README.md](docs/README.md)
-- 组织级文档源：`linked-docs -> ../seclab-docs`
+- 组织级共享文档：[seclab-docs](https://github.com/seclab-dev/seclab-docs)
