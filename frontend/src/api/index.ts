@@ -110,8 +110,8 @@ class HttpClient {
   delete<T>(url: string, params?: object, _object = {}): Promise<ApiResponse<T>> {
     return this.service.delete(url, { params, ..._object })
   }
-  download<BlobPart>(url: string, params?: object, _object = {}): Promise<BlobPart> {
-    return this.service.post(url, params, _object)
+  download(url: string, params?: object, _object = {}): Promise<Blob> {
+    return this.service.post<Blob, Blob>(url, params, _object)
   }
   upload<T>(
     url: string,
