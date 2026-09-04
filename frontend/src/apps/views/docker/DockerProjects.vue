@@ -2,6 +2,7 @@
 /** Docker Compose 项目管理页：查询、配置、部署进度与节点变化均在模块内处理。 */
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { load as parseYaml, YAMLException } from 'js-yaml'
 import { useDockerStore } from '@/stores/docker'
 import { useNodeStore } from '@/stores/node'
 import { useConfirmationModalStore } from '@/stores/confirmation-modal'
@@ -113,6 +114,36 @@ const loadProjects = (page = store.projectPage) =>
     pageSize: store.projectPageSize,
   })
 
+/** 使用本地解析器即时检查 YAML 语法；Compose 语义仍由 Agent 校验。 */
+const validateYamlSyntax = (value: string) => {
+  if (!value.trim()) return ''
+  try {
+    parseYaml(value)
+    return ''
+  } catch (error) {
+    if (!(error instanceof YAMLException)) return 'Invalid YAML syntax'
+    if (!error.mark) return `YAML syntax error: ${error.reason}`
+    const line = error.mark.line + 1
+    const column = error.mark.column + 1
+    return `YAML syntax error at line ${line}, column ${column}: ${error.reason}`
+  }
+}
+
+const createYamlError = computed(() => validateYamlSyntax(createForm.composeYaml))
+const configurationYamlError = computed(() => validateYamlSyntax(configurationYaml.value))
+
+/** 接收创建编辑器内容，并清除已经失效的服务端错误。 */
+const updateCreateYaml = (value: string) => {
+  createForm.composeYaml = value
+  createError.value = ''
+}
+
+/** 接收配置编辑器内容，并清除已经失效的服务端错误。 */
+const updateConfigurationYaml = (value: string) => {
+  configurationYaml.value = value
+  configurationError.value = ''
+}
+
 const openDetail = async (name: string) => {
   detailProjectName.value = name
   detailVisible.value = true
@@ -145,6 +176,7 @@ const fillComposeExample = async () => {
 }
 const submitCreate = async () => {
   createError.value = ''
+  if (createYamlError.value) return
   const validation = await store.validateComposeYaml(createForm.composeYaml)
   if (!validation) {
     createError.value = store.projectConfigurationError || t('common.unknownError')
@@ -184,6 +216,7 @@ const closeConfiguration = () => {
 const saveConfiguration = async () => {
   if (!store.projectConfiguration) return
   configurationError.value = ''
+  if (configurationYamlError.value) return
   const validation = await store.validateComposeYaml(configurationYaml.value)
   if (!validation?.valid) {
     configurationError.value =
@@ -580,13 +613,22 @@ onUnmounted(() => {
           <div class="compose-editor" data-ui="compose-editor">
             <MonacoEditor
               id="docker-project-compose"
-              v-model="createForm.composeYaml"
+              :model-value="createForm.composeYaml"
               name="composeYaml"
               language="yaml"
               :minimap="false"
               aria-labelledby="docker-project-compose-label"
+              @update:model-value="updateCreateYaml"
             />
           </div>
+          <h4
+            v-if="createYamlError"
+            class="compose-yaml-error"
+            role="alert"
+            data-ui="compose-yaml-error"
+          >
+            {{ createYamlError }}
+          </h4>
         </div>
       </div>
       <template #footer>
@@ -596,6 +638,7 @@ onUnmounted(() => {
         <SecLabButton
           type="primary"
           :loading="store.projectMutationLoading"
+          :disabled="Boolean(createYamlError)"
           @click="submitCreate"
           >{{ t('app.docker.projects.actions.submit') }}</SecLabButton
         >
@@ -632,15 +675,26 @@ onUnmounted(() => {
         />
         <div
           v-if="store.projectConfiguration"
-          class="compose-editor configuration-editor"
-          data-ui="compose-editor"
+          class="configuration-compose-field"
+          data-ui="compose-configuration-field"
         >
-          <MonacoEditor
-            v-model="configurationYaml"
-            language="yaml"
-            :minimap="false"
-            :aria-label="t('app.docker.projects.configuration.editorLabel')"
-          />
+          <div class="compose-editor configuration-editor" data-ui="compose-editor">
+            <MonacoEditor
+              :model-value="configurationYaml"
+              language="yaml"
+              :minimap="false"
+              :aria-label="t('app.docker.projects.configuration.editorLabel')"
+              @update:model-value="updateConfigurationYaml"
+            />
+          </div>
+          <h4
+            v-if="configurationYamlError"
+            class="compose-yaml-error"
+            role="alert"
+            data-ui="compose-yaml-error"
+          >
+            {{ configurationYamlError }}
+          </h4>
         </div>
         <SecLabLoading
           :loading="store.projectConfigurationLoading && !store.projectConfiguration"
@@ -652,7 +706,7 @@ onUnmounted(() => {
         <SecLabButton
           type="primary"
           :loading="store.projectMutationLoading"
-          :disabled="!store.projectConfiguration"
+          :disabled="!store.projectConfiguration || Boolean(configurationYamlError)"
           @click="saveConfiguration"
           >{{ t('common.save') }}</SecLabButton
         >
@@ -1193,10 +1247,12 @@ onUnmounted(() => {
   border-radius: var(--sdl-radius-md);
 }
 .compose-field,
+.configuration-compose-field,
 .compose-field-header {
   display: flex;
 }
-.compose-field {
+.compose-field,
+.configuration-compose-field {
   flex-direction: column;
   gap: var(--sdl-space-2);
 }
@@ -1208,6 +1264,14 @@ onUnmounted(() => {
   color: var(--sdl-text-primary);
   font-size: var(--sdl-font-body-sm);
   font-weight: var(--sdl-font-weight-medium);
+}
+.compose-yaml-error {
+  margin: 0;
+  color: var(--sdl-danger);
+  font-size: var(--sdl-font-caption);
+  font-weight: 500;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
 }
 .required-mark {
   color: var(--sdl-danger);

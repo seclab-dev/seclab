@@ -1,4 +1,4 @@
-import { nextTick, reactive } from 'vue'
+import { defineComponent, h, nextTick, reactive } from 'vue'
 import { createI18n } from 'vue-i18n'
 import { mount } from '@vue/test-utils'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -85,7 +85,21 @@ const mountView = () =>
       plugins: [createI18n({ legacy: false, locale: 'zh', messages: { zh, en } })],
       stubs: {
         DockerProjectDetailDrawer: true,
-        MonacoEditor: true,
+        MonacoEditor: defineComponent({
+          name: 'MonacoEditor',
+          props: { modelValue: { type: String, default: '' } },
+          emits: ['update:modelValue'],
+          setup(_props, { emit }) {
+            return () =>
+              h('textarea', {
+                'data-ui': 'monaco-editor-stub',
+                onInput: (event: Event) => {
+                  const value = (event.target as HTMLTextAreaElement).value
+                  emit('update:modelValue', value)
+                },
+              })
+          },
+        }),
       },
     },
   })
@@ -108,6 +122,87 @@ describe('DockerProjects deployment dialogs', () => {
     expect(dialog?.querySelector('input[type="checkbox"]')?.getAttribute('aria-label')).toBe(
       '部署前拉取最新镜像',
     )
+    wrapper.unmount()
+  })
+
+  it('创建项目时实时校验 YAML 语法并阻止提交', async () => {
+    const wrapper = mountView()
+    const vm = wrapper.vm as unknown as {
+      openCreate: () => void
+    }
+    vm.openCreate()
+    await nextTick()
+    const editor = document.body.querySelector(
+      '[data-ui="project-create-dialog"] [data-ui="monaco-editor-stub"]',
+    ) as HTMLTextAreaElement
+    const invalidYaml =
+      'services:\n  app:\n    image: nginx:latest\n    name: test\n    user: admin\n    asdsdas'
+    editor.value = invalidYaml
+    editor.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+
+    const dialog = document.body.querySelector('[data-ui="project-create-dialog"]')
+    const syntaxErrorElement = dialog?.querySelector('[data-ui="compose-yaml-error"]')
+    const syntaxError = syntaxErrorElement?.textContent ?? ''
+    expect(syntaxErrorElement?.tagName).toBe('H4')
+    expect(syntaxErrorElement?.querySelector('.sl-alert-icon')).toBeNull()
+    expect(syntaxError).toContain('YAML syntax error at line 6, column 12:')
+    expect(syntaxError).not.toContain('\n 3 |')
+    expect(
+      (dialog?.querySelector('.sl-dialog-footer button:last-child') as HTMLButtonElement).disabled,
+    ).toBe(true)
+
+    const validYaml = 'services:\n  app:\n    image: nginx:latest\n'
+    editor.value = validYaml
+    editor.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+
+    expect(dialog?.querySelector('[data-ui="compose-yaml-error"]')).toBeNull()
+    expect(
+      (dialog?.querySelector('.sl-dialog-footer button:last-child') as HTMLButtonElement).disabled,
+    ).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('修改配置时实时校验 YAML 语法并阻止保存', async () => {
+    setupStore()
+    state.docker.projectConfiguration = {
+      composeYaml: 'services: {}',
+      revision: 1,
+      state: 'pending',
+    }
+    const wrapper = mountView()
+    const vm = wrapper.vm as unknown as {
+      configurationVisible: boolean
+    }
+    vm.configurationVisible = true
+    await nextTick()
+    const editor = document.body.querySelector(
+      '[data-ui="project-configuration-drawer"] [data-ui="monaco-editor-stub"]',
+    ) as HTMLTextAreaElement
+    const invalidYaml = 'services:\n  app: ['
+    editor.value = invalidYaml
+    editor.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+
+    const drawer = document.body.querySelector('[data-ui="project-configuration-drawer"]')
+    const syntaxErrorElement = drawer?.querySelector('[data-ui="compose-yaml-error"]')
+    expect(syntaxErrorElement?.tagName).toBe('H4')
+    expect(syntaxErrorElement?.querySelector('.sl-alert-icon')).toBeNull()
+    expect(syntaxErrorElement?.textContent).toBeTruthy()
+    expect(
+      (drawer?.querySelector('.sl-drawer-footer button:last-child') as HTMLButtonElement).disabled,
+    ).toBe(true)
+
+    const validYaml = 'services:\n  app:\n    image: nginx:latest\n'
+    editor.value = validYaml
+    editor.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+
+    expect(drawer?.querySelector('[data-ui="compose-yaml-error"]')).toBeNull()
+    expect(
+      (drawer?.querySelector('.sl-drawer-footer button:last-child') as HTMLButtonElement).disabled,
+    ).toBe(false)
     wrapper.unmount()
   })
 
