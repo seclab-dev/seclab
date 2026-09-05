@@ -6,6 +6,8 @@
 
 SecLab 是面向安全测试、套件化安全工具、漏洞验证和主机运维的分布式安全实验室平台。系统由主控 `seclab` 和节点执行面 `seclab-agent` 组成，主控负责控制面、Web 控制台和全局状态，Agent 负责本地 Docker、文件系统、进程、网络和任务执行。
 
+![Preview](https://raw.githubusercontent.com/seclab-dev/seclab/main/docs/assets/preview.png)
+
 ## 核心能力
 
 - 桌面式 Web 控制台：应用库、多窗口、桌面图标、通知、日志和主题切换。
@@ -14,37 +16,6 @@ SecLab 是面向安全测试、套件化安全工具、漏洞验证和主机运�
 - 套件中心：导入、安装、启用、停用和卸载 `.slsp` Compose 套件。
 - 主机运维：文件、进程、磁盘、防火墙、终端、脚本和计划任务。
 - 在线升级与审计：升级流程、平台事件、运行日志和关键操作审计。
-
-## 架构
-
-```text
-Vue Web Console
-       |
-       v
-seclab 控制面
-       |
-       +-- Unix Socket --> local seclab-agent
-       |
-       +-- HTTPS / WSS + mTLS --> remote seclab-agent
-                                    |
-                                    v
-                                  Docker / Host
-```
-
-核心命名：
-
-| 名称 | 英文 | 标识 | 说明 |
-| --- | --- | --- | --- |
-| 主控 | Master | `seclab` | 控制面服务，全局状态来源。 |
-| 本地节点 | Local Node | `local` | 主控本机内置工作节点。 |
-| 节点 | Node | UUID | 平台纳管的外部计算节点。 |
-
-## 技术栈
-
-- 后端：Rust、Axum、Tokio、SQLx、Tower、Bollard、Rustls。
-- 前端：Vue 3、Vite、TypeScript、Pinia、Vue I18n。
-- UI：`@seclab-dev/tokens`、`@seclab-dev/icons`、`@seclab-dev/vue`。
-- 运行时：Docker、Docker Compose、systemd。
 
 ## 目录结构
 
@@ -86,19 +57,6 @@ pnpm -C frontend lint
 pnpm -C frontend build
 ```
 
-发布包构建：
-
-```bash
-./scripts/build-release.sh
-```
-
-版本同步：
-
-```bash
-./scripts/set-version.sh 0.1.0-alpha.1
-```
-
 ## 文档
 
-- 当前仓库文档入口：[docs/README.md](docs/README.md)
-- 组织级共享文档：[seclab-docs](https://github.com/seclab-dev/seclab-docs)
+- 文档库：[seclab-docs](https://github.com/seclab-dev/seclab-docs)

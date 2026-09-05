@@ -1,7 +1,5 @@
 # seclab 仓库文档索引
 
-本目录只保留 `seclab` 主控仓库的项目私有文档。
-
 ## 组织级文档
 
 组织级共享文档由 [seclab-docs](https://github.com/seclab-dev/seclab-docs) 仓库统一维护：
@@ -13,10 +11,3 @@
 - [suites](https://github.com/seclab-dev/seclab-docs/tree/main/suites)：Compose 套件中心与套件开发规范。
 - [simulation](https://github.com/seclab-dev/seclab-docs/tree/main/simulation)：协议仿真、PCAP、规则库升级与兼容契约。
 - [operations](https://github.com/seclab-dev/seclab-docs/tree/main/operations)：运行时协议、跨 NAT、在线升级。
-
-## 本仓库私有文档
-
-- [architecture/notification-center.md](architecture/notification-center.md)：个人通知中心的领域边界、可信投影、接口隔离与前端生命周期。
-- [architecture/operation-runtime-logs.md](architecture/operation-runtime-logs.md)：操作日志与运行日志的领域边界和查询模型。
-- [architecture/SecLabDocker管理控制台设计文档.md](architecture/SecLabDocker管理控制台设计文档.md)：Docker 管理控制台具体组件设计。
-- [todo/SecLab 架构安全改进规划.md](todo/SecLab 架构安全改进规划.md)：当前仓库安全改造 TODO。
