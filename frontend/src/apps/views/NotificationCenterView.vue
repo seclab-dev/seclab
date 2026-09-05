@@ -145,10 +145,10 @@ const tableColumns = computed<SecLabTableColumn[]>(() => [
     slot: 'content',
     align: 'center',
   },
-  { label: t('app.notificationCenter.columns.target'), minWidth: 190, slot: 'target' },
+  { label: t('app.notificationCenter.columns.target'), minWidth: 170, slot: 'target' },
   {
     label: t('app.notificationCenter.columns.actions'),
-    width: 104,
+    width: 120,
     align: 'center',
     slot: 'actions',
   },
