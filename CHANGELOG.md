@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.1.0-alpha.4](https://github.com/seclab-dev/seclab/releases/tag/0.1.0-alpha.3...0.1.0-alpha.4) - 2026-09-05
+
 ### 不兼容变更
 
 - Agent 动态创建的套件工作负载容器统一命名为 `sl-<workloadName>`，套件需通过 `workloadName` 提供唯一、可读的完整名称主体。

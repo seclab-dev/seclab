@@ -3551,7 +3551,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "seclab"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -3605,7 +3605,7 @@ dependencies = [
 
 [[package]]
 name = "seclab-agent"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -3652,7 +3652,7 @@ dependencies = [
 
 [[package]]
 name = "seclab-api"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "axum",
  "bcrypt",
@@ -3672,7 +3672,7 @@ dependencies = [
 
 [[package]]
 name = "seclab-contracts"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "axum",
  "chrono",
@@ -3684,15 +3684,15 @@ dependencies = [
 
 [[package]]
 name = "seclab-runtime"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 
 [[package]]
 name = "seclab-scenario"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 
 [[package]]
 name = "seclab-security"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "anyhow",
  "rcgen",
@@ -3701,7 +3701,7 @@ dependencies = [
 
 [[package]]
 name = "seclab-slctl"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "anyhow",
  "bcrypt",
@@ -3714,7 +3714,7 @@ dependencies = [
 
 [[package]]
 name = "seclab-upgrade"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "base64",
  "blake2b_simd",
