@@ -4,7 +4,7 @@
 
 ## [Unreleased]
 
-## [0.1.0-alpha.4](https://github.com/seclab-dev/seclab/releases/tag/0.1.0-alpha.3...0.1.0-alpha.4) - 2026-09-05
+## [0.1.0-alpha.4](https://github.com/seclab-dev/seclab/compare/0.1.0-alpha.3...0.1.0-alpha.4) - 2026-09-05
 
 ### 不兼容变更
 
@@ -41,7 +41,7 @@
 - 通知中心对不适用操作结果的系统与安全通知显示明确占位符，不再留下易被误解为空缺的结果栏。
 - 运行日志采用稳定的单行网格展示，统一时间、级别、日志源和消息间距；长日志源与消息支持省略和悬浮查看，时间格式固定补零且全屏时日志源不会过度扩张。
 
-## [0.1.0-alpha.3](https://github.com/seclab-dev/seclab/releases/tag/0.1.0-alpha.2...0.1.0-alpha.3) - 2026-08-04
+## [0.1.0-alpha.3](https://github.com/seclab-dev/seclab/compare/0.1.0-alpha.2...0.1.0-alpha.3) - 2026-08-04
 
 ### 不兼容变更
 
@@ -261,7 +261,7 @@
 - 修复文件已实际保存但仍显示失败、刷新失败遮挡已有内容，以及保存与移动、删除或上传并发冲突的问题。
 - 修复进程列表在窗口节点变化时读取错误节点、旧响应覆盖新筛选，以及信号成功投递后仍被误报为失败的问题。
 
-## [0.1.0-alpha.2](https://github.com/seclab-dev/seclab/releases/tag/0.1.0-alpha.1...0.1.0-alpha.2) - 2026-07-11
+## [0.1.0-alpha.2](https://github.com/seclab-dev/seclab/compare/0.1.0-alpha.1...0.1.0-alpha.2) - 2026-07-11
 
 ### 不兼容变更
 
@@ -319,7 +319,7 @@
 - 修复应用库中内置应用和套件应用卡片对齐方式不一致的问题。
 - 修复发布工作流中的 release tag 格式问题。
 
-## [0.1.0-alpha.1](https://github.com/seclab-dev/seclab/releases/tag/0.1.0-alpha.1) - 2026-06-28
+## [0.1.0-alpha.1](https://github.com/seclab-dev/seclab/commits/0.1.0-alpha.1) - 2026-06-28
 
 ### Added
 
