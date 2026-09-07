@@ -3,6 +3,7 @@ import * as docker from '../interface/docker'
 import type { AxiosProgressEvent } from 'axios'
 
 const IMAGE_UPLOAD_TIMEOUT_MS = 24 * 60 * 60 * 1000
+const CONTAINER_BATCH_ACTION_TIMEOUT_MS = 610 * 1000
 
 export interface DockerImageLoadOptions {
   signal?: AbortSignal
@@ -93,6 +94,7 @@ const createScopedDockerApi = (nodeId?: string) => ({
     return http.post<docker.DockerContainerBatchActionResult>(
       buildDockerPath('/agent/docker/containers/actions', nodeId),
       payload,
+      { timeout: CONTAINER_BATCH_ACTION_TIMEOUT_MS },
     )
   },
   execContainer: (id: string, payload: docker.ContainerExecRequest) => {

@@ -493,6 +493,10 @@ fn is_long_running_request(path: &str) -> bool {
         || path.contains("/agent/docker/suites/install")
         || path.contains("/agent/docker/daemon/settings")
         || path.contains("/agent/docker/system/prune")
+        || path
+            .split('?')
+            .next()
+            .is_some_and(|value| value.ends_with("/agent/docker/containers/actions"))
         || is_suite_progress_stream(path)
 }
 
@@ -791,6 +795,19 @@ mod tests {
     #[test]
     fn docker_system_prune_uses_long_timeout() {
         assert!(is_long_running_request("/api/v1/agent/docker/system/prune"));
+    }
+
+    #[test]
+    fn docker_container_batch_actions_use_long_timeout() {
+        assert!(is_long_running_request(
+            "/api/v1/agent/docker/containers/actions"
+        ));
+        assert!(is_long_running_request(
+            "/api/v1/node/node-1/agent/docker/containers/actions?source=web"
+        ));
+        assert!(!is_long_running_request(
+            "/api/v1/agent/docker/containers/example/stop"
+        ));
     }
 
     #[test]

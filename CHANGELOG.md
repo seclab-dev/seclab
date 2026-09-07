@@ -8,6 +8,10 @@
 
 - Docker 容器列表支持直接操作 Compose 和套件归属容器，删除时会提示可能产生的编排影响。
 
+### Fixed
+
+- 修复大量 Docker 容器执行批量操作时因默认请求超时而提前失败的问题。
+
 ## [0.1.0-alpha.4](https://github.com/seclab-dev/seclab/compare/0.1.0-alpha.3...0.1.0-alpha.4) - 2026-09-05
 
 ### 不兼容变更
