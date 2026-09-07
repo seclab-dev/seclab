@@ -247,9 +247,6 @@ onUnmounted(() => {
       <SecLabTag :type="summary?.state === 'running' ? 'success' : 'info'" effect="light">
         {{ stateLabel(summary?.state) }}
       </SecLabTag>
-      <SecLabTag v-if="summary?.management.readOnly" type="warning" effect="plain">
-        {{ managementLabel(summary.management.kind, summary.management.ownerName) }}
-      </SecLabTag>
     </div>
 
     <SecLabTabs v-model="activeTab" :tabs="tabs" class="detail-tabs" data-ui="detail-tabs" />

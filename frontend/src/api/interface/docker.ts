@@ -217,7 +217,6 @@ export type DockerContainerManagementKind = 'suite' | 'compose' | 'custom'
 export interface DockerContainerManagement {
   kind: DockerContainerManagementKind
   ownerName?: string
-  readOnly: boolean
 }
 
 /** 容器状态允许执行的操作。 */

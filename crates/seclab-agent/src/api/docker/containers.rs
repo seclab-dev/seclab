@@ -255,7 +255,6 @@ pub async fn rename_container(
     let new_name = payload.name.clone();
     let result: ApiResult<Response> = async {
         let docker = state.docker_client().await?;
-        ensure_mutable_container(&docker, &id).await?;
         let options = query_parameters::RenameContainerOptionsBuilder::new()
             .name(&payload.name)
             .build();
@@ -403,7 +402,6 @@ pub async fn exec_container(
     info!("Requesting container exec: {}", id);
     let result: ApiResult<Response> = async {
         let docker = state.docker_client().await?;
-        ensure_mutable_container(&docker, &id).await?;
         let exec = docker
             .create_exec(
                 &id,
@@ -621,7 +619,7 @@ fn summary_from_container(container: &ContainerSummary) -> Option<docker::Docker
         status_text: container.status.clone().unwrap_or_default(),
         health,
         ports,
-        capabilities: capabilities_for(management.kind, state),
+        capabilities: capabilities_for(state),
         management,
     })
 }
@@ -686,7 +684,7 @@ fn detail_from_inspect(
             .unwrap_or_default(),
         health,
         ports,
-        capabilities: capabilities_for(management.kind, normalized_state),
+        capabilities: capabilities_for(normalized_state),
         management,
     };
     let host_config = inspect.host_config.as_ref();
@@ -805,27 +803,13 @@ pub(crate) fn classify_management(
     } else {
         (docker::DockerContainerManagementKind::Custom, None)
     };
-    docker::DockerContainerManagement {
-        kind,
-        owner_name,
-        read_only: kind != docker::DockerContainerManagementKind::Custom,
-    }
+    docker::DockerContainerManagement { kind, owner_name }
 }
 
-/// 根据归属和状态计算容器模块允许执行的动作。
-fn capabilities_for(
-    management_kind: docker::DockerContainerManagementKind,
-    state: docker::DockerContainerState,
-) -> docker::DockerContainerCapabilities {
-    use docker::DockerContainerManagementKind as ManagementKind;
+/// 根据实时状态计算容器模块允许执行的动作。
+fn capabilities_for(state: docker::DockerContainerState) -> docker::DockerContainerCapabilities {
     use docker::DockerContainerState as State;
 
-    if management_kind != ManagementKind::Custom {
-        return docker::DockerContainerCapabilities {
-            can_exec: state == State::Running,
-            ..Default::default()
-        };
-    }
     docker::DockerContainerCapabilities {
         can_start: matches!(state, State::Created | State::Exited),
         can_stop: matches!(
@@ -868,7 +852,7 @@ async fn container_action_response(
     )
 }
 
-/// 使用容器 ID 执行生命周期动作，并统一应用归属和状态保护。
+/// 使用容器 ID 执行生命周期动作，并统一应用实时状态校验。
 async fn execute_container_action(
     state: &Arc<AppState>,
     context: &DockerOperationContext,
@@ -882,8 +866,6 @@ async fn execute_container_action(
             .inspect_container(id, None::<query_parameters::InspectContainerOptions>)
             .await?;
         name = display_container_name(&inspect, id);
-        let management = management_from_inspect(&inspect);
-        ensure_mutable(&management, &name)?;
         let current_state = state_from_value(
             inspect
                 .state
@@ -892,8 +874,7 @@ async fn execute_container_action(
                 .map(ToString::to_string)
                 .as_deref(),
         );
-        let capabilities =
-            capabilities_for(docker::DockerContainerManagementKind::Custom, current_state);
+        let capabilities = capabilities_for(current_state);
         ensure_action_allowed(action, current_state, capabilities, &name)?;
 
         match action {
@@ -1044,44 +1025,6 @@ fn normalize_batch_ids(ids: Vec<String>) -> ApiResult<Vec<String>> {
         }
     }
     Ok(normalized)
-}
-
-/// 在执行容器变更前从 Docker Inspect 获取可信归属并执行只读守卫。
-async fn ensure_mutable_container(docker: &bollard::Docker, id: &str) -> ApiResult<()> {
-    let inspect = docker
-        .inspect_container(id, None::<query_parameters::InspectContainerOptions>)
-        .await?;
-    let management = management_from_inspect(&inspect);
-    let name = display_container_name(&inspect, id);
-    ensure_mutable(&management, &name)
-}
-
-/// 拒绝在容器模块修改套件或 Compose 托管容器。
-fn ensure_mutable(management: &docker::DockerContainerManagement, name: &str) -> ApiResult<()> {
-    if management.read_only {
-        return Err(ApiError::conflict(
-            ErrorCode::DockerContainerProtected,
-            "managed Docker containers are read-only in the container module",
-        )
-        .with_detail(format!(
-            "container={} management={}",
-            name,
-            management.kind.as_str()
-        )));
-    }
-    Ok(())
-}
-
-fn management_from_inspect(
-    inspect: &ContainerInspectResponse,
-) -> docker::DockerContainerManagement {
-    let labels = inspect
-        .config
-        .as_ref()
-        .and_then(|config| config.labels.as_ref())
-        .cloned()
-        .unwrap_or_default();
-    classify_management(&labels)
 }
 
 fn display_container_name(inspect: &ContainerInspectResponse, fallback: &str) -> String {
@@ -1357,8 +1300,8 @@ const fn restart_policy_name(
 mod tests {
     use super::{
         capabilities_for, classify_management, detail_from_inspect, ensure_action_allowed,
-        ensure_mutable, normalize_batch_ids, normalize_top_result, state_from_value,
-        summary_from_container, validate_create_request,
+        normalize_batch_ids, normalize_top_result, state_from_value, summary_from_container,
+        validate_create_request,
     };
     use crate::models::docker::{
         DockerContainerAction as Action, DockerContainerCreateMount,
@@ -1404,21 +1347,18 @@ mod tests {
         ]));
         assert_eq!(management.kind, DockerContainerManagementKind::Suite);
         assert_eq!(management.owner_name.as_deref(), Some("suite-1"));
-        assert!(management.read_only);
 
         let compose = classify_management(&labels(&[("com.docker.compose.project", "project-1")]));
         assert_eq!(compose.kind, DockerContainerManagementKind::Compose);
         assert_eq!(compose.owner_name.as_deref(), Some("project-1"));
-        assert!(compose.read_only);
 
         let custom = classify_management(&HashMap::new());
         assert_eq!(custom.kind, DockerContainerManagementKind::Custom);
-        assert!(!custom.read_only);
     }
 
     #[test]
-    fn capabilities_follow_state_and_management() {
-        let running = capabilities_for(DockerContainerManagementKind::Custom, State::Running);
+    fn capabilities_follow_container_state_for_every_management_kind() {
+        let running = capabilities_for(State::Running);
         assert!(running.can_stop);
         assert!(running.can_restart);
         assert!(running.can_pause);
@@ -1427,28 +1367,17 @@ mod tests {
         assert!(!running.can_start);
         assert!(!running.can_remove);
 
-        let paused = capabilities_for(DockerContainerManagementKind::Custom, State::Paused);
+        let paused = capabilities_for(State::Paused);
         assert!(paused.can_stop);
         assert!(paused.can_restart);
         assert!(paused.can_unpause);
         assert!(!paused.can_pause);
         assert!(!paused.can_exec);
 
-        let exited = capabilities_for(DockerContainerManagementKind::Custom, State::Exited);
+        let exited = capabilities_for(State::Exited);
         assert!(exited.can_start);
         assert!(exited.can_restart);
         assert!(exited.can_remove);
-
-        let suite = capabilities_for(DockerContainerManagementKind::Suite, State::Running);
-        assert!(suite.can_exec);
-        assert!(!suite.can_stop);
-        assert_eq!(
-            capabilities_for(DockerContainerManagementKind::Suite, State::Exited),
-            Default::default()
-        );
-        let compose = capabilities_for(DockerContainerManagementKind::Compose, State::Running);
-        assert!(compose.can_exec);
-        assert!(!compose.can_restart);
     }
 
     #[test]
@@ -1474,7 +1403,7 @@ mod tests {
             DockerContainerManagementKind::Compose
         );
         assert!(summary.capabilities.can_exec);
-        assert!(!summary.capabilities.can_restart);
+        assert!(summary.capabilities.can_restart);
     }
 
     #[test]
@@ -1500,13 +1429,6 @@ mod tests {
         assert_eq!(detail.environment[0].value, "");
         assert_eq!(detail.environment[1].name, "TOKEN");
         assert_eq!(detail.environment[1].value, "part=part");
-    }
-
-    #[test]
-    fn rejects_managed_container_changes_with_stable_error_code() {
-        let management = classify_management(&labels(&[("seclab.owner", "suite")]));
-        let error = ensure_mutable(&management, "suite-container").expect_err("protected");
-        assert_eq!(error.code, ErrorCode::DockerContainerProtected);
     }
 
     #[test]
@@ -1543,7 +1465,7 @@ mod tests {
 
     #[test]
     fn rejects_actions_that_do_not_match_container_state() {
-        let running = capabilities_for(DockerContainerManagementKind::Custom, State::Running);
+        let running = capabilities_for(State::Running);
         ensure_action_allowed(Action::Stop, State::Running, running, "example")
             .expect("running container can stop");
         let error = ensure_action_allowed(Action::Remove, State::Running, running, "example")

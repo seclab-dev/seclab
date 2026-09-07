@@ -387,6 +387,8 @@ const zh: typeof en = {
         createContainerFailed: '创建容器失败: {message}',
         invalidContainerNameOrId: '容器名字或ID错误',
         deleteContainersConfirm: '确认删除容器 {name}? 此操作不可撤销。',
+        deleteManagedContainersConfirm:
+          '确认删除容器 {name}？其中的 Compose 或套件容器可能在后续部署时被重新创建。此操作不可撤销。',
         deleteConfirmTitle: '确认删除',
         deleteAction: '删除',
         containerActionFailed: '容器 {name} 执行 {action} 操作失败：{message}',
@@ -572,11 +574,6 @@ const zh: typeof en = {
           custom: '自定义',
           compose: 'Compose',
           suite: '套件',
-        },
-        readOnly: {
-          custom: '当前容器不可操作',
-          compose: '请前往 Compose 项目管理',
-          suite: '请前往套件中心管理',
         },
         states: {
           created: '已创建',

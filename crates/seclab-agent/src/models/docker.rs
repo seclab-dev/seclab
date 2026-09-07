@@ -64,24 +64,12 @@ pub enum DockerContainerManagementKind {
     Custom,
 }
 
-impl DockerContainerManagementKind {
-    /// 返回用于日志和错误详情的稳定标识。
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Suite => "suite",
-            Self::Compose => "compose",
-            Self::Custom => "custom",
-        }
-    }
-}
-
 /// Docker 容器的管理归属。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DockerContainerManagement {
     pub kind: DockerContainerManagementKind,
     pub owner_name: Option<String>,
-    pub read_only: bool,
 }
 
 /// 供前端稳定消费的 Docker 容器状态。

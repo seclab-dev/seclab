@@ -402,6 +402,8 @@ const en = {
         createContainerFailed: 'Failed to create container: {message}',
         invalidContainerNameOrId: 'Invalid container name or ID',
         deleteContainersConfirm: 'Delete container {name}? This action cannot be undone.',
+        deleteManagedContainersConfirm:
+          'Delete container {name}? Compose or suite containers may be recreated by a later deployment. This action cannot be undone.',
         deleteConfirmTitle: 'Confirm Delete',
         deleteAction: 'Delete',
         containerActionFailed: 'Container {name} failed to execute {action}: {message}',
@@ -590,11 +592,6 @@ const en = {
           custom: 'Custom',
           compose: 'Compose',
           suite: 'Suite',
-        },
-        readOnly: {
-          custom: 'This container cannot be changed',
-          compose: 'Manage this container from its Compose project',
-          suite: 'Manage this container from Suite Center',
         },
         states: {
           created: 'Created',

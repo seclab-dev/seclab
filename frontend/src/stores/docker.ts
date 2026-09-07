@@ -1233,6 +1233,7 @@ export const useDockerStore = defineStore('docker', () => {
     if (validTargets.some(({ id }) => containerActionLoadingIds.value.includes(id))) {
       return false
     }
+    const targetIds = validTargets.map(({ id }) => id)
     let confirmed = true
     if (action === 'remove') {
       const targetNames = validTargets.map((item) => item.name).join(', ')
@@ -1240,8 +1241,16 @@ export const useDockerStore = defineStore('docker', () => {
         validTargets.length > 1
           ? t('app.docker.messages.containerCount', { count: validTargets.length })
           : `"${targetNames}"`
+      const containsManagedContainer = containers.value.some(
+        (container) => targetIds.includes(container.id) && container.management.kind !== 'custom',
+      )
       confirmed = await modalStore.showConfirmation(
-        t('app.docker.messages.deleteContainersConfirm', { name: promptName }),
+        t(
+          containsManagedContainer
+            ? 'app.docker.messages.deleteManagedContainersConfirm'
+            : 'app.docker.messages.deleteContainersConfirm',
+          { name: promptName },
+        ),
         t('app.docker.messages.deleteConfirmTitle'),
         t('app.docker.messages.deleteAction'),
         t('confirmation.cancel'),
@@ -1249,7 +1258,6 @@ export const useDockerStore = defineStore('docker', () => {
     }
     if (!confirmed) return false
 
-    const targetIds = validTargets.map(({ id }) => id)
     containerActionLoadingIds.value = [...containerActionLoadingIds.value, ...targetIds]
     let succeeded = false
     try {

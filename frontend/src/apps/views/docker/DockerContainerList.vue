@@ -74,9 +74,7 @@ const filteredContainers = computed(() => {
   })
 })
 
-const selectableContainers = computed(() =>
-  filteredContainers.value.filter((container) => !container.management.readOnly),
-)
+const selectableContainers = computed(() => filteredContainers.value)
 const isAllSelected = computed(
   () =>
     selectableContainers.value.length > 0 &&
@@ -95,11 +93,7 @@ const selectedContainers = computed(() =>
 watch(
   () => store.containers,
   (containers) => {
-    const availableIds = new Set(
-      containers
-        .filter((container) => !container.management.readOnly)
-        .map((container) => container.id),
-    )
+    const availableIds = new Set(containers.map((container) => container.id))
     selectedIds.value = new Set([...selectedIds.value].filter((id) => availableIds.has(id)))
   },
 )
@@ -238,15 +232,6 @@ const batchActions = computed(() => [
 ])
 
 function rowActions(container: DockerContainerSummary) {
-  if (container.management.readOnly) {
-    return [
-      {
-        label: t(`app.docker.containers.readOnly.${container.management.kind}`),
-        handler: () => undefined,
-        disabled: true,
-      },
-    ]
-  }
   const loading = store.containerActionLoadingIds.includes(container.id)
   return [
     {
@@ -393,7 +378,6 @@ function rowActions(container: DockerContainerSummary) {
         <template #selection="{ row: container }: { row: DockerContainerSummary }">
           <SecLabCheckbox
             :model-value="selectedIds.has(container.id)"
-            :disabled="container.management.readOnly"
             @update:model-value="(selected) => setRowSelected(container.id, selected)"
           />
         </template>
