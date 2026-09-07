@@ -281,6 +281,56 @@ normalize_abs_path() {
   echo "$path"
 }
 
+# 从现有 systemd 服务或默认目录标记读取安装目录。
+detect_existing_seclab_home() {
+  local unit
+  local detected_home
+  for unit in /etc/systemd/system/seclab.service /etc/systemd/system/seclab-agent.service; do
+    [[ -f "$unit" ]] || continue
+    detected_home="$(sed -n 's/^[[:space:]]*Environment=SECLAB_HOME=//p' "$unit" | tail -n 1)"
+    if [[ -n "$detected_home" ]]; then
+      printf '%s' "$detected_home"
+      return 0
+    fi
+  done
+  if [[ -f /opt/seclab/config/agent.install_dir ]]; then
+    $PREFIX cat /opt/seclab/config/agent.install_dir | head -n 1
+    return 0
+  fi
+  return 1
+}
+
+# 读取覆盖安装需要复用的监听与回调配置。
+load_existing_runtime_config() {
+  local path="${SECLAB_CONFIG_DIR}/runtime-listen.json"
+  local content
+  local existing_host
+  local existing_port
+  local existing_public_host
+  [[ -f "$path" ]] || fail "existing runtime config not found: $path"
+  content="$($PREFIX cat "$path")" || fail "failed to read existing runtime config: $path"
+  existing_host="$(printf '%s\n' "$content" | sed -nE 's/.*"host"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -n 1)"
+  existing_port="$(printf '%s\n' "$content" | sed -nE 's/.*"port"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' | head -n 1)"
+  existing_public_host="$(printf '%s\n' "$content" | sed -nE 's/.*"publicHost"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -n 1)"
+  [[ -n "$existing_host" ]] || fail "existing runtime config has no valid host: $path"
+  [[ "$existing_port" =~ ^[0-9]+$ ]] || fail "existing runtime config has no valid port: $path"
+  if (( existing_port < 1 || existing_port > 65535 )); then
+    fail "existing runtime config port must be in range 1-65535: $existing_port"
+  fi
+  if [[ -n "$existing_public_host" ]]; then
+    validate_callback_host "$existing_public_host"
+  fi
+  if [[ "$SECLAB_HOST_FROM_ARG" != "true" ]]; then
+    SECLAB_HOST="$existing_host"
+  fi
+  if [[ "$SECLAB_PORT_FROM_ARG" != "true" ]]; then
+    SECLAB_PORT="$existing_port"
+  fi
+  if [[ "$SECLAB_PUBLIC_HOST_FROM_ARG" != "true" ]]; then
+    SECLAB_PUBLIC_HOST="$existing_public_host"
+  fi
+}
+
 is_firewalld_active() {
   if ! command_exists firewall-cmd; then
     return 1
@@ -380,6 +430,7 @@ sudo_prefix() {
 }
 
 SECLAB_HOST="::"
+SECLAB_HOST_FROM_ARG="false"
 SECLAB_PORT="7310"
 SECLAB_PORT_FROM_ARG="false"
 SECLAB_PUBLIC_HOST=""
@@ -392,6 +443,7 @@ while [[ $# -gt 0 ]]; do
     --seclab-host)
       [[ $# -ge 2 ]] || fail "missing value for --seclab-host"
       SECLAB_HOST="$2"
+      SECLAB_HOST_FROM_ARG="true"
       shift 2
       ;;
     --seclab-port)
@@ -414,6 +466,7 @@ done
 
 # Check if already installed before any user prompts
 installed="false"
+EXISTING_SECLAB_HOME=""
 if [[ -f "/etc/systemd/system/seclab.service" || -f "/etc/systemd/system/seclab-agent.service" ]]; then
   installed="true"
 elif [[ -f "/opt/seclab/config/node.role" ]]; then
@@ -421,24 +474,48 @@ elif [[ -f "/opt/seclab/config/node.role" ]]; then
 fi
 
 if [[ "$installed" == "true" ]]; then
+  EXISTING_SECLAB_HOME="$(detect_existing_seclab_home)" || fail "failed to detect the existing SecLab installation directory"
   if ! prompt_yes_no "SecLab installation or service was detected. Overwrite existing installation? (y/N): "; then
     log "Installation cancelled."
     exit 0
   fi
 fi
 
-if [[ "$SECLAB_PORT_FROM_ARG" != "true" ]]; then
-  while true; do
-    INPUT_SECLAB_PORT="$(read_tty_input "Use default SecLab port (${SECLAB_PORT})? : ")" || fail "failed to read port input"
-    if [[ -z "$INPUT_SECLAB_PORT" ]]; then
-      break
-    fi
-    if [[ "$INPUT_SECLAB_PORT" =~ ^[0-9]+$ ]] && (( INPUT_SECLAB_PORT >= 1 && INPUT_SECLAB_PORT <= 65535 )); then
-      SECLAB_PORT="$INPUT_SECLAB_PORT"
-      break
-    fi
-    warn "invalid port: $INPUT_SECLAB_PORT, expected 1-65535"
-  done
+if [[ "$installed" == "true" ]]; then
+  SECLAB_HOME="$(normalize_abs_path "$EXISTING_SECLAB_HOME")"
+else
+  if [[ "$SECLAB_PORT_FROM_ARG" != "true" ]]; then
+    while true; do
+      INPUT_SECLAB_PORT="$(read_tty_input "Use default SecLab port (${SECLAB_PORT})? : ")" || fail "failed to read port input"
+      if [[ -z "$INPUT_SECLAB_PORT" ]]; then
+        break
+      fi
+      if [[ "$INPUT_SECLAB_PORT" =~ ^[0-9]+$ ]] && (( INPUT_SECLAB_PORT >= 1 && INPUT_SECLAB_PORT <= 65535 )); then
+        SECLAB_PORT="$INPUT_SECLAB_PORT"
+        break
+      fi
+      warn "invalid port: $INPUT_SECLAB_PORT, expected 1-65535"
+    done
+  fi
+
+  if [[ "$SECLAB_PUBLIC_HOST_FROM_ARG" != "true" ]]; then
+    DETECTED_SECLAB_PUBLIC_HOST="$(detect_lan_ipv4)"
+    SECLAB_PUBLIC_HOST="$(read_default_callback_host "$DETECTED_SECLAB_PUBLIC_HOST" "$SECLAB_PORT")"
+  fi
+  SECLAB_HOME="$(normalize_abs_path "$(read_optional_path "Installation directory" "$SECLAB_HOME")")"
+fi
+
+SECLAB_CONFIG_DIR="${SECLAB_HOME}/config"
+SECLAB_DB_DIR="${SECLAB_HOME}/database"
+SECLAB_LOG_DIR="${SECLAB_HOME}/logs"
+SECLAB_RUN_DIR="${SECLAB_HOME}/run"
+SECLAB_AGENT_SOCKET="${SECLAB_RUN_DIR}/seclab-agent.sock"
+RUNNING_SUITE_SOCKET_CONTAINERS=()
+
+if [[ "$installed" == "true" ]]; then
+  load_existing_runtime_config
+  log "reuse existing installation directory: ${SECLAB_HOME}"
+  log "reuse existing runtime config: ${SECLAB_HOST}:${SECLAB_PORT}"
 fi
 
 if ! [[ "$SECLAB_PORT" =~ ^[0-9]+$ ]]; then
@@ -448,42 +525,43 @@ if (( SECLAB_PORT < 1 || SECLAB_PORT > 65535 )); then
   fail "SecLab port must be in range 1-65535: $SECLAB_PORT"
 fi
 
-if [[ "$SECLAB_PUBLIC_HOST_FROM_ARG" != "true" ]]; then
-  DETECTED_SECLAB_PUBLIC_HOST="$(detect_lan_ipv4)"
-  SECLAB_PUBLIC_HOST="$(read_default_callback_host "$DETECTED_SECLAB_PUBLIC_HOST" "$SECLAB_PORT")"
+if [[ -n "$SECLAB_PUBLIC_HOST" ]]; then
+  validate_callback_host "$SECLAB_PUBLIC_HOST"
+elif [[ "$installed" != "true" || "$SECLAB_PUBLIC_HOST_FROM_ARG" == "true" ]]; then
+  fail "default callback host cannot be empty"
 fi
-validate_callback_host "$SECLAB_PUBLIC_HOST"
-
-SECLAB_HOME="$(normalize_abs_path "$(read_optional_path "Installation directory" "$SECLAB_HOME")")"
-SECLAB_CONFIG_DIR="${SECLAB_HOME}/config"
-SECLAB_DB_DIR="${SECLAB_HOME}/database"
-SECLAB_LOG_DIR="${SECLAB_HOME}/logs"
-SECLAB_RUN_DIR="${SECLAB_HOME}/run"
-SECLAB_AGENT_SOCKET="${SECLAB_RUN_DIR}/seclab-agent.sock"
-RUNNING_SUITE_SOCKET_CONTAINERS=()
-
-DEFAULT_ADMIN_USERNAME="seclab"
-DEFAULT_ADMIN_PASSWORD="$(random_chars 16 'A-Za-z0-9!@#$%^&*')"
-DEFAULT_SAFE_ENTRY="$(random_chars 16 'A-Za-z0-9')"
-
-ADMIN_USERNAME="$(read_tty_input "Admin username [${DEFAULT_ADMIN_USERNAME}]: ")" || ADMIN_USERNAME=""
-if [[ -z "$ADMIN_USERNAME" ]]; then
-  ADMIN_USERNAME="$DEFAULT_ADMIN_USERNAME"
+PRESERVE_EXISTING_SECURITY="false"
+if [[ -s "${SECLAB_DB_DIR}/seclab.db" ]]; then
+  PRESERVE_EXISTING_SECURITY="true"
 fi
-validate_username "$ADMIN_USERNAME" || fail "Admin username must be 1-64 characters and contain only letters, digits, underscore, or hyphen"
 
-ADMIN_PASSWORD="$(read_tty_input "Admin password [generated]: ")" || ADMIN_PASSWORD=""
-if [[ -z "$ADMIN_PASSWORD" ]]; then
-  ADMIN_PASSWORD="$DEFAULT_ADMIN_PASSWORD"
-fi
-[[ -n "$ADMIN_PASSWORD" ]] || fail "Admin password must not be empty"
-((${#ADMIN_PASSWORD} >= 5)) || fail "Admin password must be at least 5 characters"
+ADMIN_USERNAME=""
+ADMIN_PASSWORD=""
+SAFE_ENTRY=""
+if [[ "$PRESERVE_EXISTING_SECURITY" != "true" ]]; then
+  DEFAULT_ADMIN_USERNAME="seclab"
+  DEFAULT_ADMIN_PASSWORD="$(random_chars 16 'A-Za-z0-9!@#$%^&*')"
+  DEFAULT_SAFE_ENTRY="$(random_chars 16 'A-Za-z0-9')"
 
-SAFE_ENTRY="$(read_tty_input "Safe login entry [${DEFAULT_SAFE_ENTRY}]: ")" || SAFE_ENTRY=""
-if [[ -z "$SAFE_ENTRY" ]]; then
-  SAFE_ENTRY="$DEFAULT_SAFE_ENTRY"
+  ADMIN_USERNAME="$(read_tty_input "Admin username [${DEFAULT_ADMIN_USERNAME}]: ")" || ADMIN_USERNAME=""
+  if [[ -z "$ADMIN_USERNAME" ]]; then
+    ADMIN_USERNAME="$DEFAULT_ADMIN_USERNAME"
+  fi
+  validate_username "$ADMIN_USERNAME" || fail "Admin username must be 1-64 characters and contain only letters, digits, underscore, or hyphen"
+
+  ADMIN_PASSWORD="$(read_tty_input "Admin password [generated]: ")" || ADMIN_PASSWORD=""
+  if [[ -z "$ADMIN_PASSWORD" ]]; then
+    ADMIN_PASSWORD="$DEFAULT_ADMIN_PASSWORD"
+  fi
+  [[ -n "$ADMIN_PASSWORD" ]] || fail "Admin password must not be empty"
+  ((${#ADMIN_PASSWORD} >= 5)) || fail "Admin password must be at least 5 characters"
+
+  SAFE_ENTRY="$(read_tty_input "Safe login entry [${DEFAULT_SAFE_ENTRY}]: ")" || SAFE_ENTRY=""
+  if [[ -z "$SAFE_ENTRY" ]]; then
+    SAFE_ENTRY="$DEFAULT_SAFE_ENTRY"
+  fi
+  validate_safe_entry "$SAFE_ENTRY" || fail "Safe entry must be 8-32 ASCII letters or digits and must not use a reserved path prefix"
 fi
-validate_safe_entry "$SAFE_ENTRY" || fail "Safe entry must be 8-32 ASCII letters or digits and must not use a reserved path prefix"
 
 if [[ "$installed" == "true" ]]; then
   capture_running_suite_socket_containers "$SECLAB_AGENT_SOCKET"
@@ -607,15 +685,19 @@ run_seclab_init_runtime_config() {
 log "prepare directories under ${SECLAB_HOME}"
 $PREFIX mkdir -p "$SECLAB_CONFIG_DIR" "$SECLAB_DB_DIR" "$SECLAB_LOG_DIR" "$SECLAB_RUN_DIR"
 
-log "write bootstrap security file: ${SECLAB_CONFIG_DIR}/bootstrap-security.json"
-BOOTSTRAP_SECURITY_JSON="$(
-  printf '{"username":"%s","password":"%s","safe_entry":"%s","password_complexity":false}\n' \
-    "$(json_escape "$ADMIN_USERNAME")" \
-    "$(json_escape "$ADMIN_PASSWORD")" \
-    "$(json_escape "$SAFE_ENTRY")"
-)"
-printf '%s' "$BOOTSTRAP_SECURITY_JSON" | $PREFIX tee "$SECLAB_CONFIG_DIR/bootstrap-security.json" >/dev/null
-$PREFIX chmod 0600 "$SECLAB_CONFIG_DIR/bootstrap-security.json"
+if [[ "$PRESERVE_EXISTING_SECURITY" != "true" ]]; then
+  log "write bootstrap security file: ${SECLAB_CONFIG_DIR}/bootstrap-security.json"
+  BOOTSTRAP_SECURITY_JSON="$(
+    printf '{"username":"%s","password":"%s","safe_entry":"%s","password_complexity":false}\n' \
+      "$(json_escape "$ADMIN_USERNAME")" \
+      "$(json_escape "$ADMIN_PASSWORD")" \
+      "$(json_escape "$SAFE_ENTRY")"
+  )"
+  printf '%s' "$BOOTSTRAP_SECURITY_JSON" | $PREFIX tee "$SECLAB_CONFIG_DIR/bootstrap-security.json" >/dev/null
+  $PREFIX chmod 0600 "$SECLAB_CONFIG_DIR/bootstrap-security.json"
+else
+  log "preserve existing administrator and security settings"
+fi
 
 log_section "== install agent"
 log "install binary: /usr/local/bin/seclab-agent"
@@ -649,9 +731,15 @@ fi
 
 log "write config: ${SECLAB_CONFIG_DIR}/seclab.toml"
 write_file_if_missing "$SECLAB_CONFIG_DIR/seclab.toml" "jwtSecret = \"$JWT_SECRET\"\nagentBinary = \"/usr/local/bin/seclab-agent\"\nslctlPath = \"/usr/local/bin/slctl\"\n"
-log "init SecLab listen config: ${SECLAB_HOST}:${SECLAB_PORT}"
-log "default controller callback URL: https://${SECLAB_PUBLIC_HOST}:${SECLAB_PORT}"
-run_seclab_init_runtime_config
+if [[ "$installed" != "true" || "$SECLAB_HOST_FROM_ARG" == "true" || "$SECLAB_PORT_FROM_ARG" == "true" || "$SECLAB_PUBLIC_HOST_FROM_ARG" == "true" ]]; then
+  log "init SecLab listen config: ${SECLAB_HOST}:${SECLAB_PORT}"
+  if [[ -n "$SECLAB_PUBLIC_HOST" ]]; then
+    log "default controller callback URL: https://${SECLAB_PUBLIC_HOST}:${SECLAB_PORT}"
+  fi
+  run_seclab_init_runtime_config
+else
+  log "preserve existing SecLab listen and callback config"
+fi
 
 log "write service: /etc/systemd/system/seclab.service"
 write_service "seclab"
@@ -668,10 +756,14 @@ log "agent service started"
 restore_running_suite_socket_containers
 
 log_section "== install completed"
-echo "SecLab initial login information:"
-echo
-echo "  Username: ${ADMIN_USERNAME}"
-echo "  Password: ${ADMIN_PASSWORD}"
-echo "  URL     : https://${SECLAB_PUBLIC_HOST}:${SECLAB_PORT}/${SAFE_ENTRY}"
-echo
-echo "Please save the password now. slctl can reset the password but cannot display it later."
+if [[ "$PRESERVE_EXISTING_SECURITY" != "true" ]]; then
+  echo "SecLab initial login information:"
+  echo
+  echo "  Username: ${ADMIN_USERNAME}"
+  echo "  Password: ${ADMIN_PASSWORD}"
+  echo "  URL     : https://${SECLAB_PUBLIC_HOST}:${SECLAB_PORT}/${SAFE_ENTRY}"
+  echo
+  echo "Please save the password now. slctl can reset the password but cannot display it later."
+else
+  echo "Existing administrator credentials and security settings were preserved."
+fi

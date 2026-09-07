@@ -60,15 +60,27 @@ async fn initialize_admin_if_not_exists(
         .fetch_one(seclab_db)
         .await?;
 
-    if user_count > 0 && !bootstrap_path.exists() {
-        debug!("Admin user already exists. Skipping bootstrap security initialization.");
+    if user_count > 0 {
+        if bootstrap_path.exists() {
+            fs::remove_file(bootstrap_path).map_err(|err| {
+                anyhow::anyhow!(
+                    "existing admin user preserved but failed to remove bootstrap security file {}: {}",
+                    bootstrap_path.display(),
+                    err
+                )
+            })?;
+            info!(
+                "Existing admin user and security settings preserved; bootstrap security file removed."
+            );
+        } else {
+            debug!("Admin user already exists. Skipping bootstrap security initialization.");
+        }
         return Ok(());
     }
 
     if !bootstrap_path.exists() {
         if allow_dev_default {
-            initialize_admin_from_values(seclab_db, user_count, "admin", "admin", "", false)
-                .await?;
+            initialize_admin_from_values(seclab_db, "admin", "admin", "", false).await?;
             info!(
                 "Initialized development default admin user admin/admin with safe entry disabled."
             );
@@ -93,7 +105,6 @@ async fn initialize_admin_if_not_exists(
 
     initialize_admin_from_values(
         seclab_db,
-        user_count,
         &bootstrap.username,
         &bootstrap.password,
         bootstrap.safe_entry.trim(),
@@ -121,7 +132,6 @@ async fn initialize_admin_if_not_exists(
 
 async fn initialize_admin_from_values(
     seclab_db: &DbPool,
-    existing_user_count: i64,
     username: &str,
     password: &str,
     safe_entry: &str,
@@ -134,13 +144,6 @@ async fn initialize_admin_from_values(
             return Err(anyhow::anyhow!("Failed to hash admin password"));
         }
     };
-
-    if existing_user_count > 0 {
-        sqlx::query("DELETE FROM auth_sessions")
-            .execute(seclab_db)
-            .await?;
-        sqlx::query("DELETE FROM users").execute(seclab_db).await?;
-    }
 
     let result = sqlx::query(
         r#"
@@ -300,6 +303,85 @@ mod tests {
                 .unwrap()
         );
         assert!(!bootstrap_path.exists());
+    }
+
+    #[tokio::test]
+    async fn existing_admin_and_security_are_preserved_when_bootstrap_exists() {
+        let pool = setup_test_db().await;
+        let initial_bootstrap = unique_bootstrap_path("existing-initial");
+        initialize_admin_if_not_exists(&pool, &initial_bootstrap, true)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE users SET username = 'existing-admin' WHERE id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        system_config::update_security_settings(&pool, "KeepMe123", true)
+            .await
+            .unwrap();
+        let original_password_hash: String =
+            sqlx::query_scalar("SELECT password_hash FROM users WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO auth_sessions (id, session_token_hash, user_id, expires_at) VALUES ('session-1', 'token-1', 1, '2099-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO upgrade_plans (
+                plan_id, target_version, component, scope, strategy, status,
+                requested_by_user_id, requested_by, trace_id
+            ) VALUES ('plan-1', '0.2.0', 'cluster', '{}', '{}', 'succeeded', 1, 'existing-admin', 'trace-1')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let overwrite_bootstrap = unique_bootstrap_path("existing-overwrite");
+        fs::create_dir_all(overwrite_bootstrap.parent().unwrap()).unwrap();
+        fs::write(
+            &overwrite_bootstrap,
+            r#"{"username":"replacement","password":"67890","safe_entry":"Replace123","password_complexity":false}"#,
+        )
+        .unwrap();
+
+        initialize_admin_if_not_exists(&pool, &overwrite_bootstrap, false)
+            .await
+            .unwrap();
+
+        let (user_id, username, password_hash): (i64, String, String) =
+            sqlx::query_as("SELECT id, username, password_hash FROM users")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(user_id, 1);
+        assert_eq!(username, "existing-admin");
+        assert_eq!(password_hash, original_password_hash);
+        assert_eq!(
+            system_config::get_safe_entry_value(&pool).await.unwrap(),
+            "KeepMe123"
+        );
+        assert!(
+            system_config::password_complexity_enabled(&pool)
+                .await
+                .unwrap()
+        );
+        let plan_count: i64 = sqlx::query_scalar("SELECT COUNT(1) FROM upgrade_plans")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(plan_count, 1);
+        let session_count: i64 = sqlx::query_scalar("SELECT COUNT(1) FROM auth_sessions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(session_count, 1);
+        assert!(!overwrite_bootstrap.exists());
     }
 
     #[tokio::test]
