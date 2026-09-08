@@ -632,7 +632,6 @@ export type DockerNetworkManagementKind = 'system' | 'compose' | 'suite' | 'cust
 export interface DockerNetworkManagement {
   kind: DockerNetworkManagementKind
   ownerName?: string
-  readOnly: boolean
 }
 
 /** Docker 网络允许执行的操作。 */
@@ -852,7 +851,6 @@ export type DockerVolumeManagementKind = 'suite' | 'compose' | 'custom'
 export interface DockerVolumeManagement {
   kind: DockerVolumeManagementKind
   ownerName?: string
-  readOnly: boolean
 }
 
 /** Docker 卷在当前模块允许执行的操作。 */

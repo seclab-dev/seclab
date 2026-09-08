@@ -22,6 +22,7 @@ import type {
   DockerVolumeManagementKind,
   DockerVolumeSummary,
 } from '@/api/interface/docker'
+import { useConfirmationModalStore } from '@/stores/confirmation-modal'
 import { useDockerStore } from '@/stores/docker'
 import { useNodeStore } from '@/stores/node'
 import { formatKeyValue, parseKeyValueLines } from '@/utils/docker-format'
@@ -33,6 +34,7 @@ defineOptions({ inheritAttrs: false })
 const { t } = useI18n()
 const store = useDockerStore()
 const nodeStore = useNodeStore()
+const modalStore = useConfirmationModalStore()
 
 const search = ref('')
 const managementFilter = ref<'' | DockerVolumeManagementKind>('')
@@ -135,11 +137,6 @@ function managementTagType(kind: DockerVolumeManagementKind): 'primary' | 'warni
   return 'warning'
 }
 
-/** 返回托管卷的管理入口说明。 */
-function readOnlyReason(volume: DockerVolumeSummary): string {
-  return t(`app.docker.volumes.readOnly.${volume.management.kind}`)
-}
-
 /** 返回容器状态标签的语义色。 */
 function stateTagType(state: string): 'success' | 'warning' | 'danger' | 'default' {
   if (state === 'running') return 'success'
@@ -219,14 +216,26 @@ function closeDetail(): void {
   store.clearVolumeDetail()
 }
 
-/** 删除允许管理的自定义卷。 */
+/** 删除允许管理的数据卷。 */
 async function deleteVolume(volume: DockerVolumeSummary): Promise<void> {
   if (!volume.capabilities.canRemove) return
+  const confirmed = await modalStore.showConfirmation(
+    t(
+      volume.management.kind === 'custom'
+        ? 'app.docker.messages.deleteVolumeConfirm'
+        : 'app.docker.messages.deleteManagedVolumeConfirm',
+      { name: volume.name },
+    ),
+    t('app.docker.messages.deleteConfirmTitle'),
+    t('app.docker.messages.deleteAction'),
+    t('confirmation.cancel'),
+  )
+  if (!confirmed) return
   const deleted = await store.removeVolume(volume)
   if (deleted && selectedSummary.value?.name === volume.name) closeDetail()
 }
 
-/** 生成卷行操作，并对托管卷提供管理入口说明。 */
+/** 生成卷行操作。 */
 function rowActions(volume: DockerVolumeSummary) {
   return [
     {
@@ -238,7 +247,6 @@ function rowActions(volume: DockerVolumeSummary) {
       handler: () => void deleteVolume(volume),
       class: 'app-btn-delete',
       disabled: !volume.capabilities.canRemove,
-      tooltip: volume.capabilities.canRemove ? undefined : readOnlyReason(volume),
     },
   ]
 }
@@ -411,13 +419,6 @@ watch(
       @close="closeDetail"
     >
       <div class="detail-content" data-slot="detail">
-        <SecLabAlert
-          v-if="currentSummary?.management.readOnly"
-          type="info"
-          :title="t('app.docker.volumes.detail.readOnlyTitle')"
-          :description="readOnlyReason(currentSummary)"
-          show-icon
-        />
         <SecLabAlert
           v-if="store.volumeDetailError"
           type="warning"

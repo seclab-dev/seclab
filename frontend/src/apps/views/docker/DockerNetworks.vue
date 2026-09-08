@@ -97,7 +97,7 @@ const filteredNetworks = computed(() => {
 
 const currentDetail = computed(() => store.networkDetail)
 const currentSummary = computed(() => currentDetail.value?.summary ?? selectedSummary.value)
-const isReadOnlyDetail = computed(() => currentSummary.value?.management.readOnly ?? true)
+const isSystemNetwork = computed(() => currentSummary.value?.management.kind === 'system')
 const canManageConnections = computed(
   () => currentSummary.value?.capabilities.canManageConnections ?? false,
 )
@@ -185,8 +185,9 @@ function managementTagType(
   return 'default'
 }
 
-function readOnlyReason(network: DockerNetworkSummary): string {
-  return t(`app.docker.networks.readOnly.${network.management.kind}`)
+/** 返回系统网络的操作限制说明。 */
+function systemProtectionReason(): string {
+  return t('app.docker.networks.systemProtected')
 }
 
 function formatIpam(
@@ -278,7 +279,12 @@ function closeDetail(): void {
 async function deleteNetwork(network: DockerNetworkSummary): Promise<void> {
   if (!network.capabilities.canRemove) return
   const confirmed = await modalStore.showConfirmation(
-    t('app.docker.networks.actions.deleteConfirm', { name: network.name }),
+    t(
+      network.management.kind === 'custom'
+        ? 'app.docker.networks.actions.deleteConfirm'
+        : 'app.docker.networks.actions.deleteManagedConfirm',
+      { name: network.name },
+    ),
     t('app.docker.messages.deleteConfirmTitle'),
     t('app.docker.messages.deleteAction'),
     t('confirmation.cancel'),
@@ -335,7 +341,7 @@ function rowActions(network: DockerNetworkSummary) {
       handler: () => void deleteNetwork(network),
       class: 'app-btn-delete',
       disabled: !network.capabilities.canRemove,
-      tooltip: network.capabilities.canRemove ? undefined : readOnlyReason(network),
+      tooltip: network.capabilities.canRemove ? undefined : systemProtectionReason(),
     },
   ]
 }
@@ -601,10 +607,10 @@ watch(
     >
       <div class="detail-content" data-slot="detail">
         <SecLabAlert
-          v-if="isReadOnlyDetail && currentSummary"
+          v-if="isSystemNetwork"
           type="info"
-          :title="t('app.docker.networks.detail.readOnlyTitle')"
-          :description="readOnlyReason(currentSummary)"
+          :title="t('app.docker.networks.detail.systemProtectedTitle')"
+          :description="systemProtectionReason()"
           show-icon
         />
         <SecLabAlert
