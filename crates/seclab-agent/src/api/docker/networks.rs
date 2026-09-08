@@ -93,7 +93,7 @@ pub async fn inspect_network(
     )
 }
 
-/// 删除自定义网络；托管网络和仍连接容器的网络会在 Agent 侧拒绝。
+/// 删除非系统网络；系统网络和仍连接容器的网络会在 Agent 侧拒绝。
 pub async fn remove_network(
     State(state): State<Arc<AppState>>,
     context: DockerOperationContext,
@@ -105,7 +105,7 @@ pub async fn remove_network(
         let docker = state.docker_client().await?;
         let network = inspect(&docker, &id).await?;
         network_name = display_name(&network.name, &id);
-        ensure_mutable(&network)?;
+        ensure_not_system_network(&network)?;
         ensure_unused(&network)?;
         docker.remove_network(&id).await?;
         Ok(ApiResponse::ok("Network removed").into_response())
@@ -123,7 +123,7 @@ pub async fn remove_network(
         .await
 }
 
-/// 将运行中的容器连接到自定义网络。
+/// 将运行中的容器连接到非系统网络。
 pub async fn connect_network(
     State(state): State<Arc<AppState>>,
     context: DockerOperationContext,
@@ -141,7 +141,7 @@ pub async fn connect_network(
         let docker = state.docker_client().await?;
         let network = inspect(&docker, &id).await?;
         network_name = display_name(&network.name, &id);
-        ensure_mutable(&network)?;
+        ensure_not_system_network(&network)?;
 
         let container = docker.inspect_container(&container_id, None).await?;
         container_name = display_name(&container.name, &container_id);
@@ -178,7 +178,7 @@ pub async fn connect_network(
         .await
 }
 
-/// 将容器从自定义网络断开；强制断开会记录为高影响操作。
+/// 将容器从非系统网络断开；强制断开会记录为高影响操作。
 pub async fn disconnect_network(
     State(state): State<Arc<AppState>>,
     context: DockerOperationContext,
@@ -197,7 +197,7 @@ pub async fn disconnect_network(
         let docker = state.docker_client().await?;
         let network = inspect(&docker, &id).await?;
         network_name = display_name(&network.name, &id);
-        ensure_mutable(&network)?;
+        ensure_not_system_network(&network)?;
         if let Some(endpoint) = network
             .containers
             .as_ref()
@@ -305,7 +305,7 @@ fn build_summary(
         .unwrap_or(&id)
         .to_string();
     let management = classify_management(&name, ingress.unwrap_or(false), labels);
-    let mutable = !management.read_only;
+    let mutable = management.kind != DockerNetworkManagementKind::System;
     DockerNetworkSummary {
         id,
         name,
@@ -397,34 +397,32 @@ fn classify_management(
     labels: Option<&HashMap<String, String>>,
 ) -> DockerNetworkManagement {
     let labels = labels.cloned().unwrap_or_default();
-    let (kind, owner_name) = if labels.get("seclab.owner").map(String::as_str) == Some("suite") {
-        (
-            DockerNetworkManagementKind::Suite,
-            Some("SecLab".to_string()),
-        )
-    } else if let Some(project) = labels.get("com.docker.compose.project") {
-        (DockerNetworkManagementKind::Compose, Some(project.clone()))
-    } else if ingress || matches!(name, "bridge" | "host" | "none") {
-        (
-            DockerNetworkManagementKind::System,
-            Some(if ingress { "Swarm" } else { "Docker" }.to_string()),
-        )
-    } else {
-        (DockerNetworkManagementKind::Custom, None)
-    };
-    DockerNetworkManagement {
-        kind,
-        owner_name,
-        read_only: kind != DockerNetworkManagementKind::Custom,
-    }
+    let (kind, owner_name) =
+        if ingress || matches!(name, "bridge" | "host" | "none" | "docker_gwbridge") {
+            (
+                DockerNetworkManagementKind::System,
+                Some(if ingress { "Swarm" } else { "Docker" }.to_string()),
+            )
+        } else if labels.get("seclab.owner").map(String::as_str) == Some("suite") {
+            (
+                DockerNetworkManagementKind::Suite,
+                Some("SecLab".to_string()),
+            )
+        } else if let Some(project) = labels.get("com.docker.compose.project") {
+            (DockerNetworkManagementKind::Compose, Some(project.clone()))
+        } else {
+            (DockerNetworkManagementKind::Custom, None)
+        };
+    DockerNetworkManagement { kind, owner_name }
 }
 
-fn ensure_mutable(network: &NetworkInspect) -> ApiResult<()> {
+/// 拒绝修改 Docker 默认网络和 Swarm Ingress 网络。
+fn ensure_not_system_network(network: &NetworkInspect) -> ApiResult<()> {
     let summary = summary_from_inspect(network);
-    if summary.management.read_only {
+    if summary.management.kind == DockerNetworkManagementKind::System {
         return Err(ApiError::conflict(
             ErrorCode::DockerNetworkProtected,
-            "managed Docker networks are read-only in the network module",
+            "Docker system networks cannot be changed",
         )
         .with_detail(format!(
             "network={} management={:?}",
@@ -685,11 +683,19 @@ mod tests {
     fn classifies_managed_and_custom_networks() {
         let cases = [
             (
-                network("bridge", &[], false),
+                network(
+                    "bridge",
+                    &[("com.docker.compose.project", "project")],
+                    false,
+                ),
                 DockerNetworkManagementKind::System,
             ),
             (
-                network("ingress", &[], true),
+                network("ingress", &[("seclab.owner", "suite")], true),
+                DockerNetworkManagementKind::System,
+            ),
+            (
+                network("docker_gwbridge", &[], false),
                 DockerNetworkManagementKind::System,
             ),
             (
@@ -712,22 +718,36 @@ mod tests {
         for (network, expected) in cases {
             let summary = summary_from_inspect(&network);
             assert_eq!(summary.management.kind, expected);
-            assert_eq!(
-                summary.management.read_only,
-                expected != DockerNetworkManagementKind::Custom
-            );
-            assert_eq!(
-                summary.capabilities.can_remove,
-                expected == DockerNetworkManagementKind::Custom
-            );
+            let mutable = expected != DockerNetworkManagementKind::System;
+            assert_eq!(summary.capabilities.can_remove, mutable);
+            assert_eq!(summary.capabilities.can_manage_connections, mutable);
         }
     }
 
     #[test]
-    fn rejects_mutation_for_managed_networks() {
-        let error = ensure_mutable(&network("bridge", &[], false)).unwrap_err();
-        assert_eq!(error.status, axum::http::StatusCode::CONFLICT);
-        assert_eq!(error.code, ErrorCode::DockerNetworkProtected);
+    fn protects_only_system_networks() {
+        for system_network in [network("bridge", &[], false), network("ingress", &[], true)] {
+            let error = ensure_not_system_network(&system_network).unwrap_err();
+            assert_eq!(error.status, axum::http::StatusCode::CONFLICT);
+            assert_eq!(error.code, ErrorCode::DockerNetworkProtected);
+        }
+        assert!(
+            ensure_not_system_network(&network(
+                "project_default",
+                &[("com.docker.compose.project", "project")],
+                false,
+            ))
+            .is_ok()
+        );
+        assert!(
+            ensure_not_system_network(&network(
+                "seclab-suite-network",
+                &[("seclab.owner", "suite")],
+                false,
+            ))
+            .is_ok()
+        );
+        assert!(ensure_not_system_network(&network("custom", &[], false)).is_ok());
     }
 
     #[test]

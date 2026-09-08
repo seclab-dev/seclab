@@ -1939,7 +1939,7 @@ export const useDockerStore = defineStore('docker', () => {
     }
   }
 
-  /** 删除自定义网络。 */
+  /** 删除允许管理的网络。 */
   const removeNetwork = async (network: dockerType.DockerNetworkSummary): Promise<boolean> => {
     if (networkDeleteLoadingId.value) return false
     networkDeleteLoadingId.value = network.id
@@ -2118,13 +2118,6 @@ export const useDockerStore = defineStore('docker', () => {
   /** 删除允许管理的数据卷，并保留失败后的现有列表。 */
   const removeVolume = async (volume: dockerType.DockerVolumeSummary): Promise<boolean> => {
     if (!volume.capabilities.canRemove || volumeDeleteLoadingName.value) return false
-    const confirmed = await modalStore.showConfirmation(
-      t('app.docker.messages.deleteVolumeConfirm', { name: volume.name }),
-      t('app.docker.messages.deleteConfirmTitle'),
-      t('app.docker.messages.deleteAction'),
-      t('confirmation.cancel'),
-    )
-    if (!confirmed) return false
     volumeDeleteLoadingName.value = volume.name
     try {
       const res = await dockerClient.value.removeVolume(volume.name)

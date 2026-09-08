@@ -433,6 +433,8 @@ const en = {
         listVolumesFailed: 'Failed to load volumes: {message}',
         volumeNameRequired: 'Please enter volume name',
         deleteVolumeConfirm: 'Delete volume "{name}"? This action cannot be undone.',
+        deleteManagedVolumeConfirm:
+          'Delete managed volume “{name}”? Its project or suite may become inconsistent and recreate it during a later deployment.',
         deleteVolumeSuccess: 'Volume deleted.',
         deleteVolumeFailed: 'Failed to delete volume: {message}',
         pruneConfirm:
@@ -1100,12 +1102,7 @@ const en = {
           suite: 'Suite',
           custom: 'Custom',
         },
-        readOnly: {
-          system: 'System networks are managed by Docker and are read-only here.',
-          compose: 'Compose networks must be managed from their project.',
-          suite: 'Suite networks must be managed from their suite.',
-          custom: '',
-        },
+        systemProtected: 'System networks are managed by Docker and cannot be changed or deleted.',
         features: {
           internal: 'Internal',
           ipv6: 'IPv6',
@@ -1121,6 +1118,8 @@ const en = {
           view: 'View',
           delete: 'Delete',
           deleteConfirm: 'Delete network "{name}"? This cannot be undone.',
+          deleteManagedConfirm:
+            'Delete managed network “{name}”? Its project or suite may become inconsistent and recreate it during a later deployment.',
         },
         create: {
           title: 'New Network',
@@ -1166,7 +1165,7 @@ const en = {
           ipv6: 'IPv6 Address',
           macAddress: 'MAC Address',
           actions: 'Actions',
-          readOnlyTitle: 'Managed network',
+          systemProtectedTitle: 'System network',
           refreshFailed: 'Network detail refresh failed. Existing detail is retained.',
           connectContainer: 'Connect Container',
           disconnectContainer: 'Disconnect',
@@ -1202,13 +1201,6 @@ const en = {
           suite: 'Suite',
           compose: 'Compose',
           custom: 'Custom',
-        },
-        readOnly: {
-          suite:
-            'This volume is managed by Suite Center. Manage its data lifecycle from the owning suite.',
-          compose:
-            'This volume is managed by a Compose project. Manage its data lifecycle from the owning project.',
-          custom: '',
         },
         actions: {
           create: 'New Volume',
@@ -1250,7 +1242,6 @@ const en = {
           readOnlyMode: 'Read-only',
           readWriteMode: 'Read-write',
           noReferences: 'No containers currently reference this volume.',
-          readOnlyTitle: 'Managed volume',
           loadFailed: 'Failed to load volume details',
           states: {
             created: 'Created',

@@ -1,4 +1,4 @@
-//! Docker 卷 API：提供规范化列表、详情、校验与托管资源保护。
+//! Docker 卷 API：提供规范化列表、详情、校验与使用状态保护。
 
 use crate::api::docker::context::DockerOperationContext;
 use crate::models::docker::{
@@ -82,7 +82,7 @@ pub async fn create_volume(
         .await
 }
 
-/// 删除自定义且未被容器引用的 Docker 卷。
+/// 删除未被容器引用的 Docker 卷。
 pub async fn remove_volume(
     State(state): State<Arc<AppState>>,
     context: DockerOperationContext,
@@ -95,7 +95,6 @@ pub async fn remove_volume(
         let volume = docker.inspect_volume(&name).await?;
         let summary = summary_from_volume(&volume);
         management = summary.management.kind.as_str();
-        ensure_mutable(&summary)?;
         let references = list_references(&docker, &name).await?;
         ensure_unused(&references)?;
         docker
@@ -136,9 +135,7 @@ fn summary_from_volume(volume: &Volume) -> DockerVolumeSummary {
         name: volume.name.clone(),
         driver: volume.driver.clone(),
         created_at: created_at_seconds(volume.created_at.as_ref()),
-        capabilities: DockerVolumeCapabilities {
-            can_remove: !management.read_only,
-        },
+        capabilities: DockerVolumeCapabilities { can_remove: true },
         management,
     }
 }
@@ -176,11 +173,7 @@ fn classify_management(labels: &HashMap<String, String>) -> DockerVolumeManageme
     } else {
         (DockerVolumeManagementKind::Custom, None)
     };
-    DockerVolumeManagement {
-        kind,
-        owner_name,
-        read_only: kind != DockerVolumeManagementKind::Custom,
-    }
+    DockerVolumeManagement { kind, owner_name }
 }
 
 /// 构造固定使用 local 驱动的创建请求。
@@ -306,22 +299,6 @@ fn references_from_containers(
     references
 }
 
-/// 拒绝在卷模块修改套件或 Compose 托管卷。
-fn ensure_mutable(summary: &DockerVolumeSummary) -> ApiResult<()> {
-    if summary.management.read_only {
-        return Err(ApiError::conflict(
-            ErrorCode::DockerVolumeProtected,
-            "managed Docker volumes are read-only in the volume module",
-        )
-        .with_detail(format!(
-            "volume={} management={}",
-            summary.name,
-            summary.management.kind.as_str()
-        )));
-    }
-    Ok(())
-}
-
 /// 拒绝删除仍被容器引用的卷，并提供安全的容器名称摘要。
 fn ensure_unused(references: &[DockerVolumeContainerReference]) -> ApiResult<()> {
     if references.is_empty() {
@@ -389,9 +366,9 @@ mod tests {
             suite.management.owner_name.as_deref(),
             Some("suite-project")
         );
-        assert!(!suite.capabilities.can_remove);
+        assert!(suite.capabilities.can_remove);
         assert_eq!(compose.management.kind, DockerVolumeManagementKind::Compose);
-        assert!(!compose.capabilities.can_remove);
+        assert!(compose.capabilities.can_remove);
         assert_eq!(custom.management.kind, DockerVolumeManagementKind::Custom);
         assert!(custom.capabilities.can_remove);
     }
@@ -405,21 +382,6 @@ mod tests {
         assert_eq!(response.items[0].name, "Alpha");
         assert_eq!(response.items[1].name, "zeta");
         assert_eq!(response.warnings, vec!["plugin warning"]);
-    }
-
-    #[test]
-    fn rejects_protected_volumes() {
-        let suite = summary_from_volume(&volume("suite-data", &[("seclab.owner", "suite")]));
-        let compose = summary_from_volume(&volume(
-            "compose-data",
-            &[("com.docker.compose.project", "project")],
-        ));
-        let error = ensure_mutable(&suite).unwrap_err();
-        assert_eq!(error.code, ErrorCode::DockerVolumeProtected);
-        assert_eq!(
-            ensure_mutable(&compose).unwrap_err().code,
-            ErrorCode::DockerVolumeProtected
-        );
     }
 
     #[test]

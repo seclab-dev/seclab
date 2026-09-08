@@ -702,7 +702,6 @@ pub enum DockerNetworkManagementKind {
 pub struct DockerNetworkManagement {
     pub kind: DockerNetworkManagementKind,
     pub owner_name: Option<String>,
-    pub read_only: bool,
 }
 
 /// Docker 网络允许执行的操作。
@@ -980,7 +979,6 @@ impl DockerVolumeManagementKind {
 pub struct DockerVolumeManagement {
     pub kind: DockerVolumeManagementKind,
     pub owner_name: Option<String>,
-    pub read_only: bool,
 }
 
 /// Docker 卷在当前模块允许执行的操作。

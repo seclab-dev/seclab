@@ -417,6 +417,8 @@ const zh: typeof en = {
         listVolumesFailed: '获取数据卷列表失败：{message}',
         volumeNameRequired: '请填写数据卷名称',
         deleteVolumeConfirm: '确认删除数据卷 "{name}"? 此操作不可撤销。',
+        deleteManagedVolumeConfirm:
+          '确认删除托管数据卷“{name}”吗？所属项目或套件状态可能不一致，后续部署可能重新创建。',
         deleteVolumeSuccess: '数据卷已删除。',
         deleteVolumeFailed: '删除数据卷失败: {message}',
         pruneConfirm:
@@ -1077,12 +1079,7 @@ const zh: typeof en = {
           suite: '套件',
           custom: '自定义',
         },
-        readOnly: {
-          system: '系统网络由 Docker 管理，在此处只读。',
-          compose: 'Compose 网络应从所属项目中管理。',
-          suite: '套件网络应从所属套件中管理。',
-          custom: '',
-        },
+        systemProtected: '系统网络由 Docker 管理，不能直接修改或删除。',
         features: {
           internal: '内部',
           ipv6: 'IPv6',
@@ -1098,6 +1095,8 @@ const zh: typeof en = {
           view: '查看',
           delete: '删除',
           deleteConfirm: '确认删除网络“{name}”吗？此操作无法撤销。',
+          deleteManagedConfirm:
+            '确认删除托管网络“{name}”吗？所属项目或套件状态可能不一致，后续部署可能重新创建。',
         },
         create: {
           title: '新增网络',
@@ -1143,7 +1142,7 @@ const zh: typeof en = {
           ipv6: 'IPv6 地址',
           macAddress: 'MAC 地址',
           actions: '操作',
-          readOnlyTitle: '托管网络',
+          systemProtectedTitle: '系统网络',
           refreshFailed: '网络详情刷新失败，已保留现有详情。',
           connectContainer: '接入容器',
           disconnectContainer: '断开连接',
@@ -1178,11 +1177,6 @@ const zh: typeof en = {
           suite: '套件',
           compose: 'Compose',
           custom: '自定义',
-        },
-        readOnly: {
-          suite: '该数据卷由套件中心管理，请从所属套件执行数据生命周期操作。',
-          compose: '该数据卷由 Compose 项目管理，请从所属项目执行数据生命周期操作。',
-          custom: '',
         },
         actions: {
           create: '新建数据卷',
@@ -1224,7 +1218,6 @@ const zh: typeof en = {
           readOnlyMode: '只读',
           readWriteMode: '读写',
           noReferences: '当前没有容器引用此数据卷。',
-          readOnlyTitle: '托管数据卷',
           loadFailed: '数据卷详情加载失败',
           states: {
             created: '已创建',
